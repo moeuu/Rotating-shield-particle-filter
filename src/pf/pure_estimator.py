@@ -287,6 +287,10 @@ class PurePFEstimator(_PFEstimatorCore):
                     spectrum_model.transport_feature_order
                 ),
                 "shared_background_owned_by_generative_model": True,
+                "station_assimilation_bridge": (
+                    "exact_shared_latent_view_prefix_marginals"
+                ),
+                "final_prefix_target_equals_joint_station_likelihood": True,
                 "full_spectrum_contract_hash_sha256": full_spectrum_hash,
             },
             "cardinality_prior": {
@@ -305,10 +309,19 @@ class PurePFEstimator(_PFEstimatorCore):
                 "applies_independently_per_isotope": True,
             },
             "joint_particle_initialization": {
-                "proposal": "direct_independent_isotope_product_prior_iid",
-                "common_outer_weights": "uniform",
+                "proposal": (
+                    "full_support_observation_guided_product_proposal"
+                    if bool(self.pf_config.joint_guided_initialization)
+                    else "direct_independent_isotope_product_prior_iid"
+                ),
+                "common_outer_weights": (
+                    "exact_product_prior_over_proposal_importance_weights"
+                    if bool(self.pf_config.joint_guided_initialization)
+                    else "uniform"
+                ),
                 "isotope_cardinalities_coupled_by_row": False,
                 "per_isotope_stratified_marginal_weights_reused": False,
+                "external_optimizer": False,
             },
             "strength_prior": {
                 "kind": "bounded_uniform",
@@ -334,6 +347,8 @@ class PurePFEstimator(_PFEstimatorCore):
                 "canonical_order": "surface_chart_id_then_continuous_u_v",
                 "canonical_density_factor": "K_factorial",
                 "same_chart_sources_allowed": True,
+                "pair_interaction_prior": "none_iid_surface_positions",
+                "proximity_used_only_in_target_preserving_proposals": True,
                 "continuous_uv_support": True,
                 "chart_max_edge_m": float(
                     self.pf_config.structural_rj_surface_chart_max_edge_m
@@ -397,6 +412,18 @@ class PurePFEstimator(_PFEstimatorCore):
                     "observations_target_beta_and_immutable_known_model_only_"
                     "never_current_particle_population"
                 ),
+                "guided_initialization": {
+                    "enabled": bool(
+                        self.pf_config.joint_guided_initialization
+                    ),
+                    "proposal_support": (
+                        "positive_product_prior_mixture_for_every_isotope"
+                    ),
+                    "weight_correction": (
+                        "exact_product_position_and_strength_prior_over_q"
+                    ),
+                    "uses_external_optimizer": False,
+                },
                 "position_proposal_chart_conditional": (
                     "continuous_uniform_unit_square_uv"
                 ),
@@ -455,6 +482,14 @@ class PurePFEstimator(_PFEstimatorCore):
                 "split_merge_attempt_probability": float(
                     self.pf_config.structural_rj_split_merge_probability
                 ),
+                "block_independence_attempt_probability": float(
+                    self.pf_config
+                    .structural_rj_block_independence_probability
+                ),
+                "block_independence_proposal": (
+                    "full_isotope_cardinality_position_strength_"
+                    "independence_mh_with_explicit_forward_reverse_density"
+                ),
                 "split_merge_direction_weights": {
                     "split": float(
                         self.pf_config.structural_rj_split_probability
@@ -466,6 +501,36 @@ class PurePFEstimator(_PFEstimatorCore):
                 "split_merge_strength_map": (
                     "strength_transfer_with_exact_total_strength_jacobian"
                 ),
+                "split_position_proposal": (
+                    "two_children_independently_from_parent_local_chart_"
+                    "mixture_with_global_surface_support"
+                ),
+                "split_global_position_probability": float(
+                    self.pf_config
+                    .structural_rj_split_global_position_probability
+                ),
+                "merge_pair_proposal": (
+                    "exact_same_or_one_portal_surface_distance_weighted_"
+                    "ordered_pair_with_uniform_global_support"
+                ),
+                "merge_position_proposal": (
+                    "equal_mixture_of_local_chart_proposals_from_both_"
+                    "children_with_exact_reverse_two_child_density"
+                ),
+                "merge_relocates_combined_source": True,
+                "merge_uniform_pair_probability": float(
+                    self.pf_config
+                    .structural_rj_merge_uniform_pair_probability
+                ),
+                "merge_distance_sigma_m": float(
+                    self.pf_config.structural_rj_merge_distance_sigma_m
+                ),
+                "split_merge_selection_density_in_mh_ratio": True,
+                "structural_sweep_order": (
+                    "birth_death_then_split_merge_then_block_independence_"
+                    "then_global_position_then_local_position_then_strength"
+                ),
+                "post_merge_same_sweep_refinement": True,
                 "boundary_normalization": {
                     "rule": ("renormalize_admissible_birth_death_direction_weights"),
                     "at_k_zero": {"birth": 1.0, "death": 0.0},
@@ -657,8 +722,11 @@ class PurePFEstimator(_PFEstimatorCore):
 
     def posterior_point_estimate(self) -> dict[str, PFPointEstimate]:
         """Return one coherent joint-particle configuration and uncertainty."""
+        cached = self._cached_posterior_point_estimate()
+        if cached is not None:
+            return cached
         if not self.filters:
-            return {}
+            return self._store_posterior_point_estimate({})
         (
             isotope_order,
             weights,
@@ -828,7 +896,7 @@ class PurePFEstimator(_PFEstimatorCore):
                 ),
                 selected_stratum_mass=maximum_mass,
             )
-        return result
+        return self._store_posterior_point_estimate(result)
 
     def posterior_snapshot(self) -> PFPosteriorSnapshot:
         """Return a schema-v1 PF posterior result with reproducibility metadata."""
@@ -860,28 +928,9 @@ class PurePFEstimator(_PFEstimatorCore):
         self,
     ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Project the PF posterior into the historical array result format."""
-        result: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
-        for isotope, point_estimate in self.posterior_point_estimate().items():
-            if not point_estimate.modes:
-                result[isotope] = (
-                    np.zeros((0, 3), dtype=float),
-                    np.zeros(0, dtype=float),
-                )
-                continue
-            result[isotope] = (
-                np.asarray(
-                    [mode.position_medoid_xyz for mode in point_estimate.modes],
-                    dtype=float,
-                ),
-                np.asarray(
-                    [
-                        mode.strength_representative_cps_1m
-                        for mode in point_estimate.modes
-                    ],
-                    dtype=float,
-                ),
-            )
-        return result
+        return self._project_posterior_point_estimates(
+            self.posterior_point_estimate()
+        )
 
     def estimate_all(
         self,

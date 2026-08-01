@@ -13,7 +13,7 @@ import threading
 import time
 from collections.abc import Mapping
 
-from runtime_defaults import DEFAULT_CUI_SPLIT_VIEW_DIR
+from pf.runtime_defaults import DEFAULT_CUI_SPLIT_VIEW_DIR
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CUI_VIEW_DIR = ROOT / DEFAULT_CUI_SPLIT_VIEW_DIR

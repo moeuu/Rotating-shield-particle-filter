@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import MISSING, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,13 +46,15 @@ from pf.profiles import (
     resolve_estimator_profile,
     resolve_structural_transition_provenance,
 )
-from pf.pure_estimator import PurePFEstimator
-from pf.state import IsotopeState
-from pf.surface_atlas import ContinuousSurfaceAtlas
 from pf.structural_rj import (
     EXPLICIT_CARDINALITY_PRIOR_POLICY,
     TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+    ContinuousStrengthProposal,
+    ContinuousSurfacePositionProposal,
 )
+from pf.pure_estimator import PurePFEstimator
+from pf.state import IsotopeState
+from measurement.surface_atlas import ContinuousSurfaceAtlas
 from sim.runtime import load_runtime_config
 from pure_pf_test_support import approved_full_spectrum_model
 
@@ -459,6 +462,33 @@ def _stable_fixed_k_estimator() -> RotatingShieldPFEstimator:
         particle.log_weight = float(np.log(0.5))
     estimator.history_estimates = [estimator.estimates(), estimator.estimates()]
     return estimator
+
+
+def test_exact_posterior_summary_is_cached_per_state_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated report consumers must share one exact intrinsic medoid."""
+    estimator = _stable_fixed_k_estimator()
+    estimator._invalidate_posterior_summary_cache()
+    original = pf_estimator_module.posterior_point_estimate_from_states
+    calls: list[int] = []
+
+    def counted_report(*args: object, **kwargs: object) -> PFPointEstimate:
+        """Count exact report evaluations while preserving their result."""
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pf_estimator_module,
+        "posterior_point_estimate_from_states",
+        counted_report,
+    )
+    first = estimator.estimates()
+    second = estimator.estimates()
+
+    assert len(calls) == 1
+    np.testing.assert_array_equal(first["Cs-137"][0], second["Cs-137"][0])
+    np.testing.assert_array_equal(first["Cs-137"][1], second["Cs-137"][1])
 
 
 @pytest.mark.parametrize(
@@ -916,6 +946,9 @@ def test_variable_cardinality_cannot_converge_at_the_truncation_boundary() -> No
         ("structural_rj_position_proposal_prior_weight", 0.0),
         ("structural_rj_local_position_move_probability", 1.1),
         ("structural_rj_strength_move_probability", 2.0),
+        ("structural_rj_split_global_position_probability", 0.0),
+        ("structural_rj_merge_uniform_pair_probability", 0.0),
+        ("structural_rj_merge_distance_sigma_m", 0.0),
         ("credible_surface_radius_threshold_m", -0.1),
         ("converge_min_ess_ratio", 0.0),
         ("converge_cardinality_min_probability", 1.1),
@@ -1109,6 +1142,13 @@ def test_structural_model_manifest_resolves_priors_and_surface_atlases() -> None
         "iid_uniform_physical_surface_area_canonical_unordered"
     )
     assert surface_prior["same_chart_sources_allowed"] is True
+    assert surface_prior["pair_interaction_prior"] == (
+        "none_iid_surface_positions"
+    )
+    assert (
+        surface_prior["proximity_used_only_in_target_preserving_proposals"]
+        is True
+    )
     assert surface_prior["continuous_uv_support"] is True
     assert surface_prior["support_quantization"] is False
     assert surface_prior["continuous_coordinates_within_each_chart"] is True
@@ -1166,6 +1206,16 @@ def test_structural_model_manifest_resolves_priors_and_surface_atlases() -> None
     assert rj_kernel["local_position_physical_area_jacobian"] == 1.0
     assert rj_kernel["local_position_invalid_trace"] == (
         "explicit_self_transition_without_redraw"
+    )
+    assert rj_kernel["merge_pair_proposal"] == (
+        "exact_same_or_one_portal_surface_distance_weighted_ordered_pair_"
+        "with_uniform_global_support"
+    )
+    assert rj_kernel["split_merge_selection_density_in_mh_ratio"] is True
+    assert rj_kernel["post_merge_same_sweep_refinement"] is True
+    assert rj_kernel["structural_sweep_order"] == (
+        "birth_death_then_split_merge_then_block_independence_then_"
+        "global_position_then_local_position_then_strength"
     )
     assert rj_kernel["boundary_normalization"]["at_k_zero"] == {
         "birth": 1.0,
@@ -1242,19 +1292,13 @@ def test_structural_model_manifest_resolves_priors_and_surface_atlases() -> None
     )
 
 
-@pytest.mark.parametrize(
-    "relative_path",
-    [
-        "configs/python/experiments/pf_strict_3d.json",
-        "configs/geant4/experiments/pf_strict_3d.json",
-    ],
-)
 def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning(
-    relative_path: str,
 ) -> None:
-    """Strict configs retain mission budget, collision, and 3-D planning."""
+    """The PF-owned config retains budget and 3-D planning policy."""
     root = Path(__file__).resolve().parents[1]
-    resolved = enforce_pure_runtime_settings(load_runtime_config(root / relative_path))
+    resolved = enforce_pure_runtime_settings(
+        load_runtime_config(root / "configs/pf/pf_strict_3d.json")
+    )
     assert resolved["structural_cardinality_prior_policy"] == (
         TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY
     )
@@ -1271,10 +1315,8 @@ def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning(
     assert resolved["path_planner"] == "dss_pp"
     assert "spectrum_count_method" not in resolved
     assert "calibration_count_method" not in resolved
-    expected_backend = "geant4" if "geant4" in relative_path else "python"
-    assert resolved["measurement_log_output_dir"] == (
-        f"logs/pure_pf/{expected_backend}_pf_strict_3d_measurement_log"
-    )
+    assert "sim_backend" not in resolved
+    assert "measurement_log_output_dir" not in resolved
     dss = resolved["dss_pp"]
     # These inherited settings prove the nested section is fully specified,
     # not accidentally replaced by a three-key shallow override.
@@ -1296,62 +1338,40 @@ def test_mission_budget_rejects_unbounded_fail_open_values(
         resolver(value, {})
 
 
-@pytest.mark.parametrize(
-    "relative_path",
-    [
-        "configs/geant4/variance_reduction_external_no_isaac_32threads.json",
-        "configs/geant4/high_fidelity_external_no_isaac.json",
-        "configs/python/high_fidelity_no_isaac.json",
-    ],
-)
-def test_standard_runtime_configs_declare_strict_pf_boundary(
-    relative_path: str,
-) -> None:
-    """Standard config files must not rely on runtime overrides for PF purity."""
-    root = Path(__file__).resolve().parents[1]
-    payload = load_runtime_config(root / relative_path)
-
-    assert payload["pure_pf_schema_version"] == PURE_PF_SCHEMA_VERSION
-    assert payload["estimator_profile"] == "pf_strict"
-    assert float(payload["pf_strength_prior_max_cps_1m"]) > float(
-        payload["pf_strength_prior_min_cps_1m"]
-    )
-
-
 def test_standard_geant4_config_selects_exact_surface_rj_kernel() -> None:
-    """The production Geant4 config must select only exact surface RJ-MH."""
+    """The PF config must select only exact surface RJ-MH."""
     root = Path(__file__).resolve().parents[1]
     payload = load_runtime_config(
-        root
-        / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+        root / "configs/pf/pf_strict_3d.json"
     )
+    payload = enforce_pure_runtime_settings(payload)
 
     assert payload["variable_cardinality"] is True
     assert float(payload["structural_rj_surface_chart_max_edge_m"]) > 0.0
     assert float(payload["structural_rj_move_probability"]) > 0.0
     assert float(payload["structural_rj_birth_probability"]) > 0.0
     assert float(payload["structural_rj_death_probability"]) > 0.0
-    assert (
-        float(payload["structural_rj_local_position_move_probability"])
-        == 1.0
+    attempt_probabilities = np.asarray(
+        [
+            payload["structural_rj_move_probability"],
+            payload["structural_rj_position_move_probability"],
+            payload["structural_rj_local_position_move_probability"],
+            payload["structural_rj_strength_move_probability"],
+            payload["structural_rj_split_merge_probability"],
+        ],
+        dtype=np.float64,
     )
+    assert np.all(attempt_probabilities > 0.0)
+    assert np.all(attempt_probabilities <= 1.0)
     assert float(payload["structural_cardinality_prior_mean"]) > 0.0
 
 
-@pytest.mark.parametrize(
-    "relative_path",
-    [
-        "configs/geant4/variance_reduction_external_no_isaac_32threads.json",
-        "configs/geant4/high_fidelity_external_no_isaac.json",
-        "configs/python/high_fidelity_no_isaac.json",
-    ],
-)
-def test_standard_runtime_configs_select_parallel_compute_paths(
-    relative_path: str,
-) -> None:
-    """Standard runtimes must select parallel planning worker paths."""
+def test_standard_pf_config_selects_parallel_compute_paths() -> None:
+    """The standard PF config must select parallel planning worker paths."""
     root = Path(__file__).resolve().parents[1]
-    payload = load_runtime_config(root / relative_path)
+    payload = enforce_pure_runtime_settings(
+        load_runtime_config(root / "configs/pf/pf_strict_3d.json")
+    )
 
     assert int(payload["python_worker_count"]) > 1
     assert int(payload["pose_selection_workers"]) > 1
@@ -2182,22 +2202,24 @@ def test_joint_smc_reports_station_and_cumulative_lineage_separately(
         _select_delta_beta,
     )
 
-    def _zero_likelihood(station: JointStationObservation) -> object:
-        """Return a finite inert likelihood for every aligned row."""
+    def _zero_prefix_likelihood(
+        station: JointStationObservation,
+    ) -> object:
+        """Return finite inert empty/full prefixes for every aligned row."""
         import torch
 
         del station
-        return torch.zeros(4, dtype=torch.float64)
+        return torch.zeros((2, 4), dtype=torch.float64)
 
     monkeypatch.setattr(
         estimator,
-        "_joint_station_log_likelihood_torch",
-        _zero_likelihood,
+        "_joint_station_prefix_log_likelihood_torch",
+        _zero_prefix_likelihood,
     )
     monkeypatch.setattr(
         estimator,
         "_joint_rejuvenate",
-        lambda stations, target_beta: None,
+        lambda stations, target_beta, newest_prefix_count=None: None,
     )
     monkeypatch.setattr(
         estimator,
@@ -2239,6 +2261,85 @@ def test_joint_smc_reports_station_and_cumulative_lineage_separately(
             "station_unique_ancestors",
             "cumulative_unique_ancestors",
         }.issubset(step)
+        for step in estimator.last_joint_temper_steps
+    )
+
+
+def test_joint_temper_step_limit_is_applied_per_view_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each exact view-prefix bridge must receive the configured step limit."""
+    torch = pytest.importorskip("torch")
+    estimator = RotatingShieldPFEstimator(
+        isotopes=("Cs-137",),
+        surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            variable_cardinality=False,
+            init_num_sources=(1, 1),
+            target_ess_ratio=0.5,
+            max_temper_steps=1,
+            use_gpu=False,
+            position_max=(3.0, 3.0, 3.0),
+        ),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
+    )
+    estimator.add_measurement_pose(np.asarray([1.5, 1.5, 1.5]))
+    estimator._ensure_kernel_cache()
+    model = estimator._full_spectrum_model()
+    filt = estimator.filters["Cs-137"]
+
+    def _finish_prefix(**kwargs: object) -> tuple[float, object, float]:
+        """Complete each prefix bridge in one exact tempering step."""
+        remaining = float(kwargs["remaining"])
+        return (
+            remaining,
+            torch.full((4,), -np.log(4.0), dtype=torch.float64),
+            4.0,
+        )
+
+    monkeypatch.setattr(filt, "_select_delta_beta", _finish_prefix)
+    monkeypatch.setattr(
+        estimator,
+        "_joint_station_prefix_log_likelihood_torch",
+        lambda station: torch.zeros((3, 4), dtype=torch.float64),
+    )
+    monkeypatch.setattr(
+        estimator,
+        "_joint_rejuvenate",
+        lambda stations, target_beta, newest_prefix_count=None: None,
+    )
+    monkeypatch.setattr(
+        estimator,
+        "_promote_joint_birth_proposal_station",
+        lambda station: None,
+    )
+    station = JointStationObservation(
+        spectrum_vb=np.zeros(
+            (2, np.asarray(model.energy_axis_keV).size),
+            dtype=np.float64,
+        ),
+        energy_axis_keV=np.asarray(model.energy_axis_keV, dtype=np.float64),
+        generative_contract_hash_sha256=model.contract_hash_sha256,
+        pose_idx=0,
+        detector_position_xyz_m=(1.5, 1.5, 1.5),
+        fe_indices=np.asarray([0, 1], dtype=np.int64),
+        pb_indices=np.asarray([0, 1], dtype=np.int64),
+        live_times_s=np.asarray([1.0, 1.0], dtype=np.float64),
+        station_sequence_id=0,
+    )
+
+    estimator._joint_tempered_station_update(station)
+
+    assert len(estimator.last_joint_temper_steps) == 2
+    assert [
+        step["prefix_count"] for step in estimator.last_joint_temper_steps
+    ] == [1.0, 2.0]
+    assert all(
+        step["beta_total"] == pytest.approx(1.0)
         for step in estimator.last_joint_temper_steps
     )
 
@@ -2303,10 +2404,16 @@ def test_joint_rejuvenation_uses_newest_station_boundary_on_every_sweep(
         *,
         target_beta: float,
         tempering_start_row: int | None,
+        current_target_log_likelihood: np.ndarray,
     ) -> None:
         """Record the estimator-owned evidence and newest-station boundary."""
         assert estimator._active_joint_structural_geometry is evidence
         assert tempering_start_row is not None
+        estimator.filters[
+            "Cs-137"
+        ].last_structural_target_log_likelihood = (
+            np.asarray(current_target_log_likelihood, dtype=np.float64).copy()
+        )
         calls.append(
             (
                 int(evidence.row_count),
@@ -2315,10 +2422,25 @@ def test_joint_rejuvenation_uses_newest_station_boundary_on_every_sweep(
             )
         )
 
+    def _refresh(stations: object) -> None:
+        """Install a sentinel cache for the isolated boundary test."""
+        del stations
+        total = np.zeros((4, 1, 1, 1), dtype=np.float64)
+        estimator._joint_structural_transport_cache = (
+            total,
+            total.copy(),
+            np.zeros(total.shape + (4,), dtype=np.float64),
+        )
+
     monkeypatch.setattr(
         estimator,
         "_refresh_joint_structural_transport_cache",
-        lambda stations: None,
+        _refresh,
+    )
+    monkeypatch.setattr(
+        estimator,
+        "_joint_history_log_likelihood_numpy",
+        lambda **_: np.zeros(4, dtype=np.float64),
     )
     monkeypatch.setattr(
         estimator.filters["Cs-137"],
@@ -2344,6 +2466,250 @@ def test_joint_rejuvenation_uses_newest_station_boundary_on_every_sweep(
         (5, 2, 0.4),
         (2, 0, 1.0),
     ]
+
+
+def test_joint_mixing_diagnostics_measure_state_not_ancestry() -> None:
+    """Movement diagnostics must respond when one aligned state row changes."""
+    estimator = RotatingShieldPFEstimator(
+        isotopes=("Cs-137",),
+        surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            variable_cardinality=False,
+            init_num_sources=(1, 1),
+            use_gpu=False,
+            position_max=(3.0, 3.0, 3.0),
+        ),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
+    )
+    estimator.add_measurement_pose(np.asarray([1.5, 1.5, 1.5]))
+    estimator._ensure_kernel_cache()
+    before = estimator._joint_mixing_snapshot()
+    particle = estimator.filters["Cs-137"].continuous_particles[0]
+    particle.state.strengths[0] *= 1.1
+    after = estimator._joint_mixing_snapshot()
+
+    diagnostics = estimator._joint_mixing_diagnostics(
+        before,
+        after,
+        target_before=np.asarray([-3.0, -2.0, -1.0, 0.0]),
+        target_after=np.asarray([-3.1, -2.0, -1.0, 0.0]),
+    )
+
+    assert diagnostics["state_change_weight_mass"] == pytest.approx(0.25)
+    assert diagnostics["k_transition_weight_mass"] == 0.0
+    assert diagnostics["surface_position_esjd_m2"] == 0.0
+    assert diagnostics["log_strength_esjd"] > 0.0
+    assert diagnostics["distinct_joint_state_count"] >= 2.0
+    assert diagnostics["joint_k_vector_lag1_correlation"] == 1.0
+    assert diagnostics["k_lag1_correlation.Cs-137"] == 1.0
+
+
+def test_joint_k_vector_lag1_correlation_tracks_cardinality_reversal() -> None:
+    """The joint cardinality diagnostic must expose inverse sweep movement."""
+    before = np.asarray(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    after = 1.0 - before
+    weights = np.full(4, 0.25, dtype=np.float64)
+
+    correlation = (
+        RotatingShieldPFEstimator._weighted_vector_lag1_correlation(
+            before,
+            after,
+            weights,
+        )
+    )
+
+    assert correlation == pytest.approx(-1.0)
+
+
+def test_guided_initialization_uses_exact_prior_over_proposal_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guided initialization must weight its defensive joint mixture exactly."""
+    estimator = RotatingShieldPFEstimator(
+        isotopes=("Cs-137",),
+        surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=8,
+            max_sources=2,
+            variable_cardinality=True,
+            init_num_sources=(0, 2),
+            use_gpu=False,
+            position_max=(3.0, 3.0, 3.0),
+            joint_guided_initialization=True,
+        ),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
+    )
+    estimator.add_measurement_pose(np.asarray([1.5, 1.5, 1.5]))
+    estimator._ensure_kernel_cache()
+    filt = estimator.filters["Cs-137"]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    alignment = np.zeros(atlas.chart_count, dtype=np.float64)
+    alignment[0] = 1.0
+    position_proposal = ContinuousSurfacePositionProposal(
+        area_prior_probabilities=atlas.chart_probabilities,
+        alignment_scores=alignment,
+        prior_component_probability=0.5,
+    )
+    strength_proposal = ContinuousStrengthProposal(
+        minimum=filt._strength_prior.minimum,
+        maximum=filt._strength_prior.maximum,
+        data_locations_by_chart=np.full(
+            atlas.chart_count,
+            0.5
+            * (
+                filt._strength_prior.minimum
+                + filt._strength_prior.maximum
+            ),
+            dtype=np.float64,
+        ),
+        data_sigma=1.0,
+        prior_component_probability=1.0,
+        data_informative=False,
+    )
+
+    def _build_proposal(
+        *_: object,
+        **__: object,
+    ) -> ContinuousSurfacePositionProposal:
+        """Install exact prior position and strength proposal densities."""
+        filt._structural_rj_strength_proposal = strength_proposal
+        return position_proposal
+
+    monkeypatch.setattr(
+        filt,
+        "_build_continuous_rj_position_proposal",
+        _build_proposal,
+    )
+    identities_before = tuple(
+        particle.joint_row_identity
+        for particle in filt.continuous_particles
+    )
+    model = estimator._full_spectrum_model()
+    station = JointStationObservation(
+        spectrum_vb=np.zeros(
+            (1, np.asarray(model.energy_axis_keV).size),
+            dtype=np.float64,
+        ),
+        energy_axis_keV=np.asarray(model.energy_axis_keV, dtype=np.float64),
+        generative_contract_hash_sha256=model.contract_hash_sha256,
+        pose_idx=0,
+        detector_position_xyz_m=(1.5, 1.5, 1.5),
+        fe_indices=np.asarray([0], dtype=np.int64),
+        pb_indices=np.asarray([0], dtype=np.int64),
+        live_times_s=np.asarray([1.0], dtype=np.float64),
+        station_sequence_id=0,
+    )
+
+    estimator._apply_joint_guided_initialization(station)
+
+    log_prior = np.zeros(8, dtype=np.float64)
+    log_guided = np.zeros(8, dtype=np.float64)
+    for row, particle in enumerate(filt.continuous_particles):
+        chart_ids = particle.state.surface_chart_ids
+        log_prior[row] = float(
+            filt._structural_rj_cardinality_prior.log_prob(
+                particle.state.num_sources
+            )
+        ) + float(
+            np.sum(
+                atlas.log_chart_probabilities[chart_ids]
+            )
+        )
+        log_guided[row] = float(
+            filt._structural_rj_cardinality_prior.log_prob(
+                particle.state.num_sources
+            )
+        ) + float(np.sum(position_proposal.log_density(chart_ids)))
+    log_mixture = np.logaddexp(
+        np.log(0.5) + log_prior,
+        np.log(0.5) + log_guided,
+    )
+    log_ratio = log_prior - log_mixture
+    expected_log_weights = log_ratio - np.logaddexp.reduce(log_ratio)
+    expected_weights = np.exp(expected_log_weights)
+    assert estimator._joint_guided_initialization_applied
+    assert estimator.last_joint_guided_initialization_ess == pytest.approx(
+        1.0 / np.sum(np.square(expected_weights))
+    )
+    assert np.allclose(
+        estimator._strict_joint_particle_weights(),
+        expected_weights,
+        rtol=0.0,
+        atol=1.0e-15,
+    )
+    assert tuple(
+        particle.joint_row_identity
+        for particle in filt.continuous_particles
+    ) == identities_before
+
+
+def test_adaptive_rejuvenation_uses_movement_and_soft_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second exact sweep is optional and must obey the station soft budget."""
+    estimator = object.__new__(RotatingShieldPFEstimator)
+    estimator.pf_config = SimpleNamespace(
+        joint_rejuvenation_min_sweeps=1,
+        joint_rejuvenation_max_sweeps=2,
+        joint_rejuvenation_min_state_change_weight_mass=0.1,
+        joint_rejuvenation_min_surface_esjd_m2=1.0e-4,
+        joint_rejuvenation_min_log_strength_esjd=1.0e-4,
+        joint_smc_soft_wall_time_s=1800.0,
+    )
+    estimator.last_joint_rejuvenation_diagnostics = []
+    estimator.last_joint_smc_soft_budget_exceeded = False
+    calls = 0
+
+    def _sweep(*_: object, **__: object) -> dict[str, float]:
+        """Return inadequate movement once and adequate movement second."""
+        nonlocal calls
+        calls += 1
+        return {
+            "state_change_weight_mass": 0.05 if calls == 1 else 0.2,
+            "surface_position_esjd_m2": 0.0 if calls == 1 else 0.1,
+            "log_strength_esjd": 0.0,
+            "k_transition_weight_mass": 0.0,
+        }
+
+    monkeypatch.setattr(estimator, "_joint_rejuvenate", _sweep)
+    estimator._joint_rejuvenate_adaptive(
+        (),
+        target_beta=0.5,
+        newest_prefix_count=2,
+        station_start_s=time.perf_counter(),
+    )
+
+    assert calls == 2
+    assert len(estimator.last_joint_rejuvenation_diagnostics) == 2
+    assert not estimator.last_joint_smc_soft_budget_exceeded
+
+    estimator.last_joint_rejuvenation_diagnostics = []
+    estimator.pf_config.joint_smc_soft_wall_time_s = 1.0
+    calls = 0
+    estimator._joint_rejuvenate_adaptive(
+        (),
+        target_beta=0.5,
+        newest_prefix_count=2,
+        station_start_s=time.perf_counter() - 2.0,
+    )
+
+    assert calls == 1
+    assert estimator.last_joint_smc_soft_budget_exceeded
 
 
 def test_joint_structural_geometry_rejects_same_length_row_mismatch() -> None:
@@ -2434,9 +2800,9 @@ def test_joint_smc_recovers_before_an_inadmissible_minimum_increment(
     monkeypatch.setattr(filt, "_select_delta_beta", _select_delta_beta)
     monkeypatch.setattr(
         estimator,
-        "_joint_station_log_likelihood_torch",
+        "_joint_station_prefix_log_likelihood_torch",
         lambda station: torch.zeros(
-            4,
+            (2, 4),
             dtype=torch.float64,
         ),
     )
@@ -2444,8 +2810,8 @@ def test_joint_smc_recovers_before_an_inadmissible_minimum_increment(
     monkeypatch.setattr(
         estimator,
         "_joint_rejuvenate",
-        lambda stations, target_beta: rejuvenation_betas.append(
-            float(target_beta)
+        lambda stations, target_beta, newest_prefix_count=None: (
+            rejuvenation_betas.append(float(target_beta))
         ),
     )
     monkeypatch.setattr(
@@ -2475,6 +2841,9 @@ def test_joint_smc_recovers_before_an_inadmissible_minimum_increment(
     assert filt.last_temper_resample_count == 1
     assert estimator.last_joint_temper_steps[0] == pytest.approx(
         {
+            "prefix_count": 1.0,
+            "prefix_view_count": 1.0,
+            "station_beta": 0.0,
             "beta_total": 0.0,
             "delta_beta": 0.0,
             "ess": 1.0 / (0.4**2 + 0.3**2 + 0.2**2 + 0.1**2),
@@ -2525,6 +2894,18 @@ def test_torch_weight_and_likelihood_normalization_fail_fast(
     ):
         with pytest.raises(RuntimeError):
             filt._normalized_log_weights_torch(invalid)
+
+    huge_negative = torch.full(
+        (4,),
+        -1.0e16,
+        dtype=torch.float64,
+    )
+    huge_normalized = filt._normalized_log_weights_torch(huge_negative)
+    assert float(torch.logsumexp(huge_normalized, dim=0)) == pytest.approx(
+        0.0,
+        abs=1.0e-15,
+    )
+    assert filt._ess_from_logw_torch(huge_normalized) == pytest.approx(4.0)
 
     normalized = torch.full((4,), -np.log(4.0), dtype=torch.float64)
     for invalid_likelihood in (
@@ -3022,6 +3403,88 @@ def test_joint_history_station_batch_matches_serial_likelihood_oracle(
 
     assert call_shapes == [(station_count, 1, view_count, bin_count)]
     assert action_chunks == [station_count]
+    assert np.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_joint_history_prefix_bridge_matches_exact_shared_latent_oracle() -> None:
+    """The newest-station bridge must interpolate exact prefix marginals."""
+    estimator = RotatingShieldPFEstimator(
+        isotopes=("Cs-137",),
+        surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            variable_cardinality=False,
+            init_num_sources=(1, 1),
+            use_gpu=False,
+            position_max=(3.0, 3.0, 3.0),
+        ),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
+    )
+    estimator.add_measurement_pose(np.asarray([1.5, 1.5, 1.5]))
+    estimator._ensure_kernel_cache()
+    filt = estimator.filters["Cs-137"]
+    model = estimator._full_spectrum_model()
+    view_count = 3
+    particle_count = 4
+    line_count = len(tuple(model.line_identity))
+    bin_count = np.asarray(model.energy_axis_keV).size
+    live_times = np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
+    stations = tuple(
+        SimpleNamespace(
+            fe_indices=np.arange(view_count, dtype=np.int64),
+            live_times_s=live_times.copy(),
+            spectrum_vb=np.zeros(
+                (view_count, bin_count),
+                dtype=np.float64,
+            ),
+            station_sequence_id=index,
+        )
+        for index in range(2)
+    )
+    rng = np.random.default_rng(20260730)
+    total = rng.uniform(
+        0.0,
+        0.05,
+        size=(particle_count, 2 * view_count, 1, line_count),
+    )
+    uncollided = 0.8 * total
+    features = np.zeros(total.shape + (4,), dtype=np.float64)
+    features[..., 3] = 1.0
+    beta = 0.35
+    prefix_count = 2
+    past_ll = model.log_likelihood_numpy(
+        stations[0].spectrum_vb,
+        total[:, :view_count],
+        uncollided[:, :view_count],
+        features[:, :view_count],
+        live_times,
+    )
+    prefixes = model.prefix_log_likelihood_numpy(
+        stations[1].spectrum_vb,
+        total[:, view_count:],
+        uncollided[:, view_count:],
+        features[:, view_count:],
+        live_times,
+    )
+    expected = (
+        past_ll
+        + (1.0 - beta) * prefixes[prefix_count - 1]
+        + beta * prefixes[prefix_count]
+    )
+
+    actual = estimator._joint_history_log_likelihood_numpy(
+        filt=filt,
+        stations=stations,
+        total_nvsl=total,
+        uncollided_nvsl=uncollided,
+        features_nvslf=features,
+        target_beta=beta,
+        newest_prefix_count=prefix_count,
+    )
+
     assert np.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
 
 

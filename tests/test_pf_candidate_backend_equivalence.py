@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -169,6 +170,62 @@ def test_exact_rj_candidate_target_matches_numpy_and_torch_cpu() -> None:
     )
 
 
+def test_cached_fixed_state_transport_matches_direct_batch_kernel() -> None:
+    """Station caching must preserve the former direct transport arithmetic."""
+    estimator = _estimator(use_gpu=True)
+    station = _station()
+    layout = estimator._joint_line_layout()
+    for isotope in estimator.joint_isotope_order():
+        global_columns, local_indices, branching_weights = layout[isotope]
+        filt = estimator.filters[isotope]
+        direct = (
+            filt._continuous_expected_line_transport_components_pair_sequence_torch(
+                pose_idx=int(station.pose_idx),
+                fe_indices=station.fe_indices,
+                pb_indices=station.pb_indices,
+                live_times_s=station.live_times_s,
+                positive_line_indices=local_indices,
+            )
+        )
+        cached_total, cached_uncollided, cached_features = (
+            estimator._joint_isotope_station_transport_components_torch(
+                station,
+                isotope,
+            )
+        )
+        branch = branching_weights.reshape(1, 1, 1, -1)
+        np.testing.assert_allclose(
+            cached_total[..., global_columns].detach().cpu().numpy(),
+            direct.total_kernel.detach().cpu().numpy() * branch,
+            rtol=0.0,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            cached_uncollided[..., global_columns].detach().cpu().numpy(),
+            direct.uncollided_kernel.detach().cpu().numpy() * branch,
+            rtol=0.0,
+            atol=0.0,
+        )
+        direct_features = np.stack(
+            [
+                direct.tau_fe.detach().cpu().numpy(),
+                direct.tau_pb.detach().cpu().numpy(),
+                direct.tau_obstacle.detach().cpu().numpy(),
+                direct.distance_m.detach().cpu().numpy(),
+            ],
+            axis=-1,
+        )
+        np.testing.assert_allclose(
+            cached_features[..., global_columns, :]
+            .detach()
+            .cpu()
+            .numpy(),
+            direct_features,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
 def test_exact_rj_candidate_target_matches_numpy_and_cuda() -> None:
     """The production CUDA target must preserve the NumPy PF target."""
     torch = pytest.importorskip("torch")
@@ -186,6 +243,111 @@ def test_exact_rj_candidate_target_matches_numpy_and_cuda() -> None:
         rtol=2.0e-12,
         atol=1.0e-8,
     )
+
+
+def test_torch_rj_target_keeps_history_resident_and_reuses_unit_transport() -> None:
+    """Torch RJ must retain history tensors and cache exact surface responses."""
+    torch = pytest.importorskip("torch")
+    station = _station()
+    estimator = _estimator(use_gpu=True)
+    estimator._active_joint_station_history = (station,)
+    estimator._refresh_joint_structural_transport_cache((station,))
+    cache = estimator._joint_structural_transport_cache
+    assert cache is not None
+    assert all(torch.is_tensor(value) for value in cache)
+    assert all(str(value.device) == "cpu" for value in cache)
+    estimator._joint_structural_transport_cache = None
+    estimator._active_joint_station_history = None
+
+    first = _conditional_target(estimator, station)
+    first_hits = estimator.last_joint_structural_unit_cache_hits
+    first_misses = estimator.last_joint_structural_unit_cache_misses
+    second = _conditional_target(estimator, station)
+
+    assert first_misses > 0
+    assert estimator.last_joint_structural_unit_cache_hits > first_hits
+    assert estimator.last_joint_structural_unit_cache_misses == first_misses
+    np.testing.assert_array_equal(second, first)
+
+
+def test_unit_transport_cache_preserves_completed_station_shards() -> None:
+    """Appending a station must reuse exact responses from completed stations."""
+    estimator = _estimator(use_gpu=True)
+    filt = estimator.filters["Cs-137"]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    chart_ids = np.asarray([0, 1], dtype=np.int64)
+    surface_uv = np.asarray(
+        [[0.2, 0.3], [0.7, 0.8]],
+        dtype=np.float64,
+    )
+    positions = atlas.positions_xyz(chart_ids, surface_uv)
+    local_indices = estimator._joint_line_layout()["Cs-137"][1]
+    first_station = _station()
+    second_station = replace(
+        first_station,
+        fe_indices=np.asarray([1, 4], dtype=np.int64),
+        pb_indices=np.asarray([6, 0], dtype=np.int64),
+        station_sequence_id=1,
+    )
+    first_geometry = estimator._joint_history_structural_geometry(
+        "Cs-137",
+        (first_station,),
+    )
+    combined_geometry = estimator._joint_history_structural_geometry(
+        "Cs-137",
+        (first_station, second_station),
+    )
+
+    first = estimator._joint_cached_continuous_unit_components(
+        filt=filt,
+        data=first_geometry,
+        positions_s3=positions,
+        chart_ids_s=chart_ids,
+        positive_line_indices=local_indices,
+    )
+    first_misses = estimator.last_joint_structural_unit_cache_misses
+    combined = estimator._joint_cached_continuous_unit_components(
+        filt=filt,
+        data=combined_geometry,
+        positions_s3=positions,
+        chart_ids_s=chart_ids,
+        positive_line_indices=local_indices,
+    )
+
+    assert estimator.last_joint_structural_unit_cache_hits >= chart_ids.size
+    assert (
+        estimator.last_joint_structural_unit_cache_misses
+        == first_misses + chart_ids.size
+    )
+    for first_values, combined_values in zip(
+        first,
+        combined,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            combined_values[: first_geometry.row_count],
+            first_values,
+        )
+
+    misses_before_repeat = estimator.last_joint_structural_unit_cache_misses
+    repeated = estimator._joint_cached_continuous_unit_components(
+        filt=filt,
+        data=combined_geometry,
+        positions_s3=positions,
+        chart_ids_s=chart_ids,
+        positive_line_indices=local_indices,
+    )
+    assert (
+        estimator.last_joint_structural_unit_cache_misses
+        == misses_before_repeat
+    )
+    for repeated_values, combined_values in zip(
+        repeated,
+        combined,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(repeated_values, combined_values)
 
 
 def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:

@@ -286,6 +286,103 @@ def _active_surface_source_medoid(
     return positions[int(np.argmin(np.sum(pairwise, axis=1)))].copy()
 
 
+def _batched_particle_display_arrays(
+    particle_filter: Any,
+    particle_weights: NDArray[np.float64],
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Build exact particle-cloud arrays through the fixed-slot batch path."""
+    packer = getattr(
+        particle_filter,
+        "_packed_continuous_surface_state_arrays",
+        None,
+    )
+    particles = getattr(particle_filter, "continuous_particles", [])
+    weights = np.asarray(particle_weights, dtype=float).reshape(-1)
+    if not callable(packer):
+        flat_positions: list[NDArray[np.float64]] = []
+        flat_weights: list[float] = []
+        representative_positions: list[NDArray[np.float64]] = []
+        representative_weights: list[float] = []
+        for particle, weight in zip(particles, weights, strict=True):
+            active_positions = _active_display_positions(
+                particle_filter,
+                particle.state,
+            )
+            if active_positions.size == 0:
+                continue
+            representative_positions.append(
+                _active_surface_source_medoid(active_positions)
+            )
+            representative_weights.append(float(weight))
+            flat_positions.extend(active_positions)
+            flat_weights.extend(
+                [float(weight)] * int(active_positions.shape[0])
+            )
+        return (
+            np.vstack(flat_positions)
+            if flat_positions
+            else np.zeros((0, 3), dtype=float),
+            np.asarray(flat_weights, dtype=float),
+            np.vstack(representative_positions)
+            if representative_positions
+            else np.zeros((0, 3), dtype=float),
+            np.asarray(representative_weights, dtype=float),
+        )
+
+    packed_positions, _strengths, active_mask, _chart_ids, _surface_uv = (
+        packer()
+    )
+    positions = np.asarray(packed_positions, dtype=float)
+    mask = np.asarray(active_mask, dtype=bool)
+    if (
+        positions.ndim != 3
+        or positions.shape[2] != 3
+        or mask.shape != positions.shape[:2]
+        or weights.shape != positions.shape[:1]
+        or np.any(~np.isfinite(positions))
+        or np.any(~np.isfinite(weights))
+    ):
+        raise RuntimeError(
+            "PF visualization received invalid batched continuous states."
+        )
+    source_counts = np.sum(mask, axis=1, dtype=np.int64)
+    nonempty = source_counts > 0
+    flat_positions = np.asarray(positions[mask], dtype=float)
+    flat_weights = np.repeat(weights, source_counts)
+    if not np.any(nonempty):
+        return (
+            flat_positions,
+            flat_weights,
+            np.zeros((0, 3), dtype=float),
+            np.zeros(0, dtype=float),
+        )
+    differences = positions[:, :, None, :] - positions[:, None, :, :]
+    pairwise = np.linalg.norm(differences, axis=3)
+    valid_pairs = mask[:, :, None] & mask[:, None, :]
+    candidate_cost = np.sum(
+        np.where(valid_pairs, pairwise, 0.0),
+        axis=2,
+    )
+    candidate_cost = np.where(mask, candidate_cost, np.inf)
+    representative_slots = np.argmin(candidate_cost, axis=1)
+    row_indices = np.arange(positions.shape[0], dtype=np.int64)
+    representative_positions = positions[
+        row_indices[nonempty],
+        representative_slots[nonempty],
+    ]
+    return (
+        flat_positions,
+        flat_weights,
+        np.asarray(representative_positions, dtype=float),
+        weights[nonempty],
+    )
+
+
 class RealTimePFVisualizer:
     """
     Simple matplotlib-based 3D visualizer for the PF state.
@@ -2360,7 +2457,7 @@ def build_frame_from_pf(
     Construct a PFFrame snapshot from the joint PF and raw spectrum.
 
     Args:
-        pf: Sequential estimator exposing ``filters`` and ``estimate_all()``.
+        pf: Sequential estimator exposing ``filters`` and cached estimates.
         step_index: integer step
         time_sec: cumulative time in seconds
         detector_position: Physical detector XYZ used by the likelihood.
@@ -2370,8 +2467,10 @@ def build_frame_from_pf(
         spectrum_energy_keV: Native incident-energy bin axis.
         spectrum_counts: Raw nonnegative native histogram.
     """
-    if hasattr(pf, "estimate_all"):
-        est: Dict[str, object] = pf.estimate_all()
+    if hasattr(pf, "visualization_estimates"):
+        est: Dict[str, object] = pf.visualization_estimates()
+    elif hasattr(pf, "estimate_all"):
+        est = pf.estimate_all()
     else:
         est = pf.estimates()  # type: ignore[attr-defined]
     particle_positions: Dict[str, NDArray[np.float64]] = {}
@@ -2382,35 +2481,29 @@ def build_frame_from_pf(
     estimated_strengths: Dict[str, NDArray[np.float64]] = {}
 
     for iso, filt in pf.filters.items():
-        positions: list[NDArray[np.float64]] = []
-        weights: list[float] = []
-        representative_positions: list[NDArray[np.float64]] = []
-        representative_weights: list[float] = []
         cont_particles = getattr(filt, "continuous_particles", [])
         cont_weights = getattr(filt, "continuous_weights", np.zeros(0))
         if cont_particles and len(cont_weights) == len(cont_particles):
-            for p, w in zip(cont_particles, cont_weights):
-                active_positions = _active_display_positions(filt, p.state)
-                if active_positions.size == 0:
-                    continue
-                representative_positions.append(
-                    _active_surface_source_medoid(active_positions),
-                )
-                representative_weights.append(float(w))
-                for pos in active_positions:
-                    positions.append(pos)
-                    weights.append(float(w))
-        particle_positions[iso] = np.vstack(positions) if positions else np.zeros((0, 3))
-        particle_weights[iso] = np.asarray(weights, dtype=float)
-        particle_representative_positions[iso] = (
-            np.vstack(representative_positions)
-            if representative_positions
-            else np.zeros((0, 3))
-        )
-        particle_representative_weights[iso] = np.asarray(
-            representative_weights,
-            dtype=float,
-        )
+            (
+                particle_positions[iso],
+                particle_weights[iso],
+                particle_representative_positions[iso],
+                particle_representative_weights[iso],
+            ) = _batched_particle_display_arrays(
+                filt,
+                np.asarray(cont_weights, dtype=float),
+            )
+        else:
+            particle_positions[iso] = np.zeros((0, 3), dtype=float)
+            particle_weights[iso] = np.zeros(0, dtype=float)
+            particle_representative_positions[iso] = np.zeros(
+                (0, 3),
+                dtype=float,
+            )
+            particle_representative_weights[iso] = np.zeros(
+                0,
+                dtype=float,
+            )
         if iso in est:
             value = est[iso]
             if hasattr(value, "positions"):

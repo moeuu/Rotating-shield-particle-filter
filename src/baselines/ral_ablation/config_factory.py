@@ -33,19 +33,19 @@ from pf.randomness import (
     named_rng_provenance,
     named_stream_seed,
 )
-from runtime_defaults import (
+from pf.runtime_defaults import (
     DEFAULT_CUI_SPLIT_VIEW_DIR,
     DEFAULT_MEASUREMENT_TIME_S,
     DEFAULT_NO_ROTATION_OVERHEAD_S,
     DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M,
 )
+from runtime.assets import standard_geant4_config_path
 from runtime_environment import attach_random_manchester_transport_geometry
 from sim.runtime import load_runtime_config
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_BASE_CONFIG = (
-    ROOT / "configs" / "geant4" / "variance_reduction_external_no_isaac_32threads.json"
-)
+DEFAULT_BASE_CONFIG = standard_geant4_config_path()
+DEFAULT_PF_CONFIG = ROOT / "configs" / "pf" / "pf_strict_3d.json"
 DEFAULT_OUTPUT_DIR = ROOT / "results" / "ral_ablation"
 DEFAULT_MEASUREMENT_LOG_ROOT = Path("results") / "ral_ablation" / "measurement_logs"
 DEFAULT_ISOTOPES = ("Cs-137", "Co-60", "Eu-154")
@@ -575,7 +575,8 @@ def _variant_config(
     output_tag: str,
 ) -> dict[str, Any]:
     """Return the runtime config for one ablation variant."""
-    config = _deep_update(base_config, _parallel_runtime_overrides(base_config))
+    config = _deep_update(base_config, _load_json(DEFAULT_PF_CONFIG))
+    config = _deep_update(config, _parallel_runtime_overrides(config))
     config = _deep_update(config, variant.overrides)
     config = enforce_pure_runtime_settings(config)
     if config.get("backend") != "geant4" or config.get("engine_mode") != "external":

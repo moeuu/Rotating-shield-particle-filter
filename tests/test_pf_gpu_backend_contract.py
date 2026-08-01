@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
 
 from pf import gpu_utils
 from pf.particle_filter import IsotopeParticleFilter
-from realtime_demo import (
-    _preflight_pure_pf_compute_backend,
-    run_live_pf,
-)
 
 
 def test_explicit_numpy_backend_does_not_probe_torch(
@@ -30,7 +25,7 @@ def test_explicit_numpy_backend_does_not_probe_torch(
         _unexpected_probe,
     )
 
-    backend = _preflight_pure_pf_compute_backend(
+    backend = gpu_utils.preflight_compute_backend(
         use_gpu=False,
         gpu_device="cuda",
         gpu_dtype="float64",
@@ -55,7 +50,7 @@ def test_requested_torch_backend_propagates_device_failure(
     )
 
     with pytest.raises(RuntimeError, match="unavailable"):
-        _preflight_pure_pf_compute_backend(
+        gpu_utils.preflight_compute_backend(
             use_gpu=True,
             gpu_device="cuda",
             gpu_dtype="float64",
@@ -109,15 +104,6 @@ def test_filter_explicit_numpy_backend_skips_torch_probe(
     )
 
     assert filt._can_use_gpu() is False
-
-
-def test_compute_preflight_precedes_external_simulation_creation() -> None:
-    """CUDA failure must occur before a Geant4 sidecar can be launched."""
-    source = inspect.getsource(run_live_pf)
-    preflight_offset = source.index("_preflight_pure_pf_compute_backend(")
-    runtime_offset = source.index("create_simulation_runtime(")
-
-    assert preflight_offset < runtime_offset
 
 
 def test_torch_cpu_probe_executes_float64_when_installed() -> None:

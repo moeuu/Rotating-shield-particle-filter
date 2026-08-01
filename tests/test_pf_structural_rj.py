@@ -13,12 +13,19 @@ from pf.structural_rj import (
     ContinuousStrengthProposal,
     ContinuousSurfacePositionProposal,
     SplitMergeMoveProbabilities,
+    bounded_simplex_probability,
+    bounded_uniform_simplex_log_density,
     continuous_birth_log_acceptance_ratio,
     continuous_death_log_acceptance_ratio,
     continuous_joint_position_strength_log_acceptance_ratio,
     continuous_merge_log_acceptance_ratio,
+    continuous_group_merge_log_acceptance_ratio,
+    continuous_group_split_log_acceptance_ratio,
     continuous_position_log_acceptance_ratio,
+    continuous_relocated_merge_log_acceptance_ratio,
+    continuous_relocated_split_log_acceptance_ratio,
     continuous_split_log_acceptance_ratio,
+    distance_weighted_ordered_pair_probabilities,
     log_acceptance_probability,
     split_fraction_bounds,
 )
@@ -217,6 +224,56 @@ def test_fixed_mixture_density_is_reciprocal_across_exact_rj_moves() -> None:
         log_reverse_position_proposal=new_proposal,
         log_reverse_fraction_proposal=0.2,
     )
+    np.testing.assert_allclose(split, -merge, atol=1.0e-14)
+
+
+def test_relocated_split_merge_acceptance_ratios_are_reciprocal() -> None:
+    """The two-child position map must satisfy exact RJ detailed balance."""
+    cardinality_prior = CardinalityPrior([1.0, 2.0, 3.0, 4.0])
+    move_probabilities = SplitMergeMoveProbabilities(
+        max_cardinality=3,
+        split_weight=0.6,
+        merge_weight=0.4,
+    )
+    split = continuous_relocated_split_log_acceptance_ratio(
+        current_cardinality=2,
+        total_strength=7.0,
+        log_likelihood_ratio=0.25,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=move_probabilities,
+        log_parent_position_prior_density=-1.1,
+        log_first_child_position_prior_density=-1.3,
+        log_second_child_position_prior_density=-1.5,
+        log_parent_strength_prior_density=-0.7,
+        log_first_child_strength_prior_density=-0.8,
+        log_second_child_strength_prior_density=-0.9,
+        log_forward_first_position_proposal=-1.7,
+        log_forward_second_position_proposal=-1.9,
+        log_forward_fraction_proposal=0.4,
+        log_reverse_merged_position_proposal=-2.1,
+        log_forward_parent_selection=-math.log(2.0),
+        log_reverse_pair_selection=-2.3,
+    )
+    merge = continuous_relocated_merge_log_acceptance_ratio(
+        current_cardinality=3,
+        merged_strength=7.0,
+        log_likelihood_ratio=-0.25,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=move_probabilities,
+        log_first_child_position_prior_density=-1.3,
+        log_second_child_position_prior_density=-1.5,
+        log_merged_position_prior_density=-1.1,
+        log_first_child_strength_prior_density=-0.8,
+        log_second_child_strength_prior_density=-0.9,
+        log_merged_strength_prior_density=-0.7,
+        log_forward_pair_selection=-2.3,
+        log_forward_merged_position_proposal=-2.1,
+        log_reverse_parent_selection=-math.log(2.0),
+        log_reverse_first_position_proposal=-1.7,
+        log_reverse_second_position_proposal=-1.9,
+        log_reverse_fraction_proposal=0.4,
+    )
+
     np.testing.assert_allclose(split, -merge, atol=1.0e-14)
 
 
@@ -545,6 +602,87 @@ def test_continuous_split_and_reverse_merge_are_reciprocal(
     np.testing.assert_allclose(split_ratio, -merge_ratio, atol=1.0e-14)
 
 
+def test_nonuniform_local_split_merge_selection_is_reciprocal() -> None:
+    """State-dependent parent/pair densities must cancel in reverse RJ moves."""
+    cardinality_prior = CardinalityPrior([0.12, 0.27, 0.34, 0.27])
+    moves = SplitMergeMoveProbabilities(max_cardinality=3)
+    likelihood_ratio = np.asarray([0.4, -0.8], dtype=np.float64)
+    total_strength = np.asarray([3.1, 4.2], dtype=np.float64)
+    forward_parent = np.log(np.asarray([0.7, 0.3], dtype=np.float64))
+    reverse_pair = np.log(np.asarray([0.55, 0.08], dtype=np.float64))
+
+    split_ratio = continuous_split_log_acceptance_ratio(
+        current_cardinality=2,
+        total_strength=total_strength,
+        log_likelihood_ratio=likelihood_ratio,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=moves,
+        log_new_position_prior_density=-1.7,
+        log_old_strength_prior_density=-0.9,
+        log_retained_strength_prior_density=-0.6,
+        log_new_strength_prior_density=-0.7,
+        log_forward_position_proposal=-1.2,
+        log_forward_fraction_proposal=0.1,
+        log_forward_parent_selection=forward_parent,
+        log_reverse_pair_selection=reverse_pair,
+    )
+    merge_ratio = continuous_merge_log_acceptance_ratio(
+        current_cardinality=3,
+        merged_strength=total_strength,
+        log_likelihood_ratio=-likelihood_ratio,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=moves,
+        log_deleted_position_prior_density=-1.7,
+        log_deleted_strength_prior_density=-0.7,
+        log_retained_strength_prior_density=-0.6,
+        log_merged_strength_prior_density=-0.9,
+        log_reverse_position_proposal=-1.2,
+        log_reverse_fraction_proposal=0.1,
+        log_forward_pair_selection=reverse_pair,
+        log_reverse_parent_selection=forward_parent,
+    )
+
+    np.testing.assert_allclose(split_ratio, -merge_ratio, atol=1.0e-14)
+
+
+def test_distance_weighted_pair_proposal_is_batched_and_full_support() -> None:
+    """Nearby pairs must be preferred without making distant pairs unreachable."""
+    distances = np.asarray(
+        [
+            [0.1, 1.0, np.inf],
+            [2.0, 0.2, 0.8],
+        ],
+        dtype=np.float64,
+    )
+
+    probabilities = distance_weighted_ordered_pair_probabilities(
+        distances,
+        sigma_m=0.5,
+        uniform_component_probability=0.1,
+    )
+
+    np.testing.assert_allclose(
+        np.sum(probabilities, axis=1),
+        1.0,
+        rtol=0.0,
+        atol=1.0e-14,
+    )
+    assert np.all(probabilities > 0.0)
+    assert probabilities[0, 0] > probabilities[0, 1] > probabilities[0, 2]
+    assert probabilities[1, 1] > probabilities[1, 2] > probabilities[1, 0]
+    scalar_oracle = []
+    for row in distances:
+        local = np.exp(-0.5 * np.square(row / 0.5))
+        local /= np.sum(local)
+        scalar_oracle.append(0.1 / row.size + 0.9 * local)
+    np.testing.assert_allclose(
+        probabilities,
+        np.asarray(scalar_oracle, dtype=np.float64),
+        rtol=0.0,
+        atol=1.0e-14,
+    )
+
+
 def test_split_merge_flux_includes_selection_density_and_jacobian() -> None:
     """Canonical target, ordered merge choices, fraction density, and q Jacobian balance."""
     current_cardinality = 2
@@ -661,3 +799,65 @@ def test_invalid_continuous_boundary_moves_fail_fast() -> None:
             log_reverse_position_proposal=0.0,
             log_reverse_strength_proposal=0.0,
         )
+
+
+def test_bounded_multi_split_density_has_exact_truncation_normalizer() -> None:
+    """The multi-split fraction law must use its bounded-simplex mass."""
+    totals = np.asarray([2.5, 4.5, 7.5, 13.0], dtype=np.float64)
+    probability = bounded_simplex_probability(
+        totals,
+        group_size=3,
+        minimum_strength=1.0,
+        maximum_strength=4.0,
+    )
+
+    assert probability[0] == 0.0
+    assert 0.0 < probability[1] <= 1.0
+    assert 0.0 < probability[2] <= 1.0
+    assert probability[3] == 0.0
+    fractions = np.asarray([[0.25, 0.35, 0.40]], dtype=np.float64)
+    density = bounded_uniform_simplex_log_density(
+        fractions,
+        total_strength=np.asarray([4.0]),
+        minimum_strength=1.0,
+        maximum_strength=4.0,
+    )
+    expected = math.lgamma(3.0) - math.log(
+        float(
+            bounded_simplex_probability(
+                np.asarray([4.0]),
+                group_size=3,
+                minimum_strength=1.0,
+                maximum_strength=4.0,
+            )[0]
+        )
+    )
+    assert float(density[0]) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("group_size", [3, 4])
+def test_multi_component_split_merge_ratios_are_reciprocal(
+    group_size: int,
+) -> None:
+    """Matching multi-component proposal terms must reverse exactly."""
+    target_ratio = np.asarray([1.7, -0.4], dtype=np.float64)
+    forward = np.asarray([-8.2, -7.1], dtype=np.float64)
+    reverse = np.asarray([-5.4, -6.6], dtype=np.float64)
+    totals = np.asarray([4.5, 7.25], dtype=np.float64)
+
+    split = continuous_group_split_log_acceptance_ratio(
+        log_target_ratio=target_ratio,
+        log_forward_proposal=forward,
+        log_reverse_proposal=reverse,
+        total_strength=totals,
+        group_size=group_size,
+    )
+    merge = continuous_group_merge_log_acceptance_ratio(
+        log_target_ratio=-target_ratio,
+        log_forward_proposal=reverse,
+        log_reverse_proposal=forward,
+        merged_strength=totals,
+        group_size=group_size,
+    )
+
+    np.testing.assert_allclose(split, -merge, atol=1.0e-14)

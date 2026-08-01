@@ -19,7 +19,10 @@ from baselines.ral_ablation.config_factory import (
     _variant_config,
     build_ablation_plan,
 )
-from baselines.ral_ablation.path_policies import select_baseline_next_pose
+from baselines.ral_ablation.path_policies import (
+    resolve_rotation_limit_for_active_program,
+    select_baseline_next_pose,
+)
 from baselines.ral_ablation.shield_policies import select_baseline_shield_program
 from measurement.source_boundary import (
     SURFACE_SOURCE_RUNTIME_KEYS,
@@ -29,8 +32,10 @@ from measurement.source_boundary import (
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.estimator import RotatingShieldPFConfig
 from pf.particle_filter import PFConfig
-from realtime_demo import _resolve_rotation_limit_for_active_program
-from runtime_defaults import DEFAULT_MEASUREMENT_TIME_S, DEFAULT_NO_ROTATION_OVERHEAD_S
+from pf.runtime_defaults import (
+    DEFAULT_MEASUREMENT_TIME_S,
+    DEFAULT_NO_ROTATION_OVERHEAD_S,
+)
 
 
 def test_fixed_shield_policy_repeats_one_pair() -> None:
@@ -189,7 +194,7 @@ def test_round_robin_shield_policy_advances_by_pose() -> None:
 def test_explicit_shield_program_rotation_limit_is_strict_for_baselines() -> None:
     """Baseline shield programs should not be padded by adaptive shield selection."""
     assert (
-        _resolve_rotation_limit_for_active_program(
+        resolve_rotation_limit_for_active_program(
             base_rotation_limit=8,
             active_shield_program=(2, 3),
             strict_planned_shield_program=False,
@@ -198,7 +203,7 @@ def test_explicit_shield_program_rotation_limit_is_strict_for_baselines() -> Non
         == 2
     )
     assert (
-        _resolve_rotation_limit_for_active_program(
+        resolve_rotation_limit_for_active_program(
             base_rotation_limit=8,
             active_shield_program=(2, 3),
             strict_planned_shield_program=True,
@@ -207,7 +212,7 @@ def test_explicit_shield_program_rotation_limit_is_strict_for_baselines() -> Non
         == 2
     )
     assert (
-        _resolve_rotation_limit_for_active_program(
+        resolve_rotation_limit_for_active_program(
             base_rotation_limit=8,
             active_shield_program=(2, 3),
             strict_planned_shield_program=False,

@@ -1,5 +1,15 @@
 # AGENTS.md
 
+## Repository ownership
+
+- This repository owns PF/SMC/exact-RJ inference, PF-specific planning, diagnostics,
+  evaluation, and posterior reporting only.
+- Geant4, environments, detector/shield physics, spectrum generation, observation
+  generation, and MeasurementLog v2 writing belong exclusively to the sibling
+  `Rotating-shield-simulation-runtime` repository.
+- Do not copy shared runtime source back into this repository. Consume its package API
+  and truth-free MeasurementLog v2 artifacts.
+
 ## Tech stack
 
 - Use Python 3.x
@@ -151,14 +161,9 @@
   and the exact artifact paths. End that run cycle after the analysis and wait
   for explicit user direction before modifying the implementation or starting
   another full simulation.
-- "Full simulation" means the standard no-GUI Geant4/PF runtime. Use
-  `uv run python main.py --full-simulation` or `uv run python main.py` unless
-  the user explicitly asks for another mode. This resolves to
-  `--mode geant4-cui` with
-  `configs/geant4/variance_reduction_external_no_isaac_32threads.json`.
-- Do not use `--cui` to mean the Python analytic model. `--cui` is an alias for
-  the standard Geant4 CUI full simulation; use `--python-cui` only when the user
-  explicitly asks for the Python analytic mode.
+- "Full simulation" now means acquisition in the sibling shared-runtime repository,
+  followed by PF replay of its finalized MeasurementLog v2. Do not reintroduce
+  simulator modes into this repository's `main.py`.
 - Before changing simulation, Geant4, spectrum-generation, or PF observation
   ingestion code, read `docs/simulation_fidelity_policy.md`.
 - Do not introduce runtime shortcuts that lower physical fidelity for speed:

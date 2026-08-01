@@ -101,3 +101,22 @@ def require_torch_compute_device(
             "Pure PF use_gpu=true could not execute float64 torch arithmetic "
             f"on device {device_name!r}."
         ) from exc
+
+
+def preflight_compute_backend(
+    *,
+    use_gpu: bool,
+    gpu_device: str,
+    gpu_dtype: str,
+) -> str:
+    """Validate the selected PF compute backend before replay starts."""
+    dtype_name = str(gpu_dtype).strip().lower()
+    if dtype_name != "float64":
+        raise ValueError(
+            "Production pure-PF runtime requires gpu_dtype='float64'; "
+            "lower-precision posterior dynamics are forbidden."
+        )
+    if not bool(use_gpu):
+        return "batched_numpy_float64"
+    require_torch_compute_device(str(gpu_device), dtype_name)
+    return "batched_torch_float64"

@@ -25,8 +25,12 @@ class FullSpectrumGenerativeModel(Protocol):
     """
 
     @property
+    def runtime_ready(self) -> bool:
+        """Return whether training-only contracts authorize runtime use."""
+
+    @property
     def production_ready(self) -> bool:
-        """Return whether independent holdout gates approved runtime use."""
+        """Return whether independent holdout gates approved formal release."""
 
     @property
     def contract_hash_sha256(self) -> str:
@@ -43,6 +47,9 @@ class FullSpectrumGenerativeModel(Protocol):
     @property
     def transport_feature_order(self) -> tuple[str, ...]:
         """Return the final-axis order of geometry-conditioned line features."""
+
+    def require_runtime_ready(self) -> None:
+        """Raise unless the immutable training-only model is runtime-ready."""
 
     def require_production_ready(self) -> None:
         """Raise unless the immutable model passed every production gate."""
@@ -66,6 +73,26 @@ class FullSpectrumGenerativeModel(Protocol):
         live_times_s_v: object,
     ) -> object:
         """Return the Torch-equivalent joint log likelihood per particle."""
+
+    def prefix_log_likelihood_numpy(
+        self,
+        observed_spectrum_vb: NDArray[np.float64],
+        total_line_contributions_nvsl: NDArray[np.float64],
+        uncollided_line_contributions_nvsl: NDArray[np.float64],
+        transport_features_nvslf: NDArray[np.float64],
+        live_times_s_v: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return exact shared-latent likelihoods for every view prefix."""
+
+    def prefix_log_likelihood_torch(
+        self,
+        observed_spectrum_vb: object,
+        total_line_contributions_nvsl: object,
+        uncollided_line_contributions_nvsl: object,
+        transport_features_nvslf: object,
+        live_times_s_v: object,
+    ) -> object:
+        """Return Torch shared-latent likelihoods for every view prefix."""
 
     def cross_log_likelihood_numpy(
         self,
@@ -169,18 +196,18 @@ class FullSpectrumGenerativeModel(Protocol):
 def validate_full_spectrum_model(
     model: object,
 ) -> FullSpectrumGenerativeModel:
-    """Return a structurally complete, production-approved spectrum model."""
+    """Return a structurally complete, training-approved runtime model."""
     if not isinstance(model, FullSpectrumGenerativeModel):
         raise TypeError(
             "Pure PF requires a FullSpectrumGenerativeModel implementing the "
             "shared NumPy/Torch likelihood, predictive sampler, and manifest."
         )
-    model.require_production_ready()
-    production_ready = model.production_ready
-    if type(production_ready) is not bool or production_ready is not True:
+    model.require_runtime_ready()
+    runtime_ready = model.runtime_ready
+    if type(runtime_ready) is not bool or runtime_ready is not True:
         raise RuntimeError(
-            "Full-spectrum model reported production_ready=False after its "
-            "production gate."
+            "Full-spectrum model reported runtime_ready=False after its "
+            "training-only runtime gate."
         )
     contract_hash = model.contract_hash_sha256
     if (

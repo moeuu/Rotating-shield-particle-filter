@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import measurement.continuous_kernels as continuous_kernels
 from measurement.continuous_kernels import (
     ContinuousKernel,
     expected_counts_single_isotope,
@@ -182,15 +183,14 @@ def test_runtime_expected_counts_use_shared_kernel_component() -> None:
     """Runtime PF and planner code should not bypass ContinuousKernel counts."""
     root = Path(__file__).resolve().parents[1]
     checked_paths = [
-        "src/measurement/continuous_kernels.py",
-        "src/pf/particle_filter.py",
-        "src/pf/estimator.py",
-        "src/planning/dss_pp.py",
-        "src/realtime_demo.py",
+        Path(continuous_kernels.__file__).resolve(),
+        root / "src/pf/particle_filter.py",
+        root / "src/pf/estimator.py",
+        root / "src/planning/dss_pp.py",
     ]
-    for rel_path in checked_paths:
-        text = (root / rel_path).read_text(encoding="utf-8")
-        assert "gpu_utils.expected_counts_" not in text, rel_path
+    for path in checked_paths:
+        text = path.read_text(encoding="utf-8")
+        assert "gpu_utils.expected_counts_" not in text, path
 
 
 def test_geometric_scaling_inverse_square() -> None:

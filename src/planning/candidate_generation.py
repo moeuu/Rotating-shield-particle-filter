@@ -557,3 +557,98 @@ def generate_candidate_poses(
         if extra.size:
             filtered = np.vstack([filtered, extra])
     return _stable_unique_candidates(filtered)[:requested_count]
+
+
+def generate_planning_candidates(
+    *,
+    current_pose_xyz: NDArray[np.float64],
+    map_api: object | None,
+    n_candidates: int,
+    min_dist_from_visited: float,
+    visited_poses_xyz: NDArray[np.float64] | None,
+    bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]],
+    detector_heights_m: Sequence[float] | None = None,
+    rng: np.random.Generator | None = None,
+) -> tuple[NDArray[np.float64], dict[str, object]]:
+    """Generate one globally sampled reachable 3-D PF planning action pool."""
+    if rng is None:
+        raise ValueError("Planning candidate generation requires an explicit RNG.")
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError("rng must be a numpy.random.Generator.")
+    bounds_lo = np.asarray(bounds_xyz[0], dtype=np.float64)
+    bounds_hi = np.asarray(bounds_xyz[1], dtype=np.float64)
+    if (
+        bounds_lo.shape != (3,)
+        or bounds_hi.shape != (3,)
+        or np.any(~np.isfinite(bounds_lo))
+        or np.any(~np.isfinite(bounds_hi))
+        or np.any(bounds_hi < bounds_lo)
+    ):
+        raise ValueError("bounds_xyz must contain finite ordered 3-D bounds.")
+    candidates = generate_candidate_poses(
+        current_pose_xyz=current_pose_xyz,
+        map_api=map_api,
+        n_candidates=n_candidates,
+        strategy="free_space_sobol",
+        min_dist_from_visited=min_dist_from_visited,
+        visited_poses_xyz=visited_poses_xyz,
+        bounds_xyz=(bounds_lo, bounds_hi),
+        detector_heights_m=detector_heights_m,
+        require_motion_reachable=True,
+        rng=rng,
+    )
+    candidates = np.asarray(candidates, dtype=np.float64)
+    if (
+        candidates.ndim != 2
+        or candidates.shape[1] != 3
+        or np.any(~np.isfinite(candidates))
+    ):
+        raise RuntimeError(
+            "Global candidate generation returned an invalid 3-D action pool."
+        )
+    if candidates.shape[0] == 0:
+        raise RuntimeError(
+            "No globally sampled candidate satisfies bounds, free-space, "
+            "reachability, and physical separation."
+        )
+    return candidates, {
+        "contract": "global_reachable_3d_sobol_pool_v1",
+        "candidate_count": int(candidates.shape[0]),
+        "requested_candidate_count": int(n_candidates),
+        "minimum_3d_separation_m": float(min_dist_from_visited),
+        "physical_separation_relaxed": False,
+        "horizontal_quality_gate": False,
+        "bounds_lo_xyz_m": [float(value) for value in bounds_lo],
+        "bounds_hi_xyz_m": [float(value) for value in bounds_hi],
+        "detector_heights_m": (
+            None
+            if detector_heights_m is None
+            else [float(value) for value in detector_heights_m]
+        ),
+    }
+
+
+def planning_candidate_checkpoint_parameters(
+    *,
+    pose_candidates: int,
+    pose_min_dist: float,
+    bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]],
+    detector_heights_m: Sequence[float] | None,
+) -> dict[str, object]:
+    """Return PF planning-pool parameters protected by checkpoint identity."""
+    bounds_lo = np.asarray(bounds_xyz[0], dtype=float).reshape(3)
+    bounds_hi = np.asarray(bounds_xyz[1], dtype=float).reshape(3)
+    return {
+        "pose_candidates": int(pose_candidates),
+        "pose_min_dist_m": float(pose_min_dist),
+        "bounds_lo_xyz_m": [float(value) for value in bounds_lo],
+        "bounds_hi_xyz_m": [float(value) for value in bounds_hi],
+        "detector_heights_m": (
+            None
+            if detector_heights_m is None
+            else [float(value) for value in detector_heights_m]
+        ),
+        "candidate_pool_contract": (
+            "global_reachable_3d_sobol_with_physical_separation_v1"
+        ),
+    }

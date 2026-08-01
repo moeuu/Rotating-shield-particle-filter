@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import itertools
 import math
 from typing import TYPE_CHECKING, Callable, List, Tuple
 import os
@@ -45,14 +46,19 @@ from pf.structural_rj import (
     continuous_birth_log_acceptance_ratio,
     continuous_death_log_acceptance_ratio,
     continuous_joint_position_strength_log_acceptance_ratio,
-    continuous_merge_log_acceptance_ratio,
+    continuous_relocated_merge_log_acceptance_ratio,
+    continuous_relocated_split_log_acceptance_ratio,
+    bounded_simplex_probability,
+    bounded_uniform_simplex_log_density,
+    continuous_group_merge_log_acceptance_ratio,
+    continuous_group_split_log_acceptance_ratio,
     continuous_position_log_acceptance_ratio,
-    continuous_split_log_acceptance_ratio,
+    distance_weighted_ordered_pair_probabilities,
     split_fraction_bounds,
     truncated_poisson_cardinality_probabilities,
     validate_cardinality_prior_policy,
 )
-from pf.surface_atlas import ContinuousSurfaceAtlas
+from measurement.surface_atlas import ContinuousSurfaceAtlas
 
 if TYPE_CHECKING:
     import torch
@@ -69,6 +75,31 @@ def _pf_debug_timing_enabled() -> bool:
 
 class TemperingIncrementRequiresRejuvenation(RuntimeError):
     """Signal that no configured positive beta increment preserves target ESS."""
+
+
+def _ordered_source_pair_columns(
+    cardinality: int,
+) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """Return every ordered donor/receiver source-column pair."""
+    if (
+        isinstance(cardinality, (bool, np.bool_))
+        or not isinstance(cardinality, (int, np.integer))
+        or int(cardinality) < 2
+    ):
+        raise ValueError("Ordered source pairs require cardinality at least two.")
+    count = int(cardinality)
+    donor_grid = np.repeat(
+        np.arange(count, dtype=np.int64)[:, None],
+        count,
+        axis=1,
+    )
+    receiver_grid = np.repeat(
+        np.arange(count, dtype=np.int64)[None, :],
+        count,
+        axis=0,
+    )
+    distinct = donor_grid != receiver_grid
+    return donor_grid[distinct], receiver_grid[distinct]
 
 
 def _canonical_sha256(value: object, *, name: str) -> str:
@@ -177,8 +208,15 @@ class PFConfig:
     structural_rj_local_position_sigma_m: float = 0.5
     structural_rj_strength_move_probability: float = 1.0
     structural_rj_split_merge_probability: float = 1.0
+    structural_rj_block_independence_probability: float = 0.1
+    structural_rj_multi_component_probability: float = 0.1
+    structural_rj_multi_component_max_group_size: int = 4
     structural_rj_split_probability: float = 0.5
     structural_rj_merge_probability: float = 0.5
+    structural_rj_split_global_position_probability: float = 0.1
+    structural_rj_merge_uniform_pair_probability: float = 0.1
+    structural_rj_merge_distance_sigma_m: float = 0.5
+    structural_rj_merge_response_sigma: float = 0.05
     structural_cardinality_prior_policy: str = (
         TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY
     )
@@ -217,6 +255,11 @@ class PFConfig:
                 "structural_rj_proposal_score_cache_max_bytes",
                 self.structural_rj_proposal_score_cache_max_bytes,
                 1,
+            ),
+            (
+                "structural_rj_multi_component_max_group_size",
+                self.structural_rj_multi_component_max_group_size,
+                3,
             ),
             ("max_temper_steps", self.max_temper_steps, 1),
         ):
@@ -257,8 +300,14 @@ class PFConfig:
             "structural_rj_local_position_sigma_m",
             "structural_rj_strength_move_probability",
             "structural_rj_split_merge_probability",
+            "structural_rj_block_independence_probability",
+            "structural_rj_multi_component_probability",
             "structural_rj_split_probability",
             "structural_rj_merge_probability",
+            "structural_rj_split_global_position_probability",
+            "structural_rj_merge_uniform_pair_probability",
+            "structural_rj_merge_distance_sigma_m",
+            "structural_rj_merge_response_sigma",
             "structural_cardinality_prior_mean",
             "target_ess_ratio",
             "min_delta_beta",
@@ -386,13 +435,52 @@ class PFConfig:
             "structural_rj_local_position_move_probability",
             "structural_rj_strength_move_probability",
             "structural_rj_split_merge_probability",
+            "structural_rj_block_independence_probability",
+            "structural_rj_multi_component_probability",
             "structural_rj_split_probability",
             "structural_rj_merge_probability",
+            "structural_rj_split_global_position_probability",
+            "structural_rj_merge_uniform_pair_probability",
         ):
             probability = float(getattr(self, probability_name))
             if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
                 raise ValueError(f"{probability_name} must lie in [0, 1].")
             setattr(self, probability_name, probability)
+        for full_support_probability_name in (
+            "structural_rj_split_global_position_probability",
+            "structural_rj_merge_uniform_pair_probability",
+        ):
+            if getattr(self, full_support_probability_name) <= 0.0:
+                raise ValueError(
+                    f"{full_support_probability_name} must lie in (0, 1]."
+                )
+        self.structural_rj_merge_distance_sigma_m = float(
+            self.structural_rj_merge_distance_sigma_m
+        )
+        if (
+            not np.isfinite(self.structural_rj_merge_distance_sigma_m)
+            or self.structural_rj_merge_distance_sigma_m <= 0.0
+        ):
+            raise ValueError(
+                "structural_rj_merge_distance_sigma_m must be finite and positive."
+            )
+        self.structural_rj_merge_response_sigma = float(
+            self.structural_rj_merge_response_sigma
+        )
+        if (
+            not np.isfinite(self.structural_rj_merge_response_sigma)
+            or self.structural_rj_merge_response_sigma <= 0.0
+        ):
+            raise ValueError(
+                "structural_rj_merge_response_sigma must be finite and positive."
+            )
+        self.structural_rj_multi_component_max_group_size = int(
+            self.structural_rj_multi_component_max_group_size
+        )
+        if self.structural_rj_multi_component_max_group_size < 3:
+            raise ValueError(
+                "structural_rj_multi_component_max_group_size must be at least 3."
+            )
         if self.max_sources is None or int(self.max_sources) < 1:
             raise ValueError("Pure PF requires a finite positive max_sources.")
         self.max_sources = int(self.max_sources)
@@ -788,6 +876,12 @@ class IsotopeParticleFilter:
         self.last_structural_rj_proposal_snapshot_sha256: str | None = None
         self._structural_rj_move_counts: dict[str, int | float] = {}
         self._structural_rj_tempering_start_row: int | None = None
+        self._structural_rj_current_target_log_likelihood: (
+            NDArray[np.float64] | None
+        ) = None
+        self.last_structural_target_log_likelihood: (
+            NDArray[np.float64] | None
+        ) = None
         self._joint_target_evaluator: (
             Callable[..., NDArray[np.float64]] | None
         ) = None
@@ -1581,28 +1675,31 @@ class IsotopeParticleFilter:
                 self.kernel.poses[int(pose_idx)],
                 dtype=np.float64,
             )
-            detector_positions = np.repeat(
-                detector_position.reshape(1, 3),
-                view_count,
-                axis=0,
-            )
             components = (
                 self.continuous_kernel
-                .line_transport_components_selected_pairs_for_detectors(
+                .line_transport_components_pair_program_for_detectors(
                     isotope=self.isotope,
-                    detector_positions=detector_positions,
+                    detector_positions=detector_position.reshape(1, 3),
                     sources=unique_positions,
-                    fe_indices=fe_arr,
-                    pb_indices=pb_arr,
+                    fe_indices=fe_arr.reshape(1, view_count),
+                    pb_indices=pb_arr.reshape(1, view_count),
                     positive_line_indices=line_indices,
                 )
             )
+            component_total = np.asarray(
+                components.total_kernel,
+                dtype=np.float64,
+            )[0]
+            component_uncollided = np.asarray(
+                components.uncollided_kernel,
+                dtype=np.float64,
+            )[0]
             total_active = np.transpose(
-                components.total_kernel[:, inverse, :],
+                component_total[:, inverse, :],
                 (1, 0, 2),
             )
             uncollided_active = np.transpose(
-                components.uncollided_kernel[:, inverse, :],
+                component_uncollided[:, inverse, :],
                 (1, 0, 2),
             )
             rate_scale = active_strengths[:, None, None]
@@ -1621,8 +1718,12 @@ class IsotopeParticleFilter:
                     components.distance_m,
                 ),
             ):
+                component_values = np.asarray(
+                    values,
+                    dtype=np.float64,
+                )[0]
                 output[particle_ids, :, source_slots, :] = np.transpose(
-                    np.asarray(values, dtype=np.float64)[:, inverse, :],
+                    component_values[:, inverse, :],
                     (1, 0, 2),
                 )
         tensors = [
@@ -1659,10 +1760,16 @@ class IsotopeParticleFilter:
                 "All particle log weights are negative infinity; posterior "
                 "normalization is undefined."
             )
-        normalizer = torch.logsumexp(logw, dim=0)
-        if not bool(torch.isfinite(normalizer).detach().cpu().item()):
+        finite_max = torch.max(logw)
+        if not bool(torch.isfinite(finite_max).detach().cpu().item()):
             raise RuntimeError("Particle log-weight normalizer is non-finite.")
-        normalized = logw - normalizer
+        shifted = logw - finite_max
+        shifted_normalizer = torch.logsumexp(shifted, dim=0)
+        if not bool(
+            torch.isfinite(shifted_normalizer).detach().cpu().item()
+        ):
+            raise RuntimeError("Particle log-weight normalizer is non-finite.")
+        normalized = shifted - shifted_normalizer
         if bool(torch.any(torch.isnan(normalized)).detach().cpu().item()) or bool(
             torch.any(torch.isinf(normalized) & (normalized > 0.0))
             .detach()
@@ -2017,11 +2124,16 @@ class IsotopeParticleFilter:
         fe_indices = np.asarray(data.fe_indices, dtype=np.int64).reshape(-1)
         pb_indices = np.asarray(data.pb_indices, dtype=np.int64).reshape(-1)
         live_times = np.asarray(data.live_times, dtype=np.float64).reshape(-1)
+        sequence_ids = np.asarray(
+            data.station_sequence_ids,
+            dtype=np.int64,
+        ).reshape(-1)
         if (
             detector_positions.shape != (measurement_count, 3)
             or fe_indices.size != measurement_count
             or pb_indices.size != measurement_count
             or live_times.size != measurement_count
+            or sequence_ids.size != measurement_count
             or np.any(~np.isfinite(live_times))
             or np.any(live_times <= 0.0)
         ):
@@ -2029,17 +2141,193 @@ class IsotopeParticleFilter:
                 "Line-component measurement geometry and live times are "
                 "invalid."
             )
-        components = (
-            self.continuous_kernel
-            .line_transport_components_selected_pairs_for_detectors(
-                isotope=self.isotope,
-                detector_positions=detector_positions,
-                sources=requested_transport,
-                fe_indices=fe_indices,
-                pb_indices=pb_indices,
-                positive_line_indices=line_indices,
+        if self._can_use_gpu():
+            orientation_count = int(
+                len(self.continuous_kernel.orientations)
             )
-        )
+            if (
+                orientation_count <= 0
+                or np.any(fe_indices < 0)
+                or np.any(fe_indices >= orientation_count)
+                or np.any(pb_indices < 0)
+                or np.any(pb_indices >= orientation_count)
+            ):
+                raise ValueError(
+                    "Continuous RJ shield indices lie outside the orientation "
+                    "support."
+                )
+            pair_indices = (
+                fe_indices * orientation_count + pb_indices
+            ).astype(np.int64, copy=False)
+            unique_sequences, sequence_inverse = np.unique(
+                sequence_ids,
+                return_inverse=True,
+            )
+            station_rows = [
+                np.flatnonzero(sequence_inverse == station_index)
+                for station_index in range(unique_sequences.size)
+            ]
+            view_counts = np.asarray(
+                [rows.size for rows in station_rows],
+                dtype=np.int64,
+            )
+            if np.any(view_counts <= 0):
+                raise RuntimeError(
+                    "Continuous RJ station grouping produced an empty program."
+                )
+            if np.unique(view_counts).size == 1:
+                for rows in station_rows:
+                    if not np.all(
+                        detector_positions[rows]
+                        == detector_positions[int(rows[0])]
+                    ):
+                        raise ValueError(
+                            "One station sequence contains multiple detector "
+                            "positions."
+                        )
+                station_detectors = np.stack(
+                    [
+                        detector_positions[int(rows[0])]
+                        for rows in station_rows
+                    ],
+                    axis=0,
+                )
+                fe_program = np.stack(
+                    [fe_indices[rows] for rows in station_rows],
+                    axis=0,
+                )
+                pb_program = np.stack(
+                    [pb_indices[rows] for rows in station_rows],
+                    axis=0,
+                )
+                program_components = (
+                    self.continuous_kernel
+                    .line_transport_components_pair_program_for_detectors(
+                        isotope=self.isotope,
+                        detector_positions=station_detectors,
+                        sources=requested_transport,
+                        fe_indices=fe_program,
+                        pb_indices=pb_program,
+                        positive_line_indices=line_indices,
+                    )
+                )
+                row_view_indices = np.empty(
+                    measurement_count,
+                    dtype=np.int64,
+                )
+                for rows in station_rows:
+                    row_view_indices[rows] = np.arange(
+                        rows.size,
+                        dtype=np.int64,
+                    )
+                expected_program_shape = (
+                    int(unique_sequences.size),
+                    int(view_counts[0]),
+                    int(requested_transport.shape[0]),
+                    int(line_indices.size),
+                )
+
+                def _selected_component(
+                    field_name: str,
+                ) -> NDArray[np.float64]:
+                    """Restore history rows from one batched station program."""
+                    values = np.asarray(
+                        getattr(program_components, field_name),
+                        dtype=np.float64,
+                    )
+                    if values.shape != expected_program_shape:
+                        raise RuntimeError(
+                            "Pair-program continuous RJ component shape is "
+                            "invalid."
+                        )
+                    return np.asarray(
+                        values[sequence_inverse, row_view_indices],
+                        dtype=np.float64,
+                    )
+
+                components = LineTransportComponents(
+                    total_kernel=_selected_component("total_kernel"),
+                    unattenuated_kernel=_selected_component(
+                        "unattenuated_kernel"
+                    ),
+                    uncollided_kernel=_selected_component(
+                        "uncollided_kernel"
+                    ),
+                    tau_fe=_selected_component("tau_fe"),
+                    tau_pb=_selected_component("tau_pb"),
+                    tau_obstacle=_selected_component("tau_obstacle"),
+                    tau_obstacle_compton=_selected_component(
+                        "tau_obstacle_compton"
+                    ),
+                    distance_m=_selected_component("distance_m"),
+                )
+            else:
+                unique_detectors, detector_inverse = np.unique(
+                    detector_positions,
+                    axis=0,
+                    return_inverse=True,
+                )
+                all_pair_components = (
+                    self.continuous_kernel
+                    .line_transport_components_all_pairs_for_detectors(
+                        isotope=self.isotope,
+                        detector_positions=unique_detectors,
+                        sources=requested_transport,
+                        positive_line_indices=line_indices,
+                    )
+                )
+                expected_all_pair_shape = (
+                    int(unique_detectors.shape[0]),
+                    orientation_count**2,
+                    int(requested_transport.shape[0]),
+                    int(line_indices.size),
+                )
+
+                def _selected_component(
+                    field_name: str,
+                ) -> NDArray[np.float64]:
+                    """Select requested rows from all-pair GPU components."""
+                    values = np.asarray(
+                        getattr(all_pair_components, field_name),
+                        dtype=np.float64,
+                    )
+                    if values.shape != expected_all_pair_shape:
+                        raise RuntimeError(
+                            "All-pair continuous RJ component shape is invalid."
+                        )
+                    return np.asarray(
+                        values[detector_inverse, pair_indices],
+                        dtype=np.float64,
+                    )
+
+                components = LineTransportComponents(
+                    total_kernel=_selected_component("total_kernel"),
+                    unattenuated_kernel=_selected_component(
+                        "unattenuated_kernel"
+                    ),
+                    uncollided_kernel=_selected_component(
+                        "uncollided_kernel"
+                    ),
+                    tau_fe=_selected_component("tau_fe"),
+                    tau_pb=_selected_component("tau_pb"),
+                    tau_obstacle=_selected_component("tau_obstacle"),
+                    tau_obstacle_compton=_selected_component(
+                        "tau_obstacle_compton"
+                    ),
+                    distance_m=_selected_component("distance_m"),
+                )
+        else:
+            components = (
+                self.continuous_kernel
+                .line_transport_components_selected_pairs_for_detectors(
+                    isotope=self.isotope,
+                    detector_positions=detector_positions,
+                    sources=requested_transport,
+                    fe_indices=fe_indices,
+                    pb_indices=pb_indices,
+                    positive_line_indices=line_indices,
+                )
+            )
         return LineTransportComponents(
             total_kernel=np.asarray(
                 components.total_kernel,
@@ -2239,6 +2527,72 @@ class IsotopeParticleFilter:
             "joint-isotope target evaluator."
         )
 
+    def _continuous_rj_current_log_likelihood(
+        self,
+        data: StructuralGeometryBatch,
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        *,
+        chart_ids: NDArray[np.int64],
+        particle_indices: NDArray[np.int64],
+        target_beta: float,
+    ) -> NDArray[np.float64]:
+        """Return cached current-target values or evaluate an uncached group."""
+        indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        cached = self._structural_rj_current_target_log_likelihood
+        if cached is None:
+            return self._continuous_rj_group_log_likelihood(
+                data,
+                positions,
+                strengths,
+                chart_ids=chart_ids,
+                particle_indices=indices,
+                target_beta=target_beta,
+            )
+        if (
+            cached.shape != (len(self.continuous_particles),)
+            or np.any(indices < 0)
+            or np.any(indices >= cached.size)
+        ):
+            raise RuntimeError(
+                "Continuous RJ current-target cache is misaligned."
+            )
+        result = np.asarray(cached[indices], dtype=np.float64)
+        if np.any(np.isnan(result)) or np.any(np.isposinf(result)):
+            raise RuntimeError(
+                "Continuous RJ current-target cache is numerically invalid."
+            )
+        return result.copy()
+
+    def _update_continuous_rj_current_log_likelihood(
+        self,
+        particle_indices: NDArray[np.int64],
+        accepted: NDArray[np.bool_],
+        proposed_log_likelihood: NDArray[np.float64],
+    ) -> None:
+        """Commit accepted candidate target values to the sweep-local cache."""
+        cached = self._structural_rj_current_target_log_likelihood
+        if cached is None:
+            return
+        indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        acceptance = np.asarray(accepted, dtype=bool).reshape(-1)
+        proposed = np.asarray(
+            proposed_log_likelihood,
+            dtype=np.float64,
+        ).reshape(-1)
+        if (
+            indices.size != acceptance.size
+            or proposed.size != indices.size
+            or np.any(indices < 0)
+            or np.any(indices >= cached.size)
+            or np.any(np.isnan(proposed[acceptance]))
+            or np.any(np.isposinf(proposed[acceptance]))
+        ):
+            raise RuntimeError(
+                "Accepted continuous RJ target values are invalid."
+            )
+        cached[indices[acceptance]] = proposed[acceptance]
+
     def set_joint_target_evaluator(
         self,
         evaluator: Callable[..., NDArray[np.float64]] | None,
@@ -2427,7 +2781,7 @@ class IsotopeParticleFilter:
                     selected_indices,
                     int(cardinality),
                 )
-                base_ll = self._continuous_rj_group_log_likelihood(
+                base_ll = self._continuous_rj_current_log_likelihood(
                     data,
                     positions,
                     strengths,
@@ -2537,6 +2891,11 @@ class IsotopeParticleFilter:
                         proposed_uv,
                         proposed_positions,
                         proposed_strengths,
+                    )
+                    self._update_continuous_rj_current_log_likelihood(
+                        selected_indices,
+                        accepted,
+                        proposed_ll,
                     )
                     self._continuous_rj_transition_mass(
                         "birth_accepted",
@@ -2679,6 +3038,11 @@ class IsotopeParticleFilter:
                     proposed_positions,
                     proposed_strengths,
                 )
+                self._update_continuous_rj_current_log_likelihood(
+                    selected_indices,
+                    accepted,
+                    proposed_ll,
+                )
                 self._continuous_rj_transition_mass(
                     "death_accepted",
                     selected_indices,
@@ -2737,7 +3101,7 @@ class IsotopeParticleFilter:
                 particle_indices,
                 int(cardinality),
             )
-            base_ll = self._continuous_rj_group_log_likelihood(
+            base_ll = self._continuous_rj_current_log_likelihood(
                 data,
                 positions,
                 strengths,
@@ -2840,6 +3204,11 @@ class IsotopeParticleFilter:
                 proposed_positions,
                 proposed_strengths,
             )
+            self._update_continuous_rj_current_log_likelihood(
+                particle_indices,
+                accepted,
+                proposed_ll,
+            )
         self._structural_rj_move_counts.update(
             {
                 "global_position_attempted": attempted_count,
@@ -2883,7 +3252,7 @@ class IsotopeParticleFilter:
                 particle_indices,
                 int(cardinality),
             )
-            base_ll = self._continuous_rj_group_log_likelihood(
+            base_ll = self._continuous_rj_current_log_likelihood(
                 data,
                 positions,
                 strengths,
@@ -2973,6 +3342,11 @@ class IsotopeParticleFilter:
                 proposed_positions,
                 proposed_strengths,
             )
+            self._update_continuous_rj_current_log_likelihood(
+                particle_indices,
+                accepted,
+                proposed_ll,
+            )
         self._structural_rj_move_counts.update(
             {
                 "local_position_attempted": attempted_count,
@@ -3013,7 +3387,7 @@ class IsotopeParticleFilter:
                 particle_indices,
                 int(cardinality),
             )
-            base_ll = self._continuous_rj_group_log_likelihood(
+            base_ll = self._continuous_rj_current_log_likelihood(
                 data,
                 positions,
                 strengths,
@@ -3061,6 +3435,11 @@ class IsotopeParticleFilter:
                 positions,
                 proposed_strengths,
             )
+            self._update_continuous_rj_current_log_likelihood(
+                particle_indices,
+                accepted,
+                proposed_ll,
+            )
         self._structural_rj_move_counts.update(
             {
                 "strength_attempted": attempted_count,
@@ -3068,6 +3447,1062 @@ class IsotopeParticleFilter:
             }
         )
         return accepted_count
+
+    def _continuous_rj_ordered_pair_probabilities(
+        self,
+        chart_ids: NDArray[np.int64],
+        surface_uv: NDArray[np.float64],
+    ) -> tuple[
+        NDArray[np.int64],
+        NDArray[np.int64],
+        NDArray[np.float64],
+    ]:
+        """Return batched distance-weighted ordered merge-pair probabilities."""
+        atlas = self._structural_rj_surface_atlas
+        if atlas is None:
+            raise RuntimeError("Continuous surface atlas is unavailable.")
+        charts = np.asarray(chart_ids, dtype=np.int64)
+        uv = np.asarray(surface_uv, dtype=np.float64)
+        if (
+            charts.ndim != 2
+            or charts.shape[1] < 2
+            or uv.shape != charts.shape + (2,)
+        ):
+            raise ValueError(
+                "Merge-pair probabilities require aligned P x K chart/UV arrays."
+            )
+        donor_columns, receiver_columns = _ordered_source_pair_columns(
+            int(charts.shape[1])
+        )
+        distances = atlas.local_surface_coordinate_path_distance_m(
+            charts[:, donor_columns],
+            uv[:, donor_columns, :],
+            charts[:, receiver_columns],
+            uv[:, receiver_columns, :],
+        )
+        probabilities = distance_weighted_ordered_pair_probabilities(
+            distances,
+            sigma_m=float(
+                self.config.structural_rj_merge_distance_sigma_m
+            ),
+            uniform_component_probability=float(
+                self.config.structural_rj_merge_uniform_pair_probability
+            ),
+        )
+        expected_shape = (charts.shape[0], donor_columns.size)
+        if probabilities.shape != expected_shape:
+            raise RuntimeError(
+                "Distance-weighted merge proposal returned an invalid shape."
+            )
+        return donor_columns, receiver_columns, probabilities
+
+    def _continuous_rj_multi_group_probabilities(
+        self,
+        data: StructuralGeometryBatch,
+        chart_ids: NDArray[np.int64],
+        surface_uv: NDArray[np.float64],
+        positions: NDArray[np.float64],
+        *,
+        group_size: int,
+    ) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+        """Return distance/physical-response weighted group probabilities."""
+        atlas = self._structural_rj_surface_atlas
+        if atlas is None:
+            raise RuntimeError("Continuous surface atlas is unavailable.")
+        cardinality = int(chart_ids.shape[1])
+        groups = np.asarray(
+            tuple(itertools.combinations(range(cardinality), int(group_size))),
+            dtype=np.int64,
+        )
+        if groups.ndim != 2 or groups.shape[0] == 0:
+            raise ValueError("No multi-component group exists for this state.")
+        row_count = int(chart_ids.shape[0])
+        maximum_surface_distance = np.zeros(
+            (row_count, groups.shape[0]),
+            dtype=np.float64,
+        )
+        minimum_response_cosine = np.ones_like(maximum_surface_distance)
+        line_indices = self.continuous_kernel.positive_line_indices(
+            self.isotope
+        )
+        branching_weights = self.continuous_kernel.line_branching_weights(
+            self.isotope,
+            line_indices,
+        )
+        flattened_positions = np.asarray(
+            positions,
+            dtype=np.float64,
+        ).reshape(row_count * cardinality, 3)
+        flattened_charts = np.asarray(
+            chart_ids,
+            dtype=np.int64,
+        ).reshape(row_count * cardinality)
+        components = self._continuous_rj_line_transport_component_columns(
+            data,
+            flattened_positions,
+            line_indices,
+            chart_ids=flattened_charts,
+        )
+        measurement_count = int(data.row_count)
+        physical_response = np.asarray(
+            components.total_kernel,
+            dtype=np.float64,
+        ).reshape(
+            measurement_count,
+            row_count,
+            cardinality,
+            int(line_indices.size),
+        )
+        physical_response *= branching_weights.reshape(1, 1, 1, -1)
+        signatures = np.transpose(
+            physical_response,
+            (1, 2, 0, 3),
+        ).reshape(row_count, cardinality, -1)
+        norms = np.sqrt(
+            np.sum(np.square(signatures), axis=-1, keepdims=True)
+        )
+        signatures = signatures / np.maximum(
+            norms,
+            np.finfo(np.float64).tiny,
+        )
+        selected_signatures = signatures[:, groups, :]
+        for first, second in itertools.combinations(range(int(group_size)), 2):
+            distances = atlas.local_surface_coordinate_path_distance_m(
+                chart_ids[:, groups[:, first]],
+                surface_uv[:, groups[:, first], :],
+                chart_ids[:, groups[:, second]],
+                surface_uv[:, groups[:, second], :],
+            )
+            maximum_surface_distance = np.maximum(
+                maximum_surface_distance,
+                distances,
+            )
+            cosine = np.sum(
+                selected_signatures[:, :, first, :]
+                * selected_signatures[:, :, second, :],
+                axis=-1,
+            )
+            minimum_response_cosine = np.minimum(
+                minimum_response_cosine,
+                np.clip(cosine, -1.0, 1.0),
+            )
+        response_distance = np.sqrt(
+            np.maximum(0.0, 2.0 - 2.0 * minimum_response_cosine)
+        )
+        distance_sigma = float(self.config.structural_rj_merge_distance_sigma_m)
+        response_sigma = float(self.config.structural_rj_merge_response_sigma)
+        scores = np.exp(
+            -0.5 * np.square(maximum_surface_distance / distance_sigma)
+            -0.5 * np.square(response_distance / response_sigma)
+        )
+        score_sums = np.sum(scores, axis=1, keepdims=True)
+        cohesive_probabilities = np.divide(
+            scores,
+            score_sums,
+            out=np.full_like(scores, 1.0 / float(groups.shape[0])),
+            where=score_sums > 0.0,
+        )
+        position_proposal = self._structural_rj_position_proposal
+        if position_proposal is None:
+            cleanup_scores = np.ones_like(scores)
+        else:
+            evidence_ratio = np.exp(
+                position_proposal.log_density(chart_ids)
+                - atlas.log_chart_probabilities[chart_ids]
+            )
+            group_evidence = evidence_ratio[:, groups]
+            receiver_evidence = np.max(group_evidence, axis=2)
+            donor_evidence = (
+                np.sum(group_evidence, axis=2) - receiver_evidence
+            ) / float(int(group_size) - 1)
+            cleanup_scores = receiver_evidence / np.maximum(
+                donor_evidence,
+                np.finfo(np.float64).tiny,
+            )
+        cleanup_sums = np.sum(cleanup_scores, axis=1, keepdims=True)
+        cleanup_probabilities = np.divide(
+            cleanup_scores,
+            cleanup_sums,
+            out=np.full_like(scores, 1.0 / float(groups.shape[0])),
+            where=cleanup_sums > 0.0,
+        )
+        normalized = 0.5 * (
+            cohesive_probabilities + cleanup_probabilities
+        )
+        uniform = float(
+            self.config.structural_rj_merge_uniform_pair_probability
+        )
+        probabilities = (
+            (1.0 - uniform) * normalized
+            + uniform / float(groups.shape[0])
+        )
+        probabilities /= np.sum(probabilities, axis=1, keepdims=True)
+        return groups, probabilities
+
+    def _continuous_rj_multi_direction_support(
+        self,
+        cardinality: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], float, float]:
+        """Return supported group sizes and normalized direction probabilities."""
+        maximum_group = min(
+            int(self.config.structural_rj_multi_component_max_group_size),
+            int(self.config.max_sources),
+        )
+        split_sizes = tuple(
+            size
+            for size in range(3, maximum_group + 1)
+            if int(cardinality) + size - 1 <= int(self.config.max_sources)
+        )
+        merge_sizes = tuple(
+            size
+            for size in range(3, maximum_group + 1)
+            if size <= int(cardinality)
+        )
+        if split_sizes and merge_sizes:
+            return split_sizes, merge_sizes, 0.5, 0.5
+        if split_sizes:
+            return split_sizes, merge_sizes, 1.0, 0.0
+        if merge_sizes:
+            return split_sizes, merge_sizes, 0.0, 1.0
+        return split_sizes, merge_sizes, 0.0, 0.0
+
+    def _sample_bounded_simplex(
+        self,
+        totals: NDArray[np.float64],
+        *,
+        group_size: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+        """Sample a bounded uniform simplex with vectorized exact rejection."""
+        values = np.asarray(totals, dtype=np.float64).reshape(-1)
+        probability = bounded_simplex_probability(
+            values,
+            group_size=int(group_size),
+            minimum_strength=self._strength_prior.minimum,
+            maximum_strength=self._strength_prior.maximum,
+        )
+        accepted = probability > 0.0
+        pending = accepted.copy()
+        fractions = np.zeros((values.size, int(group_size)), dtype=np.float64)
+        for _ in range(16_384):
+            rows = np.flatnonzero(pending)
+            if rows.size == 0:
+                break
+            draws = self._random_generator.dirichlet(
+                np.ones(int(group_size), dtype=np.float64),
+                size=rows.size,
+            )
+            child_strengths = draws * values[rows, None]
+            valid = (
+                np.all(child_strengths >= self._strength_prior.minimum, axis=1)
+                & np.all(
+                    child_strengths <= self._strength_prior.maximum,
+                    axis=1,
+                )
+            )
+            fractions[rows[valid]] = draws[valid]
+            pending[rows[valid]] = False
+        accepted &= ~pending
+        return fractions, accepted
+
+    def _continuous_rj_block_log_densities(
+        self,
+        chart_ids: NDArray[np.int64],
+        strengths: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return physical-prior and full-support block-proposal log densities."""
+        atlas = self._structural_rj_surface_atlas
+        cardinality_prior = self._structural_rj_cardinality_prior
+        if atlas is None or cardinality_prior is None:
+            raise RuntimeError("Continuous block-RJ priors are unavailable.")
+        charts = np.asarray(chart_ids, dtype=np.int64)
+        values = np.asarray(strengths, dtype=np.float64)
+        if charts.ndim != 2 or values.shape != charts.shape:
+            raise ValueError("Block-RJ states must share particle/source axes.")
+        cardinality = int(charts.shape[1])
+        row_count = int(charts.shape[0])
+        log_prior = np.full(
+            row_count,
+            float(cardinality_prior.log_prob(cardinality))
+            + math.lgamma(float(cardinality) + 1.0),
+            dtype=np.float64,
+        )
+        log_proposal = log_prior.copy()
+        if cardinality == 0:
+            return log_prior, log_proposal
+        position_proposal = self._active_continuous_rj_position_proposal()
+        strength_proposal = self._active_continuous_rj_strength_proposal()
+        log_prior += np.sum(
+            atlas.log_chart_probabilities[charts]
+            + np.asarray(
+                self._strength_prior.log_prob(values),
+                dtype=np.float64,
+            ),
+            axis=1,
+            dtype=np.float64,
+        )
+        log_proposal += np.sum(
+            position_proposal.log_density(charts)
+            + strength_proposal.log_density(charts, values),
+            axis=1,
+            dtype=np.float64,
+        )
+        return log_prior, log_proposal
+
+    def _apply_continuous_rj_multi_component(
+        self,
+        data: StructuralGeometryBatch,
+        *,
+        target_beta: float = 1.0,
+    ) -> tuple[int, int]:
+        """Apply exact 3--4 component split/merge proposals in one jump.
+
+        Candidate groups mix two normalized selectors: intrinsic-distance plus
+        line-resolved response cohesion for split components, and a frozen
+        data-informed evidence contrast for deleting several weak ghosts into
+        one supported receiver. The mixture retains an explicit uniform term.
+        The full-support uniform component, state-dependent group selection,
+        bounded-simplex density, position density, and strength Jacobian are
+        all included in the forward/reverse ratio.
+        """
+        probability = float(
+            self.config.structural_rj_multi_component_probability
+        )
+        if probability <= 0.0:
+            return 0, 0
+        atlas = self._structural_rj_surface_atlas
+        if atlas is None:
+            raise RuntimeError("Continuous surface atlas is unavailable.")
+        particle_count = len(self.continuous_particles)
+        cardinalities = np.asarray(
+            [
+                particle.state.num_sources
+                for particle in self.continuous_particles
+            ],
+            dtype=np.int64,
+        )
+        available = np.asarray(
+            [
+                sum(self._continuous_rj_multi_direction_support(int(value))[2:])
+                > 0.0
+                for value in cardinalities
+            ],
+            dtype=bool,
+        )
+        attempted = (
+            self._random_generator.random(particle_count) < probability
+        ) & available
+        accepted_splits = 0
+        accepted_merges = 0
+        attempted_splits = 0
+        attempted_merges = 0
+        global_probability = float(
+            self.config.structural_rj_split_global_position_probability
+        )
+        for cardinality in np.unique(cardinalities[attempted]).tolist():
+            particle_indices = np.flatnonzero(
+                attempted & (cardinalities == int(cardinality))
+            ).astype(np.int64, copy=False)
+            (
+                split_sizes,
+                merge_sizes,
+                split_direction_probability,
+                _,
+            ) = self._continuous_rj_multi_direction_support(int(cardinality))
+            split_rows = (
+                self._random_generator.random(particle_indices.size)
+                < split_direction_probability
+            )
+            for is_split in (True, False):
+                direction_rows = np.flatnonzero(split_rows == is_split)
+                if direction_rows.size == 0:
+                    continue
+                sizes = split_sizes if is_split else merge_sizes
+                if not sizes:
+                    continue
+                chosen_sizes = self._random_generator.choice(
+                    np.asarray(sizes, dtype=np.int64),
+                    size=direction_rows.size,
+                    replace=True,
+                )
+                for group_size in np.unique(chosen_sizes).tolist():
+                    local_rows = direction_rows[
+                        chosen_sizes == int(group_size)
+                    ]
+                    indices = particle_indices[local_rows]
+                    (
+                        chart_ids,
+                        surface_uv,
+                        positions,
+                        strengths,
+                    ) = self._continuous_rj_group_arrays(
+                        indices,
+                        int(cardinality),
+                    )
+                    base_ll = self._continuous_rj_current_log_likelihood(
+                        data,
+                        positions,
+                        strengths,
+                        chart_ids=chart_ids,
+                        particle_indices=indices,
+                        target_beta=target_beta,
+                    )
+                    current_prior, _ = self._continuous_rj_block_log_densities(
+                        chart_ids,
+                        strengths,
+                    )
+                    if is_split:
+                        attempted_splits += int(indices.size)
+                        self._continuous_rj_transition_mass(
+                            "multi_split_attempted",
+                            indices,
+                        )
+                        accepted, proposed_ll = self._continuous_rj_multi_split(
+                            data,
+                            particle_indices=indices,
+                            cardinality=int(cardinality),
+                            group_size=int(group_size),
+                            chart_ids=chart_ids,
+                            surface_uv=surface_uv,
+                            positions=positions,
+                            strengths=strengths,
+                            base_ll=base_ll,
+                            current_prior=current_prior,
+                            split_sizes=split_sizes,
+                            split_direction_probability=(
+                                split_direction_probability
+                            ),
+                            target_beta=target_beta,
+                            global_probability=global_probability,
+                        )
+                        accepted_splits += int(np.sum(accepted))
+                        self._update_continuous_rj_current_log_likelihood(
+                            indices,
+                            accepted,
+                            proposed_ll,
+                        )
+                        self._continuous_rj_transition_mass(
+                            "multi_split_accepted",
+                            indices,
+                            accepted,
+                        )
+                    else:
+                        attempted_merges += int(indices.size)
+                        self._continuous_rj_transition_mass(
+                            "multi_merge_attempted",
+                            indices,
+                        )
+                        accepted, proposed_ll = self._continuous_rj_multi_merge(
+                            data,
+                            particle_indices=indices,
+                            cardinality=int(cardinality),
+                            group_size=int(group_size),
+                            chart_ids=chart_ids,
+                            surface_uv=surface_uv,
+                            positions=positions,
+                            strengths=strengths,
+                            base_ll=base_ll,
+                            current_prior=current_prior,
+                            merge_sizes=merge_sizes,
+                            target_beta=target_beta,
+                            global_probability=global_probability,
+                        )
+                        accepted_merges += int(np.sum(accepted))
+                        self._update_continuous_rj_current_log_likelihood(
+                            indices,
+                            accepted,
+                            proposed_ll,
+                        )
+                        self._continuous_rj_transition_mass(
+                            "multi_merge_accepted",
+                            indices,
+                            accepted,
+                        )
+        self._structural_rj_move_counts.update(
+            {
+                "multi_split_attempted": attempted_splits,
+                "multi_split_accepted": accepted_splits,
+                "multi_merge_attempted": attempted_merges,
+                "multi_merge_accepted": accepted_merges,
+            }
+        )
+        return accepted_splits, accepted_merges
+
+    def _continuous_rj_multi_split(
+        self,
+        data: StructuralGeometryBatch,
+        *,
+        particle_indices: NDArray[np.int64],
+        cardinality: int,
+        group_size: int,
+        chart_ids: NDArray[np.int64],
+        surface_uv: NDArray[np.float64],
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        base_ll: NDArray[np.float64],
+        current_prior: NDArray[np.float64],
+        split_sizes: tuple[int, ...],
+        split_direction_probability: float,
+        target_beta: float,
+        global_probability: float,
+    ) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
+        """Propose one exact parent-to-group multi-split batch."""
+        atlas = self._structural_rj_surface_atlas
+        if atlas is None:
+            raise RuntimeError("Continuous surface atlas is unavailable.")
+        row_count = int(particle_indices.size)
+        rows = np.arange(row_count, dtype=np.int64)
+        parent_columns = self._random_generator.integers(
+            0,
+            int(cardinality),
+            size=row_count,
+            dtype=np.int64,
+        )
+        totals = strengths[rows, parent_columns]
+        fractions, feasible = self._sample_bounded_simplex(
+            totals,
+            group_size=group_size,
+        )
+        parent_charts = chart_ids[rows, parent_columns]
+        child_charts: list[NDArray[np.int64]] = []
+        child_uv: list[NDArray[np.float64]] = []
+        child_positions: list[NDArray[np.float64]] = []
+        child_log_density: list[NDArray[np.float64]] = []
+        for _ in range(group_size):
+            sampled = atlas.sample_local_chart_mixture(
+                parent_charts,
+                global_component_probability=global_probability,
+                rng=self._random_generator,
+            )
+            child_charts.append(sampled[0])
+            child_uv.append(sampled[1])
+            child_positions.append(sampled[2])
+            child_log_density.append(sampled[3])
+        keep = (
+            np.arange(int(cardinality))[None, :]
+            != parent_columns[:, None]
+        )
+        retained_count = int(cardinality) - 1
+        proposed_charts = np.concatenate(
+            (
+                chart_ids[keep].reshape(row_count, retained_count),
+                np.stack(child_charts, axis=1),
+            ),
+            axis=1,
+        )
+        proposed_uv = np.concatenate(
+            (
+                surface_uv[keep].reshape(row_count, retained_count, 2),
+                np.stack(child_uv, axis=1),
+            ),
+            axis=1,
+        )
+        proposed_positions = np.concatenate(
+            (
+                positions[keep].reshape(row_count, retained_count, 3),
+                np.stack(child_positions, axis=1),
+            ),
+            axis=1,
+        )
+        proposed_strengths = np.concatenate(
+            (
+                strengths[keep].reshape(row_count, retained_count),
+                fractions * totals[:, None],
+            ),
+            axis=1,
+        )
+        proposed_cardinality = int(cardinality) + int(group_size) - 1
+        reverse_groups, reverse_probabilities = (
+            self._continuous_rj_multi_group_probabilities(
+                data,
+                proposed_charts,
+                proposed_uv,
+                proposed_positions,
+                group_size=group_size,
+            )
+        )
+        child_columns = np.arange(
+            retained_count,
+            proposed_cardinality,
+            dtype=np.int64,
+        )
+        reverse_group_column = int(
+            np.flatnonzero(
+                np.all(reverse_groups == child_columns[None, :], axis=1)
+            )[0]
+        )
+        reverse_group_log_probability = np.log(
+            reverse_probabilities[:, reverse_group_column]
+        )
+        reverse_merged_log_density = np.logaddexp.reduce(
+            np.stack(
+                [
+                    atlas.local_chart_mixture_log_density(
+                        child_charts[index],
+                        parent_charts,
+                        global_component_probability=global_probability,
+                    )
+                    for index in range(group_size)
+                ],
+                axis=1,
+            ),
+            axis=1,
+        ) - math.log(float(group_size))
+        fraction_log_density = bounded_uniform_simplex_log_density(
+            fractions,
+            total_strength=totals,
+            minimum_strength=self._strength_prior.minimum,
+            maximum_strength=self._strength_prior.maximum,
+        )
+        _, reverse_merge_sizes, _, reverse_merge_probability = (
+            self._continuous_rj_multi_direction_support(proposed_cardinality)
+        )
+        log_forward = (
+            math.log(split_direction_probability)
+            - math.log(float(len(split_sizes)))
+            - math.log(float(cardinality))
+            + math.lgamma(float(group_size) + 1.0)
+            + np.sum(np.stack(child_log_density, axis=1), axis=1)
+            + fraction_log_density
+        )
+        log_reverse = (
+            math.log(reverse_merge_probability)
+            - math.log(float(len(reverse_merge_sizes)))
+            + reverse_group_log_probability
+            + reverse_merged_log_density
+        )
+        canonical = self._continuous_rj_canonicalize_rows(
+            proposed_charts,
+            proposed_uv,
+            proposed_positions,
+            proposed_strengths,
+        )
+        proposed_charts, proposed_uv, proposed_positions, proposed_strengths = (
+            canonical
+        )
+        proposed_ll = np.full(row_count, float("-inf"), dtype=np.float64)
+        log_ratio = np.full(row_count, float("-inf"), dtype=np.float64)
+        valid_rows = np.flatnonzero(feasible & np.isfinite(fraction_log_density))
+        if valid_rows.size:
+            proposed_ll[valid_rows] = self._continuous_rj_group_log_likelihood(
+                data,
+                proposed_positions[valid_rows],
+                proposed_strengths[valid_rows],
+                chart_ids=proposed_charts[valid_rows],
+                particle_indices=particle_indices[valid_rows],
+                target_beta=target_beta,
+            )
+            proposed_prior, _ = self._continuous_rj_block_log_densities(
+                proposed_charts[valid_rows],
+                proposed_strengths[valid_rows],
+            )
+            target_ratio = (
+                _extended_log_target_ratio(
+                    proposed_ll[valid_rows],
+                    base_ll[valid_rows],
+                )
+                + proposed_prior
+                - current_prior[valid_rows]
+            )
+            log_ratio[valid_rows] = continuous_group_split_log_acceptance_ratio(
+                log_target_ratio=target_ratio,
+                log_forward_proposal=log_forward[valid_rows],
+                log_reverse_proposal=log_reverse[valid_rows],
+                total_strength=totals[valid_rows],
+                group_size=group_size,
+            )
+        accepted = feasible & (
+            np.log(self._random_generator.random(row_count))
+            < np.minimum(log_ratio, 0.0)
+        )
+        self._commit_continuous_rj_states(
+            particle_indices,
+            accepted,
+            proposed_charts,
+            proposed_uv,
+            proposed_positions,
+            proposed_strengths,
+        )
+        return accepted, proposed_ll
+
+    def _continuous_rj_multi_merge(
+        self,
+        data: StructuralGeometryBatch,
+        *,
+        particle_indices: NDArray[np.int64],
+        cardinality: int,
+        group_size: int,
+        chart_ids: NDArray[np.int64],
+        surface_uv: NDArray[np.float64],
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        base_ll: NDArray[np.float64],
+        current_prior: NDArray[np.float64],
+        merge_sizes: tuple[int, ...],
+        target_beta: float,
+        global_probability: float,
+    ) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
+        """Propose one exact response-targeted group-to-parent multi-merge."""
+        atlas = self._structural_rj_surface_atlas
+        if atlas is None:
+            raise RuntimeError("Continuous surface atlas is unavailable.")
+        row_count = int(particle_indices.size)
+        rows = np.arange(row_count, dtype=np.int64)
+        groups, probabilities = self._continuous_rj_multi_group_probabilities(
+            data,
+            chart_ids,
+            surface_uv,
+            positions,
+            group_size=group_size,
+        )
+        cumulative = np.cumsum(probabilities, axis=1)
+        cumulative[:, -1] = 1.0
+        group_columns = np.sum(
+            self._random_generator.random(row_count)[:, None] > cumulative,
+            axis=1,
+            dtype=np.int64,
+        )
+        selected_columns = groups[group_columns]
+        selected_charts = chart_ids[rows[:, None], selected_columns]
+        selected_uv = surface_uv[rows[:, None], selected_columns]
+        selected_positions = positions[rows[:, None], selected_columns]
+        selected_strengths = strengths[rows[:, None], selected_columns]
+        merged_strengths = np.sum(selected_strengths, axis=1)
+        fractions = selected_strengths / np.maximum(
+            merged_strengths[:, None],
+            np.finfo(np.float64).tiny,
+        )
+        fraction_log_density = bounded_uniform_simplex_log_density(
+            fractions,
+            total_strength=merged_strengths,
+            minimum_strength=self._strength_prior.minimum,
+            maximum_strength=self._strength_prior.maximum,
+        )
+        anchor_offsets = self._random_generator.integers(
+            0,
+            group_size,
+            size=row_count,
+            dtype=np.int64,
+        )
+        anchor_charts = selected_charts[rows, anchor_offsets]
+        (
+            merged_charts,
+            merged_uv,
+            merged_positions,
+            _,
+        ) = atlas.sample_local_chart_mixture(
+            anchor_charts,
+            global_component_probability=global_probability,
+            rng=self._random_generator,
+        )
+        forward_merged_log_density = np.logaddexp.reduce(
+            np.stack(
+                [
+                    atlas.local_chart_mixture_log_density(
+                        selected_charts[:, index],
+                        merged_charts,
+                        global_component_probability=global_probability,
+                    )
+                    for index in range(group_size)
+                ],
+                axis=1,
+            ),
+            axis=1,
+        ) - math.log(float(group_size))
+        keep = np.ones((row_count, cardinality), dtype=bool)
+        keep[rows[:, None], selected_columns] = False
+        retained_count = cardinality - group_size
+        proposed_charts = np.concatenate(
+            (
+                chart_ids[keep].reshape(row_count, retained_count),
+                merged_charts[:, None],
+            ),
+            axis=1,
+        )
+        proposed_uv = np.concatenate(
+            (
+                surface_uv[keep].reshape(row_count, retained_count, 2),
+                merged_uv[:, None, :],
+            ),
+            axis=1,
+        )
+        proposed_positions = np.concatenate(
+            (
+                positions[keep].reshape(row_count, retained_count, 3),
+                merged_positions[:, None, :],
+            ),
+            axis=1,
+        )
+        proposed_strengths = np.concatenate(
+            (
+                strengths[keep].reshape(row_count, retained_count),
+                merged_strengths[:, None],
+            ),
+            axis=1,
+        )
+        proposed_cardinality = cardinality - group_size + 1
+        split_sizes, _, reverse_split_probability, _ = (
+            self._continuous_rj_multi_direction_support(proposed_cardinality)
+        )
+        reverse_child_position_log_density = np.sum(
+            np.stack(
+                [
+                    atlas.local_chart_mixture_log_density(
+                        merged_charts,
+                        selected_charts[:, index],
+                        global_component_probability=global_probability,
+                    )
+                    for index in range(group_size)
+                ],
+                axis=1,
+            ),
+            axis=1,
+        )
+        _, _, _, merge_direction_probability = (
+            self._continuous_rj_multi_direction_support(cardinality)
+        )
+        log_forward = (
+            math.log(merge_direction_probability)
+            - math.log(float(len(merge_sizes)))
+            + np.log(probabilities[rows, group_columns])
+            + forward_merged_log_density
+        )
+        log_reverse = (
+            math.log(reverse_split_probability)
+            - math.log(float(len(split_sizes)))
+            - math.log(float(proposed_cardinality))
+            + math.lgamma(float(group_size) + 1.0)
+            + reverse_child_position_log_density
+            + fraction_log_density
+        )
+        feasible = (
+            np.asarray(
+                self._strength_prior.in_support(merged_strengths),
+                dtype=bool,
+            )
+            & np.isfinite(fraction_log_density)
+        )
+        canonical = self._continuous_rj_canonicalize_rows(
+            proposed_charts,
+            proposed_uv,
+            proposed_positions,
+            proposed_strengths,
+        )
+        proposed_charts, proposed_uv, proposed_positions, proposed_strengths = (
+            canonical
+        )
+        proposed_ll = np.full(row_count, float("-inf"), dtype=np.float64)
+        log_ratio = np.full(row_count, float("-inf"), dtype=np.float64)
+        valid_rows = np.flatnonzero(feasible)
+        if valid_rows.size:
+            proposed_ll[valid_rows] = self._continuous_rj_group_log_likelihood(
+                data,
+                proposed_positions[valid_rows],
+                proposed_strengths[valid_rows],
+                chart_ids=proposed_charts[valid_rows],
+                particle_indices=particle_indices[valid_rows],
+                target_beta=target_beta,
+            )
+            proposed_prior, _ = self._continuous_rj_block_log_densities(
+                proposed_charts[valid_rows],
+                proposed_strengths[valid_rows],
+            )
+            target_ratio = (
+                _extended_log_target_ratio(
+                    proposed_ll[valid_rows],
+                    base_ll[valid_rows],
+                )
+                + proposed_prior
+                - current_prior[valid_rows]
+            )
+            log_ratio[valid_rows] = continuous_group_merge_log_acceptance_ratio(
+                log_target_ratio=target_ratio,
+                log_forward_proposal=log_forward[valid_rows],
+                log_reverse_proposal=log_reverse[valid_rows],
+                merged_strength=merged_strengths[valid_rows],
+                group_size=group_size,
+            )
+        accepted = feasible & (
+            np.log(self._random_generator.random(row_count))
+            < np.minimum(log_ratio, 0.0)
+        )
+        self._commit_continuous_rj_states(
+            particle_indices,
+            accepted,
+            proposed_charts,
+            proposed_uv,
+            proposed_positions,
+            proposed_strengths,
+        )
+        return accepted, proposed_ll
+
+    def _apply_continuous_rj_block_independence(
+        self,
+        data: StructuralGeometryBatch,
+        *,
+        target_beta: float = 1.0,
+    ) -> tuple[int, int]:
+        """Apply an exact full-isotope trans-dimensional independence move.
+
+        The proposal replaces every source component of one isotope at once.
+        It therefore crosses the low-likelihood intermediate states that make
+        sequential deletion of several ghosts or merging several split
+        components ineffective.  Cardinality, chart coordinates, and strength
+        densities all have full prior support and are evaluated in both
+        directions, so this is ordinary Metropolis-Hastings on the disjoint
+        union of the continuous ``K``-source spaces and requires no implicit
+        dimension-matching Jacobian.
+        """
+        probability = float(
+            self.config.structural_rj_block_independence_probability
+        )
+        if probability <= 0.0:
+            return 0, 0
+        atlas = self._structural_rj_surface_atlas
+        cardinality_prior = self._structural_rj_cardinality_prior
+        if atlas is None or cardinality_prior is None:
+            raise RuntimeError("Continuous block-RJ priors are unavailable.")
+        particle_count = len(self.continuous_particles)
+        attempted_indices = np.flatnonzero(
+            self._random_generator.random(particle_count) < probability
+        ).astype(np.int64, copy=False)
+        if attempted_indices.size == 0:
+            return 0, 0
+        self._continuous_rj_transition_mass(
+            "block_attempted",
+            attempted_indices,
+        )
+        current_cardinalities = np.asarray(
+            [
+                self.continuous_particles[int(index)].state.num_sources
+                for index in attempted_indices
+            ],
+            dtype=np.int64,
+        )
+        proposed_cardinalities = self._random_generator.choice(
+            cardinality_prior.probabilities.size,
+            size=attempted_indices.size,
+            replace=True,
+            p=cardinality_prior.probabilities,
+        ).astype(np.int64, copy=False)
+        base_ll = np.full(
+            attempted_indices.size,
+            float("-inf"),
+            dtype=np.float64,
+        )
+        current_log_prior = np.full_like(base_ll, float("-inf"))
+        current_log_proposal = np.full_like(base_ll, float("-inf"))
+        for cardinality in np.unique(current_cardinalities).tolist():
+            rows = np.flatnonzero(current_cardinalities == int(cardinality))
+            particle_indices = attempted_indices[rows]
+            charts, _, positions, strengths = self._continuous_rj_group_arrays(
+                particle_indices,
+                int(cardinality),
+            )
+            base_ll[rows] = self._continuous_rj_current_log_likelihood(
+                data,
+                positions,
+                strengths,
+                chart_ids=charts,
+                particle_indices=particle_indices,
+                target_beta=target_beta,
+            )
+            prior, proposal = self._continuous_rj_block_log_densities(
+                charts,
+                strengths,
+            )
+            current_log_prior[rows] = prior
+            current_log_proposal[rows] = proposal
+        accepted_count = 0
+        cardinality_change_count = 0
+        for cardinality in np.unique(proposed_cardinalities).tolist():
+            rows = np.flatnonzero(proposed_cardinalities == int(cardinality))
+            particle_indices = attempted_indices[rows]
+            row_count = int(rows.size)
+            source_count = row_count * int(cardinality)
+            charts_flat, uv_flat, positions_flat = atlas.sample(
+                source_count,
+                rng=self._random_generator,
+                chart_probabilities=(
+                    self._active_continuous_rj_position_proposal()
+                    .chart_probabilities
+                ),
+            )
+            strengths_flat = (
+                self._active_continuous_rj_strength_proposal().sample(
+                    charts_flat,
+                    rng=self._random_generator,
+                )
+            )
+            charts = charts_flat.reshape(row_count, int(cardinality))
+            uv = uv_flat.reshape(row_count, int(cardinality), 2)
+            positions = positions_flat.reshape(
+                row_count,
+                int(cardinality),
+                3,
+            )
+            strengths = np.asarray(
+                strengths_flat,
+                dtype=np.float64,
+            ).reshape(row_count, int(cardinality))
+            proposed_ll = self._continuous_rj_group_log_likelihood(
+                data,
+                positions,
+                strengths,
+                chart_ids=charts,
+                particle_indices=particle_indices,
+                target_beta=target_beta,
+            )
+            proposed_log_prior, proposed_log_proposal = (
+                self._continuous_rj_block_log_densities(
+                    charts,
+                    strengths,
+                )
+            )
+            log_ratio = (
+                _extended_log_target_ratio(proposed_ll, base_ll[rows])
+                + proposed_log_prior
+                - current_log_prior[rows]
+                + current_log_proposal[rows]
+                - proposed_log_proposal
+            )
+            accepted = np.log(
+                self._random_generator.random(row_count)
+            ) < np.minimum(log_ratio, 0.0)
+            accepted_count += self._commit_continuous_rj_states(
+                particle_indices,
+                accepted,
+                charts,
+                uv,
+                positions,
+                strengths,
+            )
+            changed = accepted & (
+                current_cardinalities[rows] != int(cardinality)
+            )
+            cardinality_change_count += int(np.sum(changed))
+            self._update_continuous_rj_current_log_likelihood(
+                particle_indices,
+                accepted,
+                proposed_ll,
+            )
+            self._continuous_rj_transition_mass(
+                "block_accepted",
+                particle_indices,
+                accepted,
+            )
+            self._continuous_rj_transition_mass(
+                "block_cardinality_changed",
+                particle_indices,
+                changed,
+            )
+        self._structural_rj_move_counts.update(
+            {
+                "block_attempted": int(attempted_indices.size),
+                "block_accepted": int(accepted_count),
+                "block_cardinality_changed": int(cardinality_change_count),
+            }
+        )
+        return accepted_count, cardinality_change_count
 
     def _apply_continuous_rj_split_merge(
         self,
@@ -3078,17 +4513,18 @@ class IsotopeParticleFilter:
         """Apply exact strength-transfer split/merge RJ proposals.
 
         A split keeps one source position, draws a second position from the
-        continuous surface prior, and partitions the original strength.  Its
-        reverse merge deletes the ordered donor and transfers its strength to
-        the ordered recipient.  The full strength-map Jacobian and truncated
-        split-fraction density are included in the RJ ratio.
+        full-support local surface mixture, and partitions the original
+        strength.  Its reverse merge selects nearby ordered donor/recipient
+        pairs preferentially and transfers donor strength to the recipient.
+        Both state-dependent selection probabilities, the strength-map
+        Jacobian, and the truncated split-fraction density are included in the
+        RJ ratio.
         """
         atlas = self._structural_rj_surface_atlas
         cardinality_prior = self._structural_rj_cardinality_prior
         move_probabilities = self._structural_rj_split_merge_probabilities
         if atlas is None or cardinality_prior is None or move_probabilities is None:
             raise RuntimeError("Continuous split/merge priors are unavailable.")
-        position_proposal = self._active_continuous_rj_position_proposal()
         particle_count = len(self.continuous_particles)
         cardinalities = np.asarray(
             [particle.state.num_sources for particle in self.continuous_particles],
@@ -3133,7 +4569,7 @@ class IsotopeParticleFilter:
                     particle_indices,
                     int(cardinality),
                 )
-                base_ll = self._continuous_rj_group_log_likelihood(
+                base_ll = self._continuous_rj_current_log_likelihood(
                     data,
                     positions,
                     strengths,
@@ -3167,33 +4603,143 @@ class IsotopeParticleFilter:
                     )
                     retained_strength = (1.0 - fraction) * total_strength
                     new_strength = fraction * total_strength
-                    new_chart_ids, new_uv, new_positions = atlas.sample(
-                        particle_indices.size,
-                        rng=self._random_generator,
-                        chart_probabilities=(
-                            position_proposal.chart_probabilities
+                    parent_chart_ids = chart_ids[rows, source_columns]
+                    (
+                        first_child_chart_ids,
+                        first_child_uv,
+                        first_child_positions,
+                        log_forward_first_position_proposal,
+                    ) = atlas.sample_local_chart_mixture(
+                        parent_chart_ids,
+                        global_component_probability=float(
+                            self.config
+                            .structural_rj_split_global_position_probability
                         ),
+                        rng=self._random_generator,
                     )
-                    base_split_strengths = strengths.copy()
-                    base_split_strengths[
-                        rows,
-                        source_columns,
-                    ] = retained_strength
+                    (
+                        second_child_chart_ids,
+                        second_child_uv,
+                        second_child_positions,
+                        log_forward_second_position_proposal,
+                    ) = atlas.sample_local_chart_mixture(
+                        parent_chart_ids,
+                        global_component_probability=float(
+                            self.config
+                            .structural_rj_split_global_position_probability
+                        ),
+                        rng=self._random_generator,
+                    )
+                    keep = (
+                        np.arange(int(cardinality))[None, :]
+                        != source_columns[:, None]
+                    )
+                    retained_chart_ids = chart_ids[keep].reshape(
+                        particle_indices.size,
+                        int(cardinality) - 1,
+                    )
+                    retained_uv = surface_uv[keep].reshape(
+                        particle_indices.size,
+                        int(cardinality) - 1,
+                        2,
+                    )
+                    retained_positions = positions[keep].reshape(
+                        particle_indices.size,
+                        int(cardinality) - 1,
+                        3,
+                    )
+                    retained_strength_matrix = strengths[keep].reshape(
+                        particle_indices.size,
+                        int(cardinality) - 1,
+                    )
                     proposed_chart_ids = np.concatenate(
-                        (chart_ids, new_chart_ids[:, None]),
+                        (
+                            retained_chart_ids,
+                            first_child_chart_ids[:, None],
+                            second_child_chart_ids[:, None],
+                        ),
                         axis=1,
                     )
                     proposed_uv = np.concatenate(
-                        (surface_uv, new_uv[:, None, :]),
+                        (
+                            retained_uv,
+                            first_child_uv[:, None, :],
+                            second_child_uv[:, None, :],
+                        ),
                         axis=1,
                     )
                     proposed_positions = np.concatenate(
-                        (positions, new_positions[:, None, :]),
+                        (
+                            retained_positions,
+                            first_child_positions[:, None, :],
+                            second_child_positions[:, None, :],
+                        ),
                         axis=1,
                     )
                     proposed_strengths = np.concatenate(
-                        (base_split_strengths, new_strength[:, None]),
+                        (
+                            retained_strength_matrix,
+                            retained_strength[:, None],
+                            new_strength[:, None],
+                        ),
                         axis=1,
+                    )
+                    (
+                        reverse_donor_columns,
+                        reverse_receiver_columns,
+                        reverse_pair_probabilities,
+                    ) = self._continuous_rj_ordered_pair_probabilities(
+                        proposed_chart_ids,
+                        proposed_uv,
+                    )
+                    reverse_pair_matches = (
+                        (
+                            reverse_donor_columns[None, :]
+                            == int(cardinality)
+                        )
+                        & (
+                            reverse_receiver_columns[None, :]
+                            == int(cardinality) - 1
+                        )
+                    )
+                    if not np.all(
+                        np.sum(reverse_pair_matches, axis=1) == 1
+                    ):
+                        raise RuntimeError(
+                            "Reverse merge pair was not uniquely represented."
+                        )
+                    reverse_pair_columns = np.argmax(
+                        reverse_pair_matches,
+                        axis=1,
+                    )
+                    log_reverse_pair_selection = np.log(
+                        reverse_pair_probabilities[
+                            rows,
+                            reverse_pair_columns,
+                        ]
+                    )
+                    global_probability = float(
+                        self.config
+                        .structural_rj_split_global_position_probability
+                    )
+                    log_reverse_merged_position_proposal = (
+                        np.logaddexp(
+                            atlas.local_chart_mixture_log_density(
+                                first_child_chart_ids,
+                                parent_chart_ids,
+                                global_component_probability=(
+                                    global_probability
+                                ),
+                            ),
+                            atlas.local_chart_mixture_log_density(
+                                second_child_chart_ids,
+                                parent_chart_ids,
+                                global_component_probability=(
+                                    global_probability
+                                ),
+                            ),
+                        )
+                        - math.log(2.0)
                     )
                     (
                         proposed_chart_ids,
@@ -3206,31 +4752,30 @@ class IsotopeParticleFilter:
                         proposed_positions,
                         proposed_strengths,
                     )
-                    proposed_ll = self._continuous_rj_group_log_likelihood(
-                        data,
-                        proposed_positions,
-                        proposed_strengths,
-                        chart_ids=proposed_chart_ids,
-                        particle_indices=particle_indices,
-                        target_beta=target_beta,
-                    )
                     log_ratio = np.full(
+                        particle_indices.size,
+                        float("-inf"),
+                        dtype=np.float64,
+                    )
+                    proposed_ll = np.full(
                         particle_indices.size,
                         float("-inf"),
                         dtype=np.float64,
                     )
                     valid_rows = np.flatnonzero(feasible)
                     if valid_rows.size:
-                        log_position_density = atlas.log_chart_probabilities[
-                            new_chart_ids[valid_rows]
-                        ]
-                        log_position_proposal = (
-                            position_proposal.log_density(
-                                new_chart_ids[valid_rows]
+                        proposed_ll[valid_rows] = (
+                            self._continuous_rj_group_log_likelihood(
+                                data,
+                                proposed_positions[valid_rows],
+                                proposed_strengths[valid_rows],
+                                chart_ids=proposed_chart_ids[valid_rows],
+                                particle_indices=particle_indices[valid_rows],
+                                target_beta=target_beta,
                             )
                         )
                         log_ratio[valid_rows] = (
-                            continuous_split_log_acceptance_ratio(
+                            continuous_relocated_split_log_acceptance_ratio(
                                 current_cardinality=int(cardinality),
                                 total_strength=total_strength[valid_rows],
                                 log_likelihood_ratio=(
@@ -3241,29 +4786,63 @@ class IsotopeParticleFilter:
                                 ),
                                 cardinality_prior=cardinality_prior,
                                 move_probabilities=move_probabilities,
-                                log_new_position_prior_density=(
-                                    log_position_density
+                                log_parent_position_prior_density=(
+                                    atlas.log_chart_probabilities[
+                                        parent_chart_ids[valid_rows]
+                                    ]
                                 ),
-                                log_old_strength_prior_density=(
+                                log_first_child_position_prior_density=(
+                                    atlas.log_chart_probabilities[
+                                        first_child_chart_ids[valid_rows]
+                                    ]
+                                ),
+                                log_second_child_position_prior_density=(
+                                    atlas.log_chart_probabilities[
+                                        second_child_chart_ids[valid_rows]
+                                    ]
+                                ),
+                                log_parent_strength_prior_density=(
                                     self._strength_prior.log_prob(
                                         total_strength[valid_rows]
                                     )
                                 ),
-                                log_retained_strength_prior_density=(
+                                log_first_child_strength_prior_density=(
                                     self._strength_prior.log_prob(
                                         retained_strength[valid_rows]
                                     )
                                 ),
-                                log_new_strength_prior_density=(
+                                log_second_child_strength_prior_density=(
                                     self._strength_prior.log_prob(
                                         new_strength[valid_rows]
                                     )
                                 ),
-                                log_forward_position_proposal=(
-                                    log_position_proposal
+                                log_forward_first_position_proposal=(
+                                    log_forward_first_position_proposal[
+                                        valid_rows
+                                    ]
+                                ),
+                                log_forward_second_position_proposal=(
+                                    log_forward_second_position_proposal[
+                                        valid_rows
+                                    ]
                                 ),
                                 log_forward_fraction_proposal=(
                                     -np.log(width[valid_rows])
+                                ),
+                                log_forward_parent_selection=(
+                                    np.full(
+                                        valid_rows.size,
+                                        -math.log(float(cardinality)),
+                                        dtype=np.float64,
+                                    )
+                                ),
+                                log_reverse_pair_selection=(
+                                    log_reverse_pair_selection[valid_rows]
+                                ),
+                                log_reverse_merged_position_proposal=(
+                                    log_reverse_merged_position_proposal[
+                                        valid_rows
+                                    ]
                                 ),
                             )
                         )
@@ -3281,6 +4860,11 @@ class IsotopeParticleFilter:
                         proposed_positions,
                         proposed_strengths,
                     )
+                    self._update_continuous_rj_current_log_likelihood(
+                        particle_indices,
+                        accepted,
+                        proposed_ll,
+                    )
                     self._continuous_rj_transition_mass(
                         "split_accepted",
                         particle_indices,
@@ -3293,31 +4877,42 @@ class IsotopeParticleFilter:
                     "merge_attempted",
                     particle_indices,
                 )
-                delete_columns = self._random_generator.integers(
-                    0,
-                    int(cardinality),
-                    size=particle_indices.size,
+                (
+                    donor_candidates,
+                    receiver_candidates,
+                    pair_probabilities,
+                ) = self._continuous_rj_ordered_pair_probabilities(
+                    chart_ids,
+                    surface_uv,
+                )
+                pair_cdf = np.cumsum(pair_probabilities, axis=1)
+                pair_cdf[:, -1] = 1.0
+                pair_draws = self._random_generator.random(
+                    particle_indices.size
+                )
+                pair_columns = np.sum(
+                    pair_draws[:, None] > pair_cdf,
+                    axis=1,
                     dtype=np.int64,
                 )
-                receiver_raw = self._random_generator.integers(
-                    0,
-                    int(cardinality) - 1,
-                    size=particle_indices.size,
-                    dtype=np.int64,
+                delete_columns = donor_candidates[pair_columns]
+                receiver_columns = receiver_candidates[pair_columns]
+                log_forward_pair_selection = np.log(
+                    pair_probabilities[rows, pair_columns]
                 )
-                receiver_columns = receiver_raw + (
-                    receiver_raw >= delete_columns
-                ).astype(np.int64)
-                deleted_chart_ids = chart_ids[rows, delete_columns]
-                deleted_strengths = strengths[rows, delete_columns]
-                retained_strengths = strengths[rows, receiver_columns]
-                merged_strength = deleted_strengths + retained_strengths
+                second_child_chart_ids = chart_ids[rows, delete_columns]
+                first_child_chart_ids = chart_ids[rows, receiver_columns]
+                second_child_strengths = strengths[rows, delete_columns]
+                first_child_strengths = strengths[rows, receiver_columns]
+                merged_strength = (
+                    second_child_strengths + first_child_strengths
+                )
                 lower, upper, reverse_feasible = split_fraction_bounds(
                     merged_strength,
                     minimum_strength=self._strength_prior.minimum,
                     maximum_strength=self._strength_prior.maximum,
                 )
-                reverse_fraction = deleted_strengths / np.maximum(
+                reverse_fraction = second_child_strengths / np.maximum(
                     merged_strength,
                     np.finfo(np.float64).tiny,
                 )
@@ -3330,32 +4925,103 @@ class IsotopeParticleFilter:
                     & (reverse_fraction >= lower)
                     & (reverse_fraction <= upper)
                 )
-                merged_strengths = strengths.copy()
-                merged_strengths[
-                    rows,
-                    receiver_columns,
-                ] = merged_strength
+                global_probability = float(
+                    self.config
+                    .structural_rj_split_global_position_probability
+                )
+                use_first_anchor = (
+                    self._random_generator.random(particle_indices.size)
+                    < 0.5
+                )
+                merge_anchor_chart_ids = np.where(
+                    use_first_anchor,
+                    first_child_chart_ids,
+                    second_child_chart_ids,
+                )
+                (
+                    merged_chart_ids,
+                    merged_uv,
+                    merged_positions,
+                    _sampled_merged_position_log_density,
+                ) = atlas.sample_local_chart_mixture(
+                    merge_anchor_chart_ids,
+                    global_component_probability=global_probability,
+                    rng=self._random_generator,
+                )
+                log_forward_merged_position_proposal = (
+                    np.logaddexp(
+                        atlas.local_chart_mixture_log_density(
+                            first_child_chart_ids,
+                            merged_chart_ids,
+                            global_component_probability=(
+                                global_probability
+                            ),
+                        ),
+                        atlas.local_chart_mixture_log_density(
+                            second_child_chart_ids,
+                            merged_chart_ids,
+                            global_component_probability=(
+                                global_probability
+                            ),
+                        ),
+                    )
+                    - math.log(2.0)
+                )
                 keep = (
-                    np.arange(int(cardinality))[None, :]
-                    != delete_columns[:, None]
+                    (
+                        np.arange(int(cardinality))[None, :]
+                        != delete_columns[:, None]
+                    )
+                    & (
+                        np.arange(int(cardinality))[None, :]
+                        != receiver_columns[:, None]
+                    )
                 )
-                proposed_chart_ids = chart_ids[keep].reshape(
+                retained_chart_ids = chart_ids[keep].reshape(
                     particle_indices.size,
-                    int(cardinality) - 1,
+                    int(cardinality) - 2,
                 )
-                proposed_uv = surface_uv[keep].reshape(
+                retained_uv = surface_uv[keep].reshape(
                     particle_indices.size,
-                    int(cardinality) - 1,
+                    int(cardinality) - 2,
                     2,
                 )
-                proposed_positions = positions[keep].reshape(
+                retained_positions = positions[keep].reshape(
                     particle_indices.size,
-                    int(cardinality) - 1,
+                    int(cardinality) - 2,
                     3,
                 )
-                proposed_strengths = merged_strengths[keep].reshape(
+                retained_strengths = strengths[keep].reshape(
                     particle_indices.size,
-                    int(cardinality) - 1,
+                    int(cardinality) - 2,
+                )
+                proposed_chart_ids = np.concatenate(
+                    (
+                        retained_chart_ids,
+                        merged_chart_ids[:, None],
+                    ),
+                    axis=1,
+                )
+                proposed_uv = np.concatenate(
+                    (
+                        retained_uv,
+                        merged_uv[:, None, :],
+                    ),
+                    axis=1,
+                )
+                proposed_positions = np.concatenate(
+                    (
+                        retained_positions,
+                        merged_positions[:, None, :],
+                    ),
+                    axis=1,
+                )
+                proposed_strengths = np.concatenate(
+                    (
+                        retained_strengths,
+                        merged_strength[:, None],
+                    ),
+                    axis=1,
                 )
                 (
                     proposed_chart_ids,
@@ -3368,61 +5034,104 @@ class IsotopeParticleFilter:
                     proposed_positions,
                     proposed_strengths,
                 )
-                proposed_ll = self._continuous_rj_group_log_likelihood(
-                    data,
-                    proposed_positions,
-                    proposed_strengths,
-                    chart_ids=proposed_chart_ids,
-                    particle_indices=particle_indices,
-                    target_beta=target_beta,
-                )
                 log_ratio = np.full(
+                    particle_indices.size,
+                    float("-inf"),
+                    dtype=np.float64,
+                )
+                proposed_ll = np.full(
                     particle_indices.size,
                     float("-inf"),
                     dtype=np.float64,
                 )
                 valid_rows = np.flatnonzero(feasible)
                 if valid_rows.size:
-                    log_position_density = atlas.log_chart_probabilities[
-                        deleted_chart_ids[valid_rows]
-                    ]
-                    log_reverse_position_proposal = (
-                        position_proposal.log_density(
-                            deleted_chart_ids[valid_rows]
+                    proposed_ll[valid_rows] = (
+                        self._continuous_rj_group_log_likelihood(
+                            data,
+                            proposed_positions[valid_rows],
+                            proposed_strengths[valid_rows],
+                            chart_ids=proposed_chart_ids[valid_rows],
+                            particle_indices=particle_indices[valid_rows],
+                            target_beta=target_beta,
                         )
                     )
                     width = upper[valid_rows] - lower[valid_rows]
-                    log_ratio[valid_rows] = continuous_merge_log_acceptance_ratio(
-                        current_cardinality=int(cardinality),
-                        merged_strength=merged_strength[valid_rows],
-                        log_likelihood_ratio=(
-                            _extended_log_target_ratio(
-                                proposed_ll[valid_rows],
-                                base_ll[valid_rows],
-                            )
-                        ),
-                        cardinality_prior=cardinality_prior,
-                        move_probabilities=move_probabilities,
-                        log_deleted_position_prior_density=log_position_density,
-                        log_deleted_strength_prior_density=(
-                            self._strength_prior.log_prob(
-                                deleted_strengths[valid_rows]
-                            )
-                        ),
-                        log_retained_strength_prior_density=(
-                            self._strength_prior.log_prob(
-                                retained_strengths[valid_rows]
-                            )
-                        ),
-                        log_merged_strength_prior_density=(
-                            self._strength_prior.log_prob(
-                                merged_strength[valid_rows]
-                            )
-                        ),
-                        log_reverse_position_proposal=(
-                            log_reverse_position_proposal
-                        ),
-                        log_reverse_fraction_proposal=-np.log(width),
+                    log_ratio[valid_rows] = (
+                        continuous_relocated_merge_log_acceptance_ratio(
+                            current_cardinality=int(cardinality),
+                            merged_strength=merged_strength[valid_rows],
+                            log_likelihood_ratio=(
+                                _extended_log_target_ratio(
+                                    proposed_ll[valid_rows],
+                                    base_ll[valid_rows],
+                                )
+                            ),
+                            cardinality_prior=cardinality_prior,
+                            move_probabilities=move_probabilities,
+                            log_first_child_position_prior_density=(
+                                atlas.log_chart_probabilities[
+                                    first_child_chart_ids[valid_rows]
+                                ]
+                            ),
+                            log_second_child_position_prior_density=(
+                                atlas.log_chart_probabilities[
+                                    second_child_chart_ids[valid_rows]
+                                ]
+                            ),
+                            log_merged_position_prior_density=(
+                                atlas.log_chart_probabilities[
+                                    merged_chart_ids[valid_rows]
+                                ]
+                            ),
+                            log_first_child_strength_prior_density=(
+                                self._strength_prior.log_prob(
+                                    first_child_strengths[valid_rows]
+                                )
+                            ),
+                            log_second_child_strength_prior_density=(
+                                self._strength_prior.log_prob(
+                                    second_child_strengths[valid_rows]
+                                )
+                            ),
+                            log_merged_strength_prior_density=(
+                                self._strength_prior.log_prob(
+                                    merged_strength[valid_rows]
+                                )
+                            ),
+                            log_forward_merged_position_proposal=(
+                                log_forward_merged_position_proposal[
+                                    valid_rows
+                                ]
+                            ),
+                            log_reverse_first_position_proposal=(
+                                atlas.local_chart_mixture_log_density(
+                                    merged_chart_ids[valid_rows],
+                                    first_child_chart_ids[valid_rows],
+                                    global_component_probability=(
+                                        global_probability
+                                    ),
+                                )
+                            ),
+                            log_reverse_second_position_proposal=(
+                                atlas.local_chart_mixture_log_density(
+                                    merged_chart_ids[valid_rows],
+                                    second_child_chart_ids[valid_rows],
+                                    global_component_probability=(
+                                        global_probability
+                                    ),
+                                )
+                            ),
+                            log_reverse_fraction_proposal=-np.log(width),
+                            log_forward_pair_selection=(
+                                log_forward_pair_selection[valid_rows]
+                            ),
+                            log_reverse_parent_selection=np.full(
+                                valid_rows.size,
+                                -math.log(float(cardinality - 1)),
+                                dtype=np.float64,
+                            ),
+                        )
                     )
                 accepted = feasible & (
                     np.log(self._random_generator.random(particle_indices.size))
@@ -3435,6 +5144,11 @@ class IsotopeParticleFilter:
                     proposed_uv,
                     proposed_positions,
                     proposed_strengths,
+                )
+                self._update_continuous_rj_current_log_likelihood(
+                    particle_indices,
+                    accepted,
+                    proposed_ll,
                 )
                 self._continuous_rj_transition_mass(
                     "merge_accepted",
@@ -3457,18 +5171,40 @@ class IsotopeParticleFilter:
         *,
         target_beta: float = 1.0,
         tempering_start_row: int | None = None,
+        current_target_log_likelihood: NDArray[np.float64] | None = None,
     ) -> None:
         """Apply continuous RJ/MH and always clear the tempered-target context."""
         self._structural_rj_tempering_start_row = tempering_start_row
+        if current_target_log_likelihood is None:
+            self._structural_rj_current_target_log_likelihood = None
+        else:
+            current = np.asarray(
+                current_target_log_likelihood,
+                dtype=np.float64,
+            ).reshape(-1)
+            if (
+                current.shape != (len(self.continuous_particles),)
+                or np.any(np.isnan(current))
+                or np.any(np.isposinf(current))
+            ):
+                raise ValueError(
+                    "Current structural target must align with every particle."
+                )
+            self._structural_rj_current_target_log_likelihood = current.copy()
         try:
             self._apply_exact_structural_rj_moves_impl(
                 evidence_data,
                 target_beta=target_beta,
             )
         finally:
+            current = self._structural_rj_current_target_log_likelihood
+            self.last_structural_target_log_likelihood = (
+                None if current is None else current.copy()
+            )
             self._structural_rj_position_proposal = None
             self._structural_rj_strength_proposal = None
             self._structural_rj_tempering_start_row = None
+            self._structural_rj_current_target_log_likelihood = None
 
     def _apply_exact_structural_rj_moves_impl(
         self,
@@ -3498,6 +5234,13 @@ class IsotopeParticleFilter:
             "split_accepted": 0,
             "merge_attempted": 0,
             "merge_accepted": 0,
+            "multi_split_attempted": 0,
+            "multi_split_accepted": 0,
+            "multi_merge_attempted": 0,
+            "multi_merge_accepted": 0,
+            "block_attempted": 0,
+            "block_accepted": 0,
+            "block_cardinality_changed": 0,
         }
         response_start = time.perf_counter()
         self._structural_rj_position_proposal = (
@@ -3517,6 +5260,40 @@ class IsotopeParticleFilter:
                 target_beta=target_beta,
             )
             birth_death_elapsed = time.perf_counter() - move_start
+        split_merge_start = time.perf_counter()
+        split_count = 0
+        merge_count = 0
+        if self._variable_cardinality_enabled():
+            split_count, merge_count = self._apply_continuous_rj_split_merge(
+                evidence_data,
+                target_beta=target_beta,
+            )
+        split_merge_elapsed = time.perf_counter() - split_merge_start
+        multi_component_start = time.perf_counter()
+        multi_split_count = 0
+        multi_merge_count = 0
+        if self._variable_cardinality_enabled():
+            multi_split_count, multi_merge_count = (
+                self._apply_continuous_rj_multi_component(
+                    evidence_data,
+                    target_beta=target_beta,
+                )
+            )
+        multi_component_elapsed = (
+            time.perf_counter() - multi_component_start
+        )
+        block_start = time.perf_counter()
+        block_count = 0
+        block_cardinality_change_count = 0
+        if self._variable_cardinality_enabled():
+            (
+                block_count,
+                block_cardinality_change_count,
+            ) = self._apply_continuous_rj_block_independence(
+                evidence_data,
+                target_beta=target_beta,
+            )
+        block_elapsed = time.perf_counter() - block_start
         position_start = time.perf_counter()
         position_count = self._apply_continuous_rj_global_position_moves(
             evidence_data,
@@ -3535,15 +5312,6 @@ class IsotopeParticleFilter:
             target_beta=target_beta,
         )
         strength_elapsed = time.perf_counter() - strength_start
-        split_merge_start = time.perf_counter()
-        split_count = 0
-        merge_count = 0
-        if self._variable_cardinality_enabled():
-            split_count, merge_count = self._apply_continuous_rj_split_merge(
-                evidence_data,
-                target_beta=target_beta,
-            )
-        split_merge_elapsed = time.perf_counter() - split_merge_start
         current_log_weights = np.asarray(
             [particle.log_weight for particle in self.continuous_particles],
             dtype=float,
@@ -3591,6 +5359,8 @@ class IsotopeParticleFilter:
             "rj_local_position": float(local_position_elapsed),
             "rj_strength": float(strength_elapsed),
             "rj_split_merge": float(split_merge_elapsed),
+            "rj_multi_component": float(multi_component_elapsed),
+            "rj_block_independence": float(block_elapsed),
             "target_beta": float(target_beta),
             "rj_birth_attempted": float(
                 self._structural_rj_move_counts["birth_attempted"]
@@ -3627,6 +5397,39 @@ class IsotopeParticleFilter:
                 self._structural_rj_move_counts["merge_attempted"]
             ),
             "rj_merge_accepted": float(merge_count),
+            "rj_multi_split_attempted": float(
+                self._structural_rj_move_counts["multi_split_attempted"]
+            ),
+            "rj_multi_split_accepted": float(multi_split_count),
+            "rj_multi_merge_attempted": float(
+                self._structural_rj_move_counts["multi_merge_attempted"]
+            ),
+            "rj_multi_merge_accepted": float(multi_merge_count),
+            "rj_block_attempted": float(
+                self._structural_rj_move_counts["block_attempted"]
+            ),
+            "rj_block_accepted": float(block_count),
+            "rj_block_cardinality_changed": float(
+                block_cardinality_change_count
+            ),
+            "rj_block_attempted_weight_mass": float(
+                self.last_structural_transition_weight_mass.get(
+                    "block_attempted_weight_mass",
+                    0.0,
+                )
+            ),
+            "rj_block_accepted_weight_mass": float(
+                self.last_structural_transition_weight_mass.get(
+                    "block_accepted_weight_mass",
+                    0.0,
+                )
+            ),
+            "rj_block_cardinality_changed_weight_mass": float(
+                self.last_structural_transition_weight_mass.get(
+                    "block_cardinality_changed_weight_mass",
+                    0.0,
+                )
+            ),
             "rj_birth_attempted_weight_mass": float(
                 self.last_structural_transition_weight_mass.get(
                     "birth_attempted_weight_mass",
@@ -3689,6 +5492,7 @@ class IsotopeParticleFilter:
         *,
         target_beta: float = 1.0,
         tempering_start_row: int | None = None,
+        current_target_log_likelihood: NDArray[np.float64] | None = None,
     ) -> None:
         """Apply exact continuous-surface MH/RJ rejuvenation when evidence exists."""
         if not self.continuous_particles:
@@ -3704,6 +5508,7 @@ class IsotopeParticleFilter:
             evidence_data,
             target_beta=target_beta,
             tempering_start_row=tempering_start_row,
+            current_target_log_likelihood=current_target_log_likelihood,
         )
 
     def estimate(self) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+from math import comb
 from typing import Literal, TypeAlias
 
 import numpy as np
@@ -60,6 +61,131 @@ def validate_cardinality_prior_policy(
             "structural_cardinality_prior_probs."
         )
     return normalized
+
+
+def bounded_simplex_probability(
+    total_strength: ArrayLike,
+    *,
+    group_size: int,
+    minimum_strength: float,
+    maximum_strength: float,
+) -> FloatArray:
+    """Return Dirichlet(1) mass satisfying bounded child strengths.
+
+    Inclusion-exclusion evaluates the exact volume of the simplex cut by the
+    common lower and upper child-strength bounds. This normalization is needed
+    for reversible multi-component split proposals.
+    """
+    size = int(group_size)
+    if size < 2:
+        raise ValueError("group_size must be at least two.")
+    total = np.asarray(total_strength, dtype=np.float64)
+    minimum = float(minimum_strength)
+    maximum = float(maximum_strength)
+    if (
+        np.any(~np.isfinite(total))
+        or not np.isfinite(minimum)
+        or not np.isfinite(maximum)
+        or minimum < 0.0
+        or maximum <= minimum
+    ):
+        raise ValueError("Bounded-simplex inputs are invalid.")
+    safe_total = np.maximum(total, np.finfo(np.float64).tiny)
+    lower = minimum / safe_total
+    upper = maximum / safe_total
+    residual = 1.0 - float(size) * lower
+    width = upper - lower
+    probability = np.zeros_like(total, dtype=np.float64)
+    for subset_size in range(size + 1):
+        remainder = np.maximum(
+            residual - float(subset_size) * width,
+            0.0,
+        )
+        probability += (
+            (-1.0) ** subset_size
+            * float(comb(size, subset_size))
+            * np.power(remainder, size - 1)
+        )
+    feasible = (total > size * minimum) & (total < size * maximum)
+    return np.where(feasible, np.clip(probability, 0.0, 1.0), 0.0)
+
+
+def bounded_uniform_simplex_log_density(
+    fractions: ArrayLike,
+    *,
+    total_strength: ArrayLike,
+    minimum_strength: float,
+    maximum_strength: float,
+) -> FloatArray:
+    """Return the exact conditional Dirichlet(1) log density."""
+    values = np.asarray(fractions, dtype=np.float64)
+    if values.ndim < 1 or values.shape[-1] < 2:
+        raise ValueError("fractions must end in a group axis of size at least two.")
+    size = int(values.shape[-1])
+    total = np.asarray(total_strength, dtype=np.float64)
+    if total.shape != values.shape[:-1]:
+        raise ValueError("total_strength must align with fraction rows.")
+    probability = bounded_simplex_probability(
+        total,
+        group_size=size,
+        minimum_strength=minimum_strength,
+        maximum_strength=maximum_strength,
+    )
+    child_strengths = values * total[..., None]
+    valid = (
+        np.all(np.isfinite(values), axis=-1)
+        & np.isclose(np.sum(values, axis=-1), 1.0, atol=1.0e-12)
+        & np.all(child_strengths >= float(minimum_strength), axis=-1)
+        & np.all(child_strengths <= float(maximum_strength), axis=-1)
+        & (probability > 0.0)
+    )
+    density = math.lgamma(float(size)) - np.log(
+        np.maximum(probability, np.finfo(np.float64).tiny)
+    )
+    return np.where(valid, density, float("-inf"))
+
+
+def continuous_group_split_log_acceptance_ratio(
+    *,
+    log_target_ratio: ArrayLike,
+    log_forward_proposal: ArrayLike,
+    log_reverse_proposal: ArrayLike,
+    total_strength: ArrayLike,
+    group_size: int,
+) -> FloatArray:
+    """Return an exact multi-split RJ log ratio including its Jacobian."""
+    size = int(group_size)
+    if size < 2:
+        raise ValueError("group_size must be at least two.")
+    total = np.asarray(total_strength, dtype=np.float64)
+    if np.any(~np.isfinite(total)) or np.any(total <= 0.0):
+        raise ValueError("total_strength must be finite and positive.")
+    return (
+        np.asarray(log_target_ratio, dtype=np.float64)
+        + np.asarray(log_reverse_proposal, dtype=np.float64)
+        - np.asarray(log_forward_proposal, dtype=np.float64)
+        + float(size - 1) * np.log(total)
+    )
+
+
+def continuous_group_merge_log_acceptance_ratio(
+    *,
+    log_target_ratio: ArrayLike,
+    log_forward_proposal: ArrayLike,
+    log_reverse_proposal: ArrayLike,
+    merged_strength: ArrayLike,
+    group_size: int,
+) -> FloatArray:
+    """Return the inverse exact multi-merge RJ log ratio."""
+    return continuous_group_split_log_acceptance_ratio(
+        log_target_ratio=log_target_ratio,
+        log_forward_proposal=log_forward_proposal,
+        log_reverse_proposal=log_reverse_proposal,
+        total_strength=merged_strength,
+        group_size=group_size,
+    ) - 2.0 * float(int(group_size) - 1) * np.log(
+        np.asarray(merged_strength, dtype=np.float64)
+    )
 
 
 FloatArray: TypeAlias = NDArray[np.float64]
@@ -415,6 +541,82 @@ def truncated_poisson_cardinality_probabilities(
     mass = np.exp(log_mass)
     mass /= float(np.sum(mass, dtype=np.float64))
     return np.asarray(mass, dtype=np.float64)
+
+
+def distance_weighted_ordered_pair_probabilities(
+    surface_distances_m: ArrayLike,
+    *,
+    sigma_m: float,
+    uniform_component_probability: float,
+) -> FloatArray:
+    """Return full-support probabilities over ordered source pairs.
+
+    The last array dimension enumerates ordered donor/receiver pairs.  The
+    local component favours small intrinsic surface distance, while a positive
+    uniform component preserves irreducibility even across disconnected
+    surface components.
+    """
+    distances = np.asarray(surface_distances_m, dtype=np.float64)
+    if distances.ndim < 1 or distances.shape[-1] <= 0:
+        raise ValueError(
+            "surface_distances_m must contain a nonempty pair dimension."
+        )
+    if np.any(np.isnan(distances)) or np.any(distances < 0.0):
+        raise ValueError(
+            "surface_distances_m must be nonnegative or positive infinity."
+        )
+    sigma = float(sigma_m)
+    uniform_probability = float(uniform_component_probability)
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("sigma_m must be finite and positive.")
+    if (
+        not np.isfinite(uniform_probability)
+        or uniform_probability <= 0.0
+        or uniform_probability > 1.0
+    ):
+        raise ValueError(
+            "uniform_component_probability must lie in (0, 1]."
+        )
+    pair_count = int(distances.shape[-1])
+    local_mass = np.zeros(distances.shape, dtype=np.float64)
+    finite = np.isfinite(distances)
+    local_mass[finite] = np.exp(
+        -0.5 * np.square(distances[finite] / sigma)
+    )
+    local_total = np.sum(local_mass, axis=-1, keepdims=True)
+    uniform = np.full(
+        distances.shape,
+        1.0 / pair_count,
+        dtype=np.float64,
+    )
+    local_probabilities = np.divide(
+        local_mass,
+        local_total,
+        out=uniform.copy(),
+        where=local_total > 0.0,
+    )
+    probabilities = (
+        uniform_probability * uniform
+        + (1.0 - uniform_probability) * local_probabilities
+    )
+    probabilities /= np.sum(
+        probabilities,
+        axis=-1,
+        keepdims=True,
+        dtype=np.float64,
+    )
+    if (
+        np.any(~np.isfinite(probabilities))
+        or np.any(probabilities <= 0.0)
+        or not np.allclose(
+            np.sum(probabilities, axis=-1),
+            1.0,
+            rtol=0.0,
+            atol=1.0e-14,
+        )
+    ):
+        raise RuntimeError("Ordered pair proposal probabilities are invalid.")
+    return np.asarray(probabilities, dtype=np.float64)
 
 
 def _positive_integer(value: int, *, name: str, allow_zero: bool) -> int:
@@ -1133,6 +1335,8 @@ def continuous_split_log_acceptance_ratio(
     log_new_strength_prior_density: ArrayLike,
     log_forward_position_proposal: ArrayLike,
     log_forward_fraction_proposal: ArrayLike,
+    log_forward_parent_selection: ArrayLike | None = None,
+    log_reverse_pair_selection: ArrayLike | None = None,
 ) -> FloatArray:
     """Return the exact split RJ ratio including the strength-map Jacobian."""
     current = _positive_integer(
@@ -1164,6 +1368,16 @@ def continuous_split_log_acceptance_ratio(
     reverse_move = float(move_probabilities.log_probability("merge", proposed))
     if not np.isfinite(forward_move) or not np.isfinite(reverse_move):
         raise ValueError("split and reverse merge must both be available.")
+    forward_parent_selection = (
+        -math.log(float(current))
+        if log_forward_parent_selection is None
+        else log_forward_parent_selection
+    )
+    reverse_pair_selection = (
+        -math.log(float(proposed * current))
+        if log_reverse_pair_selection is None
+        else log_reverse_pair_selection
+    )
     result = (
         _log_batch_vector(
             log_likelihood_ratio,
@@ -1194,9 +1408,17 @@ def continuous_split_log_acceptance_ratio(
             name="log_old_strength_prior_density",
         )
         + reverse_move
-        - np.log(float(proposed * current))
+        + _log_batch_vector(
+            reverse_pair_selection,
+            batch_size=batch_size,
+            name="log_reverse_pair_selection",
+        )
         - forward_move
-        + np.log(float(current))
+        - _log_batch_vector(
+            forward_parent_selection,
+            batch_size=batch_size,
+            name="log_forward_parent_selection",
+        )
         - _log_batch_vector(
             log_forward_position_proposal,
             batch_size=batch_size,
@@ -1227,6 +1449,8 @@ def continuous_merge_log_acceptance_ratio(
     log_merged_strength_prior_density: ArrayLike,
     log_reverse_position_proposal: ArrayLike,
     log_reverse_fraction_proposal: ArrayLike,
+    log_forward_pair_selection: ArrayLike | None = None,
+    log_reverse_parent_selection: ArrayLike | None = None,
 ) -> FloatArray:
     """Return the exact merge RJ ratio, reciprocal to the matching split."""
     current = _positive_integer(
@@ -1258,6 +1482,16 @@ def continuous_merge_log_acceptance_ratio(
     reverse_move = float(move_probabilities.log_probability("split", proposed))
     if not np.isfinite(forward_move) or not np.isfinite(reverse_move):
         raise ValueError("merge and reverse split must both be available.")
+    forward_pair_selection = (
+        -math.log(float(current * proposed))
+        if log_forward_pair_selection is None
+        else log_forward_pair_selection
+    )
+    reverse_parent_selection = (
+        -math.log(float(proposed))
+        if log_reverse_parent_selection is None
+        else log_reverse_parent_selection
+    )
     result = (
         _log_batch_vector(
             log_likelihood_ratio,
@@ -1288,7 +1522,11 @@ def continuous_merge_log_acceptance_ratio(
             name="log_retained_strength_prior_density",
         )
         + reverse_move
-        - np.log(float(proposed))
+        + _log_batch_vector(
+            reverse_parent_selection,
+            batch_size=batch_size,
+            name="log_reverse_parent_selection",
+        )
         + _log_batch_vector(
             log_reverse_position_proposal,
             batch_size=batch_size,
@@ -1300,9 +1538,279 @@ def continuous_merge_log_acceptance_ratio(
             name="log_reverse_fraction_proposal",
         )
         - forward_move
-        + np.log(float(current * proposed))
+        - _log_batch_vector(
+            forward_pair_selection,
+            batch_size=batch_size,
+            name="log_forward_pair_selection",
+        )
         - np.log(total)
     )
     if np.any(np.isnan(result)):
         raise ValueError("continuous merge log acceptance ratio is undefined.")
+    return np.asarray(result, dtype=np.float64)
+
+
+def continuous_relocated_split_log_acceptance_ratio(
+    *,
+    current_cardinality: int,
+    total_strength: ArrayLike,
+    log_likelihood_ratio: ArrayLike,
+    cardinality_prior: CardinalityPrior,
+    move_probabilities: SplitMergeMoveProbabilities,
+    log_parent_position_prior_density: ArrayLike,
+    log_first_child_position_prior_density: ArrayLike,
+    log_second_child_position_prior_density: ArrayLike,
+    log_parent_strength_prior_density: ArrayLike,
+    log_first_child_strength_prior_density: ArrayLike,
+    log_second_child_strength_prior_density: ArrayLike,
+    log_forward_first_position_proposal: ArrayLike,
+    log_forward_second_position_proposal: ArrayLike,
+    log_forward_fraction_proposal: ArrayLike,
+    log_reverse_merged_position_proposal: ArrayLike,
+    log_forward_parent_selection: ArrayLike,
+    log_reverse_pair_selection: ArrayLike,
+) -> FloatArray:
+    """Return the exact RJ ratio for replacing one source by two children."""
+    current = _positive_integer(
+        current_cardinality,
+        name="current_cardinality",
+        allow_zero=False,
+    )
+    proposed = current + 1
+    if proposed > cardinality_prior.max_cardinality:
+        raise ValueError("relocated split exceeds cardinality support.")
+    values = (
+        total_strength,
+        log_likelihood_ratio,
+        log_parent_position_prior_density,
+        log_first_child_position_prior_density,
+        log_second_child_position_prior_density,
+        log_parent_strength_prior_density,
+        log_first_child_strength_prior_density,
+        log_second_child_strength_prior_density,
+        log_forward_first_position_proposal,
+        log_forward_second_position_proposal,
+        log_forward_fraction_proposal,
+        log_reverse_merged_position_proposal,
+        log_forward_parent_selection,
+        log_reverse_pair_selection,
+    )
+    batch_size = max(np.asarray(value).size for value in values)
+    total = np.broadcast_to(
+        np.asarray(total_strength, dtype=np.float64),
+        (batch_size,),
+    )
+    if np.any(~np.isfinite(total)) or np.any(total <= 0.0):
+        raise ValueError("total_strength must be finite and positive.")
+    forward_move = float(
+        move_probabilities.log_probability("split", current)
+    )
+    reverse_move = float(
+        move_probabilities.log_probability("merge", proposed)
+    )
+    if not np.isfinite(forward_move) or not np.isfinite(reverse_move):
+        raise ValueError("Relocated split and merge must both be available.")
+
+    def _vector(value: ArrayLike, name: str) -> FloatArray:
+        """Return one validated vector on the common batch."""
+        return _log_batch_vector(
+            value,
+            batch_size=batch_size,
+            name=name,
+        )
+
+    result = (
+        _vector(log_likelihood_ratio, "log_likelihood_ratio")
+        + float(cardinality_prior.log_prob(proposed))
+        - float(cardinality_prior.log_prob(current))
+        + np.log(float(proposed))
+        + _vector(
+            log_first_child_position_prior_density,
+            "log_first_child_position_prior_density",
+        )
+        + _vector(
+            log_second_child_position_prior_density,
+            "log_second_child_position_prior_density",
+        )
+        - _vector(
+            log_parent_position_prior_density,
+            "log_parent_position_prior_density",
+        )
+        + _vector(
+            log_first_child_strength_prior_density,
+            "log_first_child_strength_prior_density",
+        )
+        + _vector(
+            log_second_child_strength_prior_density,
+            "log_second_child_strength_prior_density",
+        )
+        - _vector(
+            log_parent_strength_prior_density,
+            "log_parent_strength_prior_density",
+        )
+        + reverse_move
+        + _vector(
+            log_reverse_pair_selection,
+            "log_reverse_pair_selection",
+        )
+        + _vector(
+            log_reverse_merged_position_proposal,
+            "log_reverse_merged_position_proposal",
+        )
+        - forward_move
+        - _vector(
+            log_forward_parent_selection,
+            "log_forward_parent_selection",
+        )
+        - _vector(
+            log_forward_first_position_proposal,
+            "log_forward_first_position_proposal",
+        )
+        - _vector(
+            log_forward_second_position_proposal,
+            "log_forward_second_position_proposal",
+        )
+        - _vector(
+            log_forward_fraction_proposal,
+            "log_forward_fraction_proposal",
+        )
+        + np.log(total)
+    )
+    if np.any(np.isnan(result)):
+        raise ValueError(
+            "Relocated split log acceptance ratio is undefined."
+        )
+    return np.asarray(result, dtype=np.float64)
+
+
+def continuous_relocated_merge_log_acceptance_ratio(
+    *,
+    current_cardinality: int,
+    merged_strength: ArrayLike,
+    log_likelihood_ratio: ArrayLike,
+    cardinality_prior: CardinalityPrior,
+    move_probabilities: SplitMergeMoveProbabilities,
+    log_first_child_position_prior_density: ArrayLike,
+    log_second_child_position_prior_density: ArrayLike,
+    log_merged_position_prior_density: ArrayLike,
+    log_first_child_strength_prior_density: ArrayLike,
+    log_second_child_strength_prior_density: ArrayLike,
+    log_merged_strength_prior_density: ArrayLike,
+    log_forward_pair_selection: ArrayLike,
+    log_forward_merged_position_proposal: ArrayLike,
+    log_reverse_parent_selection: ArrayLike,
+    log_reverse_first_position_proposal: ArrayLike,
+    log_reverse_second_position_proposal: ArrayLike,
+    log_reverse_fraction_proposal: ArrayLike,
+) -> FloatArray:
+    """Return the reciprocal exact ratio for merging into a new position."""
+    current = _positive_integer(
+        current_cardinality,
+        name="current_cardinality",
+        allow_zero=False,
+    )
+    if current < 2:
+        raise ValueError("relocated merge requires at least two sources.")
+    proposed = current - 1
+    values = (
+        merged_strength,
+        log_likelihood_ratio,
+        log_first_child_position_prior_density,
+        log_second_child_position_prior_density,
+        log_merged_position_prior_density,
+        log_first_child_strength_prior_density,
+        log_second_child_strength_prior_density,
+        log_merged_strength_prior_density,
+        log_forward_pair_selection,
+        log_forward_merged_position_proposal,
+        log_reverse_parent_selection,
+        log_reverse_first_position_proposal,
+        log_reverse_second_position_proposal,
+        log_reverse_fraction_proposal,
+    )
+    batch_size = max(np.asarray(value).size for value in values)
+    total = np.broadcast_to(
+        np.asarray(merged_strength, dtype=np.float64),
+        (batch_size,),
+    )
+    if np.any(~np.isfinite(total)) or np.any(total <= 0.0):
+        raise ValueError("merged_strength must be finite and positive.")
+    forward_move = float(
+        move_probabilities.log_probability("merge", current)
+    )
+    reverse_move = float(
+        move_probabilities.log_probability("split", proposed)
+    )
+    if not np.isfinite(forward_move) or not np.isfinite(reverse_move):
+        raise ValueError("Relocated merge and split must both be available.")
+
+    def _vector(value: ArrayLike, name: str) -> FloatArray:
+        """Return one validated vector on the common batch."""
+        return _log_batch_vector(
+            value,
+            batch_size=batch_size,
+            name=name,
+        )
+
+    result = (
+        _vector(log_likelihood_ratio, "log_likelihood_ratio")
+        + float(cardinality_prior.log_prob(proposed))
+        - float(cardinality_prior.log_prob(current))
+        - np.log(float(current))
+        + _vector(
+            log_merged_position_prior_density,
+            "log_merged_position_prior_density",
+        )
+        - _vector(
+            log_first_child_position_prior_density,
+            "log_first_child_position_prior_density",
+        )
+        - _vector(
+            log_second_child_position_prior_density,
+            "log_second_child_position_prior_density",
+        )
+        + _vector(
+            log_merged_strength_prior_density,
+            "log_merged_strength_prior_density",
+        )
+        - _vector(
+            log_first_child_strength_prior_density,
+            "log_first_child_strength_prior_density",
+        )
+        - _vector(
+            log_second_child_strength_prior_density,
+            "log_second_child_strength_prior_density",
+        )
+        + reverse_move
+        + _vector(
+            log_reverse_parent_selection,
+            "log_reverse_parent_selection",
+        )
+        + _vector(
+            log_reverse_first_position_proposal,
+            "log_reverse_first_position_proposal",
+        )
+        + _vector(
+            log_reverse_second_position_proposal,
+            "log_reverse_second_position_proposal",
+        )
+        + _vector(
+            log_reverse_fraction_proposal,
+            "log_reverse_fraction_proposal",
+        )
+        - forward_move
+        - _vector(
+            log_forward_pair_selection,
+            "log_forward_pair_selection",
+        )
+        - _vector(
+            log_forward_merged_position_proposal,
+            "log_forward_merged_position_proposal",
+        )
+        - np.log(total)
+    )
+    if np.any(np.isnan(result)):
+        raise ValueError(
+            "Relocated merge log acceptance ratio is undefined."
+        )
     return np.asarray(result, dtype=np.float64)

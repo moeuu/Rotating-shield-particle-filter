@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +18,23 @@ class BaselinePathSelection:
     next_pose: NDArray[np.float64]
     candidate_index: int
     score: float
+
+
+def resolve_rotation_limit_for_active_program(
+    *,
+    base_rotation_limit: int,
+    active_shield_program: Sequence[int] | None,
+    strict_planned_shield_program: bool,
+    baseline_shield_policy: Mapping[str, Any] | str | None,
+) -> int:
+    """Return the measurement count for one explicit shield program."""
+    base_limit = max(1, int(base_rotation_limit))
+    if not active_shield_program:
+        return base_limit
+    program_limit = max(1, len(active_shield_program))
+    if strict_planned_shield_program or baseline_shield_policy is not None:
+        return program_limit
+    return max(base_limit, program_limit)
 
 
 def _policy_name(policy_config: Mapping[str, Any] | str | None) -> str:

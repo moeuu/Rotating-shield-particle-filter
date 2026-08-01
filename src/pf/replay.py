@@ -24,11 +24,11 @@ from measurement.surface_charts import (
     surface_chart_geometry_sha256,
 )
 from pf.full_spectrum import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
+from pf.gpu_utils import preflight_compute_backend
 from pf.profiles import apply_profile_to_config, enforce_pure_runtime_settings
 from pf.provenance import canonical_json_bytes, sha256_json
 from pf.pure_estimator import PurePFEstimator, RotatingShieldPFConfig
-from pf.randomness import validate_pf_rng_provenance
-from pf.surface_atlas import ContinuousSurfaceAtlas
+from measurement.surface_atlas import ContinuousSurfaceAtlas
 from runtime.measurement_log import (
     MEASUREMENT_LOG_SCHEMA_VERSION,
     MeasurementLog,
@@ -47,13 +47,7 @@ class PFReplayError(RuntimeError):
 
 
 _SHA256_PATTERN = frozenset("0123456789abcdef")
-_EFFECTIVE_REPLAY_FIELDS = frozenset(
-    {
-        "api_settings",
-        "pf_config",
-        "surface_atlas_diagnostics",
-    }
-)
+_DEFAULT_SURFACE_DIAGNOSTIC_POINT_COUNT = 1024
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -404,20 +398,8 @@ def _surface_atlas_replay_inputs(
     obstacle_grid: ObstacleGrid | None,
     obstacle_height_m: float,
 ) -> NDArray[np.float64]:
-    """Rebuild and authenticate the logged continuous-surface diagnostics."""
-    effective = log.runtime_config.get("effective_pf_replay")
-    if not isinstance(effective, Mapping):
-        raise PFReplayError("effective_pf_replay must be an object.")
-    raw = effective.get("surface_atlas_diagnostics")
-    if not isinstance(raw, Mapping):
-        raise PFReplayError(
-            "effective_pf_replay.surface_atlas_diagnostics must be an object."
-        )
-    point_count = _json_integer(
-        raw.get("point_count"),
-        location="surface_atlas_diagnostics.point_count",
-        minimum=1,
-    )
+    """Build deterministic PF diagnostics from shared physical geometry."""
+    point_count = _DEFAULT_SURFACE_DIAGNOSTIC_POINT_COUNT
     environment = _environment_config(log)
     try:
         geometry = build_surface_chart_geometry(
@@ -451,28 +433,6 @@ def _surface_atlas_replay_inputs(
         )
     )
     points = np.ascontiguousarray(atlas.positions_xyz(chart_ids, uv))
-    expected = {
-        "generator": "continuous_surface_atlas_area_uniform.v1",
-        "sampling_domain": "pf_physical_continuous_surface_atlas",
-        "chart_max_edge_m": float(
-            pf_config.structural_rj_surface_chart_max_edge_m
-        ),
-        "chart_count": int(atlas.chart_count),
-        "total_area_m2": float(atlas.total_area_m2),
-        "surface_atlas_contract_sha256": surface_chart_geometry_sha256(
-            geometry
-        ),
-        "ordered_vertices_sha256": sha256_json(geometry.vertices_xyz),
-        "ordered_areas_sha256": sha256_json(geometry.areas_m2),
-        **geometry.geometry_metadata,
-        "point_count": point_count,
-        "xyz_sha256": sha256_json(points),
-    }
-    if dict(raw) != expected:
-        raise PFReplayError(
-            "Logged surface-atlas diagnostics differ from the reconstructed "
-            "environment, obstacle, or PF support."
-        )
     return points
 
 
@@ -490,60 +450,12 @@ def _pf_config_values(
     return values
 
 
-def _logged_effective_replay_config(
-    log: MeasurementLog,
+def _external_replay_config(
     external_config: Mapping[str, Any],
     *,
-    seed: int,
     upper: NDArray[np.float64],
 ) -> dict[str, Any]:
-    """Resolve the exact live-run PF inputs required by replay."""
-    raw = log.runtime_config.get("effective_pf_replay")
-    if raw is None:
-        raise PFReplayError(
-            "MeasurementLog v2 replay requires effective_pf_replay; "
-            "external reconstruction is unsupported."
-        )
-    if not isinstance(raw, Mapping):
-        raise PFReplayError("effective_pf_replay must be an object.")
-    if set(raw) != _EFFECTIVE_REPLAY_FIELDS:
-        missing = sorted(_EFFECTIVE_REPLAY_FIELDS - set(raw))
-        unknown = sorted(
-            str(value) for value in set(raw) - _EFFECTIVE_REPLAY_FIELDS
-        )
-        raise PFReplayError(
-            "effective_pf_replay schema mismatch; "
-            f"missing={missing}, unknown={unknown}."
-        )
-    raw_pf = raw.get("pf_config")
-    raw_api = raw.get("api_settings")
-    if not isinstance(raw_pf, Mapping) or not isinstance(raw_api, Mapping):
-        raise PFReplayError(
-            "effective_pf_replay requires pf_config and api_settings objects."
-        )
-    if any(not isinstance(key, str) for key in raw_pf):
-        raise PFReplayError(
-            "effective_pf_replay.pf_config keys must be JSON strings."
-        )
-    raw_seed = _json_integer(
-        raw_api.get("pf_random_seed"),
-        location="effective_pf_replay.api_settings.pf_random_seed",
-        minimum=0,
-    )
-    if raw_seed != seed:
-        raise PFReplayError(
-            "Replay seed differs from the logged effective PF random seed."
-        )
-    try:
-        validate_pf_rng_provenance(
-            raw_api.get("pf_rng_provenance"),
-            root_seed=raw_seed,
-            isotopes=tuple(log.run_manifest.get("isotopes", ())),
-        )
-    except (TypeError, ValueError) as exc:
-        raise PFReplayError(
-            "Logged effective PF RNG provenance is incompatible."
-        ) from exc
+    """Resolve PF-owned replay inputs without reading estimator state from the log."""
     if external_config:
         try:
             enforce_pure_runtime_settings(external_config)
@@ -551,60 +463,14 @@ def _logged_effective_replay_config(
             raise PFReplayError(
                 "External replay configuration violates the pure-PF schema."
             ) from exc
-    allowed_overrides = {
-        "estimator_profile",
-        "use_gpu",
-        "gpu_device",
-        "gpu_dtype",
-    }
     declared = {field.name for field in fields(RotatingShieldPFConfig)}
-    unknown = sorted(set(raw_pf) - declared)
-    missing = sorted(declared - set(raw_pf))
-    if unknown:
-        raise PFReplayError(
-            "Logged effective PF configuration has unknown fields: "
-            + ", ".join(str(value) for value in unknown)
-        )
-    if missing:
-        raise PFReplayError(
-            "Logged effective PF configuration is incomplete: "
-            + ", ".join(str(value) for value in missing)
-        )
-    for key in set(external_config).intersection(log.runtime_config):
-        if key in declared:
-            continue
-        if sha256_json(external_config[key]) != sha256_json(
-            log.runtime_config[key]
-        ):
-            raise PFReplayError(
-                f"External runtime field {key!r} differs from the logged run."
-            )
-    logged_position_max = _finite_vector(
-        raw_pf["position_max"],
-        length=3,
-        location="effective_pf_replay.pf_config.position_max",
-    )
-    if not np.array_equal(logged_position_max, upper):
-        raise PFReplayError(
-            "Logged PF position_max differs from the logged environment bounds."
-        )
-    for key, value in external_config.items():
-        if (
-            key in declared
-            and key in raw_pf
-            and key not in allowed_overrides
-            and sha256_json(value) != sha256_json(raw_pf[key])
-        ):
-            raise PFReplayError(
-                f"External PF field {key!r} differs from the logged run."
-            )
-    merged = dict(raw_pf)
-    merged["pure_pf_schema_version"] = log.runtime_config.get(
-        "pure_pf_schema_version"
-    )
-    for key in allowed_overrides:
-        if key in external_config:
-            merged[key] = external_config[key]
+    merged = {
+        key: value
+        for key, value in external_config.items()
+        if key in declared or key in {"pure_pf_schema_version", "estimator_profile"}
+    }
+    merged.setdefault("pure_pf_schema_version", 1)
+    merged["position_max"] = tuple(float(value) for value in upper)
     return merged
 
 
@@ -629,15 +495,13 @@ def build_replay_estimator(
     validate_local_forward_model(log)
     isotopes = tuple(log.run_manifest["isotopes"])
     _, upper = _environment_bounds(log)
-    logged_config = _logged_effective_replay_config(
-        log,
+    replay_config = _external_replay_config(
         config,
-        seed=replay_seed,
         upper=upper,
     )
     try:
         pure_config = enforce_pure_runtime_settings(
-            logged_config,
+            replay_config,
             profile=profile,
         )
         pf_config = RotatingShieldPFConfig(
@@ -648,9 +512,14 @@ def build_replay_estimator(
             )
         )
         apply_profile_to_config(pf_config)
+        preflight_compute_backend(
+            use_gpu=bool(pf_config.use_gpu),
+            gpu_device=str(pf_config.gpu_device),
+            gpu_dtype=str(pf_config.gpu_dtype),
+        )
     except (TypeError, ValueError) as exc:
         raise PFReplayError(
-            "Logged effective PF configuration is incompatible."
+            "External PF replay configuration is incompatible."
         ) from exc
     physical_config = _resolved_physical_config(log, full_spectrum_model)
     try:
@@ -665,11 +534,11 @@ def build_replay_estimator(
     obstacle_grid = _obstacle_grid_from_log(log)
     obstacle_enabled = _required_boolean(
         physical_config,
-        "pf_obstacle_attenuation",
+        "obstacle_attenuation_enabled",
     )
     if obstacle_grid is not None and not obstacle_enabled:
         raise PFReplayError(
-            "A logged obstacle grid requires PF obstacle attenuation."
+            "A logged obstacle grid requires physical obstacle attenuation."
         )
     pf_obstacle_grid = obstacle_grid if obstacle_enabled else None
     surface_diagnostic_points = _surface_atlas_replay_inputs(
@@ -678,10 +547,6 @@ def build_replay_estimator(
         obstacle_grid=pf_obstacle_grid,
         obstacle_height_m=observation_model.obstacle_height_m,
     )
-    raw_effective = log.runtime_config["effective_pf_replay"]
-    assert isinstance(raw_effective, Mapping)
-    raw_pf = raw_effective["pf_config"]
-    assert isinstance(raw_pf, Mapping)
     actual_pf = {
         field.name: getattr(pf_config, field.name)
         for field in fields(RotatingShieldPFConfig)
@@ -690,15 +555,13 @@ def build_replay_estimator(
         log.run_manifest.get("resolved_config_sha256"),
         location="run_manifest.resolved_config_sha256",
     )
-    computed_replay_config_sha256 = (
-        logged_config_sha256
-        if sha256_json(actual_pf) == sha256_json(raw_pf)
-        else sha256_json(
-            {
-                "base_live_config_sha256": logged_config_sha256,
-                "pf_config": actual_pf,
-            }
-        )
+    computed_replay_config_sha256 = sha256_json(
+        {
+            "measurement_runtime_config_sha256": logged_config_sha256,
+            "measurement_log_sha256": log.log_sha256,
+            "pf_config": actual_pf,
+            "pf_random_seed": replay_seed,
+        }
     )
     if resolved_config_hash is not None:
         supplied_resolved_hash = _sha256_string(

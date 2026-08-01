@@ -12,7 +12,7 @@ from scipy.optimize import linear_sum_assignment
 
 from measurement.source_surfaces import SOURCE_SURFACE_REPORT_LABELS
 from measurement.surface_charts import surface_chart_geometry_sha256
-from pf.surface_atlas import ContinuousSurfaceAtlas
+from measurement.surface_atlas import ContinuousSurfaceAtlas
 
 POSITION_ERROR_TARGET_M = 0.5
 SURFACE_LABELS = SOURCE_SURFACE_REPORT_LABELS
@@ -131,6 +131,206 @@ def _normalize_sources(entries: Iterable[Any] | None) -> List[Source]:
     if entries is None:
         return []
     return [_normalize_source(entry) for entry in entries]
+
+
+def _resolution_cluster_sources(
+    sources: Sequence[Source],
+    response_signatures_rs: NDArray[np.float64],
+    *,
+    surface_atlas: ContinuousSurfaceAtlas,
+    maximum_surface_distance_m: float,
+    minimum_response_cosine_similarity: float,
+) -> tuple[List[Source], List[Dict[str, Any]]]:
+    """Cluster only intrinsically nearby, response-indistinguishable sources."""
+    source_list = list(sources)
+    source_count = len(source_list)
+    signatures = np.asarray(response_signatures_rs, dtype=np.float64)
+    if signatures.ndim != 2 or signatures.shape[1] != source_count:
+        raise ValueError(
+            "response signatures must have one column per source."
+        )
+    if np.any(~np.isfinite(signatures)):
+        raise ValueError("response signatures must be finite.")
+    if source_count == 0:
+        return [], []
+    positions = np.vstack([source.pos for source in source_list])
+    chart_ids, surface_uv = surface_atlas.locate_positions(positions)
+    distances = np.asarray(
+        surface_atlas.surface_coordinate_path_distance_upper_bound_m(
+            chart_ids[:, None],
+            surface_uv[:, None, :],
+            chart_ids[None, :],
+            surface_uv[None, :, :],
+        ),
+        dtype=np.float64,
+    )
+    if distances.shape != (source_count, source_count):
+        raise RuntimeError("Intrinsic cluster-distance shape is invalid.")
+    norms = np.linalg.norm(signatures, axis=0)
+    cosine_denominator = norms[:, None] * norms[None, :]
+    cosine = np.divide(
+        signatures.T @ signatures,
+        cosine_denominator,
+        out=np.zeros((source_count, source_count), dtype=np.float64),
+        where=cosine_denominator > 0.0,
+    )
+    np.fill_diagonal(cosine, 1.0)
+    eligible = (
+        np.isfinite(distances)
+        & (distances <= maximum_surface_distance_m)
+        & (cosine >= minimum_response_cosine_similarity)
+    )
+    groups: List[List[int]] = [[index] for index in range(source_count)]
+    while True:
+        candidates: List[Tuple[float, float, int, int]] = []
+        for left in range(len(groups)):
+            for right in range(left + 1, len(groups)):
+                left_members = np.asarray(groups[left], dtype=np.int64)
+                right_members = np.asarray(groups[right], dtype=np.int64)
+                cross = np.ix_(left_members, right_members)
+                if np.all(eligible[cross]):
+                    candidates.append(
+                        (
+                            float(np.max(distances[cross])),
+                            -float(np.min(cosine[cross])),
+                            left,
+                            right,
+                        )
+                    )
+        if not candidates:
+            break
+        _, _, left, right = min(candidates)
+        groups[left] = sorted((*groups[left], *groups[right]))
+        del groups[right]
+    clustered: List[Source] = []
+    payload: List[Dict[str, Any]] = []
+    for member_indices in groups:
+        members = np.asarray(member_indices, dtype=np.int64)
+        member_strengths = np.asarray(
+            [source_list[index].strength for index in member_indices],
+            dtype=np.float64,
+        )
+        total_strength = float(np.sum(member_strengths, dtype=np.float64))
+        medoid_cost = np.sum(
+            distances[np.ix_(members, members)]
+            * member_strengths[None, :],
+            axis=1,
+            dtype=np.float64,
+        )
+        medoid_member = int(members[int(np.argmin(medoid_cost))])
+        representative = source_list[medoid_member]
+        clustered.append(
+            Source(
+                pos=representative.pos.copy(),
+                strength=total_strength,
+                surface_kind=representative.surface_kind,
+            )
+        )
+        pair_distance = distances[np.ix_(members, members)]
+        pair_cosine = cosine[np.ix_(members, members)]
+        payload.append(
+            {
+                "member_indices": [int(value) for value in members],
+                "representative_member_index": medoid_member,
+                "representative_position_xyz_m": [
+                    float(value) for value in representative.pos
+                ],
+                "combined_strength_cps_1m": total_strength,
+                "maximum_intrinsic_diameter_m": float(
+                    np.max(pair_distance)
+                ),
+                "minimum_response_cosine_similarity": float(
+                    np.min(pair_cosine)
+                ),
+            }
+        )
+    return clustered, payload
+
+
+def compute_resolution_aware_cluster_metrics(
+    gt_by_iso: Dict[str, List[Any]],
+    est_by_iso: Dict[str, List[Any]],
+    *,
+    match_radius_m: float,
+    surface_atlas: ContinuousSurfaceAtlas,
+    gt_response_signatures_by_iso: Mapping[str, NDArray[np.float64]],
+    est_response_signatures_by_iso: Mapping[str, NDArray[np.float64]],
+    maximum_surface_distance_m: float = 2.0,
+    minimum_response_cosine_similarity: float = 0.995,
+) -> Dict[str, Any]:
+    """Report effective sources without changing raw PF cardinality.
+
+    The same predeclared rule is applied independently to truth and estimate.
+    Disconnected surface components can never cluster because their intrinsic
+    distance is infinite.  The returned raw-to-effective mapping is therefore
+    a supplemental observability metric, not a posterior rescue operation.
+    """
+    maximum_distance = _non_negative_finite(
+        maximum_surface_distance_m,
+        name="maximum_surface_distance_m",
+    )
+    minimum_similarity = _unit_interval_probability(
+        minimum_response_cosine_similarity,
+        name="minimum_response_cosine_similarity",
+    )
+    isotopes = sorted(set(gt_by_iso) | set(est_by_iso))
+    clustered_gt: Dict[str, List[Source]] = {}
+    clustered_est: Dict[str, List[Source]] = {}
+    mappings: Dict[str, Dict[str, Any]] = {}
+    for isotope in isotopes:
+        truth = _normalize_sources(gt_by_iso.get(isotope))
+        estimate = _normalize_sources(est_by_iso.get(isotope))
+        truth_clustered, truth_mapping = _resolution_cluster_sources(
+            truth,
+            np.asarray(
+                gt_response_signatures_by_iso.get(
+                    isotope,
+                    np.zeros((0, len(truth)), dtype=np.float64),
+                ),
+                dtype=np.float64,
+            ),
+            surface_atlas=surface_atlas,
+            maximum_surface_distance_m=maximum_distance,
+            minimum_response_cosine_similarity=minimum_similarity,
+        )
+        estimate_clustered, estimate_mapping = _resolution_cluster_sources(
+            estimate,
+            np.asarray(
+                est_response_signatures_by_iso.get(
+                    isotope,
+                    np.zeros((0, len(estimate)), dtype=np.float64),
+                ),
+                dtype=np.float64,
+            ),
+            surface_atlas=surface_atlas,
+            maximum_surface_distance_m=maximum_distance,
+            minimum_response_cosine_similarity=minimum_similarity,
+        )
+        clustered_gt[isotope] = truth_clustered
+        clustered_est[isotope] = estimate_clustered
+        mappings[isotope] = {
+            "raw_truth_count": len(truth),
+            "effective_truth_count": len(truth_clustered),
+            "raw_estimate_count": len(estimate),
+            "effective_estimate_count": len(estimate_clustered),
+            "truth_clusters": truth_mapping,
+            "estimate_clusters": estimate_mapping,
+        }
+    effective_metrics = compute_metrics(
+        clustered_gt,
+        clustered_est,
+        match_radius_m=match_radius_m,
+        surface_atlas=surface_atlas,
+    )
+    return {
+        "schema_version": 1,
+        "role": "supplemental_resolution_aware_evaluation_only",
+        "changes_pf_state_or_cardinality": False,
+        "maximum_surface_distance_m": maximum_distance,
+        "minimum_response_cosine_similarity": minimum_similarity,
+        "by_isotope": mappings,
+        "effective_match_metrics": effective_metrics,
+    }
 
 
 def _pairwise_distances(

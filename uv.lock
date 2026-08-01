@@ -711,6 +711,7 @@ dependencies = [
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pytest" },
+    { name = "rotating-shield-simulation-runtime" },
     { name = "scipy" },
     { name = "torch" },
 ]
@@ -720,9 +721,29 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.7" },
     { name = "numpy", specifier = ">=2.3.5" },
     { name = "pytest", specifier = ">=9.0.1" },
+    { name = "rotating-shield-simulation-runtime", editable = "../Rotating-shield-simulation-runtime" },
     { name = "scipy", specifier = ">=1.16.3" },
     { name = "torch" },
 ]
+
+[[package]]
+name = "rotating-shield-simulation-runtime"
+version = "0.1.0"
+source = { editable = "../Rotating-shield-simulation-runtime" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "scipy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "matplotlib", specifier = ">=3.10.7" },
+    { name = "numpy", specifier = ">=2.3.5" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=9.0.1" },
+    { name = "scipy", specifier = ">=1.16.3" },
+]
+provides-extras = ["test"]
 
 [[package]]
 name = "scipy"

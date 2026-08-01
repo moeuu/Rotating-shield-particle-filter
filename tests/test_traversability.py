@@ -182,6 +182,7 @@ def test_traversability_map_roundtrip_and_render(tmp_path: Path) -> None:
 
     loaded = TraversabilityMap.load(json_path)
     assert loaded == traversable
+    assert loaded.blocking_z_range_m == pytest.approx((0.05, 2.0))
     assert png_path.exists()
     assert loaded.is_free((0.5, 0.5))
     assert not loaded.is_free((0.5, 1.5))
@@ -251,6 +252,7 @@ def test_traversability_map_projects_stage_solids() -> None:
     )
 
     assert traversable.source == "stage_projected_3d_environment"
+    assert traversable.blocking_z_range_m == pytest.approx((0.05, 2.0))
     assert traversable.is_free((0.5, 0.5))
     assert not traversable.is_free((1.5, 1.5))
     assert not traversable.is_free((2.5, 0.5))

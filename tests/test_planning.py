@@ -16,7 +16,7 @@ from pf.estimator import (
     RotatingShieldPFEstimator,
     build_complete_surface_atlas_quadrature,
 )
-from pf.surface_atlas import ContinuousSurfaceAtlas
+from measurement.surface_atlas import ContinuousSurfaceAtlas
 from pf.state import IsotopeState
 from planning.dss_pp import (
     DSSPPConfig,
@@ -336,6 +336,145 @@ def test_dss_full_spectrum_components_and_eig_share_pf_model(
     )
 
 
+def test_dss_transport_deduplicates_identical_pose_pair_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated program views must share one deterministic transport call."""
+    estimator = _build_full_spectrum_planning_estimator()
+    joint = estimator.planning_joint_particles()
+    kernel = _continuous_kernel_for_estimator(
+        estimator,
+        detector_aperture_samples=121,
+    )
+    evaluate_components = (
+        kernel.line_transport_components_all_pairs_for_detectors
+    )
+    evaluated_detector_counts: list[int] = []
+
+    def _record_components(**kwargs: object) -> object:
+        """Record unique detectors and preserve the physical result."""
+        evaluated_detector_counts.append(
+            int(np.asarray(kwargs["detector_positions"]).shape[0])
+        )
+        return evaluate_components(**kwargs)
+
+    monkeypatch.setattr(
+        kernel,
+        "line_transport_components_all_pairs_for_detectors",
+        _record_components,
+    )
+    monkeypatch.setattr(
+        dss_pp,
+        "_continuous_kernel_for_estimator",
+        lambda *_args, **_kwargs: kernel,
+    )
+    repeated_program = dss_pp.ShieldProgram(
+        name="repeated",
+        pair_ids=(0,),
+        kind="test",
+    )
+    components = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        np.asarray(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        [repeated_program, repeated_program],
+        joint,
+        live_time_s=3.0,
+        detector_aperture_samples=121,
+    )
+
+    assert evaluated_detector_counts == [1]
+    np.testing.assert_array_equal(
+        components.total_pnvsl[0],
+        components.total_pnvsl[1],
+    )
+    np.testing.assert_array_equal(
+        components.uncollided_pnvsl[0],
+        components.uncollided_pnvsl[1],
+    )
+    np.testing.assert_array_equal(
+        components.features_pnvslf[0],
+        components.features_pnvslf[1],
+    )
+
+
+def test_dss_transport_skips_inactive_padded_source_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Padded source slots must not enter the expensive physical kernel."""
+    estimator = _build_full_spectrum_planning_estimator()
+    original = estimator.planning_joint_particles()
+    isotope = "Cs-137"
+    particle_count = int(original.weights_n.size)
+    padded_positions = np.zeros((particle_count, 2, 3), dtype=np.float64)
+    padded_positions[:, :1] = original.positions_nk3_by_isotope[isotope]
+    padded_chart_ids = np.zeros((particle_count, 2), dtype=np.int64)
+    padded_chart_ids[:, :1] = (
+        original.surface_chart_ids_nk_by_isotope[isotope]
+    )
+    padded_uv = np.zeros((particle_count, 2, 2), dtype=np.float64)
+    padded_uv[:, :1] = original.surface_uv_nk2_by_isotope[isotope]
+    padded_strengths = np.zeros((particle_count, 2), dtype=np.float64)
+    padded_strengths[:, :1] = original.strengths_nk_by_isotope[isotope]
+    padded_mask = padded_strengths > 0.0
+    padded = dss_pp.JointPlanningParticles(
+        isotope_order=original.isotope_order,
+        weights_n=original.weights_n,
+        positions_nk3_by_isotope={isotope: padded_positions},
+        surface_chart_ids_nk_by_isotope={isotope: padded_chart_ids},
+        surface_uv_nk2_by_isotope={isotope: padded_uv},
+        strengths_nk_by_isotope={isotope: padded_strengths},
+        source_mask_nk_by_isotope={isotope: padded_mask},
+        original_particle_indices=original.original_particle_indices,
+    )
+    kernel = _continuous_kernel_for_estimator(
+        estimator,
+        detector_aperture_samples=121,
+    )
+    evaluate_components = (
+        kernel.line_transport_components_all_pairs_for_detectors
+    )
+    evaluated_source_counts: list[int] = []
+
+    def _record_components(**kwargs: object) -> object:
+        """Record evaluated sources while preserving the physical result."""
+        evaluated_source_counts.append(
+            int(np.asarray(kwargs["sources"]).shape[0])
+        )
+        return evaluate_components(**kwargs)
+
+    monkeypatch.setattr(
+        kernel,
+        "line_transport_components_all_pairs_for_detectors",
+        _record_components,
+    )
+    monkeypatch.setattr(
+        dss_pp,
+        "_continuous_kernel_for_estimator",
+        lambda *_args, **_kwargs: kernel,
+    )
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    components = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
+        [program],
+        padded,
+        live_time_s=3.0,
+        detector_aperture_samples=121,
+    )
+
+    assert evaluated_source_counts == [int(np.count_nonzero(padded_mask))]
+    assert np.all(components.total_pnvsl[..., 1, :] == 0.0)
+    assert np.all(components.uncollided_pnvsl[..., 1, :] == 0.0)
+    assert np.all(components.features_pnvslf[..., 1, :, :] == 0.0)
+
+
 def test_dss_full_spectrum_proxy_matches_direct_reduced_eig() -> None:
     """Proxy scheduling must preserve the exact joint spectrum calculation."""
     estimator = _build_full_spectrum_planning_estimator()
@@ -450,6 +589,63 @@ def test_dss_exact_eig_is_action_batch_invariant(
         rtol=0.0,
         atol=0.0,
     )
+
+
+def test_dss_state_chunk_respects_declared_memory_budget() -> None:
+    """DSS must shrink its state chunk before rejecting a valid action."""
+    estimator = _build_full_spectrum_planning_estimator()
+    model = estimator.full_spectrum_generative_model
+    state_chunk_size = dss_pp._dss_eig_state_chunk_size(
+        model,
+        action_count=32,
+        particle_count=512,
+        sample_count=50,
+        source_slot_count=15,
+        view_count=8,
+        memory_budget_bytes=256 * 1024 * 1024,
+    )
+
+    assert state_chunk_size >= 1
+    assert state_chunk_size < 512
+    working_set_bytes = model.estimate_cross_likelihood_working_set_bytes(
+        num_actions=32,
+        num_samples=50,
+        num_particles=512,
+        num_isotopes=15,
+        num_views=8,
+        action_chunk_size=1,
+        state_chunk_size=state_chunk_size,
+    )
+    assert working_set_bytes <= 128 * 1024 * 1024
+
+
+def test_dss_likelihood_action_chunk_respects_declared_memory_budget() -> None:
+    """DSS must batch actions without exceeding its likelihood workspace."""
+    estimator = _build_full_spectrum_planning_estimator()
+    model = estimator.full_spectrum_generative_model
+    memory_budget_bytes = 256 * 1024 * 1024
+    action_chunk_size = dss_pp._dss_eig_likelihood_action_chunk_size(
+        model,
+        action_count=89,
+        particle_count=16,
+        sample_count=2,
+        source_slot_count=15,
+        view_count=8,
+        state_chunk_size=16,
+        memory_budget_bytes=memory_budget_bytes,
+    )
+
+    assert action_chunk_size == 8
+    working_set_bytes = model.estimate_cross_likelihood_working_set_bytes(
+        num_actions=89,
+        num_samples=2,
+        num_particles=16,
+        num_isotopes=15,
+        num_views=8,
+        action_chunk_size=action_chunk_size,
+        state_chunk_size=16,
+    )
+    assert working_set_bytes <= memory_budget_bytes // 2
 
 
 def test_dss_exact_eig_halves_and_retries_after_oom(
@@ -2092,10 +2288,10 @@ def test_dss_evaluates_every_action_below_shortlist_threshold(
     assert diagnostics["exact_eig_wall_s"] >= 0.0
 
 
-def test_dss_adaptive_exact_eig_recovers_proxy_missed_optimum(
+def test_dss_exact_eig_respects_predeclared_action_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An uncertified proxy shortlist must expand until it finds the optimum."""
+    """The exact stage must not expand past its real-time action budget."""
     estimator = _build_simple_estimator()
     candidates = np.asarray(
         [
@@ -2204,33 +2400,28 @@ def test_dss_adaptive_exact_eig_recovers_proxy_missed_optimum(
         ),
     )
 
-    np.testing.assert_allclose(
-        shortlisted.next_pose,
-        exhaustive.next_pose,
-        rtol=0.0,
-        atol=0.0,
-    )
-    assert shortlisted.next_pose[0] == pytest.approx(2.0)
+    assert exhaustive.next_pose[0] == pytest.approx(2.0)
+    assert shortlisted.next_pose[0] == pytest.approx(3.0)
     diagnostics = shortlisted.diagnostics["planning_eig_shortlist"]
     assert diagnostics["total_action_count"] == 4
     assert diagnostics["proxy_action_count"] == 4
-    assert diagnostics["exact_action_count"] == 4
-    assert diagnostics["adaptive_exact_eig_exhausted_all_actions"] is True
-    assert diagnostics["adaptive_exact_eig_round_count"] == 2
+    assert diagnostics["exact_action_count"] == 2
+    assert diagnostics["adaptive_exact_eig_exhausted_all_actions"] is False
+    assert diagnostics["adaptive_exact_eig_round_count"] == 1
     assert diagnostics["proxy_wall_s"] >= 0.0
     assert diagnostics["exact_eig_wall_s"] >= 0.0
     assert (
         diagnostics["shortlisted_exact_bin_state_operations"]
-        == diagnostics["legacy_all_exact_bin_state_operations"]
+        < diagnostics["legacy_all_exact_bin_state_operations"]
     )
-    assert diagnostics["shortlist_selected_proxy_rank"] == 4
+    assert diagnostics["shortlist_selected_proxy_rank"] == 2
     assert (
         diagnostics[
             "shortlist_mc_winner_exceeds_universal_excluded_bound"
         ]
-        is True
+        is False
     )
-    assert diagnostics["shortlist_formal_recall_certificate_available"] is True
+    assert diagnostics["shortlist_formal_recall_certificate_available"] is False
     assert "joint_full_spectrum" in diagnostics["proxy_contract"]
 
 

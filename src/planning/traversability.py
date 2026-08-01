@@ -62,6 +62,7 @@ class TraversabilityMap:
     grid_shape: tuple[int, int]
     traversable_cells: tuple[tuple[int, int], ...]
     robot_radius_m: float = 0.0
+    blocking_z_range_m: tuple[float, float] = (0.05, 2.0)
     source: str = "projected_3d_environment"
 
     def __post_init__(self) -> None:
@@ -88,6 +89,27 @@ class TraversabilityMap:
             field_name="robot_radius_m",
             minimum=0.0,
         )
+        if (
+            not isinstance(self.blocking_z_range_m, (list, tuple))
+            or len(self.blocking_z_range_m) != 2
+        ):
+            raise ValueError(
+                "blocking_z_range_m must contain two finite values."
+            )
+        blocking_z_range = (
+            _finite_real(
+                self.blocking_z_range_m[0],
+                field_name="blocking_z_range_m[0]",
+            ),
+            _finite_real(
+                self.blocking_z_range_m[1],
+                field_name="blocking_z_range_m[1]",
+            ),
+        )
+        if blocking_z_range[1] <= blocking_z_range[0]:
+            raise ValueError(
+                "blocking_z_range_m bounds must be strictly ordered."
+            )
         normalized_cells: list[tuple[int, int]] = []
         for index, cell in enumerate(self.traversable_cells):
             if not isinstance(cell, (list, tuple)) or len(cell) != 2:
@@ -119,6 +141,11 @@ class TraversabilityMap:
         object.__setattr__(self, "grid_shape", grid_shape)
         object.__setattr__(self, "traversable_cells", traversable)
         object.__setattr__(self, "robot_radius_m", robot_radius)
+        object.__setattr__(
+            self,
+            "blocking_z_range_m",
+            blocking_z_range,
+        )
         object.__setattr__(self, "_traversable_set", frozenset(traversable))
 
     @property
@@ -259,6 +286,10 @@ class TraversabilityMap:
             "cell_size": self.cell_size,
             "grid_shape": [self.grid_shape[0], self.grid_shape[1]],
             "robot_radius_m": self.robot_radius_m,
+            "blocking_z_range_m": [
+                self.blocking_z_range_m[0],
+                self.blocking_z_range_m[1],
+            ],
             "traversable_fraction": self.traversable_fraction,
             "traversable_cells": [list(cell) for cell in self.traversable_cells],
         }
@@ -282,6 +313,7 @@ class TraversabilityMap:
             "cell_size",
             "grid_shape",
             "robot_radius_m",
+            "blocking_z_range_m",
             "traversable_fraction",
             "traversable_cells",
         }
@@ -314,6 +346,7 @@ class TraversabilityMap:
             grid_shape=(grid_shape[0], grid_shape[1]),
             traversable_cells=tuple(cells),
             robot_radius_m=data["robot_radius_m"],
+            blocking_z_range_m=tuple(data["blocking_z_range_m"]),
             source=data["source"],
         )
         declared_fraction = _finite_real(

@@ -3,13 +3,18 @@
 import json
 import math
 
+import numpy as np
 import pytest
 
-from evaluation_metrics import compute_metrics, save_metrics_json
+from evaluation_metrics import (
+    compute_metrics,
+    compute_resolution_aware_cluster_metrics,
+    save_metrics_json,
+)
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from measurement.surface_charts import build_surface_chart_geometry
-from pf.surface_atlas import ContinuousSurfaceAtlas
+from measurement.surface_atlas import ContinuousSurfaceAtlas
 
 
 def test_compute_metrics_counts_with_gate() -> None:
@@ -38,6 +43,95 @@ def test_compute_metrics_counts_with_gate() -> None:
     assert len(metrics["isotopes"]["Cs-137"]["matches"]) == 1
     assert metrics["matching_policy"]["strength_used_for_assignment"] is False
     assert metrics["matching_policy"]["outside_radius_behavior"] == "unmatched"
+
+
+def test_resolution_cluster_merges_only_response_equivalent_surface_points() -> None:
+    """Effective K may merge a nearby split without changing raw K."""
+    atlas = ContinuousSurfaceAtlas(
+        build_surface_chart_geometry(
+            EnvironmentConfig(size_x=3.0, size_y=3.0, size_z=3.0),
+            None,
+            max_edge_m=0.5,
+        )
+    )
+    truth = {
+        "Cs-137": [
+            {"pos": [1.0, 1.0, 0.0], "strength": 100.0},
+        ]
+    }
+    estimate = {
+        "Cs-137": [
+            {"pos": [0.9, 1.0, 0.0], "strength": 40.0},
+            {"pos": [1.1, 1.0, 0.0], "strength": 60.0},
+        ]
+    }
+
+    result = compute_resolution_aware_cluster_metrics(
+        truth,
+        estimate,
+        match_radius_m=0.5,
+        surface_atlas=atlas,
+        gt_response_signatures_by_iso={
+            "Cs-137": np.asarray([[1.0], [0.0]], dtype=np.float64)
+        },
+        est_response_signatures_by_iso={
+            "Cs-137": np.asarray(
+                [[1.0, 1.0], [0.0, 0.0]],
+                dtype=np.float64,
+            )
+        },
+        maximum_surface_distance_m=0.5,
+        minimum_response_cosine_similarity=0.995,
+    )
+
+    summary = result["by_isotope"]["Cs-137"]
+    assert summary["raw_estimate_count"] == 2
+    assert summary["effective_estimate_count"] == 1
+    assert summary["estimate_clusters"][0][
+        "combined_strength_cps_1m"
+    ] == pytest.approx(100.0)
+    assert result["effective_match_metrics"]["global"]["detection"][
+        "tp"
+    ] == 1
+
+
+def test_resolution_cluster_does_not_chain_beyond_physical_resolution() -> None:
+    """Single-link chains must not merge endpoints beyond the distance gate."""
+    atlas = ContinuousSurfaceAtlas(
+        build_surface_chart_geometry(
+            EnvironmentConfig(size_x=3.0, size_y=3.0, size_z=3.0),
+            None,
+            max_edge_m=0.25,
+        )
+    )
+    estimate = {
+        "Cs-137": [
+            {"pos": [1.0, 1.0, 0.0], "strength": 40.0},
+            {"pos": [1.4, 1.0, 0.0], "strength": 40.0},
+            {"pos": [1.8, 1.0, 0.0], "strength": 40.0},
+        ]
+    }
+
+    result = compute_resolution_aware_cluster_metrics(
+        {},
+        estimate,
+        match_radius_m=0.5,
+        surface_atlas=atlas,
+        gt_response_signatures_by_iso={},
+        est_response_signatures_by_iso={
+            "Cs-137": np.ones((1, 3), dtype=np.float64)
+        },
+        maximum_surface_distance_m=0.9,
+        minimum_response_cosine_similarity=0.995,
+    )
+
+    summary = result["by_isotope"]["Cs-137"]
+    assert summary["raw_estimate_count"] == 3
+    assert summary["effective_estimate_count"] == 2
+    assert max(
+        cluster["maximum_intrinsic_diameter_m"]
+        for cluster in summary["estimate_clusters"]
+    ) <= 0.9
 
 
 def test_intrinsic_gate_rejects_thin_obstacle_opposite_face_false_pass() -> None:

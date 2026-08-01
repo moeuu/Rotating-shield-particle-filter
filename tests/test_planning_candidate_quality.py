@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 from planning import candidate_generation
-import realtime_demo
 
 
 def test_candidate_masks_reject_truthy_string_flags() -> None:
@@ -66,12 +65,12 @@ def test_height_only_global_pool_is_not_rejected_or_retried(
         )
 
     monkeypatch.setattr(
-        realtime_demo,
+        candidate_generation,
         "generate_candidate_poses",
         fake_generate_candidate_poses,
     )
     candidates, diagnostics = (
-        realtime_demo._generate_planning_candidates(
+        candidate_generation.generate_planning_candidates(
             current_pose_xyz=np.zeros(3, dtype=float),
             map_api=None,
             n_candidates=8,
@@ -107,12 +106,12 @@ def test_empty_global_pool_fails_without_relaxing_physical_separation(
         return np.zeros((0, 3), dtype=np.float64)
 
     monkeypatch.setattr(
-        realtime_demo,
+        candidate_generation,
         "generate_candidate_poses",
         empty_candidates,
     )
     with pytest.raises(RuntimeError, match="No globally sampled candidate"):
-        realtime_demo._generate_planning_candidates(
+        candidate_generation.generate_planning_candidates(
             current_pose_xyz=np.zeros(3, dtype=float),
             map_api=None,
             n_candidates=8,
@@ -130,7 +129,7 @@ def test_empty_global_pool_fails_without_relaxing_physical_separation(
 
 def test_candidate_checkpoint_records_global_pool_contract() -> None:
     """Resume compatibility must pin the global physical pool contract."""
-    parameters = realtime_demo._planning_candidate_checkpoint_parameters(
+    parameters = candidate_generation.planning_candidate_checkpoint_parameters(
         pose_candidates=64,
         pose_min_dist=3.0,
         bounds_xyz=(

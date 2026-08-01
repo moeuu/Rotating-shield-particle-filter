@@ -13,6 +13,22 @@ from pf.full_spectrum import (
     validate_observed_spectrum,
 )
 from pure_pf_test_support import approved_full_spectrum_model
+from spectrum.transport_spectral import GeometryConditionedSpectralModel
+
+
+def _runtime_ready_candidate() -> GeometryConditionedSpectralModel:
+    """Return a training-ready model without independent holdout approval."""
+    approved = approved_full_spectrum_model()
+    return GeometryConditionedSpectralModel.standard_native(
+        ("Co-60", "Cs-137", "Eu-154"),
+        dead_time_tau_s=approved.dead_time_tau_s,
+        background_rate_cps=approved.background_rate_cps,
+        rate_scale_nodes_j=approved.rate_scale_nodes_j,
+        rate_scale_weights_j=approved.rate_scale_weights_j,
+        mark_concentration_source=approved.mark_concentration_source,
+        discrepancy_training_manifest=approved.discrepancy_training_manifest,
+        additive_scatter_response=approved.additive_scatter_response,
+    )
 
 
 def _station_contract_estimator() -> RotatingShieldPFEstimator:
@@ -59,6 +75,18 @@ def _zero_spectrum_record(
     )
 
 
+def test_runtime_preflight_initializes_joint_filters_before_atlas_check() -> None:
+    """Atlas preflight must be valid before the first station update."""
+    estimator = _station_contract_estimator()
+    assert estimator.filters == {}
+
+    atlas_sha256 = estimator.initialize_joint_particle_filters()
+
+    assert set(estimator.filters) == {"Cs-137"}
+    assert len(atlas_sha256) == 64
+    assert atlas_sha256 == estimator._assert_joint_surface_atlas_alignment()
+
+
 @pytest.mark.parametrize(
     ("kwargs", "error_type"),
     [
@@ -95,18 +123,29 @@ def test_observed_full_spectrum_accepts_unit_weight_integer_counts() -> None:
     assert validated.flags.c_contiguous
 
 
-def test_model_validator_rejects_truthy_string_production_flag(
+def test_model_validator_accepts_training_ready_pre_holdout_model() -> None:
+    """The PF runtime gate must not require independent holdout approval."""
+    candidate = _runtime_ready_candidate()
+
+    validated = validate_full_spectrum_model(candidate)
+
+    assert validated is candidate
+    assert candidate.runtime_ready is True
+    assert candidate.production_ready is False
+
+
+def test_model_validator_rejects_truthy_string_runtime_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A hostile protocol object cannot use ``"false"`` as approval."""
     model = approved_full_spectrum_model()
     monkeypatch.setattr(
         type(model),
-        "production_ready",
+        "runtime_ready",
         property(lambda _self: "false"),
     )
 
-    with pytest.raises(RuntimeError, match="production_ready=False"):
+    with pytest.raises(RuntimeError, match="runtime_ready=False"):
         validate_full_spectrum_model(model)
 
 
@@ -122,12 +161,12 @@ def test_model_validator_rejects_non_string_contract_hash(
     )
     monkeypatch.setattr(
         type(model),
-        "production_ready",
+        "runtime_ready",
         property(lambda _self: True),
     )
     monkeypatch.setattr(
         type(model),
-        "require_production_ready",
+        "require_runtime_ready",
         lambda _self: None,
     )
 

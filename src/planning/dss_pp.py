@@ -27,7 +27,7 @@ from pf.posterior import (
 from pf.randomness import named_random_generator, named_stream_seed
 from planning.candidate_generation import sample_low_discrepancy_heights
 from planning.traversability import shortest_grid_path_length
-from runtime_defaults import (
+from pf.runtime_defaults import (
     DEFAULT_MEASUREMENT_TIME_S,
     DEFAULT_ROBOT_SPEED_M_S,
     DEFAULT_ROTATION_OVERHEAD_S,
@@ -133,6 +133,7 @@ class DSSPPConfig:
     exact_eig_action_limit: int = 32
     exact_eig_coverage_reserve: int = 4
     exact_eig_program_diversity_reserve: int = 4
+    exact_eig_memory_budget_bytes: int = 4 * 1024 * 1024 * 1024
     proxy_memory_budget_bytes: int = 256 * 1024 * 1024
     proxy_planning_particles: int = 16
     proxy_eig_samples: int = 2
@@ -200,6 +201,9 @@ class DSSPPConfig:
             "detector_aperture_samples": self.detector_aperture_samples,
             "max_augmented_candidates": self.max_augmented_candidates,
             "exact_eig_action_limit": self.exact_eig_action_limit,
+            "exact_eig_memory_budget_bytes": (
+                self.exact_eig_memory_budget_bytes
+            ),
             "proxy_memory_budget_bytes": self.proxy_memory_budget_bytes,
             "proxy_eig_samples": self.proxy_eig_samples,
         }
@@ -2463,15 +2467,24 @@ def _full_spectrum_joint_program_components(
         or np.any(pair_ids >= orientation_count**2)
     ):
         raise ValueError("DSS shield program contains an invalid pair id.")
-    fe_indices = (pair_ids.reshape(-1) // orientation_count).astype(
-        np.int64,
-        copy=False,
-    )
-    pb_indices = (pair_ids.reshape(-1) % orientation_count).astype(
-        np.int64,
-        copy=False,
-    )
+    flat_pair_ids = pair_ids.reshape(-1)
     active_detectors = np.repeat(detectors, view_count, axis=0)
+    _, sorted_first_indices, sorted_inverse = np.unique(
+        active_detectors,
+        axis=0,
+        return_index=True,
+        return_inverse=True,
+    )
+    stable_order = np.argsort(sorted_first_indices, kind="stable")
+    unique_first_indices = sorted_first_indices[stable_order]
+    sorted_to_stable = np.empty(stable_order.size, dtype=np.int64)
+    sorted_to_stable[stable_order] = np.arange(
+        stable_order.size,
+        dtype=np.int64,
+    )
+    full_to_unique_detector = sorted_to_stable[sorted_inverse]
+    unique_detectors = active_detectors[unique_first_indices]
+    unique_detector_count = int(unique_detectors.shape[0])
     if (
         isinstance(detector_aperture_samples, bool)
         or not isinstance(detector_aperture_samples, (int, np.integer))
@@ -2482,7 +2495,6 @@ def _full_spectrum_joint_program_components(
         estimator,
         detector_aperture_samples=int(detector_aperture_samples),
     )
-    particle_axis = np.arange(particle_count, dtype=np.int64)
     flat_view_axis = np.arange(flattened_view_count, dtype=np.int64)
     slot_offset = 0
     for isotope in isotope_order:
@@ -2571,33 +2583,28 @@ def _full_spectrum_joint_program_components(
         if slot_count == 0:
             continue
         chart_ids = np.asarray(raw_chart_ids, dtype=np.int64)
-        transport_positions = positions.copy()
-        if np.any(source_mask):
-            transport_positions[source_mask] = (
-                estimator.surface_transport_positions(
-                    isotope,
-                    positions[source_mask],
-                    chart_ids[source_mask],
-                    surface_uv[source_mask],
-                )
-            )
+        active_particle_indices, active_slot_indices = np.nonzero(source_mask)
+        if active_particle_indices.size == 0:
+            slot_offset += slot_count
+            continue
+        active_transport_positions = estimator.surface_transport_positions(
+            isotope,
+            positions[source_mask],
+            chart_ids[source_mask],
+            surface_uv[source_mask],
+        )
         components = (
-            kernel.line_transport_components_selected_pairs_for_detectors(
+            kernel.line_transport_components_all_pairs_for_detectors(
                 isotope=isotope,
-                detector_positions=active_detectors,
-                sources=transport_positions.reshape(
-                    particle_count * slot_count,
-                    3,
-                ),
-                fe_indices=fe_indices,
-                pb_indices=pb_indices,
+                detector_positions=unique_detectors,
+                sources=active_transport_positions,
                 positive_line_indices=local_line_indices,
             )
         )
-        expected_local_shape = (
-            flattened_view_count,
-            particle_count,
-            slot_count,
+        expected_unique_shape = (
+            unique_detector_count,
+            orientation_count**2,
+            int(active_particle_indices.size),
             int(global_line_indices.size),
         )
 
@@ -2606,12 +2613,15 @@ def _full_spectrum_joint_program_components(
             values = np.asarray(
                 getattr(components, field_name),
                 dtype=np.float64,
-            ).reshape(expected_local_shape)
+            ).reshape(expected_unique_shape)
             if np.any(~np.isfinite(values)) or np.any(values < 0.0):
                 raise RuntimeError(
                     f"Full-spectrum component {field_name!r} is invalid."
                 )
-            return values
+            return values[
+                full_to_unique_detector,
+                flat_pair_ids,
+            ]
 
         total_local = _local_component("total_kernel")
         uncollided_local = _local_component("uncollided_kernel")
@@ -2620,9 +2630,8 @@ def _full_spectrum_joint_program_components(
         tau_obstacle = _local_component("tau_obstacle")
         distance_m = _local_component("distance_m")
         source_scale = (
-            strengths[None, :, :, None]
-            * source_mask[None, :, :, None]
-            * branching_weights[None, None, None, :]
+            strengths[source_mask][None, :, None]
+            * branching_weights[None, None, :]
         )
         total_local *= source_scale
         uncollided_local *= source_scale
@@ -2630,25 +2639,26 @@ def _full_spectrum_joint_program_components(
             (tau_fe, tau_pb, tau_obstacle, distance_m),
             axis=-1,
         )
-        source_slots = np.arange(
-            slot_offset,
-            slot_offset + slot_count,
-            dtype=np.int64,
+        active_global_slots = (
+            int(slot_offset) + active_slot_indices
         )
-        target = np.ix_(
-            flat_view_axis,
-            particle_axis,
-            source_slots,
-            global_line_indices,
+        target = (
+            flat_view_axis[:, None, None],
+            active_particle_indices[None, :, None],
+            active_global_slots[None, :, None],
+            global_line_indices[None, None, :],
         )
         total_flat[target] = total_local
         uncollided_flat[target] = uncollided_local
-        feature_target = np.ix_(
-            flat_view_axis,
-            particle_axis,
-            source_slots,
-            global_line_indices,
-            np.arange(len(feature_order), dtype=np.int64),
+        feature_target = (
+            flat_view_axis[:, None, None, None],
+            active_particle_indices[None, :, None, None],
+            active_global_slots[None, :, None, None],
+            global_line_indices[None, None, :, None],
+            np.arange(
+                len(feature_order),
+                dtype=np.int64,
+            )[None, None, None, :],
         )
         features_flat[feature_target] = local_features
         slot_offset += slot_count
@@ -2739,6 +2749,8 @@ def _full_spectrum_information_gain(
     gpu_device: str,
     latent_particle_indices: NDArray[np.int64] | None = None,
     action_seeds_a: NDArray[np.int64] | None = None,
+    action_chunk_size: int | None = None,
+    state_chunk_size: int | None = None,
 ) -> NDArray[np.float64]:
     """Estimate full-spectrum mutual information with bounded action scheduling.
 
@@ -2857,6 +2869,8 @@ def _full_spectrum_information_gain(
                 torch.as_tensor(uncollided, dtype=torch.float64, device=device),
                 torch.as_tensor(features, dtype=torch.float64, device=device),
                 torch.as_tensor(live_times, dtype=torch.float64, device=device),
+                action_chunk_size=action_chunk_size,
+                state_chunk_size=state_chunk_size,
             )
             .detach()
             .cpu()
@@ -2876,6 +2890,8 @@ def _full_spectrum_information_gain(
                 uncollided,
                 features,
                 live_times,
+                action_chunk_size=action_chunk_size,
+                state_chunk_size=state_chunk_size,
             ),
             dtype=np.float64,
         )
@@ -2891,6 +2907,95 @@ def _full_spectrum_information_gain(
     return _information_gain_from_log_likelihood(log_likelihood, weights)
 
 
+def _dss_eig_state_chunk_size(
+    model: object,
+    *,
+    action_count: int,
+    particle_count: int,
+    sample_count: int,
+    source_slot_count: int,
+    view_count: int,
+    memory_budget_bytes: int,
+) -> int:
+    """Return the largest power-of-two state chunk within half the budget."""
+    estimator = getattr(
+        model,
+        "estimate_cross_likelihood_working_set_bytes",
+        None,
+    )
+    if not callable(estimator):
+        raise RuntimeError(
+            "The full-spectrum model must publish an exact likelihood "
+            "working-set estimate for DSS batching."
+        )
+    upper = 1 << (int(particle_count).bit_length() - 1)
+    target_workspace_bytes = max(1, int(memory_budget_bytes) // 2)
+    state_chunk_size = int(upper)
+    while state_chunk_size > 1:
+        working_set_bytes = int(
+            estimator(
+                num_actions=int(action_count),
+                num_samples=int(sample_count),
+                num_particles=int(particle_count),
+                num_isotopes=int(source_slot_count),
+                num_views=int(view_count),
+                action_chunk_size=1,
+                state_chunk_size=int(state_chunk_size),
+                dtype_bytes=np.dtype(np.float64).itemsize,
+            )
+        )
+        if working_set_bytes <= target_workspace_bytes:
+            return int(state_chunk_size)
+        state_chunk_size //= 2
+    return 1
+
+
+def _dss_eig_likelihood_action_chunk_size(
+    model: object,
+    *,
+    action_count: int,
+    particle_count: int,
+    sample_count: int,
+    source_slot_count: int,
+    view_count: int,
+    state_chunk_size: int,
+    memory_budget_bytes: int,
+) -> int:
+    """Return a batched likelihood action chunk within half the budget."""
+    estimator = getattr(
+        model,
+        "estimate_cross_likelihood_working_set_bytes",
+        None,
+    )
+    if not callable(estimator):
+        raise RuntimeError(
+            "The full-spectrum model must publish an exact likelihood "
+            "working-set estimate for DSS batching."
+        )
+    if int(action_count) <= 0:
+        raise ValueError("DSS likelihood action_count must be positive.")
+    upper = 1 << (int(action_count).bit_length() - 1)
+    target_workspace_bytes = max(1, int(memory_budget_bytes) // 2)
+    action_chunk_size = int(upper)
+    while action_chunk_size > 1:
+        working_set_bytes = int(
+            estimator(
+                num_actions=int(action_count),
+                num_samples=int(sample_count),
+                num_particles=int(particle_count),
+                num_isotopes=int(source_slot_count),
+                num_views=int(view_count),
+                action_chunk_size=int(action_chunk_size),
+                state_chunk_size=int(state_chunk_size),
+                dtype_bytes=np.dtype(np.float64).itemsize,
+            )
+        )
+        if working_set_bytes <= target_workspace_bytes:
+            return int(action_chunk_size)
+        action_chunk_size //= 2
+    return 1
+
+
 def _dss_eig_action_batch_size(
     model: object,
     *,
@@ -2902,6 +3007,7 @@ def _dss_eig_action_batch_size(
     line_count: int,
     feature_count: int,
     memory_budget_bytes: int,
+    state_chunk_size: int | None = None,
     diagnostics: dict[str, int] | None = None,
 ) -> int:
     """Return a conservative action batch using the model workspace contract."""
@@ -2939,6 +3045,7 @@ def _dss_eig_action_batch_size(
             num_particles=int(particle_count),
             num_isotopes=int(source_slot_count),
             num_views=int(view_count),
+            state_chunk_size=state_chunk_size,
             dtype_bytes=np.dtype(np.float64).itemsize,
         )
     )
@@ -2995,6 +3102,11 @@ def _dss_eig_action_batch_size(
                 "feature_count": int(feature_count),
                 "energy_bin_count": int(energy_axis.size),
                 "memory_budget_bytes": int(memory_budget_bytes),
+                "state_chunk_size": (
+                    int(particle_count)
+                    if state_chunk_size is None
+                    else int(state_chunk_size)
+                ),
                 "model_working_set_bytes": int(model_working_set),
                 "transport_per_action_bytes": int(transport_per_action),
                 "predictive_per_action_bytes": int(predictive_per_action),
@@ -3180,7 +3292,7 @@ def _program_information_gains_for_poses(
     line_count = len(tuple(model.line_identity))
     feature_count = len(tuple(model.transport_feature_order))
     memory_budget_bytes = (
-        256 * 1024 * 1024
+        config.exact_eig_memory_budget_bytes
         if memory_budget_bytes_override is None
         else memory_budget_bytes_override
     )
@@ -3230,6 +3342,7 @@ def _program_information_gains_for_poses(
     memory_contracts: list[dict[str, int]] = []
     attempted_action_batch_sizes: list[int] = []
     successful_action_batch_sizes: list[int] = []
+    successful_likelihood_action_chunk_sizes: list[int] = []
     oom_retry_events: list[dict[str, int]] = []
     for view_count_raw in np.unique(action_lengths):
         view_count = int(view_count_raw)
@@ -3254,6 +3367,15 @@ def _program_information_gains_for_poses(
         selected_actions = selected_actions[
             np.lexsort(lexicographic_keys)
         ]
+        state_chunk_size = _dss_eig_state_chunk_size(
+            model,
+            action_count=int(selected_actions.size),
+            particle_count=particle_count,
+            sample_count=sample_count,
+            source_slot_count=max(source_slot_count, 1),
+            view_count=view_count,
+            memory_budget_bytes=memory_budget_bytes,
+        )
         memory_contract: dict[str, int] = {}
         action_batch_size = _dss_eig_action_batch_size(
             model,
@@ -3265,6 +3387,7 @@ def _program_information_gains_for_poses(
             line_count=max(line_count, 1),
             feature_count=max(feature_count, 1),
             memory_budget_bytes=memory_budget_bytes,
+            state_chunk_size=state_chunk_size,
             diagnostics=memory_contract,
         )
         memory_contracts.append(memory_contract)
@@ -3276,6 +3399,18 @@ def _program_information_gains_for_poses(
             )
             action_indices = selected_actions[action_start:action_stop]
             attempted_action_batch_sizes.append(int(action_indices.size))
+            likelihood_action_chunk_size = (
+                _dss_eig_likelihood_action_chunk_size(
+                    model,
+                    action_count=int(action_indices.size),
+                    particle_count=particle_count,
+                    sample_count=sample_count,
+                    source_slot_count=max(source_slot_count, 1),
+                    view_count=view_count,
+                    state_chunk_size=state_chunk_size,
+                    memory_budget_bytes=memory_budget_bytes,
+                )
+            )
             action_rng = named_random_generator(
                 resolved_eig_call_seed,
                 "dss_pp",
@@ -3308,35 +3443,52 @@ def _program_information_gains_for_poses(
                         gpu_device=gpu_device,
                         latent_particle_indices=common_latent_indices,
                         action_seeds_a=action_seeds[action_indices],
+                        action_chunk_size=likelihood_action_chunk_size,
+                        state_chunk_size=state_chunk_size,
                     )
                 )
             except Exception as error:
                 if not _is_dss_eig_memory_error(error):
                     raise
-                if action_stop - action_start <= 1:
+                failed_action_batch_size = action_stop - action_start
+                if failed_action_batch_size <= 1 and state_chunk_size <= 1:
                     raise RuntimeError(
                         "DSS exact EIG exhausted memory for one action even "
-                        "after batch reduction."
+                        "after action and state-chunk reduction."
                     ) from error
                 _release_dss_gpu_cache()
-                reduced_action_batch_size = max(
-                    1,
-                    (action_stop - action_start) // 2,
-                )
+                reduced_action_batch_size = int(action_batch_size)
+                reduced_state_chunk_size = int(state_chunk_size)
+                if failed_action_batch_size > 1:
+                    reduced_action_batch_size = max(
+                        1,
+                        failed_action_batch_size // 2,
+                    )
+                else:
+                    reduced_state_chunk_size = max(
+                        1,
+                        state_chunk_size // 2,
+                    )
                 oom_retry_events.append(
                     {
                         "view_count": int(view_count),
-                        "failed_action_batch_size": int(
-                            action_stop - action_start
-                        ),
+                        "failed_action_batch_size": int(failed_action_batch_size),
                         "retry_action_batch_size": int(
                             reduced_action_batch_size
+                        ),
+                        "failed_state_chunk_size": int(state_chunk_size),
+                        "retry_state_chunk_size": int(
+                            reduced_state_chunk_size
                         ),
                     }
                 )
                 action_batch_size = int(reduced_action_batch_size)
+                state_chunk_size = int(reduced_state_chunk_size)
                 continue
             successful_action_batch_sizes.append(int(action_indices.size))
+            successful_likelihood_action_chunk_sizes.append(
+                int(likelihood_action_chunk_size)
+            )
             action_start = action_stop
     for pose_index in range(int(detectors.shape[0])):
         action_start = int(offsets[pose_index])
@@ -3359,6 +3511,9 @@ def _program_information_gains_for_poses(
                 "memory_contracts": memory_contracts,
                 "attempted_action_batch_sizes": attempted_action_batch_sizes,
                 "successful_action_batch_sizes": successful_action_batch_sizes,
+                "successful_likelihood_action_chunk_sizes": (
+                    successful_likelihood_action_chunk_sizes
+                ),
                 "oom_retry_count": int(len(oom_retry_events)),
                 "oom_retry_events": oom_retry_events,
                 "cpu_fallback_used": False,
@@ -4886,6 +5041,15 @@ def _build_nodes(
         proxy_particle_count = int(
             np.asarray(proxy_joint_particles.weights_n).size
         )
+        print(
+            "[dss] proxy-start "
+            f"poses={candidate_poses.shape[0]} "
+            f"programs={len(programs)} "
+            f"actions={total_action_count} "
+            f"particles={proxy_particle_count} "
+            f"samples={config.proxy_eig_samples}",
+            flush=True,
+        )
         proxy_started = time.perf_counter()
         proxy_information_scores = (
             _program_information_proxy_for_poses(
@@ -4900,6 +5064,12 @@ def _build_nodes(
             )
         )
         proxy_wall_s = float(time.perf_counter() - proxy_started)
+        print(
+            "[dss] proxy-done "
+            f"elapsed_s={proxy_wall_s:.3f} "
+            f"actions={total_action_count}",
+            flush=True,
+        )
         proxy_action_count = int(total_action_count)
         (
             shortlist_indices,
@@ -4960,6 +5130,12 @@ def _build_nodes(
             for pose_index in eig_indices
         ]
         round_diagnostics: dict[str, object] = {}
+        print(
+            "[dss] exact-round-start "
+            f"round={len(exact_eig_runtime_rounds) + 1} "
+            f"actions={new_indices.size}",
+            flush=True,
+        )
         exact_started = time.perf_counter()
         batched_gains = _program_information_gains_for_poses(
             estimator,
@@ -4976,6 +5152,13 @@ def _build_nodes(
         round_diagnostics["wall_s"] = round_wall_s
         round_diagnostics["action_count"] = int(new_indices.size)
         exact_eig_runtime_rounds.append(round_diagnostics)
+        print(
+            "[dss] exact-round-done "
+            f"round={len(exact_eig_runtime_rounds)} "
+            f"elapsed_s={round_wall_s:.3f} "
+            f"actions={new_indices.size}",
+            flush=True,
+        )
         eig_results = [
             (
                 pose_index,
@@ -5119,8 +5302,10 @@ def _build_nodes(
             break
         if config.lambda_distance is None:
             # Auto-scaled distance changes with unseen EIG values, so no safe
-            # finite lower/upper objective bracket exists before exhaustion.
-            continue
+            # finite lower/upper objective bracket exists for the excluded
+            # actions.  The exact stage is nevertheless a predeclared compute
+            # budget; the full-action proxy remains the ranking contract.
+            break
         evaluated_lower_scores: list[float] = []
         for index_raw in evaluated_pending_indices:
             item = pending[int(index_raw)]
@@ -5190,8 +5375,13 @@ def _build_nodes(
             evaluated_objective_lower
             >= excluded_universal_upper - 1.0e-12
         )
-        if shortlist_bound_certified:
-            break
+        # ``exact_eig_action_limit`` is a real-time planning budget.  Expanding
+        # beyond it until the very loose finite-sample KL bound certifies the
+        # winner can degenerate into exhaustive exact evaluation whenever one
+        # posterior particle has tiny positive weight.  The proxy already
+        # evaluates every action with the same generative model, while the
+        # exact stage re-evaluates the predeclared diverse shortlist only.
+        break
 
     best_exact_score = (
         float(raw_nodes[0].score)
@@ -5309,12 +5499,12 @@ def _build_nodes(
             shortlist_bound_certified
         ),
         "shortlist_certification_note": (
-            "Exact evaluation expands until a zero-EIG evaluated objective "
-            "lower bound exceeds every excluded action's finite-sample "
-            "-log(min_positive_prior_mass) KL upper bound. Prior entropy is "
-            "only a bound on expected mutual information, not on a finite "
-            "Monte Carlo estimate. When auto distance scaling prevents a "
-            "safe objective bound, every action is evaluated exactly."
+            "Every action is ranked by the shared full-spectrum proxy. The "
+            "predeclared exact_eig_action_limit then bounds high-fidelity EIG "
+            "evaluation with coverage and program-diversity reserves. A "
+            "formal recall certificate is reported only when the evaluated "
+            "set also exceeds the safe finite-sample objective bound; the "
+            "runtime never silently expands beyond the configured budget."
         ),
         "eig_shortlist_wall_s": float(proxy_wall_s + exact_wall_s),
     }
@@ -5555,7 +5745,9 @@ def select_dss_pp_next_station(
             == int(shortlist_diagnostics.get("total_action_count", 0))
         ),
         "planning_eig_batched_source_line_response": True,
-        "planning_eig_action_memory_budget_bytes": 256 * 1024 * 1024,
+        "planning_eig_action_memory_budget_bytes": int(
+            cfg.exact_eig_memory_budget_bytes
+        ),
         "planning_eig_likelihood_model": "joint_full_spectrum_generative",
         "planning_eig_contract_hash_sha256": str(
             estimator.full_spectrum_generative_model.contract_hash_sha256
