@@ -21,9 +21,20 @@ the standard RA-L ablation implementation:
 - ground truth source cardinality: `4 Cs-137 + 3 Co-60 + 2 Eu-154`
 - source support: continuous walls, floor, ceiling, and every exposed
   transport-component face from the shared physical surface geometry
-- random placement is uniform with respect to physical surface area and applies
-  no height preference, visibility filter, ceiling-count cap, source-separation
-  constraint, or response-observability screening
+- random placement is uniform with respect to physical surface area,
+  conditioned on a predeclared 3.0 m minimum 3-D Euclidean distance between
+  sources of the same isotope
+- no height preference, visibility filter, ceiling-count cap, or
+  response-observability screening is applied
+
+The same-isotope distance is a geometry-only hard-core condition applied to a
+complete proposed layout. It is not computed from detector poses, simulated
+counts, PF responses, or holdout results. The complete-layout rejection sampler
+therefore remains symmetric in source order and samples the physical-area
+measure conditioned on the declared separation event. Three metres is the
+fixed RA-L experiment-design value: it removes configurations that are not a
+meaningful test of separate-source recovery without screening locations for
+favourable visibility or response conditioning.
 
 Run only four closed-loop full-simulation variants for the main paper table:
 

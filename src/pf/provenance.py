@@ -72,3 +72,64 @@ def repository_commit(repository_root: Path | None = None) -> str:
         return "unavailable"
     commit = completed.stdout.strip()
     return commit if commit else "unavailable"
+
+
+def repository_source_snapshot_sha256(
+    repository_root: Path | None = None,
+) -> str:
+    """Hash the actual estimator source/config snapshot, including dirty files."""
+    root = (
+        Path(__file__).resolve().parents[2]
+        if repository_root is None
+        else Path(repository_root).resolve()
+    )
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            "Cannot enumerate the repository source snapshot."
+        ) from exc
+    prefixes = ("src/", "scripts/", "configs/", "native/", "tests/")
+    root_files = frozenset(
+        {"AGENTS.md", "main.py", "pyproject.toml", "uv.lock"}
+    )
+    paths = sorted(
+        {
+            Path(raw.decode("utf-8"))
+            for raw in completed.stdout.split(b"\0")
+            if raw
+            and (
+                raw.decode("utf-8") in root_files
+                or raw.decode("utf-8").startswith(prefixes)
+            )
+        },
+        key=lambda value: value.as_posix(),
+    )
+    digest = hashlib.sha256(b"repository_source_snapshot_v1\0")
+    for relative in paths:
+        path = root / relative
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(b"symlink\0")
+            digest.update(path.readlink().as_posix().encode("utf-8"))
+        elif path.is_file():
+            digest.update(b"file\0")
+            digest.update(path.read_bytes())
+        else:
+            digest.update(b"missing\0")
+        digest.update(b"\0")
+    return digest.hexdigest()

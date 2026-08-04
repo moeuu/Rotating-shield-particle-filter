@@ -14,6 +14,7 @@ from baselines.ral_ablation.config_factory import (
     DEFAULT_ABLATION_VARIANTS,
     DEFAULT_BASE_CONFIG,
     DEFAULT_CUI_SPLIT_VIEW_DIR,
+    DEFAULT_RAL_PASSAGE_WIDTH_M,
     _load_json,
     _source_generation_options,
     _validate_ral_transport_sampling,
@@ -59,8 +60,8 @@ def test_pf_max_sources_default_is_shared() -> None:
     assert PFConfig().max_sources == DEFAULT_MAX_SOURCES_PER_ISOTOPE
 
 
-def test_ral_source_generation_defaults_are_unconditioned() -> None:
-    """Source generation should expose physical geometry options only."""
+def test_ral_source_generation_api_default_is_unconditioned() -> None:
+    """Only the standard config, not the library API, should require 3 m."""
     options = _source_generation_options({})
 
     assert options["obstacle_height_m"] == pytest.approx(2.0)
@@ -69,6 +70,9 @@ def test_ral_source_generation_defaults_are_unconditioned() -> None:
     assert options["structural_rj_surface_chart_max_edge_m"] == pytest.approx(
         1.0
     )
+    assert options[
+        "random_source_same_isotope_min_distance_m"
+    ] == pytest.approx(0.0)
 
 
 def test_fresh_ablation_seed_is_generated_when_seeds_are_omitted(
@@ -98,7 +102,6 @@ def test_explicit_ablation_seed_remains_available_for_exact_replay() -> None:
         "random_source_max_ceiling_sources",
         "random_source_visibility_filter",
         "random_source_response_observability_filter",
-        "random_source_same_isotope_min_distance_m",
     ),
 )
 def test_ral_source_generation_rejects_removed_selection_keys(
@@ -387,19 +390,28 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert source_metadata["source_seed"] == 1251
     assert source_metadata["obstacle_seed"] == 1234
     assert source_metadata["scene_seed_policy"] == "explicit_replay"
-    assert source_metadata["source_surface_sampling_schema_version"] == 3
+    assert source_metadata["source_surface_sampling_schema_version"] == 4
     assert {
         "sampling": source_metadata["sampling"],
         "sampling_measure": source_metadata["sampling_measure"],
         "surface_geometry": source_metadata["surface_geometry"],
         "selection_conditioning": source_metadata["selection_conditioning"],
     } == {
-        "sampling": "continuous area-uniform physical-surface placement",
+        "sampling": (
+            "continuous area-uniform physical-surface placement conditioned "
+            "on same-isotope Euclidean separation"
+        ),
         "sampling_measure": "continuous_area_uniform",
         "surface_geometry": "runtime_transport_component_union",
-        "selection_conditioning": "none_physical_area_only",
+        "selection_conditioning": "same_isotope_euclidean_hard_core",
     }
+    assert source_metadata[
+        "same_isotope_min_euclidean_distance_m"
+    ] == pytest.approx(3.0)
     assert source_metadata["obstacle_height_m"] == pytest.approx(2.0)
+    assert source_metadata["passage_width_m"] == pytest.approx(
+        DEFAULT_RAL_PASSAGE_WIDTH_M
+    )
     assert source_metadata["include_room_boundaries"] is True
     assert (
         source_metadata["surface_emission_policy_sha256"]
@@ -419,9 +431,23 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         "random_source_max_ceiling_sources",
         "random_source_visibility_filter",
         "random_source_response_observability_filter",
-        "random_source_same_isotope_min_distance_m",
     }
     assert removed_truth_selection_keys.isdisjoint(source_metadata)
+    source_positions = np.asarray(
+        [source["position"] for source in source_payload["sources"]],
+        dtype=float,
+    )
+    source_isotopes = np.asarray(
+        [source["isotope"] for source in source_payload["sources"]],
+        dtype=str,
+    )
+    left, right = np.triu_indices(len(source_isotopes), k=1)
+    same = source_isotopes[left] == source_isotopes[right]
+    same_isotope_distances = np.linalg.norm(
+        source_positions[left[same]] - source_positions[right[same]],
+        axis=1,
+    )
+    assert np.all(same_isotope_distances >= 3.0)
     position_values = [
         float(value)
         for source in source_payload["sources"]
@@ -455,6 +481,13 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert "--max-sources" not in by_variant["proposed"].command
     assert "--adaptive-dwell" not in by_variant["proposed"].command
     assert "--measurement-time-s" in by_variant["proposed"].command
+    assert "--passage-width-m" in by_variant["proposed"].command
+    passage_width_idx = (
+        by_variant["proposed"].command.index("--passage-width-m") + 1
+    )
+    assert float(by_variant["proposed"].command[passage_width_idx]) == pytest.approx(
+        DEFAULT_RAL_PASSAGE_WIDTH_M
+    )
     measurement_time_idx = (
         by_variant["proposed"].command.index("--measurement-time-s") + 1
     )

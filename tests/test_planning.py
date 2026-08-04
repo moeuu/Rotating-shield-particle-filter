@@ -32,7 +32,7 @@ from planning.candidate_generation import (
 )
 from planning.traversability import TraversabilityMap
 from pf.particle_filter import IsotopeParticle
-from measurement.shielding import generate_octant_rotation_matrices
+from measurement.shielding import generate_octant_orientations
 from pure_pf_test_support import approved_full_spectrum_model
 
 
@@ -96,13 +96,7 @@ def _build_simple_estimator(
     """Build a minimal estimator with deterministic particles."""
     surface_diagnostic_points = np.array([[1.0, 0.0, 0.0]], dtype=float)
     normals = (
-        np.asarray(
-            [
-                matrix[:, 2]
-                for matrix in generate_octant_rotation_matrices()
-            ],
-            dtype=float,
-        )
+        np.asarray(generate_octant_orientations(), dtype=float)
         if canonical_octants
         else np.array(
             [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
@@ -1440,8 +1434,7 @@ def test_estimate_lambda_cost_range_scales_motion() -> None:
 
 def test_dss_pp_program_library_balances_every_shield_pair() -> None:
     """Every canonical pair must be represented without within-station repeats."""
-    mats = generate_octant_rotation_matrices()
-    normals = np.asarray([mat[:, 2] for mat in mats], dtype=float)
+    normals = np.asarray(generate_octant_orientations(), dtype=float)
     programs = build_shield_program_library(
         normals,
         program_length=8,
@@ -1568,8 +1561,7 @@ def test_shield_program_batch_schedule_matches_scalar_test_oracle(
 
 def test_dss_pp_program_library_rejects_insufficient_pair_capacity() -> None:
     """A truncated library must not silently hide valid shield actions."""
-    mats = generate_octant_rotation_matrices()
-    normals = np.asarray([mat[:, 2] for mat in mats], dtype=float)
+    normals = np.asarray(generate_octant_orientations(), dtype=float)
 
     with pytest.raises(ValueError, match="too small.*multi-partition"):
         build_shield_program_library(
@@ -2471,8 +2463,7 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
     """DSS-PP should jointly return a pose and executable shield program."""
     isotopes = ["Cs-137"]
     candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    shield_normals = np.asarray(generate_octant_orientations(), dtype=float)
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
@@ -2555,8 +2546,7 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
     """Forced DSS-PP programs should match baseline shield-policy execution."""
     isotopes = ["Cs-137"]
     candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    shield_normals = np.asarray(generate_octant_orientations(), dtype=float)
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
@@ -2631,8 +2621,7 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
     """A zero DSS-PP ranked-node limit should skip diagnostic node payloads."""
     isotopes = ["Cs-137"]
     candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    shield_normals = np.asarray(generate_octant_orientations(), dtype=float)
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
@@ -2705,8 +2694,7 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
     """DSS-PP should move toward uncovered traversable cells when weighted."""
     isotopes = ["Cs-137"]
     candidate_sources = np.array([[0.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    shield_normals = np.asarray(generate_octant_orientations(), dtype=float)
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=1,
@@ -3309,8 +3297,7 @@ def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
     """Bearing diversity should favor angularly separating any same-isotope modes."""
     isotopes = ["Co-60"]
     candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    shield_normals = np.asarray(generate_octant_orientations(), dtype=float)
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,

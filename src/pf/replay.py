@@ -21,7 +21,6 @@ from measurement.obstacles import ObstacleGrid
 from measurement.shielding import generate_octant_orientations
 from measurement.surface_charts import (
     build_surface_chart_geometry,
-    surface_chart_geometry_sha256,
 )
 from pf.full_spectrum import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
 from pf.gpu_utils import preflight_compute_backend
@@ -50,8 +49,14 @@ _SHA256_PATTERN = frozenset("0123456789abcdef")
 _DEFAULT_SURFACE_DIAGNOSTIC_POINT_COUNT = 1024
 _PF_CONFIG_ALIASES = {
     "pf_max_sources": "max_sources",
+    "pf_hard_max_sources": "hard_max_sources",
     "pf_strength_prior_min_cps_1m": "strength_prior_min_cps_1m",
     "pf_strength_prior_max_cps_1m": "strength_prior_max_cps_1m",
+    "pf_strength_prior_family": "strength_prior_family",
+    "pf_strength_prior_gamma_shape": "strength_prior_gamma_shape",
+    "pf_strength_prior_gamma_scale_cps_1m": (
+        "strength_prior_gamma_scale_cps_1m"
+    ),
 }
 
 _PF_REPLAY_PHYSICAL_OVERRIDE_KEYS = frozenset(
@@ -270,6 +275,7 @@ def validate_local_full_spectrum_contract(
             log.runtime_config,
             run_root=log.path,
         )
+        model.require_environment_applicable(log.environment)
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise PFReplayError(
             "Cannot authenticate the logged full-spectrum generative model."

@@ -1,0 +1,5 @@
+{
+  "extends": "../pf_strict_3d.json",
+  "joint_cross_isotope_state_block_probability": 0.0,
+  "joint_cross_isotope_transfer_probability": 0.1
+}

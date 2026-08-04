@@ -28,7 +28,8 @@ class PFFrame:
     - time: cumulative measurement time (s)
     - robot_position: detector position q_k (3,)
     - robot_orientation: optional robot orientation (e.g., quaternion or R)
-    - RFe, RPb: rotation matrices for iron/lead shields (3x3)
+    - RFe, RPb: incoming octant normals (3,) or legacy active material
+      rotations (3x3) for the iron/lead shields
     - duration: acquisition time T_k
     - particle_positions: isotope -> source-slot sample positions (N_points, 3)
     - particle_weights: isotope -> source-slot sample weights (N_points,)
@@ -54,6 +55,33 @@ class PFFrame:
     spectrum_counts: Optional[NDArray[np.float64]] = None
     particle_representative_positions: Optional[Dict[str, NDArray[np.float64]]] = None
     particle_representative_weights: Optional[Dict[str, NDArray[np.float64]]] = None
+
+
+def _shield_material_normal(
+    orientation: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return the physical material-centre normal for a shield orientation.
+
+    Runtime PF frames carry the shared-contract incoming octant normal. Older
+    visualization callers may instead provide the active rotation of the local
+    positive octant. The latter occupies local ``(+X,+Y,+Z)``, so its centre
+    is not the local Z axis.
+    """
+    value = np.asarray(orientation, dtype=float)
+    if value.shape == (3,):
+        normal = -value
+    elif value.shape == (3, 3):
+        local_octant_centre = np.ones(3, dtype=float) / np.sqrt(3.0)
+        normal = value @ local_octant_centre
+    else:
+        raise ValueError(
+            "Shield orientation must be an incoming normal with shape (3,) "
+            "or an active rotation with shape (3, 3)."
+        )
+    norm = float(np.linalg.norm(normal))
+    if not np.isfinite(norm) or norm <= 1.0e-12:
+        raise ValueError("Shield orientation must define a finite nonzero normal.")
+    return np.asarray(normal / norm, dtype=float)
 
 
 def frame_to_isaac_pf_payload(
@@ -1189,8 +1217,8 @@ class RealTimePFVisualizer:
         self._shield_arrows = {}
         origin = frame.robot_position
         arrow_specs = {
-            "Fe": (frame.RFe[:, 2], "magenta"),
-            "Pb": (frame.RPb[:, 2], "green"),
+            "Fe": (_shield_material_normal(frame.RFe), "magenta"),
+            "Pb": (_shield_material_normal(frame.RPb), "green"),
         }
         for name, (normal, color) in arrow_specs.items():
             arr = self.ax3d.quiver(
@@ -1393,6 +1421,22 @@ class CUISplitPFVisualizer:
         if not self.latest_spectrum_path.exists():
             self._save_spectrum_placeholder(self.latest_spectrum_path)
 
+    def set_truth(
+        self,
+        true_sources: Dict[str, NDArray[np.float64]],
+        true_strengths: Dict[str, float | Sequence[float]],
+    ) -> None:
+        """Attach evaluation-only truth without exposing it to the estimator."""
+        self.true_sources = {
+            str(isotope): np.asarray(values, dtype=np.float64).copy()
+            for isotope, values in true_sources.items()
+        }
+        self.true_strengths = {
+            str(isotope): np.asarray(values, dtype=np.float64).copy()
+            for isotope, values in true_strengths.items()
+        }
+        self._write_index_html()
+
     def update(self, frame: PFFrame) -> None:
         """Render and save the split CUI views for one PF frame."""
         self.update_index += 1
@@ -1508,6 +1552,11 @@ class CUISplitPFVisualizer:
 
     def _write_index_html(self) -> None:
         """Write the browser page that auto-refreshes the latest PNG files."""
+        truth_status = (
+            "visible (evaluation overlay only; not provided to PF/planner)"
+            if self.true_sources
+            else "hidden"
+        )
         html = """<!doctype html>
 <html lang="en">
 <head>
@@ -1524,7 +1573,7 @@ class CUISplitPFVisualizer:
   </style>
 </head>
 <body>
-  <header>Rotating Shield PF CUI View - auto refresh every 2 s</header>
+  <header>Rotating Shield PF CUI View - auto refresh every 2 s - truth: __TRUTH_STATUS__</header>
   <main>
     <section class="wide overview"><h2>RA-L experiment overview</h2><img id="overview" src="latest_experiment_overview.png"></section>
     <section><h2>Robot position 2D</h2><img id="robot" src="latest_robot_2d.png"></section>
@@ -1544,6 +1593,7 @@ class CUISplitPFVisualizer:
 </body>
 </html>
 """
+        html = html.replace("__TRUTH_STATUS__", truth_status)
         self.index_path.write_text(html, encoding="utf-8")
 
     def _save_overview_placeholder(self, output_path: Path) -> None:
@@ -1767,11 +1817,18 @@ class CUISplitPFVisualizer:
         """Return a compact textual source-count summary for the overview panel."""
         lines = [self._frame_progress_label(frame)]
         for iso in self.isotopes:
-            truth_count = int(
-                np.asarray(self.true_sources.get(iso, np.zeros((0, 3))), dtype=float)
-                .reshape((-1, 3))
-                .shape[0]
-            ) if iso in self.true_sources else 0
+            truth_label = "hidden"
+            if iso in self.true_sources:
+                truth_label = str(
+                    int(
+                        np.asarray(
+                            self.true_sources[iso],
+                            dtype=float,
+                        )
+                        .reshape((-1, 3))
+                        .shape[0]
+                    )
+                )
             est_count = int(
                 np.asarray(
                     frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float)),
@@ -1781,7 +1838,7 @@ class CUISplitPFVisualizer:
                 .shape[0]
             )
             lines.append(
-                f"{iso}: truth={truth_count} estimate={est_count}"
+                f"{iso}: truth={truth_label} estimate={est_count}"
             )
         return "\n".join(lines)
 
@@ -2354,14 +2411,28 @@ def _async_cui_split_worker(
 ) -> None:
     """Render CUI split-view frames in a dedicated worker process."""
     visualizer = CUISplitPFVisualizer(**config)
+    last_frame: PFFrame | None = None
     while True:
         message, payload = frame_queue.get()
         if message == "close":
             return
+        if message == "truth":
+            try:
+                true_sources, true_strengths = pickle.loads(payload)
+                visualizer.set_truth(true_sources, true_strengths)
+                if last_frame is not None:
+                    visualizer.update(last_frame)
+            except Exception as exc:  # pragma: no cover - worker diagnostics.
+                print(
+                    f"Async CUI split truth update error: {exc}",
+                    flush=True,
+                )
+            continue
         if message != "frame":
             continue
         try:
             frame = pickle.loads(payload)
+            last_frame = frame
             visualizer.update(frame)
         except Exception as exc:  # pragma: no cover - worker-side diagnostics only.
             print(f"Async CUI split visualization worker error: {exc}", flush=True)
@@ -2425,6 +2496,20 @@ class AsyncCUISplitPFVisualizer:
                 except queue.Empty:
                     return
 
+    def set_truth(
+        self,
+        true_sources: Dict[str, NDArray[np.float64]],
+        true_strengths: Dict[str, float | Sequence[float]],
+    ) -> None:
+        """Queue evaluation truth for post-run rendering only."""
+        if self._closed or not self._process.is_alive():
+            return
+        payload = pickle.dumps(
+            (true_sources, true_strengths),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        self._queue.put(("truth", payload), timeout=5.0)
+
     def close(self, timeout_s: float = 10.0) -> None:
         """Ask the renderer process to finish queued work and stop."""
         if self._closed:
@@ -2462,8 +2547,8 @@ def build_frame_from_pf(
         time_sec: cumulative time in seconds
         detector_position: Physical detector XYZ used by the likelihood.
         live_time_s: Fixed observation live time in seconds.
-        RFe: Iron-shield world rotation.
-        RPb: Lead-shield world rotation.
+        RFe: Iron-shield incoming normal or legacy active world rotation.
+        RPb: Lead-shield incoming normal or legacy active world rotation.
         spectrum_energy_keV: Native incident-energy bin axis.
         spectrum_counts: Raw nonnegative native histogram.
     """

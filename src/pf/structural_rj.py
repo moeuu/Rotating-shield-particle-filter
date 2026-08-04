@@ -17,9 +17,14 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.special import ndtr, ndtri
 
+from pf.strength_prior import StrengthPrior
+
 
 TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY = (
     "independent_truncated_poisson_surface_source_count_v1"
+)
+POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY = (
+    "independent_poisson_with_thin_geometric_capacity_tail_v1"
 )
 EXPLICIT_CARDINALITY_PRIOR_POLICY = (
     "explicit_pre_evaluation_cardinality_probability_vector_v1"
@@ -27,9 +32,131 @@ EXPLICIT_CARDINALITY_PRIOR_POLICY = (
 CARDINALITY_PRIOR_POLICIES = frozenset(
     {
         TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+        POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
         EXPLICIT_CARDINALITY_PRIOR_POLICY,
     }
 )
+
+
+def cross_isotope_transfer_log_proposal(
+    *,
+    donor_cardinality: int,
+    receiver_cardinality: int,
+    group_size: int,
+    maximum_sources: int,
+    maximum_group_size: int,
+) -> float:
+    """Return the state-dependent part of an isotope-transfer proposal.
+
+    The ordered isotope pair and per-row attempt probabilities are uniform and
+    cancel in the reverse ratio.  Group size is uniform over every feasible
+    size, and the transferred subset is uniform over donor components.
+    """
+    donor = _positive_integer(
+        donor_cardinality,
+        name="donor_cardinality",
+        allow_zero=False,
+    )
+    receiver = _positive_integer(
+        receiver_cardinality,
+        name="receiver_cardinality",
+        allow_zero=True,
+    )
+    group = _positive_integer(
+        group_size,
+        name="group_size",
+        allow_zero=False,
+    )
+    capacity = _positive_integer(
+        maximum_sources,
+        name="maximum_sources",
+        allow_zero=False,
+    )
+    group_cap = _positive_integer(
+        maximum_group_size,
+        name="maximum_group_size",
+        allow_zero=False,
+    )
+    feasible_maximum = min(donor, capacity - receiver, group_cap)
+    if receiver > capacity or group > feasible_maximum:
+        return float("-inf")
+    return -math.log(float(feasible_maximum)) - math.log(
+        float(comb(donor, group))
+    )
+
+
+def shifted_log_strength_random_walk_log_reverse_ratio(
+    current_strengths: ArrayLike,
+    proposed_strengths: ArrayLike,
+    active_mask: ArrayLike,
+    *,
+    minimum_strength: float,
+) -> FloatArray:
+    """Return ``log q(old|new)-log q(new|old)`` for shifted-log walks.
+
+    Gaussian increments are symmetric in ``log(strength - minimum)``.  This
+    function supplies the exact change-of-variables term in physical strength
+    coordinates and is vectorized over arbitrary leading batch axes.
+    """
+    current = np.asarray(current_strengths, dtype=np.float64)
+    proposed = np.asarray(proposed_strengths, dtype=np.float64)
+    mask = np.asarray(active_mask, dtype=np.bool_)
+    if current.shape != proposed.shape or mask.shape != current.shape:
+        raise ValueError("Strength random-walk arrays must have equal shapes.")
+    if current.ndim < 1:
+        raise ValueError("Strength random-walk arrays require a source axis.")
+    minimum = float(minimum_strength)
+    current_shifted = current - minimum
+    proposed_shifted = proposed - minimum
+    valid = (
+        np.all(~mask | np.isfinite(current), axis=-1)
+        & np.all(~mask | np.isfinite(proposed), axis=-1)
+        & np.all(~mask | (current_shifted > 0.0), axis=-1)
+        & np.all(~mask | (proposed_shifted > 0.0), axis=-1)
+    )
+    terms = np.where(
+        mask,
+        np.log(np.maximum(proposed_shifted, np.finfo(np.float64).tiny))
+        - np.log(np.maximum(current_shifted, np.finfo(np.float64).tiny)),
+        0.0,
+    )
+    result = np.sum(terms, axis=-1, dtype=np.float64)
+    return np.where(valid, result, float("-inf"))
+
+
+def independence_refresh_log_acceptance_ratio(
+    *,
+    log_target_ratio: ArrayLike,
+    log_forward_proposal: ArrayLike,
+    log_reverse_proposal: ArrayLike,
+) -> FloatArray:
+    """Return an exact MH ratio for a nonconserving independence refresh.
+
+    The proposal may change cardinality, positions, and every surviving source
+    strength simultaneously. It is a density directly on the old and new
+    source coordinates rather than a deterministic strength-transfer map, so
+    its Jacobian is exactly one and no cross-source strength conservation is
+    implied.
+    """
+    target, forward, reverse = np.broadcast_arrays(
+        np.asarray(log_target_ratio, dtype=np.float64),
+        np.asarray(log_forward_proposal, dtype=np.float64),
+        np.asarray(log_reverse_proposal, dtype=np.float64),
+    )
+    if (
+        np.any(np.isnan(target))
+        or np.any(np.isnan(forward))
+        or np.any(np.isnan(reverse))
+        or np.any(np.isposinf(forward))
+        or np.any(np.isposinf(reverse))
+    ):
+        raise ValueError("Independence-refresh log densities are invalid.")
+    result = target + reverse - forward
+    return np.where(
+        np.isfinite(forward) & np.isfinite(reverse),
+        result,
+        float("-inf"),
+    ).astype(np.float64)
 
 
 def validate_cardinality_prior_policy(
@@ -45,7 +172,11 @@ def validate_cardinality_prior_policy(
             f"{sorted(CARDINALITY_PRIOR_POLICIES)}."
         )
     if (
-        normalized == TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY
+        normalized
+        in {
+            TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+            POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
+        }
         and has_explicit_probabilities
     ):
         raise ValueError(
@@ -61,6 +192,62 @@ def validate_cardinality_prior_policy(
             "structural_cardinality_prior_probs."
         )
     return normalized
+
+
+def poisson_geometric_tail_cardinality_probabilities(
+    typical_max_cardinality: int,
+    hard_max_cardinality: int,
+    expected_cardinality: float,
+    tail_ratio: float,
+) -> FloatArray:
+    """Return a Poisson prior with a thin proper tail above the usual limit.
+
+    Cardinalities through ``typical_max_cardinality`` retain their ordinary
+    Poisson mass.  Above that point the unnormalized mass decreases by the
+    fixed, pre-evaluation ratio ``tail_ratio`` at every extra source until the
+    computational hard capacity.  This keeps five sources as the normal
+    statistical boundary while avoiding a model space that makes ``K > 5``
+    impossible regardless of the observations.
+    """
+    typical = _positive_integer(
+        typical_max_cardinality,
+        name="typical_max_cardinality",
+        allow_zero=False,
+    )
+    hard = _positive_integer(
+        hard_max_cardinality,
+        name="hard_max_cardinality",
+        allow_zero=False,
+    )
+    expected = float(expected_cardinality)
+    ratio = float(tail_ratio)
+    if hard < typical:
+        raise ValueError(
+            "hard_max_cardinality cannot be smaller than the typical maximum."
+        )
+    if not np.isfinite(expected) or expected <= 0.0:
+        raise ValueError("expected_cardinality must be finite and positive.")
+    if not np.isfinite(ratio) or not 0.0 < ratio < 1.0:
+        raise ValueError("tail_ratio must lie strictly between zero and one.")
+    support = np.arange(hard + 1, dtype=np.float64)
+    log_mass = np.empty(hard + 1, dtype=np.float64)
+    ordinary = support[: typical + 1]
+    log_mass[: typical + 1] = (
+        ordinary * math.log(expected)
+        - np.asarray(
+            [math.lgamma(float(value) + 1.0) for value in ordinary],
+            dtype=np.float64,
+        )
+    )
+    if hard > typical:
+        tail_steps = np.arange(1, hard - typical + 1, dtype=np.float64)
+        log_mass[typical + 1 :] = (
+            log_mass[typical] + tail_steps * math.log(ratio)
+        )
+    log_mass -= float(np.max(log_mass))
+    probabilities = np.exp(log_mass)
+    probabilities /= float(np.sum(probabilities, dtype=np.float64))
+    return np.asarray(probabilities, dtype=np.float64)
 
 
 def bounded_simplex_probability(
@@ -85,15 +272,19 @@ def bounded_simplex_probability(
     if (
         np.any(~np.isfinite(total))
         or not np.isfinite(minimum)
-        or not np.isfinite(maximum)
+        or np.isnan(maximum)
         or minimum < 0.0
         or maximum <= minimum
     ):
         raise ValueError("Bounded-simplex inputs are invalid.")
     safe_total = np.maximum(total, np.finfo(np.float64).tiny)
     lower = minimum / safe_total
-    upper = maximum / safe_total
     residual = 1.0 - float(size) * lower
+    if np.isposinf(maximum):
+        feasible = total > size * minimum
+        probability = np.power(np.maximum(residual, 0.0), size - 1)
+        return np.where(feasible, np.clip(probability, 0.0, 1.0), 0.0)
+    upper = maximum / safe_total
     width = upper - lower
     probability = np.zeros_like(total, dtype=np.float64)
     for subset_size in range(size + 1):
@@ -334,7 +525,7 @@ class ContinuousSurfacePositionProposal:
 class ContinuousStrengthProposal:
     """Represent a chart-conditional full-support birth-strength proposal.
 
-    The proposal mixes the bounded-uniform physical prior with a truncated
+    The proposal mixes the configured proper physical prior with a truncated
     normal centered on a sweep-fixed full-spectrum residual estimate for each
     surface chart.  Both sampling and density evaluation use the same
     normalized mixture, so birth and reverse-death ratios remain exact.
@@ -346,6 +537,10 @@ class ContinuousStrengthProposal:
     data_sigma: float
     prior_component_probability: float = 0.5
     data_informative: bool = True
+    prior_family: str = "bounded_uniform"
+    prior_gamma_shape: float = 2.0
+    prior_gamma_scale: float = 1.0
+    _prior: StrengthPrior = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Validate and freeze the chart-conditional proposal parameters."""
@@ -358,19 +553,18 @@ class ContinuousStrengthProposal:
             dtype=np.float64,
             copy=True,
         ).reshape(-1)
-        if (
-            not np.isfinite(minimum)
-            or not np.isfinite(maximum)
-            or maximum <= minimum
-        ):
-            raise ValueError(
-                "Strength-proposal bounds must be finite and increasing."
-            )
+        prior = StrengthPrior(
+            minimum=minimum,
+            maximum=maximum,
+            family=self.prior_family,
+            gamma_shape=self.prior_gamma_shape,
+            gamma_scale=self.prior_gamma_scale,
+        )
         if (
             locations.size == 0
             or np.any(~np.isfinite(locations))
             or np.any(locations < minimum)
-            or np.any(locations > maximum)
+            or np.any(locations > prior.support_maximum)
         ):
             raise ValueError(
                 "Every strength-proposal location must lie inside support."
@@ -395,6 +589,10 @@ class ContinuousStrengthProposal:
             prior_probability,
         )
         object.__setattr__(self, "data_locations_by_chart", locations)
+        object.__setattr__(self, "prior_family", prior.family)
+        object.__setattr__(self, "prior_gamma_shape", prior.gamma_shape)
+        object.__setattr__(self, "prior_gamma_scale", prior.gamma_scale)
+        object.__setattr__(self, "_prior", prior)
         object.__setattr__(
             self,
             "data_informative",
@@ -432,38 +630,38 @@ class ContinuousStrengthProposal:
         in_support = (
             np.isfinite(values)
             & (values >= self.minimum)
-            & (values <= self.maximum)
+            & (values <= self._prior.support_maximum)
         )
-        prior_density = 1.0 / (self.maximum - self.minimum)
+        prior_log_density = np.asarray(
+            self._prior.log_prob(values),
+            dtype=np.float64,
+        )
         if (
             not self.data_informative
             or self.prior_component_probability >= 1.0
         ):
-            return np.where(
-                in_support,
-                math.log(prior_density),
-                float("-inf"),
-            ).astype(np.float64)
+            return np.where(in_support, prior_log_density, float("-inf"))
         locations = np.asarray(self.data_locations_by_chart)[ids]
         lower_z = (self.minimum - locations) / self.data_sigma
-        upper_z = (self.maximum - locations) / self.data_sigma
+        upper_z = (
+            (self.maximum - locations) / self.data_sigma
+            if self._prior.family == "bounded_uniform"
+            else np.full_like(locations, np.inf)
+        )
         normalization = ndtr(upper_z) - ndtr(lower_z)
         standardized = (values - locations) / self.data_sigma
-        data_density = (
-            np.exp(-0.5 * standardized**2)
-            / (
-                math.sqrt(2.0 * math.pi)
-                * self.data_sigma
-                * normalization
-            )
+        data_log_density = (
+            -0.5 * standardized**2
+            - math.log(math.sqrt(2.0 * math.pi) * self.data_sigma)
+            - np.log(normalization)
         )
-        mixture_density = (
-            self.prior_component_probability * prior_density
-            + (1.0 - self.prior_component_probability) * data_density
+        mixture_log_density = np.logaddexp(
+            math.log(self.prior_component_probability) + prior_log_density,
+            math.log1p(-self.prior_component_probability) + data_log_density,
         )
         return np.where(
             in_support,
-            np.log(mixture_density),
+            mixture_log_density,
             float("-inf"),
         ).astype(np.float64)
 
@@ -479,10 +677,9 @@ class ContinuousStrengthProposal:
                 "Strength-proposal sampling requires a NumPy Generator."
             )
         ids = self._validated_chart_ids(chart_ids)
-        result = rng.uniform(
-            self.minimum,
-            self.maximum,
-            size=ids.shape,
+        result = np.asarray(
+            self._prior.sample(ids.shape, rng=rng),
+            dtype=np.float64,
         )
         if (
             not self.data_informative
@@ -498,9 +695,12 @@ class ContinuousStrengthProposal:
         lower_cdf = ndtr(
             (self.minimum - locations) / self.data_sigma
         )
-        upper_cdf = ndtr(
-            (self.maximum - locations) / self.data_sigma
-        )
+        if self._prior.family == "bounded_uniform":
+            upper_cdf = ndtr(
+                (self.maximum - locations) / self.data_sigma
+            )
+        else:
+            upper_cdf = np.ones_like(locations, dtype=np.float64)
         uniforms = lower_cdf + rng.random(locations.shape) * (
             upper_cdf - lower_cdf
         )
@@ -509,11 +709,10 @@ class ContinuousStrengthProposal:
         result[use_data] = (
             locations + self.data_sigma * ndtri(uniforms)
         )
-        return np.clip(
-            np.asarray(result, dtype=np.float64),
-            self.minimum,
-            self.maximum,
-        )
+        result = np.maximum(np.asarray(result, dtype=np.float64), self.minimum)
+        if self._prior.family == "bounded_uniform":
+            result = np.minimum(result, self.maximum)
+        return result
 
 
 def truncated_poisson_cardinality_probabilities(
@@ -1300,7 +1499,7 @@ def split_fraction_bounds(
     maximum = float(maximum_strength)
     if (
         not np.isfinite(minimum)
-        or not np.isfinite(maximum)
+        or np.isnan(maximum)
         or minimum < 0.0
         or maximum <= minimum
     ):

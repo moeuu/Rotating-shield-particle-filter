@@ -84,6 +84,22 @@ The initial distribution is the independent product of each isotope's
 predeclared cardinality, surface-area, and strength priors. All isotope
 containers share one outer weight and one resampling ancestry.
 
+The strict profile uses a shifted-Gamma source-strength prior.  Its support is
+`[300 kcps, infinity)`, so a physically supported multi-merge cannot be rejected
+only because the combined source exceeds the former 2 Mcps ceiling.  The Gamma
+shape and scale are predeclared physical-prior parameters, not fitted to a
+replay.  Finite strength grids are proposal design points only and never truncate
+the PF state space.
+
+Same-isotope pair and multi-component split/merge kernels remain reversible.
+Multi-merge anchor selection mixes frozen data-informed evidence with a positive
+uniform component, and the complete normalized selector is included in the RJ
+ratio.  A separate all-isotope strength block changes every active strength in
+one batched likelihood evaluation.  It imposes no conservation law between
+isotopes: simultaneous increases and decreases are merely proposals judged by
+the shared mixed-spectrum posterior.  Isotope-identity transfer is diagnostic
+and disabled in the strict profile by default.
+
 The standard cardinality policy is
 `independent_truncated_poisson_surface_source_count_v1`: independently for
 each isotope, a Poisson source-count prior with predeclared mean 2.0 is
@@ -112,9 +128,17 @@ kernel includes:
 - exact birth/death cardinality, position, strength, move-direction, and
   Jacobian terms;
 - continuous local surface moves;
-- bounded-strength MH moves;
-- exact split/merge strength-transfer transforms; and
-- joint death plus strength transfer where admissible.
+- proper shifted-Gamma strength moves without an artificial upper bound;
+- exact pair and multi-component split/merge moves that jointly refresh
+  cardinality, continuous positions, and all surviving strengths without
+  imposing a false strength-conservation law; and
+- an exact joint isotope-state block whose isotope priors remain independent
+  while the shared full-spectrum likelihood decides one simultaneous move.
+
+The ordinary cardinality model is defined through `K=5`. A proper geometric
+tail gives `K=6..8` nonzero support so `K=5` is not an artificial absorbing
+boundary; `K=8` is the explicit memory/capacity limit. The standard tail ratio
+is fixed before evaluation and is not changed in response to a run.
 
 Proposal scoring may use observations to improve mixing, but it does not alter
 the target likelihood and every non-prior proposal density appears in the MH/RJ
@@ -122,8 +146,10 @@ ratio. Accepted rejuvenation moves leave outer particle weights unchanged.
 
 Diagnostics report the current ESS after all applied likelihood, the number of
 surviving station-start ancestors, and attempted/accepted posterior weight mass
-for every structural move. Counts of unweighted moved particles are retained
-only as secondary diagnostics.
+for every structural move. Rejections also retain quantiles of the likelihood,
+prior, reverse-minus-forward proposal, Jacobian, support, nonfinite, and MH
+random terms. Counts of unweighted moved particles are retained only as
+secondary diagnostics.
 
 ## Posterior reporting and stopping
 
@@ -175,3 +201,8 @@ contract mismatch, and executes the same joint SMC/RJ path as live runtime.
 Legacy logs with a different energy axis or fitted-count contract may be used
 only by an explicitly labelled read-only diagnostic; they cannot produce an
 accepted production posterior.
+
+`scripts/run_pf_causal_replay_matrix.py` runs predeclared prior/proposal cases
+against immutable raw logs in fresh sequential processes. It is a diagnosis
+tool only: it does not fit parameters, modify observations, or constitute
+independent acceptance evidence.

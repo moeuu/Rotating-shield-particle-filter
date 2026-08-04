@@ -22,6 +22,7 @@ from measurement.source_boundary import (
 )
 from measurement.source_surfaces import (
     generate_surface_sources,
+    same_isotope_min_distance_m,
     validate_area_uniform_source_config,
 )
 from measurement.surface_charts import (
@@ -50,6 +51,7 @@ DEFAULT_PF_CONFIG = ROOT / "configs" / "pf" / "pf_strict_3d.json"
 DEFAULT_OUTPUT_DIR = ROOT / "results" / "ral_ablation"
 DEFAULT_MEASUREMENT_LOG_ROOT = Path("results") / "ral_ablation" / "measurement_logs"
 DEFAULT_ISOTOPES = ("Cs-137", "Co-60", "Eu-154")
+DEFAULT_RAL_PASSAGE_WIDTH_M = 2.0
 TRUTH_SURFACE_SOURCE_RNG_DOMAIN = "truth_surface_sources"
 MAX_FRESH_ABLATION_SEED = (1 << 48) - 18
 
@@ -384,7 +386,7 @@ def _case_isotope_count_metadata(case: AblationCase) -> dict[str, int]:
 
 
 def _source_generation_options(base_config: Mapping[str, Any]) -> dict[str, Any]:
-    """Return physical geometry options for area-uniform truth generation."""
+    """Return physical options for conditioned area-uniform truth generation."""
     validate_area_uniform_source_config(base_config)
     return {
         "obstacle_height_m": _finite_json_number(
@@ -406,6 +408,9 @@ def _source_generation_options(base_config: Mapping[str, Any]) -> dict[str, Any]
             field_name="structural_rj_surface_chart_max_edge_m",
             strictly_positive=True,
         ),
+        "random_source_same_isotope_min_distance_m": (
+            same_isotope_min_distance_m(base_config)
+        ),
     }
 
 
@@ -416,6 +421,7 @@ def _case_source_layout(
     source_seed: int,
     seed_policy: str,
     intensity_cps_1m: float | Sequence[float],
+    passage_width_m: float = DEFAULT_RAL_PASSAGE_WIDTH_M,
     source_generation_options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate a surface-constrained source layout for one case and seed."""
@@ -434,7 +440,11 @@ def _case_source_layout(
         blocked_fraction=0.4,
         rng_seed=obstacle_seed,
         keep_free_points=[(env.detector_position[0], env.detector_position[1])],
-        passage_width_m=1.0,
+        passage_width_m=_finite_json_number(
+            passage_width_m,
+            field_name="passage_width_m",
+            strictly_positive=True,
+        ),
     )
     rng = named_random_generator(
         _json_integer(source_seed, field_name="source_seed", minimum=0),
@@ -465,6 +475,11 @@ def _case_source_layout(
         field_name="structural_rj_surface_chart_max_edge_m",
         strictly_positive=True,
     )
+    minimum_same_isotope_distance_m = _finite_json_number(
+        options.get("random_source_same_isotope_min_distance_m", 0.0),
+        field_name="random_source_same_isotope_min_distance_m",
+        minimum=0.0,
+    )
     _intensity_sampling_metadata(intensity_cps_1m)
     grid, _ = attach_random_manchester_transport_geometry(
         grid,
@@ -484,6 +499,7 @@ def _case_source_layout(
         count=case.source_count,
         obstacle_height_m=obstacle_height_m,
         chart_max_edge_m=chart_max_edge_m,
+        same_isotope_min_distance_m=minimum_same_isotope_distance_m,
     )
     surface_geometry = build_surface_chart_geometry(
         env,
@@ -534,12 +550,19 @@ def _case_source_layout(
                 TRUTH_SURFACE_SOURCE_RNG_DOMAIN,
             ),
             "obstacle_seed": obstacle_seed,
-            "source_surface_sampling_schema_version": 3,
-            "sampling": "continuous area-uniform physical-surface placement",
+            "source_surface_sampling_schema_version": 4,
+            "sampling": (
+                "continuous area-uniform physical-surface placement "
+                "conditioned on same-isotope Euclidean separation"
+            ),
             "sampling_measure": "continuous_area_uniform",
             "surface_geometry": "runtime_transport_component_union",
-            "selection_conditioning": "none_physical_area_only",
+            "selection_conditioning": "same_isotope_euclidean_hard_core",
+            "same_isotope_min_euclidean_distance_m": (
+                minimum_same_isotope_distance_m
+            ),
             "obstacle_height_m": obstacle_height_m,
+            "passage_width_m": float(passage_width_m),
             "surface_chart_max_edge_m": chart_max_edge_m,
             "surface_atlas_contract_sha256": surface_atlas_sha256,
             "surface_emission_policy_sha256": (
@@ -760,6 +783,7 @@ def build_ablation_plan(
                 source_seed=source_seed,
                 seed_policy=seed_policy,
                 intensity_cps_1m=intensity_cps_1m,
+                passage_width_m=DEFAULT_RAL_PASSAGE_WIDTH_M,
                 source_generation_options=source_options,
             )
             source_path = source_dir / f"{case.name}_seed_{seed}.json"
@@ -783,6 +807,7 @@ def build_ablation_plan(
                     config_path=config_path,
                     source_path=source_path,
                     obstacle_seed=seed,
+                    passage_width_m=DEFAULT_RAL_PASSAGE_WIDTH_M,
                     output_tag=tag,
                     extra_args=variant.cli_args,
                 )
@@ -806,6 +831,7 @@ def _trial_command(
     config_path: Path,
     source_path: Path,
     obstacle_seed: int,
+    passage_width_m: float,
     output_tag: str,
     extra_args: Iterable[str] = (),
 ) -> tuple[str, ...]:
@@ -822,6 +848,8 @@ def _trial_command(
         "random",
         "--obstacle-seed",
         str(_json_integer(obstacle_seed, field_name="obstacle_seed", minimum=0)),
+        "--passage-width-m",
+        f"{_finite_json_number(passage_width_m, field_name='passage_width_m', strictly_positive=True):g}",
         "--source-config",
         source_path.as_posix(),
         "--measurement-time-s",

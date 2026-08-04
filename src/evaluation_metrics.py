@@ -381,6 +381,195 @@ def _pairwise_surface_path_distances(
     return distances
 
 
+def compute_truth_proximity_operational_metrics(
+    gt_by_iso: Dict[str, List[Any]],
+    est_by_iso: Dict[str, List[Any]],
+    *,
+    distance_thresholds_m: Sequence[float] = (0.5, 1.0, 1.5, 2.0),
+    surface_atlas: ContinuousSurfaceAtlas | None = None,
+) -> Dict[str, Any]:
+    """Aggregate evaluation-only split components around isotope truth.
+
+    Every estimate is assigned to its nearest same-isotope truth when the
+    configured radius admits it.  Multiple estimates may therefore contribute
+    to one truth strength.  Estimates outside the radius remain explicit remote
+    unmatched components.  Truth is never exposed to PF inference or planning.
+    """
+    thresholds = tuple(
+        _non_negative_finite(value, name="operational distance threshold")
+        for value in distance_thresholds_m
+    )
+    if len(set(thresholds)) != len(thresholds):
+        raise ValueError("Operational distance thresholds must be unique.")
+    isotopes = sorted(set(gt_by_iso) | set(est_by_iso))
+    threshold_rows: List[Dict[str, Any]] = []
+    for threshold in thresholds:
+        isotope_rows: Dict[str, Dict[str, Any]] = {}
+        total_estimated_strength = 0.0
+        total_remote_strength = 0.0
+        total_truth_count = 0
+        total_covered_truth_count = 0
+        total_raw_estimate_count = 0
+        total_remote_estimate_count = 0
+        for isotope in isotopes:
+            truth = _normalize_sources(gt_by_iso.get(isotope, []))
+            estimate = _normalize_sources(est_by_iso.get(isotope, []))
+            distances = (
+                _pairwise_distances(truth, estimate)
+                if surface_atlas is None
+                else _pairwise_surface_path_distances(
+                    truth,
+                    estimate,
+                    surface_atlas,
+                )
+            )
+            assignments: List[List[int]] = [[] for _ in truth]
+            nearest_truth_indices = np.full(len(estimate), -1, dtype=np.int64)
+            nearest_distances = np.full(len(estimate), np.inf, dtype=np.float64)
+            if truth and estimate:
+                nearest_truth_indices = np.argmin(distances, axis=0).astype(
+                    np.int64,
+                    copy=False,
+                )
+                nearest_distances = distances[
+                    nearest_truth_indices,
+                    np.arange(len(estimate), dtype=np.int64),
+                ]
+                for estimate_index in np.flatnonzero(
+                    np.isfinite(nearest_distances)
+                    & (nearest_distances <= threshold)
+                ):
+                    assignments[int(nearest_truth_indices[estimate_index])].append(
+                        int(estimate_index)
+                    )
+            truth_rows: List[Dict[str, Any]] = []
+            covered_truth_count = 0
+            assigned_estimate_indices: set[int] = set()
+            for truth_index, estimate_indices in enumerate(assignments):
+                assigned_estimate_indices.update(estimate_indices)
+                estimated_strength = float(
+                    np.sum(
+                        [estimate[index].strength for index in estimate_indices],
+                        dtype=np.float64,
+                    )
+                )
+                truth_strength = float(truth[truth_index].strength)
+                covered = bool(estimate_indices)
+                covered_truth_count += int(covered)
+                truth_rows.append(
+                    {
+                        "truth_index": int(truth_index),
+                        "truth_position_xyz_m": [
+                            float(value) for value in truth[truth_index].pos
+                        ],
+                        "truth_strength_cps_1m": truth_strength,
+                        "assigned_estimate_indices": estimate_indices,
+                        "assigned_estimate_count": len(estimate_indices),
+                        "combined_estimated_strength_cps_1m": estimated_strength,
+                        "combined_strength_bias_cps_1m": (
+                            estimated_strength - truth_strength
+                        ),
+                        "combined_relative_strength_bias": (
+                            (estimated_strength - truth_strength) / truth_strength
+                            if truth_strength > 0.0
+                            else None
+                        ),
+                        "covered": covered,
+                    }
+                )
+            remote_rows: List[Dict[str, Any]] = []
+            for estimate_index, source in enumerate(estimate):
+                if estimate_index in assigned_estimate_indices:
+                    continue
+                nearest_index = int(nearest_truth_indices[estimate_index])
+                nearest_distance = float(nearest_distances[estimate_index])
+                remote_rows.append(
+                    {
+                        "estimate_index": int(estimate_index),
+                        "position_xyz_m": [float(value) for value in source.pos],
+                        "strength_cps_1m": float(source.strength),
+                        "nearest_truth_index": (
+                            nearest_index if nearest_index >= 0 else None
+                        ),
+                        "nearest_truth_distance_m": (
+                            nearest_distance
+                            if np.isfinite(nearest_distance)
+                            else None
+                        ),
+                    }
+                )
+            estimated_total = float(
+                np.sum([source.strength for source in estimate], dtype=np.float64)
+            )
+            remote_strength = float(
+                np.sum(
+                    [row["strength_cps_1m"] for row in remote_rows],
+                    dtype=np.float64,
+                )
+            )
+            isotope_rows[isotope] = {
+                "raw_truth_count": len(truth),
+                "raw_estimate_count": len(estimate),
+                "covered_truth_count": covered_truth_count,
+                "remote_unmatched_estimate_count": len(remote_rows),
+                "operational_effective_estimate_count": (
+                    covered_truth_count + len(remote_rows)
+                ),
+                "total_estimated_strength_cps_1m": estimated_total,
+                "remote_unmatched_strength_cps_1m": remote_strength,
+                "remote_unmatched_strength_ratio": (
+                    remote_strength / estimated_total
+                    if estimated_total > 0.0
+                    else 0.0
+                ),
+                "truth_aggregates": truth_rows,
+                "remote_unmatched_estimates": remote_rows,
+            }
+            total_estimated_strength += estimated_total
+            total_remote_strength += remote_strength
+            total_truth_count += len(truth)
+            total_covered_truth_count += covered_truth_count
+            total_raw_estimate_count += len(estimate)
+            total_remote_estimate_count += len(remote_rows)
+        threshold_rows.append(
+            {
+                "distance_threshold_m": threshold,
+                "distance_semantics": (
+                    "intrinsic_surface_path_upper_bound_m"
+                    if surface_atlas is not None
+                    else "euclidean_3d_m"
+                ),
+                "global": {
+                    "raw_truth_count": total_truth_count,
+                    "raw_estimate_count": total_raw_estimate_count,
+                    "covered_truth_count": total_covered_truth_count,
+                    "remote_unmatched_estimate_count": (
+                        total_remote_estimate_count
+                    ),
+                    "operational_effective_estimate_count": (
+                        total_covered_truth_count + total_remote_estimate_count
+                    ),
+                    "total_estimated_strength_cps_1m": total_estimated_strength,
+                    "remote_unmatched_strength_cps_1m": total_remote_strength,
+                    "remote_unmatched_strength_ratio": (
+                        total_remote_strength / total_estimated_strength
+                        if total_estimated_strength > 0.0
+                        else 0.0
+                    ),
+                },
+                "isotopes": isotope_rows,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "role": "truth_aware_operational_evaluation_only",
+        "changes_pf_state_or_cardinality": False,
+        "truth_available_to_inference_or_planning": False,
+        "assignment": "many_estimates_to_nearest_same_isotope_truth",
+        "thresholds": threshold_rows,
+    }
+
+
 def _hungarian_assignment(cost: NDArray[np.float64]) -> List[Tuple[int, int]]:
     """Return deterministic minimal-cost Hungarian assignment pairs."""
     if cost.size == 0:
@@ -2024,6 +2213,14 @@ def compute_metrics(
         },
         "global": global_summary,
         "isotopes": metrics,
+        "operational_truth_proximity": (
+            compute_truth_proximity_operational_metrics(
+                gt_by_iso,
+                est_by_iso,
+                distance_thresholds_m=(0.5, 1.0, 1.5, 2.0),
+                surface_atlas=surface_atlas,
+            )
+        ),
     }
 
 

@@ -105,13 +105,14 @@ def load_online_runtime_configs(
     pf_config_path: str | Path | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load physical config and overlay it on PF-owned estimator defaults."""
-    physical_config = load_runtime_config(sim_config_path)
+    combined_config = load_runtime_config(sim_config_path)
+    physical_config = estimator_neutral_physical_runtime_config(combined_config)
     estimator_defaults = (
         {}
         if pf_config_path is None
         else load_runtime_config(pf_config_path)
     )
-    merged = _deep_merge_runtime_config(estimator_defaults, physical_config)
+    merged = _deep_merge_runtime_config(estimator_defaults, combined_config)
     return physical_config, enforce_pure_runtime_settings(merged)
 
 
@@ -595,6 +596,7 @@ from measurement.source_boundary import (
 from measurement.source_surfaces import (
     SOURCE_SURFACE_REPORT_LABELS,
     generate_surface_sources,
+    same_isotope_min_distance_m,
     source_surface_kinds,
     validate_area_uniform_source_config,
 )
@@ -603,10 +605,7 @@ from measurement.surface_charts import (
     build_surface_chart_geometry,
     surface_chart_geometry_sha256,
 )
-from measurement.shielding import (
-    generate_octant_orientations,
-    generate_octant_rotation_matrices,
-)
+from measurement.shielding import generate_octant_orientations
 from spectrum.library import default_library, get_detection_lines_keV
 from spectrum.transport_spectral import (
     GeometryConditionedSpectralModel,
@@ -630,6 +629,7 @@ from pf.randomness import (
     pf_rng_provenance,
 )
 from pf.replay import build_replay_estimator, replay_records
+from pf.strength_prior import StrengthPrior
 from measurement.surface_atlas import ContinuousSurfaceAtlas
 from planning.candidate_generation import generate_candidate_poses
 from planning.dss_pp import DSSPPConfig, select_dss_pp_next_station
@@ -691,7 +691,10 @@ from runtime.measurement_log import (
 )
 from runtime.assets import simulation_runtime_root
 from runtime.provenance import repository_commit as simulation_repository_commit
-from runtime.session import estimator_neutral_runtime_config
+from runtime.session import (
+    estimator_neutral_physical_runtime_config,
+    estimator_neutral_runtime_config,
+)
 
 
 _RESUME_ORCHESTRATION_CODE_PATHS: frozenset[str] = frozenset()
@@ -1475,12 +1478,8 @@ def _validate_provided_surface_source_contract(
         raw_schema,
         name="source_surface_sampling_schema_version",
         minimum=3,
-        maximum=3,
+        maximum=4,
     )
-    if schema != 3:
-        raise ValueError(
-            "Area-uniform source files must use surface sampling schema 3."
-        )
     required = {
         "obstacle_seed",
         "sampling_measure",
@@ -1500,9 +1499,32 @@ def _validate_provided_surface_source_contract(
         raise ValueError(
             "Area-uniform source metadata has the wrong sampling measure."
         )
-    if declared["selection_conditioning"] != "none_physical_area_only":
-        raise ValueError(
-            "Area-uniform source metadata must not declare truth selection."
+    minimum_same_isotope_distance_m = 0.0
+    if schema == 3:
+        if declared["selection_conditioning"] != "none_physical_area_only":
+            raise ValueError(
+                "Area-uniform source schema 3 must not declare truth "
+                "selection."
+            )
+    else:
+        if (
+            declared["selection_conditioning"]
+            != "same_isotope_euclidean_hard_core"
+        ):
+            raise ValueError(
+                "Area-uniform source schema 4 must declare the "
+                "same-isotope Euclidean hard-core contract."
+            )
+        if "same_isotope_min_euclidean_distance_m" not in declared:
+            raise ValueError(
+                "Area-uniform source schema 4 is missing its same-isotope "
+                "minimum Euclidean distance."
+            )
+        minimum_same_isotope_distance_m = _strict_json_number(
+            declared["same_isotope_min_euclidean_distance_m"],
+            name="source metadata same_isotope_min_euclidean_distance_m",
+            minimum=0.0,
+            minimum_exclusive=True,
         )
     declared_obstacle_seed = _strict_json_integer(
         declared["obstacle_seed"],
@@ -1556,13 +1578,13 @@ def _validate_provided_surface_source_contract(
         )
     if any(source.surface_chart_id is None for source in sources):
         raise ValueError(
-            "Area-uniform source schema 3 requires authoritative chart/UV "
+            "Area-uniform source schemas 3 and 4 require authoritative chart/UV "
             "metadata for every source."
         )
     payloads = [_source_runtime_payload(source) for source in sources]
     if any(set(payload) != SURFACE_SOURCE_RUNTIME_KEYS for payload in payloads):
         raise ValueError(
-            "Area-uniform source schema 3 contains an incomplete source entry."
+            "Area-uniform source file contains an incomplete source entry."
         )
     declared_source_contract = _sha256(
         declared["surface_source_runtime_contract_sha256"],
@@ -1576,6 +1598,31 @@ def _validate_provided_surface_source_contract(
             "Provided area-uniform source entries differ from their declared "
             "runtime contract."
         )
+    if schema == 4:
+        positions = np.asarray(
+            [source.position for source in sources],
+            dtype=float,
+        ).reshape(-1, 3)
+        isotopes = np.asarray(
+            [str(source.isotope) for source in sources],
+            dtype=str,
+        )
+        left, right = np.triu_indices(len(sources), k=1)
+        same = isotopes[left] == isotopes[right]
+        if np.any(same):
+            pair_distances = np.linalg.norm(
+                positions[left[same]] - positions[right[same]],
+                axis=1,
+            )
+            tolerance_m = 1.0e-9
+            if np.any(
+                pair_distances
+                < minimum_same_isotope_distance_m - tolerance_m
+            ):
+                raise ValueError(
+                    "Provided source layout violates its declared "
+                    "same-isotope Euclidean hard-core distance."
+                )
 
 
 def _validate_truth_within_pf_state_support(
@@ -1597,12 +1644,17 @@ def _validate_truth_within_pf_state_support(
         name="strength_prior_min_cps_1m",
         minimum=0.0,
     )
-    maximum_strength = _strict_json_number(
-        strength_prior_max_cps_1m,
-        name="strength_prior_max_cps_1m",
-        minimum=minimum_strength,
-        minimum_exclusive=True,
-    )
+    maximum_strength = float(strength_prior_max_cps_1m)
+    if not (
+        np.isposinf(maximum_strength)
+        or (
+            np.isfinite(maximum_strength)
+            and maximum_strength > minimum_strength
+        )
+    ):
+        raise ValueError(
+            "strength_prior_max_cps_1m must exceed the minimum or be +inf."
+        )
 
     isotope_support = {str(name) for name in candidate_isotopes}
     cardinality_by_isotope = Counter(str(source.isotope) for source in sources)
@@ -5563,6 +5615,9 @@ def run_live_pf(
     obstacle_grid = obstacle_environment.grid
     normalized_environment_mode = obstacle_environment.mode
     known_obstacle_instances = obstacle_environment.known_obstacle_instances
+    full_spectrum_model.require_environment_applicable(
+        {"geometry_family": obstacle_environment.geometry_family}
+    )
     measurement_log_obstacle_layout_path = _measurement_log_obstacle_layout_path(
         obstacle_environment,
         repository_root=SIMULATION_RUNTIME_ROOT,
@@ -5586,6 +5641,9 @@ def run_live_pf(
         source_sampling_metadata.update(provided_source_provenance)
     if normalized_source_generation_mode == "surface_random":
         source_surface_sampling_measure = validate_area_uniform_source_config(
+            runtime_config
+        )
+        minimum_same_isotope_distance_m = same_isotope_min_distance_m(
             runtime_config
         )
         source_rng_root_seed = (
@@ -5663,12 +5721,21 @@ def run_live_pf(
         print(
             "Random source surface sampling: "
             f"measure={source_surface_sampling_measure}, "
-            "selection_conditioning=none_physical_area_only"
+            "selection_conditioning=same_isotope_euclidean_hard_core, "
+            "same_isotope_min_euclidean_distance_m="
+            f"{minimum_same_isotope_distance_m:.6g}"
         )
         source_sampling_metadata = {
             "mode": normalized_source_generation_mode,
             "measure": source_surface_sampling_measure,
-            "selection_conditioning": "none_physical_area_only",
+            "selection_conditioning": (
+                "same_isotope_euclidean_hard_core"
+                if minimum_same_isotope_distance_m > 0.0
+                else "none_physical_area_only"
+            ),
+            "same_isotope_min_euclidean_distance_m": (
+                minimum_same_isotope_distance_m
+            ),
             "rng_provenance": source_rng_provenance,
         }
         if (
@@ -5698,6 +5765,9 @@ def run_live_pf(
                 minimum=0.0,
                 minimum_exclusive=True,
             ),
+            same_isotope_min_distance_m=(
+                minimum_same_isotope_distance_m
+            ),
         )
         print(
             "Generated continuous area-uniform surface sources: "
@@ -5711,8 +5781,7 @@ def run_live_pf(
     elif sources is None:
         sources = _build_demo_sources()
     normals = generate_octant_orientations()
-    rot_mats = generate_octant_rotation_matrices()
-    num_orients = len(rot_mats)
+    num_orients = len(normals)
     if save_outputs:
         PF_DIR.mkdir(parents=True, exist_ok=True)
     output_suffix = ""
@@ -5761,6 +5830,19 @@ def run_live_pf(
         runtime_config,
         save_outputs=save_outputs,
     )
+    cui_truth_display_mode = _strict_json_string(
+        runtime_config.get("cui_truth_display_mode", "post_run"),
+        name="cui_truth_display_mode",
+    ).lower()
+    if cui_truth_display_mode not in {
+        "hidden",
+        "evaluation_live",
+        "post_run",
+    }:
+        raise ValueError(
+            "cui_truth_display_mode must be hidden, evaluation_live, or "
+            "post_run."
+        )
     cui_split_view_dir_raw = runtime_config.get(
         "cui_split_view_dir",
         DEFAULT_CUI_SPLIT_VIEW_DIR,
@@ -6771,6 +6853,27 @@ def run_live_pf(
         init_num_sources=init_num_sources,
         strength_prior_min_cps_1m=strength_prior_minimum,
         strength_prior_max_cps_1m=strength_prior_maximum,
+        strength_prior_family=_strict_json_string(
+            runtime_config.get(
+                "pf_strength_prior_family",
+                "bounded_uniform",
+            ),
+            name="pf_strength_prior_family",
+        ),
+        strength_prior_gamma_shape=_strict_json_number(
+            runtime_config.get("pf_strength_prior_gamma_shape", 2.0),
+            name="pf_strength_prior_gamma_shape",
+            minimum=1.0,
+        ),
+        strength_prior_gamma_scale_cps_1m=_strict_json_number(
+            runtime_config.get(
+                "pf_strength_prior_gamma_scale_cps_1m",
+                425_000.0,
+            ),
+            name="pf_strength_prior_gamma_scale_cps_1m",
+            minimum=0.0,
+            minimum_exclusive=True,
+        ),
         history_estimate_interval=_strict_json_integer(
             runtime_config.get("history_estimate_interval", 1),
             name="history_estimate_interval",
@@ -6872,6 +6975,37 @@ def run_live_pf(
             maximum=1.0,
             minimum_exclusive=True,
         )
+    )
+    pf_conf.joint_strength_block_probability = _strict_json_number(
+        runtime_config.get("joint_strength_block_probability", 0.0),
+        name="joint_strength_block_probability",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    pf_conf.joint_strength_block_log_sigma = _strict_json_number(
+        runtime_config.get("joint_strength_block_log_sigma", 0.15),
+        name="joint_strength_block_log_sigma",
+        minimum=0.0,
+        minimum_exclusive=True,
+    )
+    pf_conf.joint_strength_block_batch_size = _strict_json_integer(
+        runtime_config.get("joint_strength_block_batch_size", 128),
+        name="joint_strength_block_batch_size",
+        minimum=1,
+    )
+    pf_conf.joint_cross_isotope_transfer_probability = _strict_json_number(
+        runtime_config.get(
+            "joint_cross_isotope_transfer_probability",
+            0.0,
+        ),
+        name="joint_cross_isotope_transfer_probability",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    pf_conf.joint_cross_isotope_transfer_max_group = _strict_json_integer(
+        runtime_config.get("joint_cross_isotope_transfer_max_group", 3),
+        name="joint_cross_isotope_transfer_max_group",
+        minimum=1,
     )
     pf_conf.credible_surface_radius_threshold_m = _strict_json_number(
         runtime_config.get("credible_surface_radius_threshold_m", 0.5),
@@ -6986,9 +7120,13 @@ def run_live_pf(
         strength_prior_min_cps_1m=float(
             pf_conf.strength_prior_min_cps_1m
         ),
-        strength_prior_max_cps_1m=float(
-            pf_conf.strength_prior_max_cps_1m
-        ),
+        strength_prior_max_cps_1m=StrengthPrior(
+            minimum=pf_conf.strength_prior_min_cps_1m,
+            maximum=pf_conf.strength_prior_max_cps_1m,
+            family=pf_conf.strength_prior_family,
+            gamma_shape=pf_conf.strength_prior_gamma_shape,
+            gamma_scale=pf_conf.strength_prior_gamma_scale_cps_1m,
+        ).support_maximum,
     )
     # Runtime creation may launch an external Geant4 process.  Keep it after
     # every truth/PF support preflight so an impossible experiment never starts
@@ -7145,8 +7283,16 @@ def run_live_pf(
             isotopes=isotopes,
             output_dir=cui_split_view_dir,
             world_bounds=(0, env.size_x, 0, env.size_y, 0, env.size_z),
-            true_sources={},
-            true_strengths={},
+            true_sources=(
+                true_src
+                if cui_truth_display_mode == "evaluation_live"
+                else {}
+            ),
+            true_strengths=(
+                true_strengths
+                if cui_truth_display_mode == "evaluation_live"
+                else {}
+            ),
             obstacle_grid=obstacle_grid,
             max_particles_per_isotope=cui_split_max_particles,
         )
@@ -7330,6 +7476,12 @@ def run_live_pf(
             "obstacle_grid": (
                 None if obstacle_grid is None else obstacle_grid.to_dict()
             ),
+            "obstacle_instances": (
+                None
+                if known_obstacle_instances is None
+                else obstacle_instances_to_dicts(known_obstacle_instances)
+            ),
+            "geometry_family": obstacle_environment.geometry_family,
         }
         execution_commit = simulation_repository_commit(
             SIMULATION_RUNTIME_ROOT
@@ -7830,6 +7982,7 @@ def run_live_pf(
             "obstacle_instances": []
             if known_obstacle_instances is None
             else obstacle_instances_to_dicts(known_obstacle_instances),
+            "geometry_family": obstacle_environment.geometry_family,
             "traversability_map_path": None
             if traversability_map_path is None
             else traversability_map_path.as_posix(),
@@ -8044,8 +8197,8 @@ def run_live_pf(
                 ig_elapsed = 0.0
                 fe_idx = best_pair_idx // num_orients
                 pb_idx = best_pair_idx % num_orients
-                RFe_sel = rot_mats[fe_idx]
-                RPb_sel = rot_mats[pb_idx]
+                RFe_sel = normals[fe_idx]
+                RPb_sel = normals[pb_idx]
                 step_motion_distance_m = float(pending_motion_distance_m)
                 step_motion_time_s = float(pending_motion_time_s)
                 step_rotation_time_s = float(rotation_overhead_s)
@@ -9212,6 +9365,11 @@ def run_live_pf(
             if last_frame is not None:
                 viz.update(last_frame)
                 if cui_split_viz is not None:
+                    if cui_truth_display_mode == "post_run":
+                        cui_split_viz.set_truth(
+                            true_src,
+                            true_strengths,
+                        )
                     cui_split_viz.update(last_frame)
             post_run_viz = _build_visualizer(include_truth=True)
             if last_frame is not None:

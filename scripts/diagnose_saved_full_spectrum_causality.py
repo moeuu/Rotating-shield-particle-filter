@@ -21,6 +21,7 @@ from pf.state import IsotopeState
 from runtime.measurement_log import (
     MeasurementLog,
     MeasurementLogRecord,
+    build_forward_model_manifest,
     load_measurement_log,
 )
 from spectrum.transport_spectral import GeometryConditionedSpectralModel
@@ -30,34 +31,35 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _upgrade_diagnostic_log(log: MeasurementLog) -> MeasurementLog:
-    """Add post-run PF defaults needed only to construct today's estimator.
+    """Remove superseded model-selection fields from an embedded-model log.
 
-    These fields did not exist when the immutable run was recorded.  They do
-    not affect the physical forward model or this fixed-state likelihood
-    diagnostic, but the current replay constructor correctly requires a
-    complete contemporary dataclass schema.
+    The interrupted acquisition predated the rule that a resolved log may
+    contain either registry selection or an embedded model, but not both.  The
+    authenticated embedded model is the one identified by every observation,
+    so only the now-ambiguous selection metadata is removed in memory.
     """
     runtime = json.loads(json.dumps(dict(log.runtime_config)))
-    effective = runtime["effective_pf_replay"]
-    pf_config = effective["pf_config"]
-    pf_config.setdefault(
-        "joint_guided_initialization_prior_row_probability",
-        0.5,
+    for key in (
+        "isotope_experiment_profile",
+        "full_spectrum_model_registry_path",
+        "full_spectrum_model_registry_file_sha256",
+        "full_spectrum_profile_calibration_status",
+    ):
+        runtime.pop(key, None)
+    forward = build_forward_model_manifest(
+        runtime_config=runtime,
+        environment=log.environment,
+        obstacle_layout_path=log.run_manifest.get("obstacle_layout_path"),
+        isotopes=tuple(log.run_manifest["isotopes"]),
+        repository_commit=log.run_manifest["repository_commit"],
+        resolved_config_sha256=log.run_manifest["resolved_config_sha256"],
+        run_root=log.path,
     )
-    pf_config.setdefault(
-        "structural_rj_block_independence_probability",
-        0.1,
+    return replace(
+        log,
+        runtime_config=runtime,
+        forward_model_manifest=forward,
     )
-    pf_config.setdefault("structural_rj_merge_response_sigma", 0.05)
-    pf_config.setdefault(
-        "structural_rj_multi_component_max_group_size",
-        4,
-    )
-    pf_config.setdefault(
-        "structural_rj_multi_component_probability",
-        0.1,
-    )
-    return replace(log, runtime_config=runtime)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -65,7 +67,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--measurement-log", required=True, type=Path)
     parser.add_argument("--truth-source-config", required=True, type=Path)
-    parser.add_argument("--posterior", required=True, type=Path)
+    state_group = parser.add_mutually_exclusive_group(required=True)
+    state_group.add_argument("--posterior", type=Path)
+    state_group.add_argument("--estimate-trace", type=Path)
     parser.add_argument("--candidate-model", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args()
@@ -101,6 +105,62 @@ def _posterior_states(path: Path) -> dict[str, list[dict[str, object]]]:
                 ),
             }
             for mode in isotope_payload["modes"]
+        ]
+    return result
+
+
+def _trace_states(path: Path, estimator: Any) -> dict[str, list[dict[str, object]]]:
+    """Resolve the final saved canonical XYZ trace onto exact surface charts."""
+    final_row: Mapping[str, object] | None = None
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid estimate-trace JSON on line {line_number}."
+                ) from exc
+            if not isinstance(candidate, Mapping):
+                raise ValueError("Each estimate-trace row must be an object.")
+            final_row = candidate
+    if final_row is None:
+        raise ValueError("Estimate trace is empty.")
+    estimates = final_row.get("estimates")
+    if not isinstance(estimates, list):
+        raise ValueError("Final estimate-trace row has no estimates list.")
+    grouped: dict[str, list[Mapping[str, object]]] = {
+        isotope: [] for isotope in estimator.joint_isotope_order()
+    }
+    for estimate in estimates:
+        if not isinstance(estimate, Mapping):
+            raise ValueError("Estimate-trace entries must be objects.")
+        isotope = str(estimate.get("isotope"))
+        if isotope not in grouped:
+            raise ValueError(f"Unexpected isotope in estimate trace: {isotope}.")
+        grouped[isotope].append(estimate)
+    result: dict[str, list[dict[str, object]]] = {}
+    for isotope, isotope_estimates in grouped.items():
+        if not isotope_estimates:
+            result[isotope] = []
+            continue
+        positions = np.asarray(
+            [estimate["pos"] for estimate in isotope_estimates],
+            dtype=np.float64,
+        )
+        atlas = estimator.filters[isotope]._structural_rj_surface_atlas
+        if atlas is None:
+            raise RuntimeError("Continuous surface atlas is unavailable.")
+        chart_ids, surface_uv = atlas.locate_positions(positions)
+        result[isotope] = [
+            {
+                "surface_chart_id": int(chart_ids[index]),
+                "surface_uv": [
+                    float(surface_uv[index, 0]),
+                    float(surface_uv[index, 1]),
+                ],
+                "strength_cps_1m": float(estimate["strength"]),
+            }
+            for index, estimate in enumerate(isotope_estimates)
         ]
     return result
 
@@ -304,7 +364,12 @@ def main() -> int:
     if args.output.exists():
         raise FileExistsError(f"Refusing to replace {args.output}")
     log = _upgrade_diagnostic_log(load_measurement_log(args.measurement_log))
-    estimator = build_replay_estimator(log, {}, profile="pf_strict", seed=0)
+    estimator = build_replay_estimator(
+        log,
+        {"pure_pf_schema_version": 1, "estimator_profile": "pf_strict"},
+        profile="pf_strict",
+        seed=0,
+    )
     estimator._ensure_kernel_cache()
     estimator._configure_joint_particle_filters()
     stations = _build_stations(estimator, log.records)
@@ -316,7 +381,12 @@ def main() -> int:
     if tuple(candidate_model.line_identity) != tuple(old_model.line_identity):
         raise RuntimeError("Candidate and logged models use different line layouts.")
     truth = _truth_states(args.truth_source_config)
-    final = _posterior_states(args.posterior)
+    if args.posterior is not None:
+        final = _posterior_states(args.posterior)
+        saved_state_kind = "canonical_posterior_modes"
+    else:
+        final = _trace_states(args.estimate_trace, estimator)
+        saved_state_kind = "final_canonical_estimate_trace"
     mixed = {
         isotope: (truth[isotope] if isotope == "Eu-154" else final[isotope])
         for isotope in estimator.joint_isotope_order()
@@ -360,8 +430,13 @@ def main() -> int:
         )
     payload = {
         "schema_version": 1,
-        "diagnostic": "saved_160_full_spectrum_truth_split_ghost_causality",
+        "diagnostic": "saved_full_spectrum_truth_split_ghost_causality",
         "fit_or_tuning_performed": False,
+        "saved_state_kind": saved_state_kind,
+        "acceptance_use": "diagnostic_only_legacy_environment",
+        "candidate_environment_applicability": (
+            "not_asserted_legacy_log_has_no_authenticated_geometry_family"
+        ),
         "measurement_log": str(args.measurement_log.resolve()),
         "record_count": len(log.records),
         "candidate_model": str(args.candidate_model.resolve()),

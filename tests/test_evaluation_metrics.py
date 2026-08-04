@@ -9,6 +9,7 @@ import pytest
 from evaluation_metrics import (
     compute_metrics,
     compute_resolution_aware_cluster_metrics,
+    compute_truth_proximity_operational_metrics,
     save_metrics_json,
 )
 from measurement.model import EnvironmentConfig
@@ -43,6 +44,39 @@ def test_compute_metrics_counts_with_gate() -> None:
     assert len(metrics["isotopes"]["Cs-137"]["matches"]) == 1
     assert metrics["matching_policy"]["strength_used_for_assignment"] is False
     assert metrics["matching_policy"]["outside_radius_behavior"] == "unmatched"
+
+
+def test_operational_metrics_aggregate_near_split_and_preserve_remote_ghost() -> None:
+    """Truth-near splits aggregate while a distant strong ghost stays explicit."""
+    truth = {
+        "Eu-154": [
+            {"pos": [0.0, 0.0, 0.0], "strength": 100.0},
+        ]
+    }
+    estimate = {
+        "Eu-154": [
+            {"pos": [0.1, 0.0, 0.0], "strength": 40.0},
+            {"pos": [0.2, 0.0, 0.0], "strength": 60.0},
+            {"pos": [5.0, 0.0, 0.0], "strength": 200.0},
+        ]
+    }
+
+    result = compute_truth_proximity_operational_metrics(
+        truth,
+        estimate,
+        distance_thresholds_m=(0.5, 1.0),
+    )
+    row = result["thresholds"][0]["isotopes"]["Eu-154"]
+
+    assert row["raw_estimate_count"] == 3
+    assert row["operational_effective_estimate_count"] == 2
+    assert row["truth_aggregates"][0]["assigned_estimate_count"] == 2
+    assert row["truth_aggregates"][0][
+        "combined_estimated_strength_cps_1m"
+    ] == pytest.approx(100.0)
+    assert row["remote_unmatched_strength_cps_1m"] == pytest.approx(200.0)
+    assert row["remote_unmatched_strength_ratio"] == pytest.approx(2.0 / 3.0)
+    assert result["changes_pf_state_or_cardinality"] is False
 
 
 def test_resolution_cluster_merges_only_response_equivalent_surface_points() -> None:

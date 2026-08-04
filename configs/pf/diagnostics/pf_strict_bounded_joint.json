@@ -1,0 +1,4 @@
+{
+  "extends": "../pf_strict_3d.json",
+  "pf_strength_prior_family": "bounded_uniform"
+}

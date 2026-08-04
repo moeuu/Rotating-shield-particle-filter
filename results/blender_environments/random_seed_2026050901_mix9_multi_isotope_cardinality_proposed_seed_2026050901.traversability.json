@@ -12,7 +12,7 @@
     0.0,
     0.0
   ],
-  "robot_radius_m": 0.35,
+  "robot_radius_m": 0.4655333881989093,
   "source": "blender_projected_3d_environment",
   "traversable_cells": [
     [
@@ -357,10 +357,6 @@
     ],
     [
       6,
-      10
-    ],
-    [
-      6,
       12
     ],
     [
@@ -382,10 +378,6 @@
     [
       7,
       8
-    ],
-    [
-      7,
-      10
     ],
     [
       7,
@@ -560,6 +552,6 @@
       19
     ]
   ],
-  "traversable_fraction": 0.68,
+  "traversable_fraction": 0.67,
   "version": 1
 }

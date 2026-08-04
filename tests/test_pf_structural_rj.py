@@ -7,6 +7,7 @@ import math
 import numpy as np
 import pytest
 
+from pf.particle_filter import IsotopeParticleFilter
 from pf.structural_rj import (
     BirthDeathMoveProbabilities,
     CardinalityPrior,
@@ -25,10 +26,137 @@ from pf.structural_rj import (
     continuous_relocated_merge_log_acceptance_ratio,
     continuous_relocated_split_log_acceptance_ratio,
     continuous_split_log_acceptance_ratio,
+    cross_isotope_transfer_log_proposal,
     distance_weighted_ordered_pair_probabilities,
+    independence_refresh_log_acceptance_ratio,
     log_acceptance_probability,
+    shifted_log_strength_random_walk_log_reverse_ratio,
+    poisson_geometric_tail_cardinality_probabilities,
     split_fraction_bounds,
 )
+
+
+def test_structural_rejection_diagnostics_decompose_exact_mh_terms() -> None:
+    """Rejected structure moves must expose likelihood, prior, q, and J."""
+    filt = object.__new__(IsotopeParticleFilter)
+    filt._structural_mh_component_samples = {}
+    filt._record_structural_mh_components(
+        "multi_merge",
+        delta_log_likelihood=np.asarray([-100.0, 3.0]),
+        delta_log_prior=np.asarray([1.0, -2.0]),
+        log_reverse_minus_forward=np.asarray([0.5, -0.25]),
+        log_jacobian=np.zeros(2, dtype=np.float64),
+        support_feasible=np.asarray([True, False]),
+        accepted=np.asarray([False, False]),
+    )
+
+    summary = filt._summarize_structural_mh_components()["multi_merge"]
+
+    assert summary["attempted"] == 2
+    assert summary["support_rejected"] == 1
+    assert summary["mh_random_rejected"] == 1
+    assert summary["component_quantiles"]["delta_log_likelihood"][
+        "median"
+    ] == pytest.approx(-48.5)
+    assert summary["component_quantiles"]["log_jacobian"]["max"] == 0.0
+
+
+def test_poisson_geometric_tail_keeps_five_typical_but_six_possible() -> None:
+    """The ordinary K=5 boundary must have a thin proper nonzero tail."""
+    probabilities = poisson_geometric_tail_cardinality_probabilities(
+        5,
+        8,
+        2.0,
+        0.05,
+    )
+
+    assert probabilities.shape == (9,)
+    assert float(np.sum(probabilities)) == pytest.approx(1.0)
+    assert probabilities[6] == pytest.approx(0.05 * probabilities[5])
+    assert probabilities[7] == pytest.approx(0.05 * probabilities[6])
+    assert probabilities[8] == pytest.approx(0.05 * probabilities[7])
+    assert np.all(probabilities > 0.0)
+
+
+def test_nonconserving_refresh_ratio_is_exactly_reciprocal() -> None:
+    """Reversing target and proposal terms must negate the MH log ratio."""
+    target = np.asarray([4.0, -3.0], dtype=np.float64)
+    forward = np.asarray([-11.0, -7.0], dtype=np.float64)
+    reverse = np.asarray([-5.0, -9.0], dtype=np.float64)
+
+    down = independence_refresh_log_acceptance_ratio(
+        log_target_ratio=target,
+        log_forward_proposal=forward,
+        log_reverse_proposal=reverse,
+    )
+    up = independence_refresh_log_acceptance_ratio(
+        log_target_ratio=-target,
+        log_forward_proposal=reverse,
+        log_reverse_proposal=forward,
+    )
+
+    np.testing.assert_allclose(down, -up, atol=1.0e-14)
+
+
+def test_cross_isotope_transfer_proposal_is_reciprocal() -> None:
+    """Forward and reverse subset probabilities use the exact changed states."""
+    forward = cross_isotope_transfer_log_proposal(
+        donor_cardinality=5,
+        receiver_cardinality=0,
+        group_size=3,
+        maximum_sources=5,
+        maximum_group_size=3,
+    )
+    reverse = cross_isotope_transfer_log_proposal(
+        donor_cardinality=3,
+        receiver_cardinality=2,
+        group_size=3,
+        maximum_sources=5,
+        maximum_group_size=3,
+    )
+
+    assert forward == pytest.approx(-math.log(3.0) - math.log(10.0))
+    assert reverse == pytest.approx(-math.log(3.0))
+    assert (reverse - forward) == pytest.approx(math.log(10.0))
+
+
+def test_cross_isotope_transfer_rejects_infeasible_group() -> None:
+    """A receiver without capacity has zero proposal density."""
+    value = cross_isotope_transfer_log_proposal(
+        donor_cardinality=2,
+        receiver_cardinality=5,
+        group_size=1,
+        maximum_sources=5,
+        maximum_group_size=3,
+    )
+
+    assert value == -math.inf
+
+
+def test_shifted_log_strength_ratio_matches_scalar_jacobian_oracle() -> None:
+    """The batched joint-strength proposal ratio must equal scalar products."""
+    current = np.asarray([[3.0, 7.0, 0.0], [5.0, 11.0, 13.0]])
+    proposed = np.asarray([[5.0, 4.0, 0.0], [4.0, 9.0, 20.0]])
+    mask = np.asarray([[True, True, False], [True, True, True]])
+
+    batched = shifted_log_strength_random_walk_log_reverse_ratio(
+        current,
+        proposed,
+        mask,
+        minimum_strength=1.0,
+    )
+    scalar = np.asarray(
+        [
+            sum(
+                math.log(proposed[row, column] - 1.0)
+                - math.log(current[row, column] - 1.0)
+                for column in np.flatnonzero(mask[row])
+            )
+            for row in range(current.shape[0])
+        ]
+    )
+
+    np.testing.assert_allclose(batched, scalar, rtol=0.0, atol=1.0e-15)
 
 
 def test_continuous_strength_proposal_density_is_normalized_per_chart() -> None:
@@ -77,6 +205,48 @@ def test_continuous_strength_proposal_sampling_has_full_prior_support() -> None:
     assert np.all(
         np.isfinite(proposal.log_density(chart_ids, samples))
     )
+
+
+def test_continuous_strength_proposal_preserves_unbounded_prior_support() -> None:
+    """A shifted-gamma mixture must propose strengths above the legacy cap."""
+    proposal = ContinuousStrengthProposal(
+        minimum=10.0,
+        maximum=20.0,
+        data_locations_by_chart=np.asarray([12.0, 18.0]),
+        data_sigma=2.0,
+        prior_component_probability=1.0,
+        prior_family="shifted_gamma",
+        prior_gamma_shape=2.0,
+        prior_gamma_scale=10.0,
+    )
+    chart_ids = np.zeros(100_000, dtype=np.int64)
+    samples = proposal.sample(
+        chart_ids,
+        rng=np.random.default_rng(934),
+    )
+
+    assert np.any(samples > proposal.maximum)
+    assert np.all(np.isfinite(proposal.log_density(chart_ids, samples)))
+
+
+def test_unbounded_split_support_has_exact_simplex_normalization() -> None:
+    """Removing the upper cap must retain exact split proposal densities."""
+    probability = bounded_simplex_probability(
+        np.asarray([10.0]),
+        group_size=3,
+        minimum_strength=1.0,
+        maximum_strength=np.inf,
+    )
+    lower, upper, feasible = split_fraction_bounds(
+        np.asarray([10.0]),
+        minimum_strength=1.0,
+        maximum_strength=np.inf,
+    )
+
+    assert probability[0] == pytest.approx(0.7**2)
+    assert feasible[0]
+    assert lower[0] == pytest.approx(0.1)
+    assert upper[0] == pytest.approx(0.9)
 
 
 def test_surface_position_proposal_mixture_preserves_full_support() -> None:

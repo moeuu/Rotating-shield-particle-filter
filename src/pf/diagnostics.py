@@ -28,6 +28,8 @@ def reset_step_diagnostics(target: Any) -> None:
     target.last_source_event_diagnostics = []
     target.last_structural_timing_s = {}
     target.last_structural_transition_weight_mass = {}
+    target.last_structural_rejection_diagnostics = {}
+    target._structural_mh_component_samples = {}
     target._resample_count_in_observation = 0
 
 

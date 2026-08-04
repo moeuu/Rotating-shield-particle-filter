@@ -53,8 +53,12 @@ from pf.randomness import (
 )
 from pf.resampling import systematic_resample
 from pf.state import IsotopeState
+from pf.strength_prior import StrengthPrior
 from pf.structural_rj import (
+    POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
     TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+    cross_isotope_transfer_log_proposal,
+    shifted_log_strength_random_walk_log_reverse_ratio,
     validate_cardinality_prior_policy,
 )
 from pf.transport_response import expected_counts_per_source
@@ -63,7 +67,8 @@ if TYPE_CHECKING:
 
 
 JOINT_HISTORY_STATION_ACTION_BATCH_SIZE = 4
-JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES = 134_217_728
+JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES = 2_147_483_648
+JOINT_STRUCTURAL_UNIT_CACHE_ACTIVE_STATE_MULTIPLIER = 2
 JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE = np.dtype(
     [
         ("chart", "<i8"),
@@ -80,6 +85,82 @@ JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES = (
     "tau_obstacle",
     "distance_m",
 )
+
+
+def _stratified_categorical_draws(
+    probabilities: NDArray[np.float64],
+    sample_count: int,
+    *,
+    rng: np.random.Generator,
+) -> NDArray[np.int64]:
+    """Draw a randomly permuted stratified categorical sample batch."""
+    values = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    count = int(sample_count)
+    total = float(np.sum(values, dtype=np.float64))
+    if (
+        count < 1
+        or values.size == 0
+        or np.any(~np.isfinite(values))
+        or np.any(values < 0.0)
+        or not np.isfinite(total)
+        or total <= 0.0
+        or not isinstance(rng, np.random.Generator)
+    ):
+        raise ValueError("Stratified categorical inputs are invalid.")
+    normalized = values / total
+    uniforms = (
+        np.arange(count, dtype=np.float64) + rng.random(count)
+    ) / float(count)
+    draws = np.searchsorted(
+        np.cumsum(normalized, dtype=np.float64),
+        uniforms,
+        side="right",
+    ).astype(np.int64, copy=False)
+    draws = np.minimum(draws, values.size - 1)
+    return draws[rng.permutation(count)]
+
+
+def _stratified_joint_cardinality_draws(
+    marginal_probabilities: Sequence[NDArray[np.float64]],
+    sample_count: int,
+    *,
+    rng: np.random.Generator,
+) -> NDArray[np.int64]:
+    """Draw product-prior K vectors with joint stratification.
+
+    The vectorized Cartesian support is tiny for the configured isotope and
+    source capacities. Sampling the flattened product distribution preserves
+    the independent cardinality prior exactly while stratifying the joint
+    vectors rather than only their separate isotope marginals.
+    """
+    probabilities = tuple(
+        np.asarray(values, dtype=np.float64).reshape(-1)
+        for values in marginal_probabilities
+    )
+    if not probabilities:
+        raise ValueError("At least one cardinality marginal is required.")
+    if any(
+        values.size == 0
+        or np.any(~np.isfinite(values))
+        or np.any(values < 0.0)
+        or not np.isclose(np.sum(values), 1.0, rtol=0.0, atol=1.0e-12)
+        for values in probabilities
+    ):
+        raise ValueError("Cardinality marginals must be probability vectors.")
+    support_shape = tuple(int(values.size) for values in probabilities)
+    support_indices = np.indices(
+        support_shape,
+        dtype=np.int64,
+    ).reshape(len(probabilities), -1).T
+    product_mass = np.ones(support_indices.shape[0], dtype=np.float64)
+    for isotope_index, values in enumerate(probabilities):
+        product_mass *= values[support_indices[:, isotope_index]]
+    flat_draws = _stratified_categorical_draws(
+        product_mass,
+        sample_count,
+        rng=rng,
+    )
+    return support_indices[flat_draws]
 
 
 def _strict_nonnegative_integer(value: object, *, name: str) -> int:
@@ -122,6 +203,7 @@ class RotatingShieldPFConfig:
     estimator_profile: str = "pf_strict"
     num_particles: int = 200
     max_sources: int | None = DEFAULT_MAX_SOURCES_PER_ISOTOPE
+    hard_max_sources: int | None = None
     variable_cardinality: bool = True
     history_estimate_interval: int = 1
     surface_diagnostic_response_cache_max_entries: int = 24
@@ -154,6 +236,7 @@ class RotatingShieldPFConfig:
     )
     structural_cardinality_prior_probs: tuple[float, ...] | list[float] | None = None
     structural_cardinality_prior_mean: float = 2.0
+    structural_cardinality_tail_ratio: float = 0.05
     max_dwell_time_s: float = 5.0  # Max dwell time per pose.
     credible_surface_radius_threshold_m: float = 0.5
     converge_min_ess_ratio: float = 0.5
@@ -171,6 +254,12 @@ class RotatingShieldPFConfig:
     joint_smc_soft_wall_time_s: float = 1800.0
     joint_guided_initialization: bool = True
     joint_guided_initialization_prior_row_probability: float = 0.5
+    joint_strength_block_probability: float = 0.0
+    joint_strength_block_log_sigma: float = 0.15
+    joint_strength_block_batch_size: int = 128
+    joint_cross_isotope_transfer_probability: float = 0.0
+    joint_cross_isotope_transfer_max_group: int = 3
+    joint_cross_isotope_state_block_probability: float = 0.0
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
     init_num_sources: Tuple[int, int] = (
         0,
@@ -178,6 +267,9 @@ class RotatingShieldPFConfig:
     )
     strength_prior_min_cps_1m: float = 1.0
     strength_prior_max_cps_1m: float = 2_000_000.0
+    strength_prior_family: str = "bounded_uniform"
+    strength_prior_gamma_shape: float = 2.0
+    strength_prior_gamma_scale_cps_1m: float = 425_000.0
     orientation_k: int = 8
     min_rotations_per_pose: int = 0
     planning_particles: int | None = None
@@ -193,6 +285,11 @@ class RotatingShieldPFConfig:
         integer_fields = (
             ("num_particles", self.num_particles, 1),
             ("history_estimate_interval", self.history_estimate_interval, 0),
+            (
+                "joint_strength_block_batch_size",
+                self.joint_strength_block_batch_size,
+                1,
+            ),
             (
                 "surface_diagnostic_response_cache_max_entries",
                 self.surface_diagnostic_response_cache_max_entries,
@@ -239,6 +336,15 @@ class RotatingShieldPFConfig:
             name="max_sources",
         ) < 1:
             raise ValueError("Pure PF requires a finite positive max_sources.")
+        if self.hard_max_sources is None:
+            self.hard_max_sources = int(self.max_sources)
+        if _strict_nonnegative_integer(
+            self.hard_max_sources,
+            name="hard_max_sources",
+        ) < int(self.max_sources):
+            raise ValueError(
+                "hard_max_sources must be at least max_sources."
+            )
         _strict_config_boolean(
             self.variable_cardinality,
             name="variable_cardinality",
@@ -261,6 +367,11 @@ class RotatingShieldPFConfig:
         numeric_fields = (
             "strength_prior_min_cps_1m",
             "strength_prior_max_cps_1m",
+            "strength_prior_gamma_shape",
+            "strength_prior_gamma_scale_cps_1m",
+            "joint_strength_block_probability",
+            "joint_strength_block_log_sigma",
+            "joint_cross_isotope_state_block_probability",
             "structural_rj_surface_chart_max_edge_m",
             "structural_rj_local_position_sigma_m",
             "structural_rj_position_proposal_prior_weight",
@@ -282,6 +393,7 @@ class RotatingShieldPFConfig:
             "structural_rj_merge_distance_sigma_m",
             "structural_rj_merge_response_sigma",
             "structural_cardinality_prior_mean",
+            "structural_cardinality_tail_ratio",
             "max_dwell_time_s",
             "credible_surface_radius_threshold_m",
             "converge_min_ess_ratio",
@@ -390,24 +502,22 @@ class RotatingShieldPFConfig:
                 "Pure PF production kernels require gpu_dtype='float64'."
             )
         self.gpu_dtype = "float64"
-        self.strength_prior_min_cps_1m = float(self.strength_prior_min_cps_1m)
-        self.strength_prior_max_cps_1m = float(self.strength_prior_max_cps_1m)
-        if (
-            not np.isfinite(self.strength_prior_min_cps_1m)
-            or self.strength_prior_min_cps_1m <= 0.0
-        ):
+        strength_prior = StrengthPrior(
+            minimum=float(self.strength_prior_min_cps_1m),
+            maximum=float(self.strength_prior_max_cps_1m),
+            family=str(self.strength_prior_family),
+            gamma_shape=float(self.strength_prior_gamma_shape),
+            gamma_scale=float(self.strength_prior_gamma_scale_cps_1m),
+        )
+        if strength_prior.minimum <= 0.0:
             raise ValueError(
                 "strength_prior_min_cps_1m must be finite and positive."
             )
-        if (
-            not np.isfinite(self.strength_prior_max_cps_1m)
-            or self.strength_prior_max_cps_1m
-            <= self.strength_prior_min_cps_1m
-        ):
-            raise ValueError(
-                "strength_prior_max_cps_1m must be finite and greater than "
-                "strength_prior_min_cps_1m."
-            )
+        self.strength_prior_min_cps_1m = strength_prior.minimum
+        self.strength_prior_max_cps_1m = strength_prior.maximum
+        self.strength_prior_family = strength_prior.family
+        self.strength_prior_gamma_shape = strength_prior.gamma_shape
+        self.strength_prior_gamma_scale_cps_1m = strength_prior.gamma_scale
         self.structural_rj_surface_chart_max_edge_m = float(
             self.structural_rj_surface_chart_max_edge_m
         )
@@ -532,6 +642,67 @@ class RotatingShieldPFConfig:
         self.joint_guided_initialization_prior_row_probability = (
             guided_prior_probability
         )
+        strength_block_probability = float(
+            self.joint_strength_block_probability
+        )
+        if (
+            not np.isfinite(strength_block_probability)
+            or not 0.0 <= strength_block_probability <= 1.0
+        ):
+            raise ValueError(
+                "joint_strength_block_probability must lie in [0, 1]."
+            )
+        self.joint_strength_block_probability = strength_block_probability
+        self.joint_strength_block_log_sigma = float(
+            self.joint_strength_block_log_sigma
+        )
+        if (
+            not np.isfinite(self.joint_strength_block_log_sigma)
+            or self.joint_strength_block_log_sigma <= 0.0
+        ):
+            raise ValueError(
+                "joint_strength_block_log_sigma must be finite and positive."
+            )
+        self.joint_strength_block_batch_size = int(
+            self.joint_strength_block_batch_size
+        )
+        cross_transfer_probability = float(
+            self.joint_cross_isotope_transfer_probability
+        )
+        if (
+            not np.isfinite(cross_transfer_probability)
+            or not 0.0 <= cross_transfer_probability <= 1.0
+        ):
+            raise ValueError(
+                "joint_cross_isotope_transfer_probability must lie in [0, 1]."
+            )
+        self.joint_cross_isotope_transfer_probability = (
+            cross_transfer_probability
+        )
+        cross_state_probability = float(
+            self.joint_cross_isotope_state_block_probability
+        )
+        if (
+            not np.isfinite(cross_state_probability)
+            or not 0.0 <= cross_state_probability <= 1.0
+        ):
+            raise ValueError(
+                "joint_cross_isotope_state_block_probability must lie in "
+                "[0, 1]."
+            )
+        self.joint_cross_isotope_state_block_probability = (
+            cross_state_probability
+        )
+        cross_transfer_max_group = int(
+            self.joint_cross_isotope_transfer_max_group
+        )
+        if cross_transfer_max_group < 1:
+            raise ValueError(
+                "joint_cross_isotope_transfer_max_group must be positive."
+            )
+        self.joint_cross_isotope_transfer_max_group = (
+            cross_transfer_max_group
+        )
         self.structural_rj_merge_distance_sigma_m = float(
             self.structural_rj_merge_distance_sigma_m
         )
@@ -570,6 +741,19 @@ class RotatingShieldPFConfig:
                 ),
             )
         )
+        self.structural_cardinality_tail_ratio = float(
+            self.structural_cardinality_tail_ratio
+        )
+        if (
+            self.structural_cardinality_prior_policy
+            == POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY
+            and not 0.0 < self.structural_cardinality_tail_ratio < 1.0
+        ):
+            raise ValueError(
+                "structural_cardinality_tail_ratio must lie in (0, 1) for "
+                "the thin-tail cardinality policy."
+            )
+
         if self.structural_cardinality_prior_probs is not None:
             if not isinstance(
                 self.structural_cardinality_prior_probs,
@@ -659,11 +843,12 @@ class RotatingShieldPFConfig:
         self.max_sources = int(self.max_sources)
         if (
             self.structural_cardinality_prior_probs is not None
-            and len(self.structural_cardinality_prior_probs) != self.max_sources + 1
+            and len(self.structural_cardinality_prior_probs)
+            != int(self.hard_max_sources) + 1
         ):
             raise ValueError(
                 "structural_cardinality_prior_probs must contain "
-                "max_sources + 1 entries."
+                "hard_max_sources + 1 entries."
             )
         initial_lower, initial_upper = (
             int(self.init_num_sources[0]),
@@ -699,6 +884,15 @@ class RotatingShieldPFConfig:
                 "init_num_sources=(K, K) within zero through max_sources."
             )
         self.init_num_sources = (initial_lower, initial_upper)
+
+    @property
+    def cardinality_capacity(self) -> int:
+        """Return the finite state-array capacity for one isotope."""
+        return int(
+            self.max_sources
+            if self.hard_max_sources is None
+            else self.hard_max_sources
+        )
 
 
 @dataclass(frozen=True)
@@ -1093,6 +1287,16 @@ class RotatingShieldPFEstimator:
             ]
             | None
         ) = None
+        self._joint_persistent_structural_transport_cache: (
+            tuple[object, object, object] | None
+        ) = None
+        self._joint_persistent_structural_station_signature: (
+            tuple[str, ...]
+        ) = ()
+        self._joint_persistent_structural_state_sha256: str | None = None
+        self.last_joint_persistent_cache_reuse_count = 0
+        self.last_joint_persistent_cache_append_count = 0
+        self.last_joint_persistent_cache_reindex_count = 0
         self._joint_structural_unit_transport_cache: dict[
             str,
             dict[str, dict[str, Any]],
@@ -1126,6 +1330,16 @@ class RotatingShieldPFEstimator:
         self.last_joint_smc_soft_budget_exceeded = False
         self._joint_guided_initialization_applied = False
         self.last_joint_guided_initialization_ess: float | None = None
+        self.last_joint_cross_isotope_attempted_weight_mass = 0.0
+        self.last_joint_cross_isotope_accepted_weight_mass = 0.0
+        self.last_joint_cross_isotope_state_attempted_weight_mass = 0.0
+        self.last_joint_cross_isotope_state_accepted_weight_mass = 0.0
+        self.last_joint_cross_isotope_state_rejection_diagnostics: dict[
+            str,
+            object,
+        ] = {}
+        self.last_joint_strength_block_attempted_weight_mass = 0.0
+        self.last_joint_strength_block_accepted_weight_mass = 0.0
         self._joint_initial_product_prior_state_sha256: str | None = None
         self.last_joint_unique_ancestor_count: int | None = None
         self.last_joint_station_unique_ancestor_count: int | None = None
@@ -2332,8 +2546,10 @@ class RotatingShieldPFEstimator:
         self,
         station: JointStationObservation,
         isotope: str,
+        *,
+        particle_indices: NDArray[np.int64] | None = None,
     ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
-        """Return one isotope's fixed-slot components in global line layout."""
+        """Return selected isotope rows in the global fixed-slot layout."""
         import torch
 
         self._assert_joint_particle_alignment()
@@ -2353,6 +2569,24 @@ class RotatingShieldPFEstimator:
             chart_ids,
             _surface_uv,
         ) = filt._packed_continuous_surface_state_arrays()
+        if particle_indices is not None:
+            raw_indices = np.asarray(particle_indices)
+            if (
+                raw_indices.ndim != 1
+                or not np.issubdtype(raw_indices.dtype, np.integer)
+            ):
+                raise ValueError("particle_indices must be a 1-D integer array.")
+            indices = np.asarray(raw_indices, dtype=np.int64)
+            if (
+                np.unique(indices).size != indices.size
+                or np.any(indices < 0)
+                or np.any(indices >= positions.shape[0])
+            ):
+                raise ValueError("particle_indices contain invalid PF rows.")
+            positions = positions[indices]
+            strengths = strengths[indices]
+            active_mask = active_mask[indices]
+            chart_ids = chart_ids[indices]
         view_count = int(station.fe_indices.size)
         station_geometry = StructuralGeometryBatch(
             detector_positions=np.repeat(
@@ -2436,7 +2670,7 @@ class RotatingShieldPFEstimator:
             device=device,
         )
         expected_local_shape = tuple(total_local.shape)
-        expected_slots = int(self.pf_config.max_sources or 0)
+        expected_slots = self.pf_config.cardinality_capacity
         if (
             total_local.ndim != 4
             or int(total_local.shape[2]) != expected_slots
@@ -2747,42 +2981,158 @@ class RotatingShieldPFEstimator:
         host-to-device copies without changing any transport or likelihood
         arithmetic.
         """
+        active = tuple(stations)
+        station_signature = tuple(
+            self._joint_station_cache_signature(station)
+            for station in active
+        )
+        state_sha256 = self._joint_structural_state_sha256()
+        persistent = self._joint_persistent_structural_transport_cache
+        persistent_signature = (
+            self._joint_persistent_structural_station_signature
+        )
+        if (
+            persistent is not None
+            and self._joint_persistent_structural_state_sha256 == state_sha256
+            and persistent_signature == station_signature
+        ):
+            self._joint_structural_transport_cache = persistent
+            self.last_joint_persistent_cache_reuse_count += 1
+            return
+        can_append = (
+            persistent is not None
+            and self._joint_persistent_structural_state_sha256 == state_sha256
+            and len(persistent_signature) < len(station_signature)
+            and station_signature[: len(persistent_signature)]
+            == persistent_signature
+        )
+        pending_stations = (
+            active[len(persistent_signature) :]
+            if can_append
+            else active
+        )
         station_components = [
             self._joint_station_transport_components_torch(station)
-            for station in stations
+            for station in pending_stations
         ]
+        if not station_components:
+            raise RuntimeError("Structural cache refresh has no station data.")
         if self.pf_config.use_gpu:
             import torch
 
-            self._joint_structural_transport_cache = tuple(
+            appended = tuple(
                 torch.cat(
                     [components[index] for components in station_components],
                     dim=1,
                 ).contiguous()
                 for index in range(3)
             )
-            return
-        self._joint_structural_transport_cache = tuple(
-            np.concatenate(
-                [
-                    components[index]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float64, copy=False)
-                    for components in station_components
-                ],
-                axis=1,
+        else:
+            appended = tuple(
+                np.concatenate(
+                    [
+                        components[index]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float64, copy=False)
+                        for components in station_components
+                    ],
+                    axis=1,
+                )
+                for index in range(3)
             )
-            for index in range(3)
+        if can_append:
+            if hasattr(persistent[0], "detach"):
+                import torch
+
+                refreshed = tuple(
+                    torch.cat((old, new), dim=1).contiguous()
+                    for old, new in zip(persistent, appended, strict=True)
+                )
+            else:
+                refreshed = tuple(
+                    np.concatenate((old, new), axis=1)
+                    for old, new in zip(persistent, appended, strict=True)
+                )
+            self.last_joint_persistent_cache_append_count += 1
+        else:
+            refreshed = appended
+        self._joint_structural_transport_cache = refreshed
+        self._joint_persistent_structural_transport_cache = refreshed
+        self._joint_persistent_structural_station_signature = (
+            station_signature
         )
+        self._joint_persistent_structural_state_sha256 = state_sha256
+
+    def _joint_structural_state_sha256(self) -> str:
+        """Hash compact accepted chart/UV/strength state without transport."""
+        digest = hashlib.sha256()
+        digest.update(b"joint_structural_accepted_state_v1")
+        for isotope in self.joint_isotope_order():
+            filt = self.filters[isotope]
+            _, strengths, mask, chart_ids, surface_uv = (
+                filt._packed_continuous_surface_state_arrays()
+            )
+            digest.update(str(isotope).encode("utf-8"))
+            for values in (strengths, mask, chart_ids, surface_uv):
+                array = np.ascontiguousarray(values)
+                digest.update(str(array.dtype).encode("ascii"))
+                digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+                digest.update(array.tobytes(order="C"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _joint_station_cache_signature(
+        station: JointStationObservation,
+    ) -> str:
+        """Return the immutable geometry signature of one station cache slab."""
+        digest = hashlib.sha256()
+        digest.update(b"joint_station_transport_geometry_v1")
+        digest.update(
+            np.asarray(
+                station.detector_position_xyz_m,
+                dtype=np.float64,
+            ).tobytes()
+        )
+        for values in (
+            station.fe_indices,
+            station.pb_indices,
+            station.live_times_s,
+        ):
+            array = np.ascontiguousarray(values)
+            digest.update(str(array.dtype).encode("ascii"))
+            digest.update(array.tobytes(order="C"))
+        digest.update(
+            np.asarray(
+                [int(station.station_sequence_id)],
+                dtype=np.int64,
+            ).tobytes()
+        )
+        return digest.hexdigest()
+
+    @classmethod
+    def _joint_station_cache_signatures(
+        cls,
+        stations: Sequence[JointStationObservation],
+    ) -> tuple[str, ...] | None:
+        """Return station signatures, or disable persistence for debug stubs."""
+        try:
+            return tuple(
+                cls._joint_station_cache_signature(station)
+                for station in stations
+            )
+        except AttributeError:
+            return None
 
     def _refresh_joint_structural_transport_cache_isotope(
         self,
         stations: Sequence[JointStationObservation],
         isotope: str,
+        *,
+        particle_indices: NDArray[np.int64] | None = None,
     ) -> None:
-        """Refresh only one moved isotope's fixed source-slot cache slice."""
+        """Refresh moved rows of one isotope's accepted-state cache slice."""
         cache = self._joint_structural_transport_cache
         if cache is None:
             raise RuntimeError(
@@ -2792,10 +3142,26 @@ class RotatingShieldPFEstimator:
         isotope_key = str(isotope)
         if isotope_key not in order:
             raise KeyError(f"Unknown joint PF isotope: {isotope_key!r}.")
+        if particle_indices is None:
+            indices = np.arange(
+                int(self.pf_config.num_particles),
+                dtype=np.int64,
+            )
+        else:
+            raw_indices = np.asarray(particle_indices)
+            if (
+                raw_indices.ndim != 1
+                or not np.issubdtype(raw_indices.dtype, np.integer)
+            ):
+                raise ValueError("particle_indices must be a 1-D integer array.")
+            indices = np.asarray(raw_indices, dtype=np.int64)
+        if indices.size == 0:
+            return
         station_components = [
             self._joint_isotope_station_transport_components_torch(
                 station,
                 isotope_key,
+                particle_indices=indices,
             )
             for station in stations
         ]
@@ -2825,7 +3191,7 @@ class RotatingShieldPFEstimator:
                 )
                 for index in range(3)
             )
-        slots_per_isotope = int(self.pf_config.max_sources or 0)
+        slots_per_isotope = self.pf_config.cardinality_capacity
         slot_start = order.index(isotope_key) * slots_per_isotope
         slot_stop = slot_start + slots_per_isotope
         mutable_cache = list(cache)
@@ -2833,8 +3199,11 @@ class RotatingShieldPFEstimator:
             mutable_cache, refreshed, strict=True
         ):
             if (
-                tuple(cached_values.shape[:2])
-                != tuple(refreshed_values.shape[:2])
+                int(cached_values.shape[0])
+                != int(self.pf_config.num_particles)
+                or int(refreshed_values.shape[0]) != int(indices.size)
+                or int(cached_values.shape[1])
+                != int(refreshed_values.shape[1])
                 or int(cached_values.shape[2]) < slot_stop
                 or int(refreshed_values.shape[2]) != slots_per_isotope
                 or tuple(cached_values.shape[3:])
@@ -2844,14 +3213,36 @@ class RotatingShieldPFEstimator:
                     "Incremental isotope transport cache shapes disagree."
                 )
             if cache_is_torch:
+                import torch
+
+                index_tensor = torch.as_tensor(
+                    indices,
+                    device=cached_values.device,
+                    dtype=torch.long,
+                )
                 cached_values[
                     :, :, slot_start:slot_stop, ...
-                ].copy_(refreshed_values)
+                ].index_copy_(0, index_tensor, refreshed_values)
             else:
                 cached_values[
-                    :, :, slot_start:slot_stop, ...
+                    indices, :, slot_start:slot_stop, ...
                 ] = refreshed_values
         self._joint_structural_transport_cache = tuple(mutable_cache)
+        station_signature = self._joint_station_cache_signatures(stations)
+        if station_signature is None:
+            self._joint_persistent_structural_transport_cache = None
+            self._joint_persistent_structural_station_signature = ()
+            self._joint_persistent_structural_state_sha256 = None
+        else:
+            self._joint_persistent_structural_transport_cache = (
+                self._joint_structural_transport_cache
+            )
+            self._joint_persistent_structural_station_signature = (
+                station_signature
+            )
+            self._joint_persistent_structural_state_sha256 = (
+                self._joint_structural_state_sha256()
+            )
 
     def _full_spectrum_log_likelihood_numpy(
         self,
@@ -3751,6 +4142,28 @@ class RotatingShieldPFEstimator:
             score_cg,
         )
 
+    def _strength_birth_proposal_grid(
+        self,
+    ) -> tuple[NDArray[np.float64], float]:
+        """Return a finite design grid without truncating prior support."""
+        prior = StrengthPrior(
+            minimum=float(self.pf_config.strength_prior_min_cps_1m),
+            maximum=float(self.pf_config.strength_prior_max_cps_1m),
+            family=str(self.pf_config.strength_prior_family),
+            gamma_shape=float(self.pf_config.strength_prior_gamma_shape),
+            gamma_scale=float(
+                self.pf_config.strength_prior_gamma_scale_cps_1m
+            ),
+        )
+        upper = prior.finite_upper_quantile(0.995)
+        grid = np.linspace(
+            prior.minimum,
+            upper,
+            int(self.pf_config.structural_rj_strength_proposal_grid_size),
+            dtype=np.float64,
+        )
+        return grid, float(prior.mean)
+
     def _joint_structural_proposal_evaluator(
         self,
         *,
@@ -3787,19 +4200,7 @@ class RotatingShieldPFEstimator:
                 "Birth-proposal chart centers must be the immutable active "
                 "continuous-surface atlas centers."
             )
-        strength_grid = np.linspace(
-            float(self.pf_config.strength_prior_min_cps_1m),
-            float(self.pf_config.strength_prior_max_cps_1m),
-            int(self.pf_config.structural_rj_strength_proposal_grid_size),
-            dtype=np.float64,
-        )
-        midpoint = float(
-            0.5
-            * (
-                self.pf_config.strength_prior_min_cps_1m
-                + self.pf_config.strength_prior_max_cps_1m
-            )
-        )
+        strength_grid, midpoint = self._strength_birth_proposal_grid()
         if chart_count == 0:
             return (
                 np.zeros(0, dtype=np.float64),
@@ -3907,12 +4308,7 @@ class RotatingShieldPFEstimator:
             raise RuntimeError(
                 "Birth-proposal prefix promotion is out of sequence."
             )
-        strength_grid = np.linspace(
-            float(self.pf_config.strength_prior_min_cps_1m),
-            float(self.pf_config.strength_prior_max_cps_1m),
-            int(self.pf_config.structural_rj_strength_proposal_grid_size),
-            dtype=np.float64,
-        )
+        strength_grid, _ = self._strength_birth_proposal_grid()
         promoted: dict[str, NDArray[np.float64]] = {}
         for isotope in self.joint_isotope_order():
             filt = self.filters[isotope]
@@ -4002,14 +4398,16 @@ class RotatingShieldPFEstimator:
         positions_s3: NDArray[np.float64],
         chart_ids_s: NDArray[np.int64],
         positive_line_indices: NDArray[np.int64],
+        prefetched_keys: NDArray[Any] | None = None,
+        prefetched_values: tuple[NDArray[np.float64], ...] | None = None,
     ) -> tuple[NDArray[np.float64], ...]:
         """Return exact unit transport for one immutable station shard.
 
         The cache changes only scheduling.  Keys contain the authoritative
         chart and continuous XYZ coordinates, while values are the exact
         continuous-kernel outputs for one immutable station geometry.
-        Missing positions are always evaluated together by the batched
-        CPU/GPU transport kernel.
+        Missing positions are evaluated together by the batched CPU/GPU
+        transport kernel, or consumed from an exact multi-station prefetch.
         """
         positions = np.asarray(positions_s3, dtype=np.float64).reshape(-1, 3)
         raw_chart_ids = np.asarray(chart_ids_s)
@@ -4118,24 +4516,57 @@ class RotatingShieldPFEstimator:
         missing_first_indices = first_indices[missing]
         missing_values: tuple[NDArray[np.float64], ...]
         if missing_first_indices.size:
-            evaluated = (
-                filt._continuous_rj_line_transport_component_columns(
-                    data,
-                    positions[missing_first_indices],
-                    line_indices,
-                    chart_ids=chart_ids[missing_first_indices],
+            if prefetched_keys is not None or prefetched_values is not None:
+                if prefetched_keys is None or prefetched_values is None:
+                    raise ValueError(
+                        "Prefetched transport keys and values must be paired."
+                    )
+                supplied_keys = np.asarray(
+                    prefetched_keys,
+                    dtype=JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE,
+                ).reshape(-1)
+                supplied_values = tuple(
+                    np.asarray(values, dtype=np.float64)
+                    for values in prefetched_values
                 )
-            )
-            missing_values = tuple(
-                np.transpose(
-                    np.asarray(
-                        getattr(evaluated, name),
-                        dtype=np.float64,
-                    ),
-                    (1, 0, 2),
+                supplied_lookup = np.searchsorted(
+                    supplied_keys,
+                    unique_keys[missing],
                 )
-                for name in JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES
-            )
+                if (
+                    len(supplied_values)
+                    != len(JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES)
+                    or np.any(supplied_lookup >= supplied_keys.size)
+                    or np.any(
+                        supplied_keys[supplied_lookup]
+                        != unique_keys[missing]
+                    )
+                ):
+                    raise RuntimeError(
+                        "Exact transport prefetch does not cover shard misses."
+                    )
+                missing_values = tuple(
+                    values[supplied_lookup] for values in supplied_values
+                )
+            else:
+                evaluated = (
+                    filt._continuous_rj_line_transport_component_columns(
+                        data,
+                        positions[missing_first_indices],
+                        line_indices,
+                        chart_ids=chart_ids[missing_first_indices],
+                    )
+                )
+                missing_values = tuple(
+                    np.transpose(
+                        np.asarray(
+                            getattr(evaluated, name),
+                            dtype=np.float64,
+                        ),
+                        (1, 0, 2),
+                    )
+                    for name in JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES
+                )
             expected_missing_shape = (
                 int(missing_first_indices.size),
                 row_count,
@@ -4165,7 +4596,12 @@ class RotatingShieldPFEstimator:
                 )
                 for _ in JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES
             )
-        generation = int(cache["generation"]) + 1
+        # A cache hit normally identifies a source in the currently accepted
+        # PF state, whereas a miss is commonly a one-shot rejected proposal.
+        # Give hits the newer generation so proposal churn cannot evict the
+        # accepted state and force exact old-station transport to be recomputed
+        # at every tempering step.
+        generation = int(cache["generation"]) + 2
         recency = np.asarray(cache["recency"], dtype=np.int64).copy()
         if np.any(hit):
             recency[safe_lookup[hit]] = generation
@@ -4175,7 +4611,7 @@ class RotatingShieldPFEstimator:
                 recency,
                 np.full(
                     int(np.count_nonzero(missing)),
-                    generation,
+                    generation - 1,
                     dtype=np.int64,
                 ),
             )
@@ -4196,11 +4632,18 @@ class RotatingShieldPFEstimator:
             * line_count
             * np.dtype(np.float64).itemsize
         )
-        capacity = max(
+        byte_capacity = max(
             1,
             JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES
             // max(bytes_per_entry, 1),
         )
+        active_state_capacity = max(
+            1,
+            JOINT_STRUCTURAL_UNIT_CACHE_ACTIVE_STATE_MULTIPLIER
+            * int(filt.config.num_particles)
+            * int(filt.config.hard_max_sources),
+        )
+        capacity = min(byte_capacity, active_state_capacity)
         if merged_keys.size > capacity:
             retain = np.argsort(
                 merged_recency,
@@ -4324,18 +4767,166 @@ class RotatingShieldPFEstimator:
         chart_ids_s: NDArray[np.int64],
         positive_line_indices: NDArray[np.int64],
     ) -> tuple[NDArray[np.float64], ...]:
-        """Return exact unit transport while preserving past-station shards."""
-        station_components = [
-            self._joint_cached_continuous_unit_components_shard(
+        """Return exact transport with one fused call for station-cache misses."""
+        positions = np.asarray(positions_s3, dtype=np.float64).reshape(-1, 3)
+        raw_chart_ids = np.asarray(chart_ids_s)
+        chart_ids = np.asarray(raw_chart_ids, dtype=np.int64).reshape(-1)
+        line_indices = np.asarray(
+            positive_line_indices,
+            dtype=np.int64,
+        ).reshape(-1)
+        if (
+            not np.issubdtype(raw_chart_ids.dtype, np.integer)
+            or raw_chart_ids.size != positions.shape[0]
+            or positions.shape[0] != chart_ids.size
+            or np.any(~np.isfinite(positions))
+            or line_indices.size == 0
+        ):
+            raise ValueError(
+                "Fused continuous transport requires aligned finite states "
+                "and positive line indices."
+            )
+        station_shards = self._joint_structural_station_geometry_shards(data)
+        if len(station_shards) == 1 or positions.shape[0] == 0:
+            return self._joint_cached_continuous_unit_components_shard(
+                filt=filt,
+                data=station_shards[0],
+                positions_s3=positions,
+                chart_ids_s=chart_ids,
+                positive_line_indices=line_indices,
+            )
+
+        request_keys = np.empty(
+            positions.shape[0],
+            dtype=JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE,
+        )
+        request_keys["chart"] = chart_ids
+        request_keys["x"] = positions[:, 0]
+        request_keys["y"] = positions[:, 1]
+        request_keys["z"] = positions[:, 2]
+        unique_keys, first_indices = np.unique(
+            request_keys,
+            return_index=True,
+        )
+        isotope_cache = self._joint_structural_unit_transport_cache.setdefault(
+            str(filt.isotope),
+            {},
+        )
+        active_shard_indices: list[int] = []
+        union_missing = np.zeros(unique_keys.size, dtype=np.bool_)
+        for shard_index, station_data in enumerate(station_shards):
+            signature = self._joint_structural_unit_cache_signature(
                 filt=filt,
                 data=station_data,
-                positions_s3=positions_s3,
-                chart_ids_s=chart_ids_s,
-                positive_line_indices=positive_line_indices,
+                positive_line_indices=line_indices,
             )
-            for station_data in self._joint_structural_station_geometry_shards(
-                data
+            cache = isotope_cache.get(signature)
+            if cache is None:
+                missing = np.ones(unique_keys.size, dtype=np.bool_)
+            else:
+                cached_keys = np.asarray(
+                    cache["keys"],
+                    dtype=JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE,
+                )
+                lookup = np.searchsorted(cached_keys, unique_keys)
+                if cached_keys.size:
+                    safe_lookup = np.minimum(lookup, cached_keys.size - 1)
+                    hit = (
+                        (lookup < cached_keys.size)
+                        & (cached_keys[safe_lookup] == unique_keys)
+                    )
+                    missing = ~hit
+                else:
+                    missing = np.ones(unique_keys.size, dtype=np.bool_)
+            if np.any(missing):
+                active_shard_indices.append(shard_index)
+                union_missing |= missing
+
+        prefetched_keys: NDArray[Any] | None = None
+        prefetched_by_shard: dict[
+            int,
+            tuple[NDArray[np.float64], ...],
+        ] = {}
+        if active_shard_indices:
+            active_shards = [
+                station_shards[index] for index in active_shard_indices
+            ]
+            fused_geometry = StructuralGeometryBatch(
+                detector_positions=np.concatenate(
+                    [shard.detector_positions for shard in active_shards],
+                    axis=0,
+                ),
+                fe_indices=np.concatenate(
+                    [shard.fe_indices for shard in active_shards],
+                ),
+                pb_indices=np.concatenate(
+                    [shard.pb_indices for shard in active_shards],
+                ),
+                live_times=np.concatenate(
+                    [shard.live_times for shard in active_shards],
+                ),
+                station_sequence_ids=np.concatenate(
+                    [shard.station_sequence_ids for shard in active_shards],
+                ),
             )
+            prefetched_keys = unique_keys[union_missing]
+            prefetched_first_indices = first_indices[union_missing]
+            evaluated = filt._continuous_rj_line_transport_component_columns(
+                fused_geometry,
+                positions[prefetched_first_indices],
+                line_indices,
+                chart_ids=chart_ids[prefetched_first_indices],
+            )
+            fused_values = tuple(
+                np.transpose(
+                    np.asarray(getattr(evaluated, name), dtype=np.float64),
+                    (1, 0, 2),
+                )
+                for name in JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES
+            )
+            row_start = 0
+            for shard_index, station_data in zip(
+                active_shard_indices,
+                active_shards,
+                strict=True,
+            ):
+                row_stop = row_start + int(station_data.row_count)
+                prefetched_by_shard[shard_index] = tuple(
+                    values[:, row_start:row_stop, :] for values in fused_values
+                )
+                row_start = row_stop
+
+        active_shard_set = set(active_shard_indices)
+        processing_order = [
+            index
+            for index in range(len(station_shards))
+            if index not in active_shard_set
+        ] + active_shard_indices
+        station_components_by_index: list[
+            tuple[NDArray[np.float64], ...] | None
+        ] = [None] * len(station_shards)
+        for shard_index in processing_order:
+            station_components_by_index[shard_index] = (
+                self._joint_cached_continuous_unit_components_shard(
+                    filt=filt,
+                    data=station_shards[shard_index],
+                    positions_s3=positions,
+                    chart_ids_s=chart_ids,
+                    positive_line_indices=line_indices,
+                    prefetched_keys=(
+                        prefetched_keys
+                        if shard_index in prefetched_by_shard
+                        else None
+                    ),
+                    prefetched_values=prefetched_by_shard.get(shard_index),
+                )
+            )
+        if any(values is None for values in station_components_by_index):
+            raise RuntimeError("Fused station transport assembly is incomplete.")
+        station_components = [
+            values
+            for values in station_components_by_index
+            if values is not None
         ]
         return tuple(
             np.concatenate(
@@ -4392,7 +4983,7 @@ class RotatingShieldPFEstimator:
         cached_total, cached_uncollided, cached_features = cache
         line_count = len(tuple(model.line_identity))
         feature_count = len(tuple(model.transport_feature_order))
-        slots_per_isotope = int(filt.config.max_sources)
+        slots_per_isotope = int(filt.config.hard_max_sources)
         total_slot_count = slots_per_isotope * len(order)
         if (
             tuple(cached_total.shape[1:])
@@ -4411,43 +5002,15 @@ class RotatingShieldPFEstimator:
         global_columns, local_indices, branching_weights = layout[
             str(filt.isotope)
         ]
-        (
-            component_total,
-            component_uncollided,
-            component_tau_fe,
-            component_tau_pb,
-            component_tau_obstacle,
-            component_distance,
-        ) = self._joint_cached_continuous_unit_components(
-            filt=filt,
-            data=data,
-            positions_s3=positions.reshape(-1, 3),
-            chart_ids_s=chart_ids.reshape(-1),
-            positive_line_indices=local_indices,
-        )
         local_shape = (
             total_views,
             indices.size,
             int(positions.shape[1]),
             int(local_indices.size),
         )
-        candidate_total_numpy = np.asarray(
-            component_total,
-            dtype=np.float64,
-        ).reshape(local_shape)
-        candidate_uncollided_numpy = np.asarray(
-            component_uncollided,
-            dtype=np.float64,
-        ).reshape(local_shape)
-        candidate_features_numpy = np.stack(
-            (
-                np.asarray(component_tau_fe, dtype=np.float64),
-                np.asarray(component_tau_pb, dtype=np.float64),
-                np.asarray(component_tau_obstacle, dtype=np.float64),
-                np.asarray(component_distance, dtype=np.float64),
-            ),
-            axis=-1,
-        ).reshape(local_shape + (feature_count,))
+        isotope_index = order.index(str(filt.isotope))
+        slot_start = isotope_index * slots_per_isotope
+        slot_stop = slot_start + slots_per_isotope
         if cache_is_torch:
             import torch
 
@@ -4471,47 +5034,267 @@ class RotatingShieldPFEstimator:
                 0,
                 index_tensor,
             ).clone()
-            scale = (
-                torch.as_tensor(
-                    strengths,
-                    device=total.device,
-                    dtype=total.dtype,
-                )[None, :, :, None]
-                * torch.as_tensor(
-                    branching_weights,
-                    device=total.device,
-                    dtype=total.dtype,
-                ).reshape(1, 1, 1, -1)
-            )
-            candidate_total = (
-                torch.as_tensor(
-                    candidate_total_numpy,
-                    device=total.device,
-                    dtype=total.dtype,
-                )
-                .mul(scale)
-                .permute(1, 0, 2, 3)
-            )
-            candidate_uncollided = (
-                torch.as_tensor(
-                    candidate_uncollided_numpy,
-                    device=total.device,
-                    dtype=total.dtype,
-                )
-                .mul(scale)
-                .permute(1, 0, 2, 3)
-            )
-            candidate_features = torch.as_tensor(
-                candidate_features_numpy,
-                device=total.device,
-                dtype=total.dtype,
-            ).permute(1, 0, 2, 3, 4)
-            global_column_selection: object = torch.as_tensor(
+            global_column_selection = torch.as_tensor(
                 global_columns,
                 device=total.device,
                 dtype=torch.long,
             )
+            packed_current = filt._packed_continuous_surface_state_arrays()
+            current_positions = packed_current[0]
+            current_strengths = packed_current[1]
+            current_mask = packed_current[2]
+            current_charts = packed_current[3]
+            current_positions = np.asarray(
+                current_positions[indices],
+                dtype=np.float64,
+            )
+            current_strengths = np.asarray(
+                current_strengths[indices],
+                dtype=np.float64,
+            )
+            current_mask = np.asarray(current_mask[indices], dtype=np.bool_)
+            current_charts = np.asarray(
+                current_charts[indices],
+                dtype=np.int64,
+            )
+            cardinality = int(positions.shape[1])
+            matches = (
+                current_mask[:, None, :]
+                & (chart_ids[:, :, None] == current_charts[:, None, :])
+                & np.all(
+                    positions[:, :, None, :]
+                    == current_positions[:, None, :, :],
+                    axis=3,
+                )
+            )
+            match_counts = np.sum(matches, axis=2, dtype=np.int64)
+            if np.any(match_counts > 1):
+                raise RuntimeError(
+                    "One proposed source matches multiple accepted source slots."
+                )
+            matched = match_counts == 1
+            matched_slots = np.argmax(matches, axis=2).astype(
+                np.int64,
+                copy=False,
+            )
+            local_line_count = int(local_indices.size)
+            candidate_total = torch.zeros(
+                (
+                    indices.size,
+                    total_views,
+                    cardinality,
+                    local_line_count,
+                ),
+                device=total.device,
+                dtype=total.dtype,
+            )
+            candidate_uncollided = torch.zeros_like(candidate_total)
+            candidate_features = torch.zeros(
+                tuple(candidate_total.shape) + (feature_count,),
+                device=total.device,
+                dtype=total.dtype,
+            )
+            if cardinality and np.any(matched):
+                accepted_total = torch.index_select(
+                    total[:, :, slot_start:slot_stop, :],
+                    3,
+                    global_column_selection,
+                )
+                accepted_uncollided = torch.index_select(
+                    uncollided[:, :, slot_start:slot_stop, :],
+                    3,
+                    global_column_selection,
+                )
+                accepted_features = torch.index_select(
+                    features[:, :, slot_start:slot_stop, :, :],
+                    3,
+                    global_column_selection,
+                )
+                matched_slot_tensor = torch.as_tensor(
+                    matched_slots,
+                    device=total.device,
+                    dtype=torch.long,
+                )
+                line_gather = matched_slot_tensor[:, None, :, None].expand(
+                    -1,
+                    total_views,
+                    -1,
+                    local_line_count,
+                )
+                feature_gather = line_gather[..., None].expand(
+                    -1,
+                    -1,
+                    -1,
+                    -1,
+                    feature_count,
+                )
+                gathered_total = torch.gather(
+                    accepted_total,
+                    2,
+                    line_gather,
+                )
+                gathered_uncollided = torch.gather(
+                    accepted_uncollided,
+                    2,
+                    line_gather,
+                )
+                gathered_features = torch.gather(
+                    accepted_features,
+                    2,
+                    feature_gather,
+                )
+                accepted_strength = np.take_along_axis(
+                    current_strengths,
+                    matched_slots,
+                    axis=1,
+                )
+                if np.any(accepted_strength[matched] <= 0.0):
+                    raise RuntimeError(
+                        "Matched accepted sources must have positive strength."
+                    )
+                strength_ratio = np.ones_like(strengths)
+                strength_ratio[matched] = (
+                    strengths[matched] / accepted_strength[matched]
+                )
+                ratio_tensor = torch.as_tensor(
+                    strength_ratio,
+                    device=total.device,
+                    dtype=total.dtype,
+                )[:, None, :, None]
+                matched_tensor = torch.as_tensor(
+                    matched,
+                    device=total.device,
+                    dtype=torch.bool,
+                )[:, None, :, None]
+                candidate_total = torch.where(
+                    matched_tensor,
+                    gathered_total * ratio_tensor,
+                    candidate_total,
+                )
+                candidate_uncollided = torch.where(
+                    matched_tensor,
+                    gathered_uncollided * ratio_tensor,
+                    candidate_uncollided,
+                )
+                candidate_features = torch.where(
+                    matched_tensor[..., None],
+                    gathered_features,
+                    candidate_features,
+                )
+            unmatched_rows, unmatched_slots = np.nonzero(~matched)
+            if unmatched_rows.size:
+                device_components = (
+                    filt._continuous_rj_line_transport_component_columns(
+                        data,
+                        positions[unmatched_rows, unmatched_slots],
+                        local_indices,
+                        chart_ids=chart_ids[unmatched_rows, unmatched_slots],
+                        device_resident=True,
+                    )
+                )
+                if not hasattr(device_components.total_kernel, "detach"):
+                    raise RuntimeError(
+                        "CUDA structural transport returned host components."
+                    )
+                branch_tensor = torch.as_tensor(
+                    branching_weights,
+                    device=total.device,
+                    dtype=total.dtype,
+                )[None, None, :]
+                strength_tensor = torch.as_tensor(
+                    strengths[unmatched_rows, unmatched_slots],
+                    device=total.device,
+                    dtype=total.dtype,
+                )[:, None, None]
+                unmatched_total = (
+                    device_components.total_kernel.permute(1, 0, 2)
+                    * strength_tensor
+                    * branch_tensor
+                )
+                unmatched_uncollided = (
+                    device_components.uncollided_kernel.permute(1, 0, 2)
+                    * strength_tensor
+                    * branch_tensor
+                )
+                unmatched_features = torch.stack(
+                    (
+                        device_components.tau_fe,
+                        device_components.tau_pb,
+                        device_components.tau_obstacle,
+                        device_components.distance_m,
+                    ),
+                    dim=-1,
+                ).permute(1, 0, 2, 3)
+                unmatched_row_tensor = torch.as_tensor(
+                    unmatched_rows,
+                    device=total.device,
+                    dtype=torch.long,
+                )
+                unmatched_slot_tensor = torch.as_tensor(
+                    unmatched_slots,
+                    device=total.device,
+                    dtype=torch.long,
+                )
+                candidate_total[
+                    unmatched_row_tensor,
+                    :,
+                    unmatched_slot_tensor,
+                    :,
+                ] = unmatched_total
+                candidate_uncollided[
+                    unmatched_row_tensor,
+                    :,
+                    unmatched_slot_tensor,
+                    :,
+                ] = unmatched_uncollided
+                candidate_features[
+                    unmatched_row_tensor,
+                    :,
+                    unmatched_slot_tensor,
+                    :,
+                    :,
+                ] = unmatched_features
+            station_count = len(
+                self._joint_structural_station_geometry_shards(data)
+            )
+            self.last_joint_structural_unit_cache_hits += int(
+                np.count_nonzero(matched) * station_count
+            )
+            self.last_joint_structural_unit_cache_misses += int(
+                unmatched_rows.size * station_count
+            )
         else:
+            (
+                component_total,
+                component_uncollided,
+                component_tau_fe,
+                component_tau_pb,
+                component_tau_obstacle,
+                component_distance,
+            ) = self._joint_cached_continuous_unit_components(
+                filt=filt,
+                data=data,
+                positions_s3=positions.reshape(-1, 3),
+                chart_ids_s=chart_ids.reshape(-1),
+                positive_line_indices=local_indices,
+            )
+            candidate_total_numpy = np.asarray(
+                component_total,
+                dtype=np.float64,
+            ).reshape(local_shape)
+            candidate_uncollided_numpy = np.asarray(
+                component_uncollided,
+                dtype=np.float64,
+            ).reshape(local_shape)
+            candidate_features_numpy = np.stack(
+                (
+                    np.asarray(component_tau_fe, dtype=np.float64),
+                    np.asarray(component_tau_pb, dtype=np.float64),
+                    np.asarray(component_tau_obstacle, dtype=np.float64),
+                    np.asarray(component_distance, dtype=np.float64),
+                ),
+                axis=-1,
+            ).reshape(local_shape + (feature_count,))
             total = np.asarray(
                 cached_total[indices],
                 dtype=np.float64,
@@ -4541,9 +5324,6 @@ class RotatingShieldPFEstimator:
                 (1, 0, 2, 3, 4),
             )
             global_column_selection = global_columns
-        isotope_index = order.index(str(filt.isotope))
-        slot_start = isotope_index * slots_per_isotope
-        slot_stop = slot_start + slots_per_isotope
         total[:, :, slot_start:slot_stop, :] = 0.0
         uncollided[:, :, slot_start:slot_stop, :] = 0.0
         features[:, :, slot_start:slot_stop, :, :] = 0.0
@@ -4612,6 +5392,1030 @@ class RotatingShieldPFEstimator:
             newest_prefix_count=self._active_joint_tempering_prefix_count,
         )
 
+    @staticmethod
+    def _joint_isotope_state_log_prior(
+        filt: IsotopeParticleFilter,
+        state: IsotopeState,
+    ) -> float:
+        """Return the exact labeled continuous-state prior log density."""
+        atlas = filt._structural_rj_surface_atlas
+        cardinality_prior = filt._structural_rj_cardinality_prior
+        if atlas is None or cardinality_prior is None:
+            raise RuntimeError("Cross-isotope transfer priors are unavailable.")
+        cardinality = int(state.num_sources)
+        value = float(cardinality_prior.log_prob(cardinality)) + math.lgamma(
+            float(cardinality) + 1.0
+        )
+        if cardinality:
+            value += float(
+                np.sum(
+                    atlas.log_chart_probabilities[
+                        state.surface_chart_ids
+                    ]
+                    + np.asarray(
+                        filt._strength_prior.log_prob(state.strengths),
+                        dtype=np.float64,
+                    )
+                )
+            )
+        return value
+
+    @staticmethod
+    def _cross_isotope_transferred_states(
+        donor_filter: IsotopeParticleFilter,
+        receiver_filter: IsotopeParticleFilter,
+        donor_state: IsotopeState,
+        receiver_state: IsotopeState,
+        transferred_indices: NDArray[np.int64],
+    ) -> tuple[IsotopeState, IsotopeState]:
+        """Return canonical donor/receiver states after identity transfer."""
+        selected = np.asarray(transferred_indices, dtype=np.int64).reshape(-1)
+        donor_count = int(donor_state.num_sources)
+        if (
+            selected.size == 0
+            or np.unique(selected).size != selected.size
+            or np.any(selected < 0)
+            or np.any(selected >= donor_count)
+        ):
+            raise ValueError("Cross-isotope transferred indices are invalid.")
+        keep = np.ones(donor_count, dtype=bool)
+        keep[selected] = False
+        new_donor = IsotopeState(
+            num_sources=int(np.sum(keep)),
+            strengths=donor_state.strengths[keep],
+            surface_chart_ids=donor_state.surface_chart_ids[keep],
+            surface_uv=donor_state.surface_uv[keep],
+        )
+        new_receiver = IsotopeState(
+            num_sources=int(receiver_state.num_sources + selected.size),
+            strengths=np.concatenate(
+                (receiver_state.strengths, donor_state.strengths[selected])
+            ),
+            surface_chart_ids=np.concatenate(
+                (
+                    receiver_state.surface_chart_ids,
+                    donor_state.surface_chart_ids[selected],
+                )
+            ),
+            surface_uv=np.concatenate(
+                (receiver_state.surface_uv, donor_state.surface_uv[selected]),
+                axis=0,
+            ),
+        )
+        donor_filter._canonicalize_structural_rj_state(new_donor)
+        receiver_filter._canonicalize_structural_rj_state(new_receiver)
+        return new_donor, new_receiver
+
+    def _evaluate_cross_isotope_receiver_states(
+        self,
+        *,
+        stations: Sequence[JointStationObservation],
+        receiver_states: Mapping[int, IsotopeState],
+        receiver_by_row: NDArray[np.int64],
+        isotope_order: tuple[str, ...],
+        target_beta: float,
+    ) -> NDArray[np.float64]:
+        """Evaluate batched receiver states with temporary donor cache active."""
+        proposed_target = np.full(
+            receiver_by_row.size,
+            float("nan"),
+            dtype=np.float64,
+        )
+        for receiver_index, isotope in enumerate(isotope_order):
+            rows_for_isotope = np.flatnonzero(
+                receiver_by_row == receiver_index
+            )
+            if rows_for_isotope.size == 0:
+                continue
+            filt = self.filters[isotope]
+            evidence = self._joint_history_structural_geometry(
+                isotope,
+                stations,
+            )
+            cardinalities = np.asarray(
+                [
+                    receiver_states[int(row)].num_sources
+                    for row in rows_for_isotope
+                ],
+                dtype=np.int64,
+            )
+            for cardinality in np.unique(cardinalities).tolist():
+                local = np.flatnonzero(cardinalities == int(cardinality))
+                rows = rows_for_isotope[local]
+                states = [receiver_states[int(row)] for row in rows]
+                if int(cardinality):
+                    chart_ids = np.stack(
+                        [state.surface_chart_ids for state in states],
+                        axis=0,
+                    )
+                    strengths = np.stack(
+                        [state.strengths for state in states],
+                        axis=0,
+                    )
+                    positions = np.stack(
+                        [filt.continuous_state_positions(state) for state in states],
+                        axis=0,
+                    )
+                else:
+                    chart_ids = np.empty((rows.size, 0), dtype=np.int64)
+                    strengths = np.empty((rows.size, 0), dtype=np.float64)
+                    positions = np.empty((rows.size, 0, 3), dtype=np.float64)
+                proposed_target[rows] = self._joint_structural_target_evaluator(
+                    filt=filt,
+                    data=evidence,
+                    positions_pks=positions,
+                    chart_ids_pk=chart_ids,
+                    strengths_pk=strengths,
+                    particle_indices=rows,
+                    target_beta=float(target_beta),
+                    tempering_start_row=sum(
+                        int(station.fe_indices.size) for station in stations[:-1]
+                    ),
+                )
+        evaluated_rows = np.asarray(
+            sorted(receiver_states),
+            dtype=np.int64,
+        )
+        if np.any(~np.isfinite(proposed_target[evaluated_rows])):
+            raise RuntimeError("Cross-isotope target evaluation was incomplete.")
+        return proposed_target
+
+    def _joint_packed_strength_state(
+        self,
+    ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+        """Return all isotope strengths in the fixed joint slot layout."""
+        strengths_by_isotope: list[NDArray[np.float64]] = []
+        masks_by_isotope: list[NDArray[np.bool_]] = []
+        for isotope in self.joint_isotope_order():
+            _, strengths, active_mask, _, _ = (
+                self.filters[isotope]._packed_continuous_surface_state_arrays()
+            )
+            strengths_by_isotope.append(
+                np.asarray(strengths, dtype=np.float64)
+            )
+            masks_by_isotope.append(np.asarray(active_mask, dtype=np.bool_))
+        return (
+            np.concatenate(strengths_by_isotope, axis=1),
+            np.concatenate(masks_by_isotope, axis=1),
+        )
+
+    def _joint_strength_block_target(
+        self,
+        stations: Sequence[JointStationObservation],
+        *,
+        particle_indices: NDArray[np.int64],
+        scale_ps: NDArray[np.float64],
+        target_beta: float,
+    ) -> NDArray[np.float64]:
+        """Evaluate one strength-only proposal from the accepted GPU cache.
+
+        The immutable unit transport, surface geometry, and line layout do not
+        change when strengths move.  Scaling cached source columns is therefore
+        exactly equivalent to transport recomputation and avoids new kernels.
+        Rows are evaluated in bounded batches to cap temporary GPU memory.
+        """
+        cache = self._joint_structural_transport_cache
+        if cache is None:
+            raise RuntimeError("Joint strength moves require an active cache.")
+        indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        scale = np.asarray(scale_ps, dtype=np.float64)
+        if scale.shape != (indices.size, int(cache[0].shape[2])):
+            raise ValueError("Joint strength scales do not match cache slots.")
+        result = np.empty(indices.size, dtype=np.float64)
+        batch_size = int(self.pf_config.joint_strength_block_batch_size)
+        filt = self.filters[self.joint_isotope_order()[0]]
+        cache_is_torch = hasattr(cache[0], "detach")
+        for start in range(0, indices.size, batch_size):
+            stop = min(start + batch_size, indices.size)
+            selected = indices[start:stop]
+            selected_scale = scale[start:stop]
+            if cache_is_torch:
+                import torch
+
+                index_tensor = torch.as_tensor(
+                    selected,
+                    device=cache[0].device,
+                    dtype=torch.long,
+                )
+                scale_tensor = torch.as_tensor(
+                    selected_scale,
+                    device=cache[0].device,
+                    dtype=cache[0].dtype,
+                )[:, None, :, None]
+                total = torch.index_select(cache[0], 0, index_tensor) * scale_tensor
+                uncollided = (
+                    torch.index_select(cache[1], 0, index_tensor) * scale_tensor
+                )
+                features = torch.index_select(cache[2], 0, index_tensor)
+                batch_result = self._joint_history_log_likelihood_torch(
+                    filt=filt,
+                    stations=stations,
+                    total_nvsl=total,
+                    uncollided_nvsl=uncollided,
+                    features_nvslf=features,
+                    target_beta=float(target_beta),
+                    newest_prefix_count=(
+                        self._active_joint_tempering_prefix_count
+                    ),
+                )
+                result[start:stop] = (
+                    batch_result.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64, copy=False)
+                )
+            else:
+                slot_scale = selected_scale[:, None, :, None]
+                result[start:stop] = self._joint_history_log_likelihood_numpy(
+                    filt=filt,
+                    stations=stations,
+                    total_nvsl=np.asarray(cache[0][selected]) * slot_scale,
+                    uncollided_nvsl=(
+                        np.asarray(cache[1][selected]) * slot_scale
+                    ),
+                    features_nvslf=np.asarray(cache[2][selected]),
+                    target_beta=float(target_beta),
+                    newest_prefix_count=(
+                        self._active_joint_tempering_prefix_count
+                    ),
+                )
+        return result
+
+    def _joint_active_cache_target(
+        self,
+        stations: Sequence[JointStationObservation],
+        *,
+        particle_indices: NDArray[np.int64],
+        target_beta: float,
+    ) -> NDArray[np.float64]:
+        """Evaluate selected rows of the currently active joint GPU cache."""
+        cache = self._joint_structural_transport_cache
+        if cache is None:
+            raise RuntimeError("A joint structural cache is not active.")
+        rows = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        if np.any(rows < 0) or np.any(rows >= int(cache[0].shape[0])):
+            raise ValueError("Joint cache particle indices are invalid.")
+        filt = self.filters[self.joint_isotope_order()[0]]
+        if hasattr(cache[0], "detach"):
+            import torch
+
+            selected = torch.as_tensor(
+                rows,
+                device=cache[0].device,
+                dtype=torch.long,
+            )
+            result = self._joint_history_log_likelihood_torch(
+                filt=filt,
+                stations=stations,
+                total_nvsl=torch.index_select(cache[0], 0, selected),
+                uncollided_nvsl=torch.index_select(cache[1], 0, selected),
+                features_nvslf=torch.index_select(cache[2], 0, selected),
+                target_beta=float(target_beta),
+                newest_prefix_count=self._active_joint_tempering_prefix_count,
+            )
+            return (
+                result.detach().cpu().numpy().astype(np.float64, copy=False)
+            )
+        return self._joint_history_log_likelihood_numpy(
+            filt=filt,
+            stations=stations,
+            total_nvsl=np.asarray(cache[0][rows]),
+            uncollided_nvsl=np.asarray(cache[1][rows]),
+            features_nvslf=np.asarray(cache[2][rows]),
+            target_beta=float(target_beta),
+            newest_prefix_count=self._active_joint_tempering_prefix_count,
+        )
+
+    def _commit_joint_strength_block(
+        self,
+        accepted_rows: NDArray[np.int64],
+        proposed_strengths_ps: NDArray[np.float64],
+        old_strengths_ps: NDArray[np.float64],
+    ) -> None:
+        """Commit accepted joint strengths and rescale their cache rows."""
+        rows = np.asarray(accepted_rows, dtype=np.int64).reshape(-1)
+        if rows.size == 0:
+            return
+        proposed = np.asarray(proposed_strengths_ps, dtype=np.float64)
+        old = np.asarray(old_strengths_ps, dtype=np.float64)
+        slots_per_isotope = self.pf_config.cardinality_capacity
+        for isotope_index, isotope in enumerate(self.joint_isotope_order()):
+            filt = self.filters[isotope]
+            cardinalities = np.asarray(
+                [
+                    filt.continuous_particles[int(row)].state.num_sources
+                    for row in rows
+                ],
+                dtype=np.int64,
+            )
+            slot_start = isotope_index * slots_per_isotope
+            for cardinality in np.unique(cardinalities).tolist():
+                local = np.flatnonzero(cardinalities == int(cardinality))
+                isotope_rows = rows[local]
+                charts, uv, positions, _ = filt._continuous_rj_group_arrays(
+                    isotope_rows,
+                    int(cardinality),
+                )
+                strengths = proposed[
+                    local,
+                    slot_start : slot_start + int(cardinality),
+                ]
+                filt._commit_continuous_rj_states(
+                    isotope_rows,
+                    np.ones(isotope_rows.size, dtype=np.bool_),
+                    charts,
+                    uv,
+                    positions,
+                    strengths,
+                )
+        cache = self._joint_structural_transport_cache
+        if cache is None:
+            raise RuntimeError("Joint strength cache disappeared during commit.")
+        scale = np.divide(
+            proposed,
+            old,
+            out=np.ones_like(proposed),
+            where=old > 0.0,
+        )
+        if hasattr(cache[0], "detach"):
+            import torch
+
+            index_tensor = torch.as_tensor(
+                rows,
+                device=cache[0].device,
+                dtype=torch.long,
+            )
+            scale_tensor = torch.as_tensor(
+                scale,
+                device=cache[0].device,
+                dtype=cache[0].dtype,
+            )[:, None, :, None]
+            for cached_values in cache[:2]:
+                updated = torch.index_select(
+                    cached_values,
+                    0,
+                    index_tensor,
+                ) * scale_tensor
+                cached_values.index_copy_(0, index_tensor, updated)
+        else:
+            for cached_values in cache[:2]:
+                cached_values[rows] *= scale[:, None, :, None]
+        self._joint_persistent_structural_transport_cache = cache
+        signatures = self._joint_station_cache_signatures(
+            self._active_joint_station_history or ()
+        )
+        if signatures is None:
+            self._joint_persistent_structural_state_sha256 = None
+        else:
+            self._joint_persistent_structural_station_signature = signatures
+            self._joint_persistent_structural_state_sha256 = (
+                self._joint_structural_state_sha256()
+            )
+
+    def _apply_joint_strength_block(
+        self,
+        stations: Sequence[JointStationObservation],
+        *,
+        target_beta: float,
+        current_target_log_likelihood: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Apply one exact all-isotope strength move without conservation.
+
+        Each active source receives a symmetric Gaussian increment in shifted
+        log-strength coordinates.  Isotope totals are not constrained or
+        transferred.  The shared spectrum likelihood alone decides whether a
+        simultaneous decrease in one isotope and increase in another is useful.
+        """
+        probability = float(self.pf_config.joint_strength_block_probability)
+        current_target = np.asarray(
+            current_target_log_likelihood,
+            dtype=np.float64,
+        )
+        if probability <= 0.0:
+            return current_target
+        current_strengths, active_mask = self._joint_packed_strength_state()
+        rng = self._joint_random_generator
+        attempted = (
+            rng.random(current_strengths.shape[0]) < probability
+        ) & np.any(active_mask, axis=1)
+        rows = np.flatnonzero(attempted).astype(np.int64, copy=False)
+        weights = self._strict_joint_particle_weights()
+        self.last_joint_strength_block_attempted_weight_mass += float(
+            np.sum(weights[rows])
+        )
+        if rows.size == 0:
+            return current_target
+        minimum = float(self.pf_config.strength_prior_min_cps_1m)
+        old = current_strengths[rows]
+        mask = active_mask[rows]
+        shifted = old - minimum
+        valid = np.all(~mask | (shifted > 0.0), axis=1)
+        noise = rng.normal(
+            loc=0.0,
+            scale=float(self.pf_config.joint_strength_block_log_sigma),
+            size=old.shape,
+        )
+        proposed = old.copy()
+        proposed[mask] = minimum + shifted[mask] * np.exp(noise[mask])
+        log_prior_ratio = np.zeros(rows.size, dtype=np.float64)
+        slots_per_isotope = self.pf_config.cardinality_capacity
+        for isotope_index, isotope in enumerate(self.joint_isotope_order()):
+            slot = slice(
+                isotope_index * slots_per_isotope,
+                (isotope_index + 1) * slots_per_isotope,
+            )
+            isotope_mask = mask[:, slot]
+            prior = self.filters[isotope]._strength_prior
+            safe_proposed = np.where(
+                isotope_mask,
+                proposed[:, slot],
+                prior.mean,
+            )
+            safe_old = np.where(
+                isotope_mask,
+                old[:, slot],
+                prior.mean,
+            )
+            log_prior_ratio += np.sum(
+                np.where(
+                    isotope_mask,
+                    np.asarray(prior.log_prob(safe_proposed))
+                    - np.asarray(prior.log_prob(safe_old)),
+                    0.0,
+                ),
+                axis=1,
+                dtype=np.float64,
+            )
+        log_proposal_ratio = (
+            shifted_log_strength_random_walk_log_reverse_ratio(
+                old,
+                proposed,
+                mask,
+                minimum_strength=minimum,
+            )
+        )
+        valid &= np.isfinite(log_prior_ratio) & np.isfinite(log_proposal_ratio)
+        scale = np.ones_like(old)
+        scale[mask] = proposed[mask] / old[mask]
+        proposed_target = np.full(rows.size, float("-inf"), dtype=np.float64)
+        valid_local = np.flatnonzero(valid)
+        if valid_local.size:
+            proposed_target[valid_local] = self._joint_strength_block_target(
+                stations,
+                particle_indices=rows[valid_local],
+                scale_ps=scale[valid_local],
+                target_beta=float(target_beta),
+            )
+        log_ratio = (
+            proposed_target
+            - current_target[rows]
+            + log_prior_ratio
+            + log_proposal_ratio
+        )
+        accepted = valid & (
+            np.log(rng.random(rows.size)) < np.minimum(log_ratio, 0.0)
+        )
+        accepted_rows = rows[accepted]
+        if accepted_rows.size:
+            self._commit_joint_strength_block(
+                accepted_rows,
+                proposed[accepted],
+                old[accepted],
+            )
+            current_target = current_target.copy()
+            current_target[accepted_rows] = proposed_target[accepted]
+            self.last_joint_strength_block_accepted_weight_mass += float(
+                np.sum(weights[accepted_rows])
+            )
+        return current_target
+
+    def _apply_joint_cross_isotope_transfer(
+        self,
+        stations: Sequence[JointStationObservation],
+        *,
+        target_beta: float,
+        current_target_log_likelihood: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Apply an exact multi-source isotope-identity transfer proposal.
+
+        A uniformly selected subset of one isotope is relabeled as another
+        isotope while retaining its continuous surface coordinates and
+        strengths.  The state-dependent subset and group-size probabilities,
+        both isotope priors, and the full joint likelihood are all included in
+        the MH ratio.  This crosses the likelihood barrier created when a clear
+        peak has been assigned to the wrong isotope during early resampling.
+        """
+        probability = float(
+            self.pf_config.joint_cross_isotope_transfer_probability
+        )
+        isotope_order = self.joint_isotope_order()
+        if probability <= 0.0 or len(isotope_order) < 2:
+            return np.asarray(current_target_log_likelihood, dtype=np.float64)
+        particle_count = int(self.pf_config.num_particles)
+        weights = self._strict_joint_particle_weights()
+        rng = self._joint_random_generator
+        attempted = rng.random(particle_count) < probability
+        donor_by_row = rng.integers(
+            0,
+            len(isotope_order),
+            size=particle_count,
+        )
+        receiver_offset = rng.integers(
+            1,
+            len(isotope_order),
+            size=particle_count,
+        )
+        receiver_by_row = (
+            donor_by_row + receiver_offset
+        ) % len(isotope_order)
+        cardinalities = np.stack(
+            [
+                np.asarray(
+                    [
+                        particle.state.num_sources
+                        for particle in self.filters[isotope].continuous_particles
+                    ],
+                    dtype=np.int64,
+                )
+                for isotope in isotope_order
+            ],
+            axis=1,
+        )
+        row_indices = np.arange(particle_count, dtype=np.int64)
+        donor_cardinality = cardinalities[row_indices, donor_by_row]
+        receiver_cardinality = cardinalities[row_indices, receiver_by_row]
+        maximum_sources = self.pf_config.cardinality_capacity
+        maximum_group = np.minimum.reduce(
+            (
+                donor_cardinality,
+                maximum_sources - receiver_cardinality,
+                np.full(
+                    particle_count,
+                    int(
+                        self.pf_config
+                        .joint_cross_isotope_transfer_max_group
+                    ),
+                    dtype=np.int64,
+                ),
+            )
+        )
+        feasible = attempted & (maximum_group > 0)
+        rows = np.flatnonzero(feasible)
+        self.last_joint_cross_isotope_attempted_weight_mass += float(
+            np.sum(weights[rows])
+        )
+        if rows.size == 0:
+            return np.asarray(current_target_log_likelihood, dtype=np.float64)
+        group_sizes = np.ones(particle_count, dtype=np.int64)
+        group_sizes[rows] = (
+            np.floor(rng.random(rows.size) * maximum_group[rows]).astype(
+                np.int64
+            )
+            + 1
+        )
+        donor_states: dict[int, IsotopeState] = {}
+        receiver_states: dict[int, IsotopeState] = {}
+        old_donor_states: dict[int, IsotopeState] = {}
+        old_receiver_states: dict[int, IsotopeState] = {}
+        log_forward = np.full(particle_count, float("-inf"), dtype=np.float64)
+        log_reverse = np.full(particle_count, float("-inf"), dtype=np.float64)
+        log_prior_ratio = np.zeros(particle_count, dtype=np.float64)
+        for row in rows.tolist():
+            donor_filter = self.filters[isotope_order[donor_by_row[row]]]
+            receiver_filter = self.filters[
+                isotope_order[receiver_by_row[row]]
+            ]
+            donor_state = donor_filter.continuous_particles[row].state
+            receiver_state = receiver_filter.continuous_particles[row].state
+            group_size = int(group_sizes[row])
+            selected = np.sort(
+                rng.choice(
+                    int(donor_state.num_sources),
+                    size=group_size,
+                    replace=False,
+                )
+            )
+            proposed_donor, proposed_receiver = (
+                self._cross_isotope_transferred_states(
+                    donor_filter,
+                    receiver_filter,
+                    donor_state,
+                    receiver_state,
+                    selected,
+                )
+            )
+            donor_states[row] = proposed_donor
+            receiver_states[row] = proposed_receiver
+            old_donor_states[row] = donor_state.copy()
+            old_receiver_states[row] = receiver_state.copy()
+            log_forward[row] = cross_isotope_transfer_log_proposal(
+                donor_cardinality=int(donor_state.num_sources),
+                receiver_cardinality=int(receiver_state.num_sources),
+                group_size=group_size,
+                maximum_sources=maximum_sources,
+                maximum_group_size=int(
+                    self.pf_config
+                    .joint_cross_isotope_transfer_max_group
+                ),
+            )
+            log_reverse[row] = cross_isotope_transfer_log_proposal(
+                donor_cardinality=int(proposed_receiver.num_sources),
+                receiver_cardinality=int(proposed_donor.num_sources),
+                group_size=group_size,
+                maximum_sources=maximum_sources,
+                maximum_group_size=int(
+                    self.pf_config
+                    .joint_cross_isotope_transfer_max_group
+                ),
+            )
+            old_prior = self._joint_isotope_state_log_prior(
+                donor_filter,
+                donor_state,
+            ) + self._joint_isotope_state_log_prior(
+                receiver_filter,
+                receiver_state,
+            )
+            new_prior = self._joint_isotope_state_log_prior(
+                donor_filter,
+                proposed_donor,
+            ) + self._joint_isotope_state_log_prior(
+                receiver_filter,
+                proposed_receiver,
+            )
+            log_prior_ratio[row] = new_prior - old_prior
+
+        touched_donors = sorted(set(donor_by_row[rows].tolist()))
+        for row in rows.tolist():
+            donor_filter = self.filters[isotope_order[donor_by_row[row]]]
+            donor_filter.continuous_particles[row].state = donor_states[row]
+        try:
+            for isotope_index in touched_donors:
+                isotope_rows = rows[
+                    donor_by_row[rows] == isotope_index
+                ]
+                self._refresh_joint_structural_transport_cache_isotope(
+                    stations,
+                    isotope_order[isotope_index],
+                    particle_indices=isotope_rows,
+                )
+            proposed_target = self._evaluate_cross_isotope_receiver_states(
+                stations=stations,
+                receiver_states=receiver_states,
+                receiver_by_row=np.where(
+                    feasible,
+                    receiver_by_row,
+                    -1,
+                ),
+                isotope_order=isotope_order,
+                target_beta=float(target_beta),
+            )
+        finally:
+            for row in rows.tolist():
+                donor_filter = self.filters[isotope_order[donor_by_row[row]]]
+                donor_filter.continuous_particles[row].state = (
+                    old_donor_states[row]
+                )
+            for isotope_index in touched_donors:
+                isotope_rows = rows[
+                    donor_by_row[rows] == isotope_index
+                ]
+                self._refresh_joint_structural_transport_cache_isotope(
+                    stations,
+                    isotope_order[isotope_index],
+                    particle_indices=isotope_rows,
+                )
+        current_target = np.asarray(
+            current_target_log_likelihood,
+            dtype=np.float64,
+        )
+        log_ratio = (
+            proposed_target[rows]
+            - current_target[rows]
+            + log_prior_ratio[rows]
+            + log_reverse[rows]
+            - log_forward[rows]
+        )
+        accepted_local = np.log(rng.random(rows.size)) < np.minimum(
+            log_ratio,
+            0.0,
+        )
+        accepted_rows = rows[accepted_local]
+        for row in accepted_rows.tolist():
+            donor_filter = self.filters[isotope_order[donor_by_row[row]]]
+            receiver_filter = self.filters[
+                isotope_order[receiver_by_row[row]]
+            ]
+            donor_filter.continuous_particles[row].state = donor_states[row]
+            receiver_filter.continuous_particles[row].state = (
+                receiver_states[row]
+            )
+        if accepted_rows.size:
+            touched = sorted(
+                set(donor_by_row[accepted_rows].tolist())
+                | set(receiver_by_row[accepted_rows].tolist())
+            )
+            for isotope_index in touched:
+                isotope_rows = accepted_rows[
+                    (donor_by_row[accepted_rows] == isotope_index)
+                    | (receiver_by_row[accepted_rows] == isotope_index)
+                ]
+                self._refresh_joint_structural_transport_cache_isotope(
+                    stations,
+                    isotope_order[isotope_index],
+                    particle_indices=isotope_rows,
+                )
+            current_target = current_target.copy()
+            current_target[accepted_rows] = proposed_target[accepted_rows]
+            self.last_joint_cross_isotope_accepted_weight_mass += float(
+                np.sum(weights[accepted_rows])
+            )
+            self._invalidate_posterior_summary_cache()
+        self._assert_joint_particle_alignment()
+        return current_target
+
+    def _apply_joint_cross_isotope_state_block(
+        self,
+        stations: Sequence[JointStationObservation],
+        *,
+        target_beta: float,
+        current_target_log_likelihood: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Jointly propose independent isotope states without strength transfer.
+
+        Each isotope retains its own cardinality, surface-position, and strength
+        priors. The proposal is coupled only by making one simultaneous MH
+        decision under the shared full-spectrum likelihood; no activity or
+        detector-cps quantity is conserved between isotope labels.
+        """
+        probability = float(
+            self.pf_config.joint_cross_isotope_state_block_probability
+        )
+        current_target = np.asarray(
+            current_target_log_likelihood,
+            dtype=np.float64,
+        )
+        if probability <= 0.0:
+            return current_target
+        particle_count = int(self.pf_config.num_particles)
+        rng = self._joint_random_generator
+        rows = np.flatnonzero(
+            rng.random(particle_count) < probability
+        ).astype(np.int64, copy=False)
+        weights = self._strict_joint_particle_weights()
+        self.last_joint_cross_isotope_state_attempted_weight_mass += float(
+            np.sum(weights[rows], dtype=np.float64)
+        )
+        if rows.size == 0:
+            return current_target
+        isotope_order = self.joint_isotope_order()
+        old_states: dict[str, list[IsotopeState]] = {}
+        proposed_states: dict[str, list[IsotopeState]] = {}
+        current_log_prior = np.zeros(rows.size, dtype=np.float64)
+        current_log_proposal = np.zeros(rows.size, dtype=np.float64)
+        proposed_log_prior = np.zeros(rows.size, dtype=np.float64)
+        proposed_log_proposal = np.zeros(rows.size, dtype=np.float64)
+        for isotope in isotope_order:
+            filt = self.filters[isotope]
+            atlas = filt._structural_rj_surface_atlas
+            cardinality_prior = filt._structural_rj_cardinality_prior
+            if atlas is None or cardinality_prior is None:
+                raise RuntimeError(
+                    "Joint isotope-state proposals require exact surface priors."
+                )
+            evidence = self._joint_history_structural_geometry(
+                isotope,
+                stations,
+            )
+            self._active_joint_structural_geometry = evidence
+            try:
+                filt._structural_rj_position_proposal = (
+                    filt._build_continuous_rj_position_proposal(
+                        evidence,
+                        target_beta=float(target_beta),
+                    )
+                )
+                old = [
+                    filt.continuous_particles[int(row)].state.copy()
+                    for row in rows
+                ]
+                old_states[isotope] = old
+                old_cardinalities = np.asarray(
+                    [state.num_sources for state in old],
+                    dtype=np.int64,
+                )
+                for cardinality in np.unique(old_cardinalities).tolist():
+                    selected = np.flatnonzero(
+                        old_cardinalities == int(cardinality)
+                    )
+                    states = [old[int(index)] for index in selected]
+                    charts = (
+                        np.stack(
+                            [state.surface_chart_ids for state in states],
+                            axis=0,
+                        )
+                        if int(cardinality)
+                        else np.empty((selected.size, 0), dtype=np.int64)
+                    )
+                    strengths = (
+                        np.stack(
+                            [state.strengths for state in states],
+                            axis=0,
+                        )
+                        if int(cardinality)
+                        else np.empty((selected.size, 0), dtype=np.float64)
+                    )
+                    prior, proposal = filt._continuous_rj_block_log_densities(
+                        charts,
+                        strengths,
+                    )
+                    current_log_prior[selected] += prior
+                    current_log_proposal[selected] += proposal
+                cardinalities = rng.choice(
+                    cardinality_prior.probabilities.size,
+                    size=rows.size,
+                    replace=True,
+                    p=cardinality_prior.probabilities,
+                ).astype(np.int64, copy=False)
+                generated: list[IsotopeState | None] = [None] * rows.size
+                for cardinality in np.unique(cardinalities).tolist():
+                    selected = np.flatnonzero(
+                        cardinalities == int(cardinality)
+                    )
+                    source_count = int(selected.size) * int(cardinality)
+                    chart_ids, surface_uv, _ = atlas.sample(
+                        source_count,
+                        rng=rng,
+                        chart_probabilities=(
+                            filt._active_continuous_rj_position_proposal()
+                            .chart_probabilities
+                        ),
+                    )
+                    strengths = np.asarray(
+                        filt._active_continuous_rj_strength_proposal().sample(
+                            chart_ids,
+                            rng=rng,
+                        ),
+                        dtype=np.float64,
+                    )
+                    charts_batch = chart_ids.reshape(
+                        selected.size,
+                        int(cardinality),
+                    )
+                    uv_batch = surface_uv.reshape(
+                        selected.size,
+                        int(cardinality),
+                        2,
+                    )
+                    strength_batch = strengths.reshape(
+                        selected.size,
+                        int(cardinality),
+                    )
+                    prior, proposal = filt._continuous_rj_block_log_densities(
+                        charts_batch,
+                        strength_batch,
+                    )
+                    proposed_log_prior[selected] += prior
+                    proposed_log_proposal[selected] += proposal
+                    for local_index, destination in enumerate(selected.tolist()):
+                        state = IsotopeState(
+                            num_sources=int(cardinality),
+                            strengths=strength_batch[local_index],
+                            surface_chart_ids=charts_batch[local_index],
+                            surface_uv=uv_batch[local_index],
+                        )
+                        filt._canonicalize_structural_rj_state(state)
+                        generated[int(destination)] = state
+                if any(state is None for state in generated):
+                    raise RuntimeError(
+                        "Joint isotope-state proposal generation was incomplete."
+                    )
+                proposed_states[isotope] = [
+                    state
+                    for state in generated
+                    if isinstance(state, IsotopeState)
+                ]
+            finally:
+                self._active_joint_structural_geometry = None
+                filt._structural_rj_position_proposal = None
+                filt._structural_rj_strength_proposal = None
+
+        def _assign(candidate: Mapping[str, Sequence[IsotopeState]]) -> None:
+            """Assign selected variable-length rows before a batched refresh."""
+            for isotope in isotope_order:
+                filt = self.filters[isotope]
+                states = candidate[isotope]
+                for local_index, row in enumerate(rows.tolist()):
+                    filt.continuous_particles[int(row)].state = (
+                        states[local_index].copy()
+                    )
+
+        _assign(proposed_states)
+        try:
+            for isotope in isotope_order:
+                self._refresh_joint_structural_transport_cache_isotope(
+                    stations,
+                    isotope,
+                    particle_indices=rows,
+                )
+            proposed_target = self._joint_active_cache_target(
+                stations,
+                particle_indices=rows,
+                target_beta=float(target_beta),
+            )
+        finally:
+            _assign(old_states)
+            for isotope in isotope_order:
+                self._refresh_joint_structural_transport_cache_isotope(
+                    stations,
+                    isotope,
+                    particle_indices=rows,
+                )
+        delta_likelihood = np.full(rows.size, float("-inf"), dtype=np.float64)
+        proposed_finite = np.isfinite(proposed_target)
+        current_finite = np.isfinite(current_target[rows])
+        both_finite = proposed_finite & current_finite
+        delta_likelihood[both_finite] = (
+            proposed_target[both_finite] - current_target[rows][both_finite]
+        )
+        delta_likelihood[proposed_finite & ~current_finite] = float("inf")
+        delta_prior = proposed_log_prior - current_log_prior
+        proposal_ratio = current_log_proposal - proposed_log_proposal
+        support = (
+            np.isfinite(current_log_prior)
+            & np.isfinite(current_log_proposal)
+            & np.isfinite(proposed_log_prior)
+            & np.isfinite(proposed_log_proposal)
+        )
+        log_ratio = delta_likelihood + delta_prior + proposal_ratio
+        accepted = support & (
+            np.log(rng.random(rows.size)) < np.minimum(log_ratio, 0.0)
+        )
+        accepted_rows = rows[accepted]
+        if accepted_rows.size:
+            for isotope in isotope_order:
+                filt = self.filters[isotope]
+                states = proposed_states[isotope]
+                for local_index in np.flatnonzero(accepted).tolist():
+                    row = int(rows[local_index])
+                    filt.continuous_particles[row].state = (
+                        states[local_index].copy()
+                    )
+                self._refresh_joint_structural_transport_cache_isotope(
+                    stations,
+                    isotope,
+                    particle_indices=accepted_rows,
+                )
+            current_target = current_target.copy()
+            current_target[accepted_rows] = proposed_target[accepted]
+            self.last_joint_cross_isotope_state_accepted_weight_mass += float(
+                np.sum(weights[accepted_rows], dtype=np.float64)
+            )
+            self._invalidate_posterior_summary_cache()
+        finite_ratio = np.isfinite(log_ratio)
+        quantile_levels = np.asarray(
+            [0.0, 0.1, 0.5, 0.9, 1.0],
+            dtype=np.float64,
+        )
+
+        def _quantiles(values: NDArray[np.float64]) -> dict[str, float] | None:
+            """Return finite rejection-diagnostic quantiles for one MH term."""
+            array = np.asarray(values, dtype=np.float64).reshape(-1)
+            finite = np.isfinite(array)
+            if not np.any(finite):
+                return None
+            return {
+                label: float(value)
+                for label, value in zip(
+                    ("min", "p10", "median", "p90", "max"),
+                    np.quantile(array[finite], quantile_levels),
+                    strict=True,
+                )
+            }
+
+        self.last_joint_cross_isotope_state_rejection_diagnostics = {
+            "attempted": int(rows.size),
+            "accepted": int(accepted_rows.size),
+            "support_rejected": int(np.count_nonzero(~support)),
+            "nonfinite_rejected": int(
+                np.count_nonzero(support & ~finite_ratio)
+            ),
+            "mh_random_rejected": int(
+                np.count_nonzero(support & finite_ratio & ~accepted)
+            ),
+            "component_quantiles": {
+                "delta_log_likelihood": _quantiles(delta_likelihood),
+                "delta_log_prior": _quantiles(delta_prior),
+                "log_reverse_minus_forward": _quantiles(proposal_ratio),
+                "log_jacobian": {
+                    label: 0.0
+                    for label in ("min", "p10", "median", "p90", "max")
+                },
+                "log_acceptance_ratio": _quantiles(log_ratio),
+            },
+        }
+        self._assert_joint_particle_alignment()
+        return current_target
+
     def _resample_joint_particles(
         self,
         normalized_log_weights: NDArray[np.float64],
@@ -4676,10 +6480,39 @@ class RotatingShieldPFEstimator:
             filt.continuous_particles = new_particles_by_isotope[isotope]
             filt.last_resample_count += 1
             filt._resample_count_in_observation += 1
+        persistent_cache = self._joint_persistent_structural_transport_cache
+        if persistent_cache is not None:
+            if hasattr(persistent_cache[0], "detach"):
+                import torch
+
+                index_tensor = torch.as_tensor(
+                    indices,
+                    device=persistent_cache[0].device,
+                    dtype=torch.long,
+                )
+                reindexed_cache = tuple(
+                    torch.index_select(values, 0, index_tensor).contiguous()
+                    for values in persistent_cache
+                )
+            else:
+                reindexed_cache = tuple(
+                    np.ascontiguousarray(values[indices])
+                    for values in persistent_cache
+                )
+            self._joint_persistent_structural_transport_cache = (
+                reindexed_cache
+            )
+            self._joint_structural_transport_cache = reindexed_cache
+            self.last_joint_persistent_cache_reindex_count += 1
         self._joint_row_generation = new_identities[0].generation
         self.last_joint_resample_indices = np.asarray(
             indices,
             dtype=np.int64,
+        )
+        self._joint_persistent_structural_state_sha256 = (
+            self._joint_structural_state_sha256()
+            if self._joint_persistent_structural_transport_cache is not None
+            else None
         )
         self._invalidate_posterior_summary_cache()
         self._assert_joint_particle_alignment()
@@ -4738,6 +6571,40 @@ class RotatingShieldPFEstimator:
             "isotope_states": isotope_states,
             "transition_mass": transition_mass,
         }
+
+    @staticmethod
+    def _joint_isotope_cache_state(
+        filt: IsotopeParticleFilter,
+    ) -> tuple[NDArray[Any], ...]:
+        """Copy compact row state used to find exact accepted cache deltas."""
+        _, strengths, mask, chart_ids, surface_uv = (
+            filt._packed_continuous_surface_state_arrays()
+        )
+        return tuple(
+            np.ascontiguousarray(values).copy()
+            for values in (strengths, mask, chart_ids, surface_uv)
+        )
+
+    @staticmethod
+    def _joint_changed_cache_rows(
+        before: tuple[NDArray[Any], ...],
+        filt: IsotopeParticleFilter,
+    ) -> NDArray[np.int64]:
+        """Return PF rows whose accepted isotope state changed exactly."""
+        after = RotatingShieldPFEstimator._joint_isotope_cache_state(filt)
+        if len(before) != len(after) or any(
+            first.shape != second.shape
+            for first, second in zip(before, after, strict=True)
+        ):
+            raise RuntimeError("Isotope cache-state shapes changed unexpectedly.")
+        changed = np.zeros(after[0].shape[0], dtype=bool)
+        for first, second in zip(before, after, strict=True):
+            changed |= np.any(
+                first.reshape(first.shape[0], -1)
+                != second.reshape(second.shape[0], -1),
+                axis=1,
+            )
+        return np.flatnonzero(changed).astype(np.int64, copy=False)
 
     @staticmethod
     def _weighted_correlation(
@@ -5028,6 +6895,24 @@ class RotatingShieldPFEstimator:
         cache_misses_start = int(
             self.last_joint_structural_unit_cache_misses
         )
+        cross_attempted_start = float(
+            self.last_joint_cross_isotope_attempted_weight_mass
+        )
+        cross_accepted_start = float(
+            self.last_joint_cross_isotope_accepted_weight_mass
+        )
+        cross_state_attempted_start = float(
+            self.last_joint_cross_isotope_state_attempted_weight_mass
+        )
+        cross_state_accepted_start = float(
+            self.last_joint_cross_isotope_state_accepted_weight_mass
+        )
+        strength_block_attempted_start = float(
+            self.last_joint_strength_block_attempted_weight_mass
+        )
+        strength_block_accepted_start = float(
+            self.last_joint_strength_block_accepted_weight_mass
+        )
         print(
             "[joint-smc] rejuvenation-start "
             f"beta={float(target_beta):.12g} "
@@ -5078,11 +6963,12 @@ class RotatingShieldPFEstimator:
                         target_beta=float(target_beta),
                         newest_prefix_count=newest_prefix_count,
                     )
-                )
+            )
             target_before = np.asarray(
                 current_target_log_likelihood,
                 dtype=np.float64,
             ).copy()
+            last_changed_rows = np.empty(0, dtype=np.int64)
             for isotope_index, isotope in enumerate(isotope_order):
                 isotope_start = time.perf_counter()
                 print(
@@ -5093,6 +6979,7 @@ class RotatingShieldPFEstimator:
                     flush=True,
                 )
                 filt = self.filters[isotope]
+                cache_state_before = self._joint_isotope_cache_state(filt)
                 evidence = self._joint_history_structural_geometry(
                     isotope,
                     active,
@@ -5120,6 +7007,11 @@ class RotatingShieldPFEstimator:
                     updated_target,
                     dtype=np.float64,
                 )
+                changed_rows = self._joint_changed_cache_rows(
+                    cache_state_before,
+                    filt,
+                )
+                last_changed_rows = changed_rows
                 timing = filt.last_structural_timing_s
                 attempt_count = sum(
                     int(timing.get(key, 0.0))
@@ -5145,12 +7037,83 @@ class RotatingShieldPFEstimator:
                     self._refresh_joint_structural_transport_cache_isotope(
                         active,
                         isotope,
+                        particle_indices=changed_rows,
                     )
+            if last_changed_rows.size:
+                self._refresh_joint_structural_transport_cache_isotope(
+                    active,
+                    isotope_order[-1],
+                    particle_indices=last_changed_rows,
+                )
+            if float(self.pf_config.joint_strength_block_probability) > 0.0:
+                current_target_log_likelihood = self._apply_joint_strength_block(
+                    active,
+                    target_beta=float(target_beta),
+                    current_target_log_likelihood=(
+                        current_target_log_likelihood
+                    ),
+                )
+            if (
+                float(
+                    self.pf_config
+                    .joint_cross_isotope_state_block_probability
+                )
+                > 0.0
+            ):
+                current_target_log_likelihood = (
+                    self._apply_joint_cross_isotope_state_block(
+                        active,
+                        target_beta=float(target_beta),
+                        current_target_log_likelihood=(
+                            current_target_log_likelihood
+                        ),
+                    )
+                )
+            if (
+                float(
+                    self.pf_config
+                    .joint_cross_isotope_transfer_probability
+                )
+                > 0.0
+            ):
+                current_target_log_likelihood = (
+                    self._apply_joint_cross_isotope_transfer(
+                        active,
+                        target_beta=float(target_beta),
+                        current_target_log_likelihood=(
+                            current_target_log_likelihood
+                        ),
+                    )
+                )
             diagnostics = self._joint_mixing_diagnostics(
                 state_before,
                 self._joint_mixing_snapshot(),
                 target_before=target_before,
                 target_after=current_target_log_likelihood,
+            )
+            diagnostics["cross_isotope_attempted_weight_mass"] = float(
+                self.last_joint_cross_isotope_attempted_weight_mass
+                - cross_attempted_start
+            )
+            diagnostics["cross_isotope_accepted_weight_mass"] = float(
+                self.last_joint_cross_isotope_accepted_weight_mass
+                - cross_accepted_start
+            )
+            diagnostics["cross_isotope_state_attempted_weight_mass"] = float(
+                self.last_joint_cross_isotope_state_attempted_weight_mass
+                - cross_state_attempted_start
+            )
+            diagnostics["cross_isotope_state_accepted_weight_mass"] = float(
+                self.last_joint_cross_isotope_state_accepted_weight_mass
+                - cross_state_accepted_start
+            )
+            diagnostics["joint_strength_attempted_weight_mass"] = float(
+                self.last_joint_strength_block_attempted_weight_mass
+                - strength_block_attempted_start
+            )
+            diagnostics["joint_strength_accepted_weight_mass"] = float(
+                self.last_joint_strength_block_accepted_weight_mass
+                - strength_block_accepted_start
             )
         finally:
             self._invalidate_posterior_summary_cache()
@@ -5317,6 +7280,7 @@ class RotatingShieldPFEstimator:
             particle_count,
             max(1, int(round(requested_prior_probability * particle_count))),
         )
+        realized_prior_probability = prior_row_count / float(particle_count)
         component_rng = named_random_generator(
             self.random_seed,
             "joint_guided_initialization_component",
@@ -5325,11 +7289,31 @@ class RotatingShieldPFEstimator:
         prior_rows[
             component_rng.permutation(particle_count)[:prior_row_count]
         ] = True
-        realized_prior_probability = prior_row_count / float(particle_count)
         particles_by_isotope: dict[str, list[IsotopeParticle]] = {}
+        cardinality_priors = tuple(
+            self.filters[isotope]._structural_rj_cardinality_prior
+            for isotope in order
+        )
+        if any(prior is None for prior in cardinality_priors):
+            raise RuntimeError(
+                "Guided initialization requires every cardinality prior."
+            )
+        cardinality_rng = named_random_generator(
+            self.random_seed,
+            "joint_guided_initialization_cardinality_vectors",
+        )
+        joint_cardinalities = _stratified_joint_cardinality_draws(
+            tuple(
+                np.asarray(prior.probabilities, dtype=np.float64)
+                for prior in cardinality_priors
+                if prior is not None
+            ),
+            particle_count,
+            rng=cardinality_rng,
+        )
         self._active_joint_station_history = (station,)
         try:
-            for isotope in order:
+            for isotope_index, isotope in enumerate(order):
                 filt = self.filters[isotope]
                 atlas = filt._structural_rj_surface_atlas
                 cardinality_prior = filt._structural_rj_cardinality_prior
@@ -5344,12 +7328,9 @@ class RotatingShieldPFEstimator:
                     isotope,
                 )
                 if filt.config.variable_cardinality:
-                    cardinalities = rng.choice(
-                        cardinality_prior.probabilities.size,
-                        size=particle_count,
-                        replace=True,
-                        p=cardinality_prior.probabilities,
-                    ).astype(np.int64, copy=False)
+                    cardinalities = joint_cardinalities[
+                        :, isotope_index
+                    ].copy()
                 else:
                     cardinalities = np.full(
                         particle_count,
@@ -5413,8 +7394,8 @@ class RotatingShieldPFEstimator:
                 log_cardinality_density = np.log(
                     cardinality_prior.probabilities[cardinalities]
                 )
-                joint_log_prior_density += log_cardinality_density
-                joint_log_guided_density += log_cardinality_density
+                isotope_log_prior_density = log_cardinality_density.copy()
+                isotope_log_guided_density = log_cardinality_density.copy()
                 if total_sources:
                     source_log_prior = (
                         atlas.log_chart_probabilities[chart_ids]
@@ -5430,16 +7411,18 @@ class RotatingShieldPFEstimator:
                             strengths,
                         )
                     )
-                    joint_log_prior_density += np.bincount(
+                    isotope_log_prior_density += np.bincount(
                         source_rows,
                         weights=source_log_prior,
                         minlength=particle_count,
                     )
-                    joint_log_guided_density += np.bincount(
+                    isotope_log_guided_density += np.bincount(
                         source_rows,
                         weights=source_log_guided,
                         minlength=particle_count,
                     )
+                joint_log_prior_density += isotope_log_prior_density
+                joint_log_guided_density += isotope_log_guided_density
                 particles: list[IsotopeParticle] = []
                 for row, cardinality in enumerate(
                     cardinalities.tolist()
@@ -5486,9 +7469,7 @@ class RotatingShieldPFEstimator:
                 math.log1p(-realized_prior_probability)
                 + joint_log_guided_density,
             )
-        log_importance_ratio = (
-            joint_log_prior_density - joint_log_proposal_density
-        )
+        log_importance_ratio = joint_log_prior_density - joint_log_proposal_density
         if np.any(~np.isfinite(log_importance_ratio)):
             raise RuntimeError(
                 "Guided initialization importance correction is invalid."
@@ -5935,7 +7916,7 @@ class RotatingShieldPFEstimator:
             raise ValueError(
                 f"Unknown joint planning particle selection method: {method}"
             )
-        max_sources = int(self.pf_config.max_sources or 0)
+        max_sources = self.pf_config.cardinality_capacity
         positions_by_isotope: Dict[str, NDArray[np.float64]] = {}
         chart_ids_by_isotope: Dict[str, NDArray[np.int64]] = {}
         surface_uv_by_isotope: Dict[str, NDArray[np.float64]] = {}
@@ -6453,7 +8434,7 @@ class RotatingShieldPFEstimator:
             estimates[isotope] = posterior_point_estimate_from_states(
                 [particle.state for particle in filt.continuous_particles],
                 np.asarray(filt.continuous_weights, dtype=float),
-                max_cardinality=self.pf_config.max_sources,
+                max_cardinality=self.pf_config.cardinality_capacity,
                 positions_by_state=[
                     filt.continuous_state_positions(particle.state)
                     for particle in filt.continuous_particles
@@ -6782,6 +8763,7 @@ class RotatingShieldPFEstimator:
                     "joint_rejuvenation_diagnostics": [],
                     "joint_smc_soft_budget_exceeded": False,
                     "joint_guided_initialization_ess": None,
+                    "joint_transport_cache": {},
                     "temper_resamples": 0,
                     "temper_min_ess": None,
                     "unique_ancestor_count": None,
@@ -6814,7 +8796,7 @@ class RotatingShieldPFEstimator:
             weights = weights / total
             current_ess = float(1.0 / max(np.sum(weights**2), eps))
             current_ess_ratio = current_ess / float(weights.size)
-            maximum_cardinality = self.pf_config.max_sources
+            maximum_cardinality = self.pf_config.cardinality_capacity
             r_int = np.fromiter(
                 (
                     validated_state_cardinality(
@@ -6903,6 +8885,13 @@ class RotatingShieldPFEstimator:
                         {},
                     )
                 ),
+                "structural_rejection_diagnostics": dict(
+                    getattr(
+                        filt,
+                        "last_structural_rejection_diagnostics",
+                        {},
+                    )
+                ),
                 "temper_steps": list(getattr(filt, "last_temper_steps", [])),
                 "joint_rejuvenation_diagnostics": [
                     dict(entry)
@@ -6914,6 +8903,39 @@ class RotatingShieldPFEstimator:
                 "joint_guided_initialization_ess": (
                     self.last_joint_guided_initialization_ess
                 ),
+                "joint_cross_isotope_state_rejection_diagnostics": dict(
+                    self.last_joint_cross_isotope_state_rejection_diagnostics
+                ),
+                "joint_transport_cache": {
+                    "unit_hits": int(
+                        self.last_joint_structural_unit_cache_hits
+                    ),
+                    "unit_misses": int(
+                        self.last_joint_structural_unit_cache_misses
+                    ),
+                    "accepted_state_reuses": int(
+                        self.last_joint_persistent_cache_reuse_count
+                    ),
+                    "history_appends": int(
+                        self.last_joint_persistent_cache_append_count
+                    ),
+                    "ancestor_reindexes": int(
+                        self.last_joint_persistent_cache_reindex_count
+                    ),
+                    "resident_device": (
+                        "cuda"
+                        if self._joint_persistent_structural_transport_cache
+                        is not None
+                        and hasattr(
+                            self._joint_persistent_structural_transport_cache[0],
+                            "detach",
+                        )
+                        else "cpu"
+                        if self._joint_persistent_structural_transport_cache
+                        is not None
+                        else None
+                    ),
+                },
                 "temper_resamples": int(getattr(filt, "last_temper_resample_count", 0)),
                 "temper_min_ess": getattr(filt, "last_temper_min_ess", None),
                 "unique_ancestor_count": getattr(
@@ -7185,8 +9207,14 @@ class RotatingShieldPFEstimator:
                     for cardinality, mass in distribution.items()
                 )
             )
-            maximum_cardinality = int(filt.config.max_sources or 0)
-            boundary_mass = float(distribution.get(maximum_cardinality, 0.0))
+            ordinary_maximum = int(filt.config.max_sources or 0)
+            boundary_mass = float(
+                sum(
+                    mass
+                    for cardinality, mass in distribution.items()
+                    if int(cardinality) >= ordinary_maximum
+                )
+            )
             radii = [
                 (
                     None

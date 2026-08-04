@@ -8,6 +8,7 @@ import math
 from typing import Any, Mapping
 
 from pf.structural_rj import (
+    POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
     TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
     validate_cardinality_prior_policy,
 )
@@ -70,6 +71,7 @@ _PURE_PF_RUNTIME_KEYS = frozenset(
         "pf_detector_count_radius_m",
         "pf_line_resolved_shield_attenuation",
         "pf_max_sources",
+        "pf_hard_max_sources",
         "pf_obstacle_attenuation",
         "pf_obstacle_material",
         "pf_obstacle_mu_by_isotope",
@@ -81,6 +83,9 @@ _PURE_PF_RUNTIME_KEYS = frozenset(
         "pf_source_extent_samples",
         "pf_strength_prior_max_cps_1m",
         "pf_strength_prior_min_cps_1m",
+        "pf_strength_prior_family",
+        "pf_strength_prior_gamma_shape",
+        "pf_strength_prior_gamma_scale_cps_1m",
         "pf_visual_estimate_cross_size_m",
         "pf_visual_estimate_cross_width_m",
         "pf_visual_estimate_radius_m",
@@ -102,6 +107,7 @@ _PURE_PF_STRUCTURAL_RUNTIME_KEYS = frozenset(
         "structural_cardinality_prior_probs",
         "structural_cardinality_prior_mean",
         "structural_cardinality_prior_policy",
+        "structural_cardinality_tail_ratio",
         "structural_rj_birth_probability",
         "structural_rj_block_independence_probability",
         "structural_rj_death_probability",
@@ -126,6 +132,10 @@ _PURE_PF_STRUCTURAL_RUNTIME_KEYS = frozenset(
         "structural_rj_split_probability",
         "structural_rj_strength_move_probability",
         "structural_rj_surface_chart_max_edge_m",
+        "joint_strength_block_probability",
+        "joint_strength_block_log_sigma",
+        "joint_strength_block_batch_size",
+        "joint_cross_isotope_state_block_probability",
     }
 )
 _DSS_PP_RUNTIME_KEYS = frozenset(
@@ -382,6 +392,19 @@ def _validate_structural_runtime_values(
         value = runtime_config["pf_max_sources"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError("pf_max_sources must be a positive integer.")
+    if "pf_hard_max_sources" in runtime_config:
+        hard_value = runtime_config["pf_hard_max_sources"]
+        if (
+            isinstance(hard_value, bool)
+            or not isinstance(hard_value, int)
+            or hard_value < 1
+        ):
+            raise ValueError("pf_hard_max_sources must be a positive integer.")
+        ordinary_value = runtime_config.get("pf_max_sources", hard_value)
+        if hard_value < ordinary_value:
+            raise ValueError(
+                "pf_hard_max_sources must be at least pf_max_sources."
+            )
     if "init_num_sources" in runtime_config:
         value = runtime_config["init_num_sources"]
         if (
@@ -540,6 +563,15 @@ def enforce_pure_runtime_settings(
         "structural_cardinality_prior_policy",
         TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
     )
+    if (
+        result["structural_cardinality_prior_policy"]
+        == POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY
+    ):
+        result.setdefault(
+            "pf_hard_max_sources",
+            int(result.get("pf_max_sources", 5)),
+        )
+        result.setdefault("structural_cardinality_tail_ratio", 0.05)
     return result
 
 

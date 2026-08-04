@@ -22,6 +22,8 @@ from pf.estimator import (
     MeasurementRecord,
     RotatingShieldPFConfig,
     RotatingShieldPFEstimator,
+    _stratified_categorical_draws,
+    _stratified_joint_cardinality_draws,
 )
 from pf.particle_filter import (
     IsotopeParticle,
@@ -47,6 +49,7 @@ from pf.profiles import (
     resolve_structural_transition_provenance,
 )
 from pf.structural_rj import (
+    POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
     EXPLICIT_CARDINALITY_PRIOR_POLICY,
     TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
     ContinuousStrengthProposal,
@@ -57,6 +60,46 @@ from pf.state import IsotopeState
 from measurement.surface_atlas import ContinuousSurfaceAtlas
 from sim.runtime import load_runtime_config
 from pure_pf_test_support import approved_full_spectrum_model
+
+
+def test_joint_strength_target_batched_matches_scalar_cache_scaling() -> None:
+    """Strength-only batching must equal per-row cached-column scaling."""
+    estimator = object.__new__(RotatingShieldPFEstimator)
+    estimator.pf_config = SimpleNamespace(joint_strength_block_batch_size=2)
+    estimator.isotopes = ("Cs-137",)
+    estimator.filters = {"Cs-137": object()}
+    estimator._active_joint_tempering_prefix_count = None
+    total = np.arange(1.0, 13.0, dtype=np.float64).reshape(3, 2, 2, 1)
+    estimator._joint_structural_transport_cache = (
+        total.copy(),
+        0.5 * total,
+        np.zeros((3, 2, 2, 1, 1), dtype=np.float64),
+    )
+    estimator._joint_history_log_likelihood_numpy = (
+        lambda **kwargs: np.sum(
+            kwargs["total_nvsl"],
+            axis=(1, 2, 3),
+            dtype=np.float64,
+        )
+    )
+    rows = np.asarray([0, 2], dtype=np.int64)
+    scale = np.asarray([[2.0, 0.5], [0.25, 3.0]], dtype=np.float64)
+
+    batched = estimator._joint_strength_block_target(
+        [SimpleNamespace(fe_indices=np.asarray([0, 1], dtype=np.int64))],
+        particle_indices=rows,
+        scale_ps=scale,
+        target_beta=1.0,
+    )
+    scalar = np.asarray(
+        [
+            np.sum(total[row] * scale[index][None, :, None])
+            for index, row in enumerate(rows)
+        ],
+        dtype=np.float64,
+    )
+
+    np.testing.assert_allclose(batched, scalar, rtol=0.0, atol=0.0)
 
 
 def test_measurement_record_requires_canonical_runtime_metadata() -> None:
@@ -1067,7 +1110,7 @@ def test_pure_estimator_initializes_the_single_strict_profile() -> None:
         isotopes=("Cs-137",),
         surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
         shield_normals=None,
-        mu_by_isotope={"Cs-137": 0.0},
+        mu_by_isotope={"Cs-137": 0.5},
         pf_config=RotatingShieldPFConfig(estimator_profile="pf_strict"),
         full_spectrum_generative_model=approved_full_spectrum_model(),
         measurement_log_sha256="b" * 64,
@@ -1300,10 +1343,12 @@ def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning(
         load_runtime_config(root / "configs/pf/pf_strict_3d.json")
     )
     assert resolved["structural_cardinality_prior_policy"] == (
-        TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY
+        POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY
     )
     assert resolved["structural_cardinality_prior_mean"] == pytest.approx(2.0)
     assert int(resolved["pf_max_sources"]) == 5
+    assert int(resolved["pf_hard_max_sources"]) == 8
+    assert resolved["structural_cardinality_tail_ratio"] == pytest.approx(0.05)
     assert "adaptive_cardinality_dwell_enable" not in resolved
     assert resolved["adaptive_mission_stop"] is False
     assert resolved["measurement_budget_max_steps"] == 160
@@ -1313,6 +1358,7 @@ def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning(
     assert resolved["detector_height_sampling_mode"] == "continuous"
     assert resolved["measurement_pose_clearance_enabled"] is True
     assert resolved["path_planner"] == "dss_pp"
+    assert resolved["cui_truth_display_mode"] == "evaluation_live"
     assert "spectrum_count_method" not in resolved
     assert "calibration_count_method" not in resolved
     assert "sim_backend" not in resolved
@@ -2533,6 +2579,30 @@ def test_joint_k_vector_lag1_correlation_tracks_cardinality_reversal() -> None:
     assert correlation == pytest.approx(-1.0)
 
 
+def test_joint_cardinality_stratification_preserves_product_prior() -> None:
+    """Guided initialization must stratify K vectors, not only marginals."""
+    marginals = (
+        np.asarray([0.25, 0.75], dtype=np.float64),
+        np.asarray([0.5, 0.5], dtype=np.float64),
+    )
+    draws = _stratified_joint_cardinality_draws(
+        marginals,
+        400,
+        rng=np.random.default_rng(7),
+    )
+    vectors, counts = np.unique(draws, axis=0, return_counts=True)
+    observed = {
+        tuple(vector.tolist()): int(count)
+        for vector, count in zip(vectors, counts, strict=True)
+    }
+    assert observed == {
+        (0, 0): 50,
+        (0, 1): 50,
+        (1, 0): 150,
+        (1, 1): 150,
+    }
+
+
 def test_guided_initialization_uses_exact_prior_over_proposal_weights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2656,6 +2726,21 @@ def test_guided_initialization_uses_exact_prior_over_proposal_weights(
         particle.joint_row_identity
         for particle in filt.continuous_particles
     ) == identities_before
+
+
+def test_guided_cardinality_draws_cover_prior_strata_deterministically() -> None:
+    """Large-probability K strata must not disappear through iid bad luck."""
+    probabilities = np.asarray([0.2, 0.3, 0.5], dtype=np.float64)
+    draws = _stratified_categorical_draws(
+        probabilities,
+        100,
+        rng=np.random.default_rng(1234),
+    )
+
+    np.testing.assert_array_equal(
+        np.bincount(draws, minlength=3),
+        np.asarray([20, 30, 50], dtype=np.int64),
+    )
 
 
 def test_adaptive_rejuvenation_uses_movement_and_soft_budget(
@@ -3129,18 +3214,23 @@ def test_incremental_transport_cache_refresh_changes_one_isotope_slice(
     def _isotope_components(
         station: object,
         isotope: str,
+        *,
+        particle_indices: NDArray[np.int64] | None = None,
     ) -> tuple[object, object, object]:
         """Return deterministic components for one station and isotope."""
         requested_isotopes.append(str(isotope))
         sequence_id = int(getattr(station, "station_sequence_id"))
         value = float(7 + sequence_id)
+        particle_count = (
+            4 if particle_indices is None else int(particle_indices.size)
+        )
         line_values = torch.full(
-            (4, 1, 1, 3),
+            (particle_count, 1, 1, 3),
             value,
             dtype=torch.float64,
         )
         feature_values = torch.full(
-            (4, 1, 1, 3, 4),
+            (particle_count, 1, 1, 3, 4),
             value + 10.0,
             dtype=torch.float64,
         )
@@ -3171,6 +3261,18 @@ def test_incremental_transport_cache_refresh_changes_one_isotope_slice(
     assert np.all(refreshed[2][:, :, 0, :, :] == 0.0)
     assert np.all(refreshed[2][:, 0, 1, :, :] == 17.0)
     assert np.all(refreshed[2][:, 1, 1, :, :] == 18.0)
+
+    refreshed[0][0, :, 1, :] = -2.0
+    requested_isotopes.clear()
+    estimator._refresh_joint_structural_transport_cache_isotope(
+        stations,
+        "Cs-137",
+        particle_indices=np.asarray([2], dtype=np.int64),
+    )
+    assert requested_isotopes == ["Cs-137", "Cs-137"]
+    assert np.all(refreshed[0][0, :, 1, :] == -2.0)
+    assert np.all(refreshed[0][2, 0, 1, :] == 7.0)
+    assert np.all(refreshed[0][2, 1, 1, :] == 8.0)
 
 
 def test_continuous_pf_state_position_is_independent_of_chart_center() -> None:
@@ -3519,3 +3621,138 @@ def test_joint_pf_rejects_different_isotope_surface_atlas_digests() -> None:
             max_points=8,
             maximum_hausdorff_bound_m=1.0,
         )
+
+
+def test_persistent_transport_cache_reuses_and_appends_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted-state transport must be reused and append only a new station."""
+    torch = pytest.importorskip("torch")
+    estimator = RotatingShieldPFEstimator(
+        isotopes=("Co-60", "Cs-137"),
+        surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Co-60": 0.0, "Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            variable_cardinality=True,
+            init_num_sources=(0, 1),
+            use_gpu=False,
+            position_max=(3.0, 3.0, 3.0),
+        ),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
+    )
+    estimator.add_measurement_pose(np.asarray([1.5, 1.5, 1.5]))
+    estimator._ensure_kernel_cache()
+    model = estimator._full_spectrum_model()
+    line_count = len(model.line_identity)
+    feature_count = len(model.transport_feature_order)
+    calls: list[int] = []
+
+    def _components(station: object) -> tuple[object, object, object]:
+        """Return one deterministic full joint transport cache slab."""
+        sequence = int(getattr(station, "station_sequence_id"))
+        calls.append(sequence)
+        total = torch.full(
+            (4, 1, 2, line_count),
+            float(sequence + 1),
+            dtype=torch.float64,
+        )
+        features = torch.full(
+            (4, 1, 2, line_count, feature_count),
+            float(sequence + 11),
+            dtype=torch.float64,
+        )
+        return total, total + 0.5, features
+
+    monkeypatch.setattr(
+        estimator,
+        "_joint_station_transport_components_torch",
+        _components,
+    )
+
+    def _station(sequence: int) -> JointStationObservation:
+        """Return one minimal full-spectrum station with strict geometry."""
+        return JointStationObservation(
+            spectrum_vb=np.zeros(
+                (1, np.asarray(model.energy_axis_keV).size),
+                dtype=np.float64,
+            ),
+            energy_axis_keV=np.asarray(model.energy_axis_keV),
+            generative_contract_hash_sha256=model.contract_hash_sha256,
+            pose_idx=sequence,
+            detector_position_xyz_m=(1.0 + sequence, 1.0, 1.0),
+            fe_indices=np.asarray([sequence % 8], dtype=np.int64),
+            pb_indices=np.asarray([(sequence + 1) % 8], dtype=np.int64),
+            live_times_s=np.asarray([1.0], dtype=np.float64),
+            station_sequence_id=sequence,
+        )
+
+    first = _station(0)
+    second = _station(1)
+    estimator._refresh_joint_structural_transport_cache((first,))
+    initial = estimator._joint_persistent_structural_transport_cache
+    assert initial is not None
+    assert calls == [0]
+
+    estimator._refresh_joint_structural_transport_cache((first,))
+    assert calls == [0]
+    assert estimator.last_joint_persistent_cache_reuse_count == 1
+    assert estimator._joint_structural_transport_cache is initial
+
+    estimator._refresh_joint_structural_transport_cache((first, second))
+    appended = estimator._joint_persistent_structural_transport_cache
+    assert appended is not None
+    assert calls == [0, 1]
+    assert estimator.last_joint_persistent_cache_append_count == 1
+    np.testing.assert_array_equal(appended[0][:, 0], 1.0)
+    np.testing.assert_array_equal(appended[0][:, 1], 2.0)
+
+
+def test_persistent_transport_cache_follows_joint_resampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistent cache rows must use the exact common ancestor vector."""
+    isotopes = ("Co-60", "Cs-137", "Eu-154")
+    estimator = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={isotope: 0.0 for isotope in isotopes},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            variable_cardinality=True,
+            init_num_sources=(0, 1),
+            use_gpu=False,
+            position_max=(3.0, 3.0, 3.0),
+        ),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
+    )
+    estimator.add_measurement_pose(np.asarray([1.5, 1.5, 1.5]))
+    estimator._ensure_kernel_cache()
+    rows = np.arange(4, dtype=np.float64).reshape(4, 1, 1, 1)
+    estimator._joint_persistent_structural_transport_cache = (
+        rows.copy(),
+        rows.copy() + 10.0,
+        rows[..., None].copy() + 20.0,
+    )
+    estimator._joint_structural_transport_cache = (
+        estimator._joint_persistent_structural_transport_cache
+    )
+    indices = np.asarray([3, 1, 1, 0], dtype=np.int64)
+    monkeypatch.setattr(
+        "pf.estimator.systematic_resample",
+        lambda *_args, **_kwargs: indices.copy(),
+    )
+
+    returned = estimator._resample_joint_particles(
+        np.full(4, -np.log(4.0), dtype=np.float64)
+    )
+
+    np.testing.assert_array_equal(returned, indices)
+    cached = estimator._joint_persistent_structural_transport_cache
+    assert cached is not None
+    np.testing.assert_array_equal(cached[0][:, 0, 0, 0], indices)
+    assert estimator.last_joint_persistent_cache_reindex_count == 1

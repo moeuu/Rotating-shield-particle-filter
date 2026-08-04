@@ -49,6 +49,47 @@ def test_strength_prior_sampling_matches_uniform_mean() -> None:
     assert float(np.mean(samples)) == pytest.approx(5.0, abs=0.02)
 
 
+def test_shifted_gamma_strength_prior_is_normalized_and_unbounded() -> None:
+    """The proper upper-unbounded prior must integrate to one."""
+    prior = StrengthPrior(
+        minimum=2.0,
+        maximum=8.0,
+        family="shifted_gamma",
+        gamma_shape=2.0,
+        gamma_scale=3.0,
+    )
+    integral, error = quad(
+        lambda value: float(np.exp(prior.log_prob(value))),
+        prior.minimum,
+        np.inf,
+        epsabs=1.0e-10,
+        epsrel=1.0e-10,
+    )
+
+    assert error < 1.0e-8
+    assert integral == pytest.approx(1.0, abs=1.0e-10)
+    assert prior.support_maximum == np.inf
+    assert prior.in_support(80.0)
+    assert np.isfinite(prior.log_prob(80.0))
+    assert prior.finite_upper_quantile() > prior.maximum
+
+
+def test_shifted_gamma_strength_prior_sampling_matches_mean() -> None:
+    """Batched shifted-gamma draws should preserve their analytic mean."""
+    prior = StrengthPrior(
+        minimum=2.0,
+        maximum=8.0,
+        family="shifted_gamma",
+        gamma_shape=2.0,
+        gamma_scale=3.0,
+    )
+    samples = prior.sample(100_000, rng=np.random.default_rng(412))
+
+    assert np.all(samples >= prior.minimum)
+    assert np.any(samples > prior.maximum)
+    assert float(np.mean(samples)) == pytest.approx(prior.mean, abs=0.04)
+
+
 def test_strength_prior_sampling_is_seed_reproducible() -> None:
     """Equal NumPy generator states should produce bitwise-equal batches."""
     prior = StrengthPrior(minimum=2.0, maximum=8.0)

@@ -26,10 +26,17 @@ from pf.profiles import (
     apply_profile_to_config,
     resolve_structural_transition_provenance,
 )
-from pf.provenance import canonical_json_bytes, repository_commit, sha256_json
+from pf.provenance import (
+    canonical_json_bytes,
+    repository_commit,
+    repository_source_snapshot_sha256,
+    sha256_json,
+)
 from pf.structural_rj import (
+    POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
     TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
     truncated_poisson_cardinality_probabilities,
+    poisson_geometric_tail_cardinality_probabilities,
     validate_cardinality_prior_policy,
 )
 
@@ -45,7 +52,7 @@ def _resolved_cardinality_prior(
     if not bool(config.variable_cardinality):
         fixed_cardinality = int(config.init_num_sources[0])
         return (fixed_cardinality,), (1.0,), "fixed_init_num_sources"
-    max_sources = config.max_sources
+    max_sources = config.cardinality_capacity
     if max_sources is None:
         return (), (), "unbounded_support_unavailable"
     support = tuple(range(int(max_sources) + 1))
@@ -55,14 +62,25 @@ def _resolved_cardinality_prior(
         has_explicit_probabilities=configured is not None,
     )
     if configured is None:
-        if policy != TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY:
+        if policy not in {
+            TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+            POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
+        }:
             raise PurePFBoundaryError(
                 "Resolved implicit cardinality prior has the wrong policy."
             )
-        probabilities = truncated_poisson_cardinality_probabilities(
-            int(max_sources),
-            float(config.structural_cardinality_prior_mean),
-        )
+        if policy == POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY:
+            probabilities = poisson_geometric_tail_cardinality_probabilities(
+                int(config.max_sources),
+                int(max_sources),
+                float(config.structural_cardinality_prior_mean),
+                float(config.structural_cardinality_tail_ratio),
+            )
+        else:
+            probabilities = truncated_poisson_cardinality_probabilities(
+                int(max_sources),
+                float(config.structural_cardinality_prior_mean),
+            )
         probabilities = validated_probability_distribution(
             probabilities,
             name="resolved truncated-Poisson cardinality prior",
@@ -138,6 +156,9 @@ class PurePFEstimator(_PFEstimatorCore):
             else str(self.resolved_config_hash)
         )
         self.repository_commit = repository_commit()
+        self.repository_source_snapshot_sha256 = (
+            repository_source_snapshot_sha256()
+        )
         self.measurement_log_sha256 = str(measurement_log_sha256)
 
     @property
@@ -255,6 +276,9 @@ class PurePFEstimator(_PFEstimatorCore):
         return {
             "schema_version": 1,
             "pure_pf_schema_version": PURE_PF_SCHEMA_VERSION,
+            "repository_source_snapshot_sha256": (
+                self.repository_source_snapshot_sha256
+            ),
             "manifest_completeness": manifest_completeness,
             "support_domain": "environment_surface",
             "structural_moves_enabled": True,
@@ -320,16 +344,40 @@ class PurePFEstimator(_PFEstimatorCore):
                     else "uniform"
                 ),
                 "isotope_cardinalities_coupled_by_row": False,
-                "per_isotope_stratified_marginal_weights_reused": False,
+                "per_isotope_stratified_marginal_weights_reused": bool(
+                    self.pf_config.joint_guided_initialization
+                ),
                 "external_optimizer": False,
             },
             "strength_prior": {
-                "kind": "bounded_uniform",
+                "kind": str(self.pf_config.strength_prior_family),
                 "minimum_cps_1m": float(
                     self.pf_config.strength_prior_min_cps_1m
                 ),
-                "maximum_cps_1m": float(
+                "maximum_cps_1m": (
+                    None
+                    if self.pf_config.strength_prior_family == "shifted_gamma"
+                    else float(self.pf_config.strength_prior_max_cps_1m)
+                ),
+                "legacy_proposal_grid_maximum_cps_1m": float(
                     self.pf_config.strength_prior_max_cps_1m
+                ),
+                "support_maximum_cps_1m": (
+                    None
+                    if self.pf_config.strength_prior_family == "shifted_gamma"
+                    else float(self.pf_config.strength_prior_max_cps_1m)
+                ),
+                "gamma_shape": (
+                    float(self.pf_config.strength_prior_gamma_shape)
+                    if self.pf_config.strength_prior_family == "shifted_gamma"
+                    else None
+                ),
+                "gamma_scale_cps_1m": (
+                    float(
+                        self.pf_config.strength_prior_gamma_scale_cps_1m
+                    )
+                    if self.pf_config.strength_prior_family == "shifted_gamma"
+                    else None
                 ),
                 "units": "detector_cps_1m",
                 "unit_definition": (
@@ -436,8 +484,8 @@ class PurePFEstimator(_PFEstimatorCore):
                     "direct_continuous_xyz_kernel_without_chart_interpolation"
                 ),
                 "strength_proposal": (
-                    "bounded_uniform_prior_plus_chart_conditional_truncated_"
-                    "normal_mixture"
+                    f"{self.pf_config.strength_prior_family}_prior_plus_"
+                    "chart_conditional_truncated_normal_mixture"
                 ),
                 "strength_proposal_prior_component_probability": float(
                     self.pf_config
@@ -575,7 +623,7 @@ class PurePFEstimator(_PFEstimatorCore):
             result[str(isotope)] = cardinality_distribution_from_states(
                 states,
                 np.asarray(filt.continuous_weights, dtype=float),
-                max_cardinality=self.pf_config.max_sources,
+                max_cardinality=self.pf_config.cardinality_capacity,
             )
         return result
 
@@ -623,7 +671,7 @@ class PurePFEstimator(_PFEstimatorCore):
             )
         if (
             np.any(cardinalities < 0)
-            or np.any(cardinalities > int(self.pf_config.max_sources or 0))
+            or np.any(cardinalities > self.pf_config.cardinality_capacity)
         ):
             raise PurePFBoundaryError(
                 "Aligned joint PF cardinalities lie outside configured support."
@@ -874,7 +922,7 @@ class PurePFEstimator(_PFEstimatorCore):
             result[str(isotope)] = posterior_point_estimate_from_states(
                 states,
                 weights,
-                max_cardinality=self.pf_config.max_sources,
+                max_cardinality=self.pf_config.cardinality_capacity,
                 positions_by_state=[
                     filt.continuous_state_positions(state)
                     for state in states

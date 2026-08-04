@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 
 from realtime_demo import (
     DEFAULT_PF_CONFIG,
@@ -13,6 +14,7 @@ from realtime_demo import (
 from runtime.assets import simulation_runtime_root, standard_geant4_config_path
 from runtime.session import estimator_neutral_runtime_config
 from sim.protocol import encode_message
+from sim.runtime import load_runtime_config
 from spectrum.transport_spectral import (
     geometry_conditioned_model_from_runtime_config,
 )
@@ -32,9 +34,33 @@ def test_standard_online_config_preserves_original_pf_contract() -> None:
     assert online["variable_cardinality"] is True
     assert online["pf_max_sources"] == 5
     assert online["pf_strength_prior_min_cps_1m"] == 300_000.0
+    assert online["pf_strength_prior_family"] == "shifted_gamma"
+    assert online["pf_strength_prior_gamma_shape"] == 2.0
+    assert online["joint_strength_block_probability"] > 0.0
+    assert online["joint_strength_block_batch_size"] == 128
+    assert online["joint_cross_isotope_transfer_probability"] == 0.0
     assert online["structural_rj_multi_component_max_group_size"] == 4
     assert online["joint_guided_initialization"] is True
     assert online["target_ess_ratio"] == 0.4
+
+
+def test_legacy_combined_config_is_split_before_simulation(tmp_path) -> None:
+    """A generated combined trial must keep PF controls estimator-side only."""
+    combined = json.loads(DEFAULT_PF_CONFIG.read_text(encoding="utf-8"))
+    standard_physical = load_runtime_config(standard_geant4_config_path())
+    combined.update(standard_physical)
+    combined["cui_truth_display_mode"] = "evaluation_live"
+    combined["num_particles"] = 2000
+    config_path = tmp_path / "combined.json"
+    config_path.write_text(json.dumps(combined), encoding="utf-8")
+
+    resolved_physical, online = load_online_runtime_configs(config_path, None)
+
+    assert resolved_physical["backend"] == "geant4"
+    assert "cui_truth_display_mode" not in resolved_physical
+    assert "num_particles" not in resolved_physical
+    assert online["cui_truth_display_mode"] == "evaluation_live"
+    assert online["num_particles"] == 2000
 
 
 def test_standard_measurement_log_config_remains_estimator_neutral() -> None:

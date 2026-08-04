@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from measurement.source_boundary import surface_emission_policy_sha256
+from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
 from pf.full_spectrum import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
 from pf.provenance import canonical_json_bytes
 from runtime.measurement_log import (
@@ -19,6 +20,10 @@ from runtime.measurement_log import (
 )
 from spectrum.response_matrix import (
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+)
+from spectrum.physics_contracts import (
+    OBSTACLE_MATERIAL_CONTRACT_SHA256,
+    TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
 )
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
@@ -168,11 +173,17 @@ def _synthetic_validation_manifest(
 def _synthetic_additive_scatter_response(
 ) -> AdditiveNoncollidedTransportResponse:
     """Return a nonzero authenticated test-only additive scatter response."""
+    artifact_contracts = {
+        str(seed): sha256(
+            f"test-additive-contract-{seed}".encode("utf-8")
+        ).hexdigest()
+        for seed in DESIGNATED_TRAINING_SCENE_SEEDS
+    }
     return AdditiveNoncollidedTransportResponse(
         coefficients=(0.8, 0.5, 0.4, 0.2, 0.1, 0.05, 0.025),
         ridge_lambda=0.1,
         training_manifest={
-            "schema_version": 1,
+            "schema_version": 2,
             "acceptance_contract_sha256": (
                 FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
             ),
@@ -188,6 +199,17 @@ def _synthetic_additive_scatter_response(
                 ).hexdigest()
                 for seed in DESIGNATED_TRAINING_SCENE_SEEDS
             },
+            "artifact_contract_sha256_by_scene": artifact_contracts,
+            "shield_pose_contract_sha256": SHIELD_POSE_CONTRACT_SHA256,
+            "detector_response_contract_sha256": (
+                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            ),
+            "obstacle_material_contract_sha256": (
+                OBSTACLE_MATERIAL_CONTRACT_SHA256
+            ),
+            "transport_physics_table_contract_sha256": (
+                TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256
+            ),
             "label_space": ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
             "selection_objective": (
                 "leave_one_training_scene_out_weighted_log1p_mse"

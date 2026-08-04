@@ -8,6 +8,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+import pf.estimator as estimator_module
 from pf.estimator import (
     JointStationObservation,
     RotatingShieldPFConfig,
@@ -170,6 +171,81 @@ def test_exact_rj_candidate_target_matches_numpy_and_torch_cpu() -> None:
     )
 
 
+def test_device_delta_reuses_unchanged_positions_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted GPU columns may replace recomputation for unchanged sources."""
+    pytest.importorskip("torch")
+    station = _station()
+    numpy_estimator = _estimator(use_gpu=False)
+    torch_estimator = _estimator(use_gpu=True)
+    chart_ids = np.asarray([[0], [1]], dtype=np.int64)
+    surface_uv = np.asarray(
+        [[[0.2, 0.3]], [[0.7, 0.8]]],
+        dtype=np.float64,
+    )
+    accepted_strengths = np.asarray([700_000.0, 900_000.0])
+    for estimator in (numpy_estimator, torch_estimator):
+        filt = estimator.filters["Cs-137"]
+        for row in range(2):
+            filt.continuous_particles[row].state = IsotopeState(
+                num_sources=1,
+                strengths=np.asarray([accepted_strengths[row]]),
+                surface_chart_ids=chart_ids[row].copy(),
+                surface_uv=surface_uv[row].copy(),
+            )
+
+    def _evaluate(estimator: RotatingShieldPFEstimator) -> np.ndarray:
+        """Evaluate a strength change at unchanged accepted positions."""
+        filt = estimator.filters["Cs-137"]
+        atlas = filt._structural_rj_surface_atlas
+        assert atlas is not None
+        positions = atlas.positions_xyz(chart_ids, surface_uv)
+        stations = (station,)
+        estimator._active_joint_station_history = stations
+        estimator._refresh_joint_structural_transport_cache(stations)
+        evidence = estimator._joint_history_structural_geometry(
+            "Cs-137",
+            stations,
+        )
+        try:
+            return estimator._joint_structural_target_evaluator(
+                filt=filt,
+                data=evidence,
+                positions_pks=positions,
+                chart_ids_pk=chart_ids,
+                strengths_pk=(accepted_strengths * 1.2).reshape(2, 1),
+                particle_indices=np.arange(2, dtype=np.int64),
+                target_beta=0.7,
+                tempering_start_row=0,
+            )
+        finally:
+            estimator._joint_structural_transport_cache = None
+            estimator._active_joint_station_history = None
+
+    expected = _evaluate(numpy_estimator)
+    torch_filter = torch_estimator.filters["Cs-137"]
+    original = torch_filter._continuous_rj_line_transport_component_columns
+    device_calls = 0
+
+    def _capture(*args: object, **kwargs: object) -> object:
+        """Count proposal transport calls after accepted-cache creation."""
+        nonlocal device_calls
+        if bool(kwargs.get("device_resident", False)):
+            device_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        torch_filter,
+        "_continuous_rj_line_transport_component_columns",
+        _capture,
+    )
+    actual = _evaluate(torch_estimator)
+
+    assert device_calls == 0
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-12, atol=1.0e-8)
+
+
 def test_cached_fixed_state_transport_matches_direct_batch_kernel() -> None:
     """Station caching must preserve the former direct transport arithmetic."""
     estimator = _estimator(use_gpu=True)
@@ -245,8 +321,10 @@ def test_exact_rj_candidate_target_matches_numpy_and_cuda() -> None:
     )
 
 
-def test_torch_rj_target_keeps_history_resident_and_reuses_unit_transport() -> None:
-    """Torch RJ must retain history tensors and cache exact surface responses."""
+def test_torch_rj_target_keeps_history_and_proposals_device_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Torch RJ must bypass the host LRU without changing exact targets."""
     torch = pytest.importorskip("torch")
     station = _station()
     estimator = _estimator(use_gpu=True)
@@ -258,15 +336,33 @@ def test_torch_rj_target_keeps_history_resident_and_reuses_unit_transport() -> N
     assert all(str(value.device) == "cpu" for value in cache)
     estimator._joint_structural_transport_cache = None
     estimator._active_joint_station_history = None
+    filt = estimator.filters["Cs-137"]
+    original = filt._continuous_rj_line_transport_component_columns
+    device_flags: list[bool] = []
 
+    def _capture_device_path(*args: object, **kwargs: object) -> object:
+        """Record selection of the device-resident transport API."""
+        device_flags.append(bool(kwargs.get("device_resident", False)))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        filt,
+        "_continuous_rj_line_transport_component_columns",
+        _capture_device_path,
+    )
+
+    misses_before = estimator.last_joint_structural_unit_cache_misses
     first = _conditional_target(estimator, station)
-    first_hits = estimator.last_joint_structural_unit_cache_hits
     first_misses = estimator.last_joint_structural_unit_cache_misses
     second = _conditional_target(estimator, station)
 
     assert first_misses > 0
-    assert estimator.last_joint_structural_unit_cache_hits > first_hits
-    assert estimator.last_joint_structural_unit_cache_misses == first_misses
+    assert estimator.last_joint_structural_unit_cache_hits == 0
+    assert (
+        estimator.last_joint_structural_unit_cache_misses - first_misses
+        == first_misses - misses_before
+    )
+    assert device_flags == [True, True]
     np.testing.assert_array_equal(second, first)
 
 
@@ -348,6 +444,150 @@ def test_unit_transport_cache_preserves_completed_station_shards() -> None:
         strict=True,
     ):
         np.testing.assert_array_equal(repeated_values, combined_values)
+
+
+def test_unit_transport_cache_fuses_multi_station_miss_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fused misses must equal serial shards with one exact kernel call."""
+    estimator = _estimator(use_gpu=True)
+    filt = estimator.filters["Cs-137"]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    chart_ids = np.asarray([0, 1], dtype=np.int64)
+    surface_uv = np.asarray(
+        [[0.2, 0.3], [0.7, 0.8]],
+        dtype=np.float64,
+    )
+    positions = atlas.positions_xyz(chart_ids, surface_uv)
+    line_indices = estimator._joint_line_layout()["Cs-137"][1]
+    first_station = _station()
+    second_station = replace(
+        first_station,
+        detector_position_xyz_m=(2.0, 1.0, 1.5),
+        fe_indices=np.asarray([1, 4], dtype=np.int64),
+        pb_indices=np.asarray([6, 0], dtype=np.int64),
+        station_sequence_id=1,
+    )
+    combined_geometry = estimator._joint_history_structural_geometry(
+        "Cs-137",
+        (first_station, second_station),
+    )
+    shards = estimator._joint_structural_station_geometry_shards(
+        combined_geometry
+    )
+    original = filt._continuous_rj_line_transport_component_columns
+    call_rows: list[int] = []
+
+    def _counted(*args: object, **kwargs: object) -> object:
+        """Record each exact transport launch without changing its result."""
+        data = args[0]
+        assert hasattr(data, "row_count")
+        call_rows.append(int(getattr(data, "row_count")))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        filt,
+        "_continuous_rj_line_transport_component_columns",
+        _counted,
+    )
+    serial_shards = [
+        estimator._joint_cached_continuous_unit_components_shard(
+            filt=filt,
+            data=shard,
+            positions_s3=positions,
+            chart_ids_s=chart_ids,
+            positive_line_indices=line_indices,
+        )
+        for shard in shards
+    ]
+    serial = tuple(
+        np.concatenate(
+            [values[index] for values in serial_shards],
+            axis=0,
+        )
+        for index in range(len(serial_shards[0]))
+    )
+    assert call_rows == [2, 2]
+
+    estimator._joint_structural_unit_transport_cache.clear()
+    call_rows.clear()
+    fused = estimator._joint_cached_continuous_unit_components(
+        filt=filt,
+        data=combined_geometry,
+        positions_s3=positions,
+        chart_ids_s=chart_ids,
+        positive_line_indices=line_indices,
+    )
+
+    assert call_rows == [4]
+    for fused_values, serial_values in zip(fused, serial, strict=True):
+        np.testing.assert_allclose(
+            fused_values,
+            serial_values,
+            rtol=2.0e-12,
+            atol=1.0e-12,
+        )
+
+
+def test_unit_transport_cache_retains_reused_state_during_proposal_churn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-shot proposals must not evict repeatedly used accepted positions."""
+    estimator = _estimator(use_gpu=True)
+    filt = estimator.filters["Cs-137"]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    station = _station()
+    geometry = estimator._joint_history_structural_geometry(
+        "Cs-137",
+        (station,),
+    )
+    line_indices = estimator._joint_line_layout()["Cs-137"][1]
+    chart_ids = np.asarray([0, 1, 2, 3], dtype=np.int64)
+    surface_uv = np.asarray(
+        [[0.2, 0.3], [0.7, 0.8], [0.1, 0.9], [0.9, 0.1]],
+        dtype=np.float64,
+    )
+    positions = atlas.positions_xyz(chart_ids, surface_uv)
+    bytes_per_entry = (
+        estimator_module.JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE.itemsize
+        + np.dtype(np.int64).itemsize
+        + len(estimator_module.JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES)
+        * geometry.row_count
+        * line_indices.size
+        * np.dtype(np.float64).itemsize
+    )
+    monkeypatch.setattr(
+        estimator_module,
+        "JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES",
+        3 * bytes_per_entry,
+    )
+
+    estimator._joint_cached_continuous_unit_components(
+        filt=filt,
+        data=geometry,
+        positions_s3=positions[:2],
+        chart_ids_s=chart_ids[:2],
+        positive_line_indices=line_indices,
+    )
+    estimator._joint_cached_continuous_unit_components(
+        filt=filt,
+        data=geometry,
+        positions_s3=positions,
+        chart_ids_s=chart_ids,
+        positive_line_indices=line_indices,
+    )
+    misses_before_reuse = estimator.last_joint_structural_unit_cache_misses
+    estimator._joint_cached_continuous_unit_components(
+        filt=filt,
+        data=geometry,
+        positions_s3=positions[:2],
+        chart_ids_s=chart_ids[:2],
+        positive_line_indices=line_indices,
+    )
+
+    assert estimator.last_joint_structural_unit_cache_misses == misses_before_reuse
 
 
 def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
