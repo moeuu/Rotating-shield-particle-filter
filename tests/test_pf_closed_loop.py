@@ -370,6 +370,8 @@ def test_detected_isotope_gate_builds_only_active_pf(
 
     assert len(build_calls) == 2
     assert build_calls[0]["args"][1]["num_particles"] == 1
+    assert build_calls[0]["args"][1]["variable_cardinality"] is False
+    assert build_calls[0]["args"][1]["init_num_sources"] == (0, 0)
     assert build_calls[1]["kwargs"]["inference_isotopes"] == ("Cs-137",)
     assert detector.measurements == []
     assert len(active_estimator.measurements) == 1

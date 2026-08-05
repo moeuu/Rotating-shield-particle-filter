@@ -776,6 +776,8 @@ def run_pf_closed_loop(
         initial_estimator_settings = dict(settings)
         if detected_only_raw:
             initial_estimator_settings["num_particles"] = 1
+            initial_estimator_settings["variable_cardinality"] = False
+            initial_estimator_settings["init_num_sources"] = (0, 0)
         estimator = build_live_estimator(
             context,
             initial_estimator_settings,
