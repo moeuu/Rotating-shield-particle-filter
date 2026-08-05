@@ -715,6 +715,174 @@ class ContinuousStrengthProposal:
         return result
 
 
+@dataclass(frozen=True)
+class ContinuousBlockStrengthProposal:
+    """Represent a row-conditional full-support strength-vector proposal.
+
+    One mixture component draws the complete source-strength vector from the
+    proper physical prior.  The other draws the complete vector from
+    independent truncated normals around an all-history conditional center.
+    Choosing the component once per particle row avoids the exponentially
+    unlikely mixture of data-informed and unrelated prior draws produced by
+    selecting a component independently for every source.  The normalized
+    block density is evaluated explicitly, so the proposal remains suitable
+    for exact trans-dimensional MH ratios.
+    """
+
+    minimum: float
+    maximum: float
+    data_locations: ArrayLike
+    data_sigma: float
+    prior_component_probability: float = 0.5
+    prior_family: str = "bounded_uniform"
+    prior_gamma_shape: float = 2.0
+    prior_gamma_scale: float = 1.0
+    _prior: StrengthPrior = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Validate and freeze the batched conditional proposal centers."""
+        minimum = float(self.minimum)
+        maximum = float(self.maximum)
+        sigma = float(self.data_sigma)
+        prior_probability = float(self.prior_component_probability)
+        locations = np.array(
+            self.data_locations,
+            dtype=np.float64,
+            copy=True,
+        )
+        prior = StrengthPrior(
+            minimum=minimum,
+            maximum=maximum,
+            family=self.prior_family,
+            gamma_shape=self.prior_gamma_shape,
+            gamma_scale=self.prior_gamma_scale,
+        )
+        if locations.ndim != 2 or locations.shape[1] < 1:
+            raise ValueError(
+                "Block strength-proposal centers require row and source axes."
+            )
+        if (
+            np.any(~np.isfinite(locations))
+            or np.any(locations < minimum)
+            or np.any(locations > prior.support_maximum)
+        ):
+            raise ValueError(
+                "Every block strength-proposal center must lie in support."
+            )
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            raise ValueError("Block strength-proposal sigma must be positive.")
+        if (
+            not np.isfinite(prior_probability)
+            or prior_probability <= 0.0
+            or prior_probability > 1.0
+        ):
+            raise ValueError(
+                "Block prior_component_probability must lie in (0, 1]."
+            )
+        locations.setflags(write=False)
+        object.__setattr__(self, "minimum", minimum)
+        object.__setattr__(self, "maximum", maximum)
+        object.__setattr__(self, "data_sigma", sigma)
+        object.__setattr__(
+            self,
+            "prior_component_probability",
+            prior_probability,
+        )
+        object.__setattr__(self, "data_locations", locations)
+        object.__setattr__(self, "prior_family", prior.family)
+        object.__setattr__(self, "prior_gamma_shape", prior.gamma_shape)
+        object.__setattr__(self, "prior_gamma_scale", prior.gamma_scale)
+        object.__setattr__(self, "_prior", prior)
+
+    def _validated_values(self, strengths: ArrayLike) -> NDArray[np.float64]:
+        """Return strength rows aligned with the immutable proposal centers."""
+        values = np.asarray(strengths, dtype=np.float64)
+        if values.shape != np.asarray(self.data_locations).shape:
+            raise ValueError(
+                "Block strengths must match proposal center row/source axes."
+            )
+        return values
+
+    def log_density(self, strengths: ArrayLike) -> FloatArray:
+        """Return one exact block-mixture log density per particle row."""
+        values = self._validated_values(strengths)
+        in_support = np.asarray(self._prior.in_support(values), dtype=np.bool_)
+        row_in_support = np.all(in_support, axis=1)
+        prior_log_density = np.sum(
+            np.asarray(self._prior.log_prob(values), dtype=np.float64),
+            axis=1,
+        )
+        if self.prior_component_probability >= 1.0:
+            return np.where(
+                row_in_support,
+                prior_log_density,
+                float("-inf"),
+            ).astype(np.float64)
+        locations = np.asarray(self.data_locations, dtype=np.float64)
+        lower_z = (self.minimum - locations) / self.data_sigma
+        if self._prior.family == "bounded_uniform":
+            upper_z = (self.maximum - locations) / self.data_sigma
+        else:
+            upper_z = np.full_like(locations, np.inf)
+        normalization = ndtr(upper_z) - ndtr(lower_z)
+        standardized = (values - locations) / self.data_sigma
+        data_log_density = np.sum(
+            -0.5 * standardized**2
+            - math.log(math.sqrt(2.0 * math.pi) * self.data_sigma)
+            - np.log(normalization),
+            axis=1,
+        )
+        mixture = np.logaddexp(
+            math.log(self.prior_component_probability) + prior_log_density,
+            math.log1p(-self.prior_component_probability)
+            + data_log_density,
+        )
+        return np.where(
+            row_in_support,
+            mixture,
+            float("-inf"),
+        ).astype(np.float64)
+
+    def sample(self, *, rng: np.random.Generator) -> NDArray[np.float64]:
+        """Draw complete strength vectors from the normalized block mixture."""
+        if not isinstance(rng, np.random.Generator):
+            raise TypeError(
+                "Block strength-proposal sampling requires a NumPy Generator."
+            )
+        shape = np.asarray(self.data_locations).shape
+        result = np.asarray(
+            self._prior.sample(shape, rng=rng),
+            dtype=np.float64,
+        )
+        if self.prior_component_probability >= 1.0:
+            return result
+        use_data = (
+            rng.random(shape[0]) >= self.prior_component_probability
+        )
+        if not np.any(use_data):
+            return result
+        locations = np.asarray(self.data_locations)[use_data]
+        lower_cdf = ndtr((self.minimum - locations) / self.data_sigma)
+        if self._prior.family == "bounded_uniform":
+            upper_cdf = ndtr(
+                (self.maximum - locations) / self.data_sigma
+            )
+        else:
+            upper_cdf = np.ones_like(locations, dtype=np.float64)
+        uniforms = lower_cdf + rng.random(locations.shape) * (
+            upper_cdf - lower_cdf
+        )
+        eps = np.finfo(np.float64).eps
+        sampled = locations + self.data_sigma * ndtri(
+            np.clip(uniforms, eps, 1.0 - eps)
+        )
+        sampled = np.maximum(sampled, self.minimum)
+        if self._prior.family == "bounded_uniform":
+            sampled = np.minimum(sampled, self.maximum)
+        result[use_data] = sampled
+        return np.asarray(result, dtype=np.float64)
+
+
 def truncated_poisson_cardinality_probabilities(
     max_cardinality: int,
     expected_cardinality: float,

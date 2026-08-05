@@ -11,6 +11,7 @@ from pf.particle_filter import IsotopeParticleFilter
 from pf.structural_rj import (
     BirthDeathMoveProbabilities,
     CardinalityPrior,
+    ContinuousBlockStrengthProposal,
     ContinuousStrengthProposal,
     ContinuousSurfacePositionProposal,
     SplitMergeMoveProbabilities,
@@ -227,6 +228,71 @@ def test_continuous_strength_proposal_preserves_unbounded_prior_support() -> Non
 
     assert np.any(samples > proposal.maximum)
     assert np.all(np.isfinite(proposal.log_density(chart_ids, samples)))
+
+
+def test_block_strength_proposal_uses_one_component_per_row() -> None:
+    """A conditional block draw must not mix prior/data choices by source."""
+    proposal = ContinuousBlockStrengthProposal(
+        minimum=0.0,
+        maximum=100.0,
+        data_locations=np.asarray(
+            [[10.0, 10.0], [90.0, 90.0]],
+            dtype=np.float64,
+        ),
+        data_sigma=1.0e-6,
+        prior_component_probability=0.5,
+    )
+    samples = np.concatenate(
+        [
+            proposal.sample(rng=np.random.default_rng(seed))
+            for seed in range(200)
+        ],
+        axis=0,
+    )
+
+    expected_centers = np.tile(
+        np.asarray([[10.0, 10.0], [90.0, 90.0]], dtype=np.float64),
+        (200, 1),
+    )
+    first_data = np.abs(samples[:, 0] - expected_centers[:, 0]) < 1.0e-4
+    first_prior = ~first_data
+    second_data = np.abs(samples[:, 1] - expected_centers[:, 1]) < 1.0e-4
+    assert np.array_equal(first_data, second_data)
+    assert np.any(first_data)
+    assert np.any(first_prior)
+    assert np.all(np.isfinite(proposal.log_density(samples[:2])))
+
+
+def test_block_strength_density_is_a_normalized_full_support_mixture() -> None:
+    """The vector density must equal the explicit prior/data block mixture."""
+    proposal = ContinuousBlockStrengthProposal(
+        minimum=1.0,
+        maximum=9.0,
+        data_locations=np.asarray([[3.0, 7.0]], dtype=np.float64),
+        data_sigma=0.8,
+        prior_component_probability=0.25,
+    )
+    values = np.asarray([[2.5, 6.5]], dtype=np.float64)
+    grid = np.linspace(1.0, 9.0, 200_001, dtype=np.float64)
+    first_data = np.exp(
+        -0.5 * np.square((grid - 3.0) / 0.8)
+    )
+    first_data /= np.trapezoid(first_data, grid)
+    second_data = np.exp(
+        -0.5 * np.square((grid - 7.0) / 0.8)
+    )
+    second_data /= np.trapezoid(second_data, grid)
+    expected = np.logaddexp(
+        math.log(0.25) - 2.0 * math.log(8.0),
+        math.log(0.75)
+        + math.log(np.interp(values[0, 0], grid, first_data))
+        + math.log(np.interp(values[0, 1], grid, second_data)),
+    )
+
+    assert proposal.log_density(values)[0] == pytest.approx(
+        expected,
+        abs=2.0e-9,
+    )
 
 
 def test_unbounded_split_support_has_exact_simplex_normalization() -> None:

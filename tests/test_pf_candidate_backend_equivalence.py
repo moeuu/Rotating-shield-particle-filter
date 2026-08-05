@@ -44,6 +44,7 @@ def _estimator(
     *,
     use_gpu: bool,
     gpu_device: str = "cpu",
+    num_particles: int = 2,
 ) -> RotatingShieldPFEstimator:
     """Build the same small joint PF on NumPy or Torch-CPU transport."""
     model = approved_full_spectrum_model()
@@ -57,7 +58,7 @@ def _estimator(
         mu_by_isotope={isotope: 0.0 for isotope in TEST_ISOTOPES},
         line_mu_by_isotope=_positive_line_transport_table(),
         pf_config=RotatingShieldPFConfig(
-            num_particles=2,
+            num_particles=num_particles,
             max_sources=1,
             variable_cardinality=True,
             init_num_sources=(0, 1),
@@ -68,9 +69,7 @@ def _estimator(
         full_spectrum_generative_model=model,
         random_seed=17,
     )
-    estimator.add_measurement_pose(
-        np.asarray([1.5, 1.5, 1.5], dtype=np.float64)
-    )
+    estimator.add_measurement_pose(np.asarray([1.5, 1.5, 1.5], dtype=np.float64))
     estimator._ensure_kernel_cache()
     return estimator
 
@@ -143,11 +142,11 @@ def test_exact_rj_candidate_target_matches_numpy_and_torch_cpu() -> None:
     numpy_estimator = _estimator(use_gpu=False)
     torch_estimator = _estimator(use_gpu=True)
 
-    numpy_components = (
-        numpy_estimator._joint_station_transport_components_torch(station)
+    numpy_components = numpy_estimator._joint_station_transport_components_torch(
+        station
     )
-    torch_components = (
-        torch_estimator._joint_station_transport_components_torch(station)
+    torch_components = torch_estimator._joint_station_transport_components_torch(
+        station
     )
     for numpy_value, torch_value in zip(
         numpy_components,
@@ -169,6 +168,168 @@ def test_exact_rj_candidate_target_matches_numpy_and_torch_cpu() -> None:
         rtol=2.0e-12,
         atol=1.0e-8,
     )
+
+
+@pytest.mark.parametrize(
+    ("use_gpu", "gpu_device"),
+    [(False, "cpu"), (True, "cpu"), (True, "cuda")],
+)
+def test_sparse_strength_grid_matches_expanded_exact_target(
+    use_gpu: bool,
+    gpu_device: str,
+) -> None:
+    """Differential source-axis assembly must equal the expanded target."""
+    if use_gpu:
+        torch = pytest.importorskip("torch")
+        if gpu_device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA is not available.")
+    estimator = _estimator(use_gpu=use_gpu, gpu_device=gpu_device)
+    station = _station()
+    stations = (station,)
+    isotope = "Cs-137"
+    filt = estimator.filters[isotope]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    chart_ids = np.asarray([[0], [1]], dtype=np.int64)
+    surface_uv = np.asarray(
+        [[[0.2, 0.3]], [[0.7, 0.8]]],
+        dtype=np.float64,
+    )
+    positions = atlas.positions_xyz(chart_ids, surface_uv)
+    strengths = np.asarray(
+        [
+            [[300_000.0], [600_000.0], [900_000.0]],
+            [[400_000.0], [800_000.0], [1_200_000.0]],
+        ],
+        dtype=np.float64,
+    )
+    indices = np.arange(2, dtype=np.int64)
+    geometry = estimator._joint_history_structural_geometry(isotope, stations)
+    estimator._active_joint_station_history = stations
+    estimator._refresh_joint_structural_transport_cache(stations)
+    try:
+        sparse = estimator._joint_structural_strength_grid_target_batch(
+            filt=filt,
+            data=geometry,
+            stations=stations,
+            positions_bks=positions,
+            chart_ids_bk=chart_ids,
+            strengths_bgk=strengths,
+            particle_indices=indices,
+            target_beta=0.7,
+        )
+        grid_count = strengths.shape[1]
+        expanded = estimator._joint_structural_target_evaluator(
+            filt=filt,
+            data=geometry,
+            positions_pks=np.broadcast_to(
+                positions[:, None],
+                (2, grid_count, 1, 3),
+            ).reshape(2 * grid_count, 1, 3),
+            chart_ids_pk=np.broadcast_to(
+                chart_ids[:, None],
+                (2, grid_count, 1),
+            ).reshape(2 * grid_count, 1),
+            strengths_pk=strengths.reshape(2 * grid_count, 1),
+            particle_indices=np.repeat(indices, grid_count),
+            target_beta=0.7,
+            tempering_start_row=0,
+        ).reshape(2, grid_count)
+    finally:
+        estimator._joint_structural_transport_cache = None
+        estimator._active_joint_station_history = None
+
+    np.testing.assert_allclose(sparse, expanded, rtol=2.0e-12, atol=1.0e-8)
+    assert estimator.last_joint_strength_grid_source_slots_after <= (
+        estimator.last_joint_strength_grid_source_slots_before
+    )
+
+
+def test_cuda_strength_grid_autotunes_real_batches_above_128() -> None:
+    """CUDA must time real 128/256/512 row slabs before caching a width."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    particle_count = 896
+    estimator = _estimator(
+        use_gpu=True,
+        gpu_device="cuda",
+        num_particles=particle_count,
+    )
+    station = _station()
+    stations = (station,)
+    isotope = "Cs-137"
+    filt = estimator.filters[isotope]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    chart_ids = (np.arange(particle_count, dtype=np.int64) % 2)[:, None]
+    phase = np.arange(particle_count, dtype=np.float64)
+    surface_uv = np.stack(
+        (
+            0.1 + 0.8 * ((phase % 97.0) / 97.0),
+            0.1 + 0.8 * ((phase % 89.0) / 89.0),
+        ),
+        axis=1,
+    )[:, None, :]
+    positions = atlas.positions_xyz(chart_ids, surface_uv)
+    strength_scale = np.linspace(
+        0.75,
+        1.25,
+        particle_count,
+        dtype=np.float64,
+    )
+    strengths = (
+        strength_scale[:, None, None]
+        * np.asarray([250_000.0, 500_000.0, 750_000.0, 1_000_000.0, 1_250_000.0])[
+            None, :, None
+        ]
+    )
+    indices = np.arange(particle_count, dtype=np.int64)
+    geometry = estimator._joint_history_structural_geometry(isotope, stations)
+    estimator._active_joint_station_history = stations
+    estimator._refresh_joint_structural_transport_cache(stations)
+    try:
+        target = estimator._joint_structural_strength_grid_target_evaluator(
+            filt=filt,
+            data=geometry,
+            positions_pks=positions,
+            chart_ids_pk=chart_ids,
+            strengths_pgk=strengths,
+            particle_indices=indices,
+            target_beta=0.7,
+            tempering_start_row=0,
+        )
+        first_diagnostics = dict(
+            estimator.last_joint_strength_grid_batch_diagnostics
+        )
+        repeated = estimator._joint_structural_strength_grid_target_evaluator(
+            filt=filt,
+            data=geometry,
+            positions_pks=positions[:10],
+            chart_ids_pk=chart_ids[:10],
+            strengths_pgk=strengths[:10],
+            particle_indices=indices[:10],
+            target_beta=0.7,
+            tempering_start_row=0,
+        )
+        cached_diagnostics = dict(
+            estimator.last_joint_strength_grid_batch_diagnostics
+        )
+    finally:
+        filt._clear_continuous_rj_device_state()
+        estimator._joint_structural_transport_cache = None
+        estimator._active_joint_station_history = None
+    assert target.shape == (particle_count, 5)
+    assert np.all(np.isfinite(target))
+    np.testing.assert_array_equal(repeated, target[:10])
+    assert first_diagnostics["mode"] == "empirical_cuda_autotune"
+    trials = first_diagnostics["trials"]
+    assert isinstance(trials, list)
+    assert [trial["batch_size"] for trial in trials] == [128, 256, 512]
+    selected = first_diagnostics["selected_batch_size"]
+    assert selected in {128, 256, 512}
+    assert cached_diagnostics["mode"] == "cached_cuda_autotune"
+    assert cached_diagnostics["selected_batch_size"] == selected
 
 
 def test_device_delta_reuses_unchanged_positions_exactly(
@@ -246,6 +407,89 @@ def test_device_delta_reuses_unchanged_positions_exactly(
     np.testing.assert_allclose(actual, expected, rtol=2.0e-12, atol=1.0e-8)
 
 
+def test_sweep_local_unit_cache_promotes_only_accepted_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only accepted proposal columns may enter the sweep-local unit cache."""
+    pytest.importorskip("torch")
+    estimator = _estimator(use_gpu=True)
+    station = _station()
+    filt = estimator.filters["Cs-137"]
+    empty = IsotopeState(
+        num_sources=0,
+        strengths=np.empty(0, dtype=np.float64),
+        surface_chart_ids=np.empty(0, dtype=np.int64),
+        surface_uv=np.empty((0, 2), dtype=np.float64),
+    )
+    for particle in filt.continuous_particles:
+        particle.state = empty.copy()
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    chart_ids = np.asarray([[0], [1]], dtype=np.int64)
+    surface_uv = np.asarray(
+        [[[0.2, 0.3]], [[0.7, 0.8]]],
+        dtype=np.float64,
+    )
+    positions = atlas.positions_xyz(chart_ids, surface_uv)
+    strengths = np.asarray([[700_000.0], [900_000.0]], dtype=np.float64)
+    indices = np.arange(2, dtype=np.int64)
+    stations = (station,)
+    estimator._active_joint_station_history = stations
+    estimator._refresh_joint_structural_transport_cache(stations)
+    evidence = estimator._joint_history_structural_geometry("Cs-137", stations)
+    original = filt._continuous_rj_line_transport_component_columns
+    call_rows: list[int] = []
+
+    def _capture(*args: object, **kwargs: object) -> object:
+        """Record the number of source geometries sent to transport."""
+        positions_arg = np.asarray(args[1], dtype=np.float64).reshape(-1, 3)
+        if bool(kwargs.get("device_resident", False)):
+            call_rows.append(int(positions_arg.shape[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        filt,
+        "_continuous_rj_line_transport_component_columns",
+        _capture,
+    )
+    try:
+        first = estimator._joint_structural_target_evaluator(
+            filt=filt,
+            data=evidence,
+            positions_pks=positions,
+            chart_ids_pk=chart_ids,
+            strengths_pk=strengths,
+            particle_indices=indices,
+            target_beta=0.7,
+            tempering_start_row=0,
+        )
+        filt._commit_continuous_rj_states(
+            indices,
+            np.asarray([True, False]),
+            chart_ids,
+            surface_uv,
+            positions,
+            strengths,
+        )
+        second = estimator._joint_structural_target_evaluator(
+            filt=filt,
+            data=evidence,
+            positions_pks=positions,
+            chart_ids_pk=chart_ids,
+            strengths_pk=strengths,
+            particle_indices=indices,
+            target_beta=0.7,
+            tempering_start_row=0,
+        )
+    finally:
+        estimator._joint_structural_transport_cache = None
+        estimator._active_joint_station_history = None
+        filt._clear_continuous_rj_device_state()
+
+    assert call_rows == [2, 1]
+    np.testing.assert_allclose(second, first, rtol=2.0e-12, atol=1.0e-8)
+
+
 def test_cached_fixed_state_transport_matches_direct_batch_kernel() -> None:
     """Station caching must preserve the former direct transport arithmetic."""
     estimator = _estimator(use_gpu=True)
@@ -292,10 +536,7 @@ def test_cached_fixed_state_transport_matches_direct_batch_kernel() -> None:
             axis=-1,
         )
         np.testing.assert_allclose(
-            cached_features[..., global_columns, :]
-            .detach()
-            .cpu()
-            .numpy(),
+            cached_features[..., global_columns, :].detach().cpu().numpy(),
             direct_features,
             rtol=0.0,
             atol=0.0,
@@ -434,10 +675,7 @@ def test_unit_transport_cache_preserves_completed_station_shards() -> None:
         chart_ids_s=chart_ids,
         positive_line_indices=local_indices,
     )
-    assert (
-        estimator.last_joint_structural_unit_cache_misses
-        == misses_before_repeat
-    )
+    assert estimator.last_joint_structural_unit_cache_misses == misses_before_repeat
     for repeated_values, combined_values in zip(
         repeated,
         combined,
@@ -473,9 +711,7 @@ def test_unit_transport_cache_fuses_multi_station_miss_batches(
         "Cs-137",
         (first_station, second_station),
     )
-    shards = estimator._joint_structural_station_geometry_shards(
-        combined_geometry
-    )
+    shards = estimator._joint_structural_station_geometry_shards(combined_geometry)
     original = filt._continuous_rj_line_transport_component_columns
     call_rows: list[int] = []
 
@@ -655,8 +891,7 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
     for isotope in TEST_ISOTOPES:
         filt = estimator.filters[isotope]
         row_identities = [
-            particle.joint_row_identity
-            for particle in filt.continuous_particles
+            particle.joint_row_identity for particle in filt.continuous_particles
         ]
         if isotope == "Cs-137":
             states = (
@@ -667,13 +902,13 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
         else:
             states = [_empty_state() for _ in range(particle_count)]
         filt.continuous_particles = [
-                IsotopeParticle(
-                    state=state,
-                    log_weight=common_log_weight,
-                    joint_row_identity=row_identities[row],
-                )
-                for row, state in enumerate(states)
-            ]
+            IsotopeParticle(
+                state=state,
+                log_weight=common_log_weight,
+                joint_row_identity=row_identities[row],
+            )
+            for row, state in enumerate(states)
+        ]
 
     fe_indices = np.arange(8, dtype=np.int64)
     pb_indices = np.arange(7, -1, -1, dtype=np.int64)
@@ -692,10 +927,8 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
         live_times_s=live_times,
         station_sequence_id=0,
     )
-    total, uncollided, features = (
-        estimator._joint_station_transport_components_torch(
-            empty_observation
-        )
+    total, uncollided, features = estimator._joint_station_transport_components_torch(
+        empty_observation
     )
     observed = model.sample_predictive_numpy(
         total[16:17].detach().cpu().numpy(),
@@ -718,10 +951,7 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
         station_sequence_id=0,
     )
     likelihood = (
-        estimator._joint_station_log_likelihood_torch(station)
-        .detach()
-        .cpu()
-        .numpy()
+        estimator._joint_station_log_likelihood_torch(station).detach().cpu().numpy()
     )
     assert np.all(np.isfinite(likelihood))
     assert likelihood[16] > likelihood[32]
@@ -743,10 +973,7 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
 
     weights = np.exp(
         np.asarray(
-            [
-                particle.log_weight
-                for particle in cs_filter.continuous_particles
-            ],
+            [particle.log_weight for particle in cs_filter.continuous_particles],
             dtype=np.float64,
         )
     )
@@ -761,9 +988,7 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
         if particle.state.num_sources != 1:
             continue
         cardinality_one_mass += float(weight)
-        inferred = cs_filter.continuous_state_positions(
-            particle.state
-        )[0]
+        inferred = cs_filter.continuous_state_positions(particle.state)[0]
         if float(np.linalg.norm(inferred - truth_position)) < 0.5:
             truth_neighborhood_mass += float(weight)
 
@@ -771,8 +996,4 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
     assert truth_neighborhood_mass > 0.99
     assert cs_filter.last_ess >= 0.25 * particle_count - 1.0e-9
     assert estimator.last_joint_temper_steps[-1]["beta_total"] == 1.0
-    assert (
-        1
-        <= estimator.last_joint_station_unique_ancestor_count
-        <= particle_count
-    )
+    assert 1 <= estimator.last_joint_station_unique_ancestor_count <= particle_count

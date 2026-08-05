@@ -6,11 +6,11 @@ reporting. It does not own Geant4, environments, detector/shield physics, spectr
 generation, or MeasurementLog serialization.
 
 Physical acquisition is implemented once in the sibling
-`Rotating-shield-simulation-runtime` repository. The online PF controller calls that
-shared runtime through `SimulationCommand`, durably stages every truth-free raw
-full-spectrum observation in MeasurementLog v2, and only then updates the PF. The
-same estimator can also consume a completed immutable log with an estimator-only PF
-configuration:
+`Rotating-shield-simulation-runtime` repository. The online PF controller sends one
+causal action at a time to the common adaptive-session API. The runtime durably stages
+the resulting truth-free raw full-spectrum observation in MeasurementLog v2 before
+returning it, and only then does PF update. The same estimator can also consume a
+completed immutable log with an estimator-only PF configuration:
 
 ```text
 Rotating-shield-simulation-runtime
@@ -35,16 +35,30 @@ The local development checkout uses an editable sibling dependency on the shared
 runtime. A release should pin the corresponding runtime revision in the deployment
 lock file.
 
-## Online full simulation
+## PF-controlled acquisition
 
 ```bash
-uv run python main.py --full-simulation
+uv run rotating-shield-pf-live \
+  --scenario /private/runtime/run-001.json \
+  --runtime-root ../Rotating-shield-simulation-runtime \
+  --config configs/pf/pf_strict_3d.json \
+  --profile pf_strict \
+  --seed 1 \
+  --output-dir results/pf-live-run-001
 ```
 
-The command uses the physical Geant4 configuration from the shared runtime and the
-PF-owned defaults in `configs/pf/pf_strict_3d.json`. Geant4, environment generation,
-shield physics, raw spectra, and MeasurementLog serialization remain implemented in
-the shared repository; only action selection and inference are local.
+Create the private, action-free scenario with the shared runtime's
+`generate-ral-scenario` command. PF never opens its realized source truth. The PF
+configuration owns its particle count, planner objective, station/view/measurement
+budgets, and stopping rule. An MLE session may use entirely different estimator
+settings while connecting to the same runtime protocol.
+
+The runtime owns reachable candidate poses and their physical motion costs. PF owns
+candidate ranking and shield-program selection. Every selected station writes
+`planner_audit.jsonl`, including the full action count, proxy rank, exact-EIG count,
+selected and best exact EIG, score/EIG leaders, top-ranked actions, shortlist
+certificate, and MC seed. Independent-seed rank stability remains an explicit
+offline diagnostic so it cannot silently double closed-loop planning time.
 
 ## Replay
 

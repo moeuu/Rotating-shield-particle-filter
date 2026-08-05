@@ -6,13 +6,15 @@ definition, statistics, and observation path.
 
 ## Standard Full Simulation Entry Point
 
-- "Full simulation" means `uv run python main.py --full-simulation`.
-- The default `uv run python main.py` entry point and `--cui` alias must resolve
-  to the standard no-GUI Geant4/PF runtime:
-  `--mode geant4-cui` with
-  `configs/geant4/variance_reduction_external_no_isaac_32threads.json`.
-- Python analytic CUI is available only through the explicit `--python-cui` or
-  `--mode python-cui` options.
+- "Full simulation" means a shared-runtime Geant4 adaptive acquisition followed
+  by PF control/replay of its finalized MeasurementLog v2.
+- Private physical scenarios are authored by
+  `rotating-shield-sim generate-ral-scenario` and executed only by
+  `rotating-shield-sim run-adaptive-session`.
+- PF controls that session through `rotating-shield-pf-live`; this repository's
+  `main.py` remains a replay-only compatibility shim.
+- Simulator backend and CUI/GUI mode selection belong exclusively to the shared
+  runtime repository.
 
 ## Prohibited Runtime Shortcuts
 

@@ -37,6 +37,7 @@ class PFFrame:
     - estimated_strengths: isotope -> (N_est,)
     - path_waypoints_xyz: optional obstacle-aware robot path segment (M, 3)
     - spectrum_energy_keV/spectrum_counts: optional raw native spectrum data
+    - record_measurement: whether this rendering corresponds to a new acquisition
     """
 
     step_index: int
@@ -55,6 +56,7 @@ class PFFrame:
     spectrum_counts: Optional[NDArray[np.float64]] = None
     particle_representative_positions: Optional[Dict[str, NDArray[np.float64]]] = None
     particle_representative_weights: Optional[Dict[str, NDArray[np.float64]]] = None
+    record_measurement: bool = True
 
 
 def _shield_material_normal(
@@ -1443,7 +1445,8 @@ class CUISplitPFVisualizer:
         setattr(frame, "_cui_update_index", int(self.update_index))
         _extend_trajectory_history(self.trajectory, frame)
         self._record_path_segment(frame)
-        self._record_measurement_point(frame)
+        if bool(getattr(frame, "record_measurement", True)):
+            self._record_measurement_point(frame)
         step = max(0, int(frame.step_index))
         robot_step_path = self.output_dir / f"robot_2d_step_{step:04d}.png"
         overview_step_path = self.output_dir / f"experiment_overview_step_{step:04d}.png"
@@ -1816,6 +1819,7 @@ class CUISplitPFVisualizer:
     def _overview_summary_text(self, frame: PFFrame) -> str:
         """Return a compact textual source-count summary for the overview panel."""
         lines = [self._frame_progress_label(frame)]
+        truth_visible = bool(self.true_sources)
         for iso in self.isotopes:
             truth_label = "hidden"
             if iso in self.true_sources:
@@ -1829,6 +1833,8 @@ class CUISplitPFVisualizer:
                         .shape[0]
                     )
                 )
+            elif truth_visible:
+                truth_label = "0"
             est_count = int(
                 np.asarray(
                     frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float)),

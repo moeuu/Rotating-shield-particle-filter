@@ -278,6 +278,7 @@ def _evaluate_state(
         station_count_log_likelihoods: list[float] = []
         station_total_z: list[float] = []
         station_mark_tail: list[float] = []
+        station_mark_upper_tail: list[float] = []
         predicted_total = 0.0
         observed_total = 0.0
         for station in stations:
@@ -333,6 +334,14 @@ def _evaluate_state(
             station_mark_tail.append(
                 float(mark_tail) if mark_tail is not None else float("nan")
             )
+            mark_upper_tail = innovation[
+                "conditional_mark_upper_tail_probability"
+            ]
+            station_mark_upper_tail.append(
+                float(mark_upper_tail)
+                if mark_upper_tail is not None
+                else float("nan")
+            )
         finite_tails = np.asarray(station_mark_tail, dtype=np.float64)
         finite_tails = finite_tails[np.isfinite(finite_tails)]
         model_metrics[model_name] = {
@@ -349,6 +358,10 @@ def _evaluate_state(
             ),
             "maximum_station_total_abs_z": float(np.max(station_total_z)),
             "median_station_total_abs_z": float(np.median(station_total_z)),
+            "station_mark_tail_probabilities": station_mark_tail,
+            "station_mark_upper_tail_probabilities": (
+                station_mark_upper_tail
+            ),
             "minimum_station_mark_tail_probability": (
                 None if finite_tails.size == 0 else float(np.min(finite_tails))
             ),

@@ -5,13 +5,14 @@ from __future__ import annotations
 import inspect
 import json
 
-from realtime_demo import (
+from pf.closed_loop import run_pf_closed_loop
+from pf.online_config import (
     DEFAULT_PF_CONFIG,
     _validated_provided_source_provenance,
     load_online_runtime_configs,
-    run_live_pf,
 )
 from runtime.assets import simulation_runtime_root, standard_geant4_config_path
+from runtime.adaptive_client import AdaptiveRuntimeClient
 from runtime.session import estimator_neutral_runtime_config
 from sim.protocol import encode_message
 from sim.runtime import load_runtime_config
@@ -95,43 +96,39 @@ def test_standard_measurement_log_config_remains_estimator_neutral() -> None:
     assert "estimator_profile" not in logged
 
 
-def test_online_controller_stages_raw_spectra_before_pf_updates() -> None:
-    """Acquired spectra must become durable before the estimator consumes them."""
-    source = inspect.getsource(run_live_pf)
+def test_closed_loop_receives_runtime_record_before_pf_updates() -> None:
+    """Acquired spectra must cross the runtime boundary before PF ingestion."""
+    source = inspect.getsource(run_pf_closed_loop)
 
-    append_offset = source.index("measurement_log_writer.append_before_update(")
-    station_offset = source.index(
-        "measurement_log_writer.mark_station_complete_before_update("
-    )
-    update_offset = source.index("estimator.update_spectrum_station(")
+    request_offset = source.index("event = client.request(")
+    parse_offset = source.index("record = parse_adaptive_record(")
+    station_offset = source.index("station_records.append(record)")
+    update_offset = source.index("_assimilate_station(")
 
-    assert append_offset < station_offset < update_offset
-
-
-def test_online_controller_passes_only_physical_config_to_simulator() -> None:
-    """Estimator settings must not leak across the simulation boundary."""
-    source = inspect.getsource(run_live_pf)
-
-    call_start = source.index("simulation_runtime = create_simulation_runtime(")
-    call_end = source.index("\n    )", call_start)
-    call_source = source[call_start:call_end]
-
-    assert "runtime_config=physical_runtime_config" in call_source
-    assert "runtime_config=runtime_config" not in call_source
+    assert request_offset < parse_offset < station_offset < update_offset
 
 
-def test_online_controller_initializes_joint_filters_before_atlas_preflight() -> None:
-    """Live startup must resolve lazy PF rows before comparing atlas hashes."""
-    source = inspect.getsource(run_live_pf)
+def test_closed_loop_uses_runtime_client_not_simulator_in_process() -> None:
+    """Estimator settings must stay outside direct simulator construction."""
+    source = inspect.getsource(run_pf_closed_loop)
+    client_source = inspect.getsource(AdaptiveRuntimeClient.__init__)
 
-    initialize_offset = source.index(
-        "estimator.initialize_joint_particle_filters()"
-    )
-    atlas_compare_offset = source.index(
-        "if estimator_atlas_sha256 != runtime_atlas_sha256:"
-    )
+    assert "AdaptiveRuntimeClient(" in source
+    assert "create_simulation_runtime" not in source
+    assert "rotating-shield-sim" in client_source
+    assert "run-adaptive-session" in client_source
 
-    assert initialize_offset < atlas_compare_offset
+
+def test_closed_loop_binds_final_log_after_live_assimilation() -> None:
+    """Live posterior publication must wait for immutable MeasurementLog binding."""
+    source = inspect.getsource(run_pf_closed_loop)
+
+    update_offset = source.index("_assimilate_station(")
+    finalize_offset = source.index("published = client.finalize()")
+    bind_offset = source.index("bind_finalized_measurement_log(estimator, log)")
+    write_offset = source.index("_write_final_outputs(")
+
+    assert update_offset < finalize_offset < bind_offset < write_offset
 
 
 def test_source_provenance_preserves_uint64_seed_across_json_protocol() -> None:

@@ -593,23 +593,33 @@ def _validate_mode_capacity(
     """Require the planner mode capacity to cover every PF source slot."""
     try:
         pf_config = estimator.pf_config
-        configured_max_sources = pf_config.max_sources
+        configured_capacity = getattr(
+            pf_config,
+            "cardinality_capacity",
+            getattr(
+                pf_config,
+                "hard_max_sources",
+                getattr(pf_config, "max_sources", None),
+            ),
+        )
     except AttributeError as error:
         raise TypeError(
             "DSS planning requires an estimator with an explicit PF config."
         ) from error
-    if configured_max_sources is None:
-        raise ValueError("DSS planning requires a finite PF max_sources value.")
-    pf_max_sources = int(configured_max_sources)
-    if pf_max_sources <= 0:
-        raise ValueError("PF max_sources must be a positive integer.")
-    configured = int(config.max_modes_per_isotope)
-    if pf_max_sources > 0 and configured < pf_max_sources:
+    if configured_capacity is None:
         raise ValueError(
-            "max_modes_per_isotope must be at least the PF max_sources "
-            f"({configured} < {pf_max_sources})."
+            "DSS planning requires a finite PF cardinality capacity."
         )
-    return pf_max_sources
+    pf_cardinality_capacity = int(configured_capacity)
+    if pf_cardinality_capacity <= 0:
+        raise ValueError("PF cardinality capacity must be a positive integer.")
+    configured = int(config.max_modes_per_isotope)
+    if configured < pf_cardinality_capacity:
+        raise ValueError(
+            "max_modes_per_isotope must be at least the PF cardinality "
+            f"capacity ({configured} < {pf_cardinality_capacity})."
+        )
+    return pf_cardinality_capacity
 
 
 def _validate_eig_likelihood_contract(
@@ -3927,6 +3937,39 @@ def _filter_path_reachable_stations(
     return candidates[reachable], removed
 
 
+def _align_candidate_values(
+    original_poses_xyz: NDArray[np.float64],
+    original_values: NDArray[np.float64],
+    retained_poses_xyz: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Align one runtime-owned candidate vector after planner filtering."""
+    original = np.asarray(original_poses_xyz, dtype=np.float64)
+    retained = np.asarray(retained_poses_xyz, dtype=np.float64)
+    values = np.asarray(original_values, dtype=np.float64).reshape(-1)
+    if original.ndim != 2 or original.shape[1:] != (3,):
+        raise ValueError("original_poses_xyz must have shape (N, 3).")
+    if retained.ndim != 2 or retained.shape[1:] != (3,):
+        raise ValueError("retained_poses_xyz must have shape (M, 3).")
+    if values.shape != (original.shape[0],):
+        raise ValueError("original_values must align with original poses.")
+    matches = np.all(
+        np.isclose(
+            retained[:, None, :],
+            original[None, :, :],
+            rtol=0.0,
+            atol=1.0e-10,
+        ),
+        axis=2,
+    )
+    counts = np.sum(matches, axis=1)
+    if np.any(counts != 1):
+        raise ValueError(
+            "Every retained candidate must match exactly one runtime pose."
+        )
+    indices = np.argmax(matches, axis=1)
+    return np.ascontiguousarray(values[indices], dtype=np.float64)
+
+
 def _free_cell_centers(
     map_api: object | None,
     *,
@@ -4641,12 +4684,20 @@ def _compose_transition_score(
     estimator: RotatingShieldPFEstimator,
     map_api: object | None,
     config: DSSPPConfig,
+    travel_time_override_s: float | None = None,
 ) -> tuple[float, float]:
     """Return node score and path length for a specific predecessor."""
     path_length = _node_path_length(map_api, previous_pose_xyz, node.pose_xyz)
     if not np.isfinite(path_length):
         return -float("inf"), float("inf")
-    travel_time = path_length / float(config.robot_speed_m_s)
+    if travel_time_override_s is None:
+        travel_time = path_length / float(config.robot_speed_m_s)
+    else:
+        travel_time = float(travel_time_override_s)
+        if not np.isfinite(travel_time) or travel_time < 0.0:
+            raise ValueError(
+                "travel_time_override_s must be finite and nonnegative."
+            )
     time_cost = travel_time + len(node.program.pair_ids) * (
         float(config.rotation_overhead_s) + float(config.live_time_s)
     )
@@ -4833,6 +4884,7 @@ def _build_nodes(
     config: DSSPPConfig,
     rng: np.random.Generator,
     joint_particles: JointPlanningParticles,
+    candidate_motion_times_s: NDArray[np.float64] | None = None,
 ) -> tuple[list[DSSPPNode], dict[str, object]]:
     """Shortlist all actions cheaply, then exactly evaluate a fixed subset."""
     kernel = _continuous_kernel_for_estimator(
@@ -4842,6 +4894,21 @@ def _build_nodes(
     candidate_poses = np.asarray(candidate_poses_xyz, dtype=float)
     if candidate_poses.ndim != 2 or candidate_poses.shape[1] != 3:
         raise ValueError("candidate_poses_xyz must be shape (N, 3).")
+    motion_times = None
+    if candidate_motion_times_s is not None:
+        motion_times = np.asarray(
+            candidate_motion_times_s,
+            dtype=np.float64,
+        ).reshape(-1)
+        if (
+            motion_times.shape != (candidate_poses.shape[0],)
+            or np.any(~np.isfinite(motion_times))
+            or np.any(motion_times < 0.0)
+        ):
+            raise ValueError(
+                "candidate_motion_times_s must align with candidates and "
+                "contain finite nonnegative values."
+            )
     info_gains = np.zeros(candidate_poses.shape[0], dtype=float)
     path_lengths = _node_path_lengths_batch(
         map_api,
@@ -5284,6 +5351,11 @@ def _build_nodes(
                 estimator=estimator,
                 map_api=map_api,
                 config=config,
+                travel_time_override_s=(
+                    None
+                    if motion_times is None
+                    else float(motion_times[int(placeholder_node.pose_index)])
+                ),
             )
             raw_nodes.append(
                 DSSPPNode(
@@ -5335,6 +5407,11 @@ def _build_nodes(
                 estimator=estimator,
                 map_api=map_api,
                 config=config,
+                travel_time_override_s=(
+                    None
+                    if motion_times is None
+                    else float(motion_times[int(lower_node.pose_index)])
+                ),
             )
             evaluated_lower_scores.append(float(lower_score))
         evaluated_objective_lower = float(max(evaluated_lower_scores))
@@ -5369,6 +5446,11 @@ def _build_nodes(
                 estimator=estimator,
                 map_api=map_api,
                 config=config,
+                travel_time_override_s=(
+                    None
+                    if motion_times is None
+                    else float(motion_times[int(upper_node.pose_index)])
+                ),
             )
             excluded_upper_scores.append(float(upper_score))
         excluded_universal_upper = float(max(excluded_upper_scores))
@@ -5433,6 +5515,7 @@ def _build_nodes(
         ),
         "exact_action_count": int(exact_action_count),
         "exact_eig_action_limit": int(config.exact_eig_action_limit),
+        "exact_eig_seed": int(exact_eig_seed),
         "adaptive_exact_eig_round_count": int(adaptive_round_count),
         "adaptive_exact_eig_exhausted_all_actions": bool(
             exact_action_count == total_action_count
@@ -5524,6 +5607,7 @@ def select_dss_pp_next_station(
     continuous_height_bounds_m: tuple[float, float] | None = None,
     config: DSSPPConfig | None = None,
     rng: np.random.Generator | None = None,
+    candidate_motion_times_s: NDArray[np.float64] | None = None,
 ) -> DSSPPResult:
     """Select the next station and its actually executed shield program.
 
@@ -5577,7 +5661,36 @@ def select_dss_pp_next_station(
         estimator,
         max_modes_per_isotope=int(cfg.max_modes_per_isotope),
     )
-    candidates = np.asarray(candidate_poses_xyz, dtype=float)
+    input_candidates = np.asarray(candidate_poses_xyz, dtype=float)
+    if (
+        input_candidates.ndim != 2
+        or input_candidates.shape[1:] != (3,)
+        or np.any(~np.isfinite(input_candidates))
+    ):
+        raise ValueError(
+            "candidate_poses_xyz must be a finite array with shape (N, 3)."
+        )
+    candidates = input_candidates
+    input_motion_times = None
+    if candidate_motion_times_s is not None:
+        input_motion_times = np.asarray(
+            candidate_motion_times_s,
+            dtype=np.float64,
+        ).reshape(-1)
+        if (
+            input_motion_times.shape != (input_candidates.shape[0],)
+            or np.any(~np.isfinite(input_motion_times))
+            or np.any(input_motion_times < 0.0)
+        ):
+            raise ValueError(
+                "candidate_motion_times_s must align with candidates and "
+                "contain finite nonnegative values."
+            )
+        if cfg.augment_candidates:
+            raise ValueError(
+                "Runtime motion times require augment_candidates=False; "
+                "new physical poses must be authored and timed by runtime."
+            )
     if cfg.augment_candidates:
         candidates = augment_candidate_stations(
             candidates,
@@ -5600,6 +5713,15 @@ def select_dss_pp_next_station(
         candidates,
         current_pose_xyz=current_pose,
         map_api=map_api,
+    )
+    motion_times = (
+        None
+        if input_motion_times is None
+        else _align_candidate_values(
+            input_candidates,
+            input_motion_times,
+            candidates,
+        )
     )
     if candidates.size == 0:
         raise ValueError(
@@ -5660,6 +5782,7 @@ def select_dss_pp_next_station(
         config=cfg,
         rng=planning_rng,
         joint_particles=joint_particles,
+        candidate_motion_times_s=motion_times,
     )
     if not nodes:
         raise ValueError("DSS-PP could not evaluate any station-program node.")
@@ -5677,6 +5800,7 @@ def select_dss_pp_next_station(
         "candidate_count": int(candidates.shape[0]),
         "separation_filtered_candidates": int(separation_filtered),
         "path_filtered_candidates": int(path_filtered),
+        "runtime_motion_times_applied": bool(motion_times is not None),
         "program_count": int(len(programs)),
         "program_library_policy": (
             "forced_predeclared_baseline"
@@ -5717,6 +5841,9 @@ def select_dss_pp_next_station(
         "evaluated_candidate_count": int(len({int(node.pose_index) for node in nodes})),
         "node_count": int(len(nodes)),
         "mode_count": int(mode_count),
+        "planning_particle_count": int(
+            np.asarray(joint_particles.weights_n).size
+        ),
         "max_modes_per_isotope": int(cfg.max_modes_per_isotope),
         "pf_max_sources": int(pf_max_sources),
         "planner_belief_sources": ["pf_posterior"],

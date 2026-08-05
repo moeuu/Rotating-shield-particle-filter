@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 
 import numpy as np
@@ -228,6 +229,215 @@ def test_structural_sweep_reuses_supplied_current_target_values() -> None:
         supplied,
     )
 
+
+def test_conditional_strength_proposal_uses_fixed_geometry_grid_target() -> None:
+    """The standard joint proposal must select the batched grid evaluator."""
+    filt = _split_merge_filter(cardinality=1)
+    geometry = _one_row_geometry()
+    filt._structural_rj_position_proposal = (
+        filt._build_continuous_rj_position_proposal(
+            geometry,
+            target_beta=0.5,
+        )
+    )
+    rows = np.arange(len(filt.continuous_particles), dtype=np.int64)
+    charts, _, positions, _ = filt._continuous_rj_group_arrays(rows, 1)
+    observed_shapes: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    def _expanded_target(**_: object) -> np.ndarray:
+        """Fail if the old row-times-grid evaluator remains selected."""
+        raise AssertionError("Expanded scalar target must not be called.")
+
+    def _grid_target(**kwargs: object) -> np.ndarray:
+        """Record fixed geometry and return one score per strength candidate."""
+        fixed_positions = np.asarray(
+            kwargs["positions_pks"],
+            dtype=np.float64,
+        )
+        strength_grid = np.asarray(
+            kwargs["strengths_pgk"],
+            dtype=np.float64,
+        )
+        observed_shapes.append((fixed_positions.shape, strength_grid.shape))
+        return np.zeros(strength_grid.shape[:2], dtype=np.float64)
+
+    filt.set_joint_target_evaluator(_expanded_target)
+    filt.set_joint_strength_grid_target_evaluator(_grid_target)
+    proposal = filt._continuous_rj_conditional_block_strength_proposal(
+        geometry,
+        chart_ids=charts,
+        positions=positions,
+        particle_indices=rows,
+        target_beta=0.5,
+    )
+
+    grid_size = int(filt.config.structural_rj_strength_proposal_grid_size)
+    assert observed_shapes == [
+        ((rows.size, 1, 3), (rows.size, grid_size, 1))
+    ]
+    assert proposal.data_locations.shape == (rows.size, 1)
+
+
+def test_current_strength_center_cache_invalidates_only_changed_rows() -> None:
+    """Accepted state changes must preserve cached centers for other rows."""
+    filt = _split_merge_filter(cardinality=1)
+    geometry = _one_row_geometry()
+    filt._structural_rj_position_proposal = (
+        filt._build_continuous_rj_position_proposal(
+            geometry,
+            target_beta=0.5,
+        )
+    )
+    particle_count = len(filt.continuous_particles)
+    filt._structural_rj_current_block_strength_centers = np.full(
+        (particle_count, filt.config.hard_max_sources),
+        float("nan"),
+        dtype=np.float64,
+    )
+    filt._structural_rj_current_block_strength_cardinalities = np.full(
+        particle_count,
+        -1,
+        dtype=np.int64,
+    )
+    evaluated_indices: list[np.ndarray] = []
+
+    def _grid_target(**kwargs: object) -> np.ndarray:
+        """Record cache misses and return deterministic exact-target scores."""
+        indices = np.asarray(kwargs["particle_indices"], dtype=np.int64)
+        strength_grid = np.asarray(
+            kwargs["strengths_pgk"],
+            dtype=np.float64,
+        )
+        evaluated_indices.append(indices.copy())
+        return np.sum(strength_grid, axis=2)
+
+    filt.set_joint_strength_grid_target_evaluator(_grid_target)
+    rows = np.arange(particle_count, dtype=np.int64)
+    charts, uv, positions, strengths = filt._continuous_rj_group_arrays(
+        rows,
+        1,
+    )
+    first = filt._continuous_rj_conditional_block_strength_proposal(
+        geometry,
+        chart_ids=charts,
+        positions=positions,
+        particle_indices=rows,
+        target_beta=0.5,
+        cache_current_state=True,
+    )
+    second = filt._continuous_rj_conditional_block_strength_proposal(
+        geometry,
+        chart_ids=charts,
+        positions=positions,
+        particle_indices=rows,
+        target_beta=0.5,
+        cache_current_state=True,
+    )
+    np.testing.assert_array_equal(first.data_locations, second.data_locations)
+    assert len(evaluated_indices) == 1
+    np.testing.assert_array_equal(evaluated_indices[0], rows)
+
+    changed_strengths = strengths.copy()
+    changed_strengths[0, 0] = 2.5
+    accepted = np.zeros(particle_count, dtype=np.bool_)
+    accepted[0] = True
+    filt._commit_continuous_rj_states(
+        rows,
+        accepted,
+        charts,
+        uv,
+        positions,
+        changed_strengths,
+    )
+    charts, _, positions, _ = filt._continuous_rj_group_arrays(rows, 1)
+    filt._continuous_rj_conditional_block_strength_proposal(
+        geometry,
+        chart_ids=charts,
+        positions=positions,
+        particle_indices=rows,
+        target_beta=0.5,
+        cache_current_state=True,
+    )
+    assert len(evaluated_indices) == 2
+    np.testing.assert_array_equal(evaluated_indices[1], np.asarray([0]))
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_torch_mh_and_fixed_capacity_state_scatter_match_numpy(
+    device_name: str,
+) -> None:
+    """Torch MH decisions and state scatters must equal their NumPy oracle."""
+    torch = pytest.importorskip("torch")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    filt = _split_merge_filter(cardinality=1)
+    rows = np.arange(len(filt.continuous_particles), dtype=np.int64)
+    charts, uv, positions, strengths = filt._continuous_rj_group_arrays(rows, 1)
+    reference = torch.zeros(
+        1,
+        device=torch.device(device_name),
+        dtype=torch.float64,
+    )
+    initial_packed = filt._packed_continuous_surface_state_arrays()
+    assert filt._initialize_continuous_rj_device_state(reference)
+    rng_oracle = np.random.default_rng()
+    rng_oracle.bit_generator.state = copy.deepcopy(
+        filt._random_generator.bit_generator.state
+    )
+    log_ratio = np.linspace(-4.0, 2.0, rows.size, dtype=np.float64)
+    support = (rows % 3) != 0
+    with np.errstate(divide="ignore"):
+        expected = (
+            np.log(rng_oracle.random(rows.size))
+            < np.minimum(log_ratio, 0.0)
+        ) & support
+    actual = filt._continuous_rj_mh_acceptance_mask(
+        log_ratio,
+        support=support,
+    )
+    np.testing.assert_array_equal(actual, expected)
+
+    accepted = (rows % 2) == 0
+    proposed_strengths = strengths.copy()
+    proposed_strengths[accepted, 0] += 0.25
+    filt._commit_continuous_rj_states(
+        rows,
+        accepted,
+        charts,
+        uv,
+        positions,
+        proposed_strengths,
+    )
+    packed = filt._packed_continuous_surface_state_arrays()
+    device_state = filt._structural_rj_device_state
+    assert device_state is not None
+    for name, expected_values in zip(
+        ("positions", "strengths", "mask", "chart_ids", "surface_uv"),
+        packed,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            device_state[name].detach().cpu().numpy(),
+            expected_values,
+        )
+    for name, expected_values in zip(
+        (
+            "cache_positions",
+            "cache_strengths",
+            "cache_mask",
+            "cache_chart_ids",
+            "cache_surface_uv",
+        ),
+        initial_packed,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            device_state[name].detach().cpu().numpy(),
+            expected_values,
+        )
+    diagnostics = filt.last_structural_device_diagnostics
+    assert diagnostics["mh_acceptance_calls"] == 1
+    assert diagnostics["state_scatter_rows"] == int(np.count_nonzero(accepted))
 
 def test_split_merge_skips_cardinality_with_no_reversible_direction() -> None:
     """K=Kmax=1 has neither split nor merge and must be a self-transition."""

@@ -12,7 +12,7 @@ import pytest
 
 from pf.provenance import canonical_json_bytes, sha256_json
 from pf.replay import PFReplayError, build_replay_estimator
-from realtime_demo import (
+from pf.live_resume import (
     _build_resume_compatibility_provenance,
     _build_resume_replay_estimator,
     _build_live_controller_checkpoint,
@@ -93,7 +93,7 @@ def _adopt(
         "prefix_repository_commit": TEST_COMMIT,
         "resume_execution_commit": execution_commit,
         "changed_paths": {
-            "src/realtime_demo.py": {
+            "src/pf/closed_loop.py": {
                 "prefix_git_blob": "old",
                 "execution_git_blob": "new",
             }
@@ -257,7 +257,7 @@ def test_resume_compatibility_requires_every_runtime_delta_explicitly(
     """No runtime path is auto-admitted, and all runtime scopes are inspected."""
     changed_runtime_paths = (
         "main.py",
-        "src/realtime_demo.py",
+        "src/pf/closed_loop.py",
         "pyproject.toml",
         "uv.lock",
         "native/kernel.cpp",
@@ -282,7 +282,7 @@ def test_resume_compatibility_requires_every_runtime_delta_explicitly(
         raise AssertionError(f"Unexpected Git command: {args}")
 
     monkeypatch.setattr(
-        "realtime_demo._git_command_text",
+        "pf.live_resume._git_command_text",
         _fake_git_command_text,
     )
     arguments = {

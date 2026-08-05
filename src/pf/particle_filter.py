@@ -40,6 +40,7 @@ from pf.structural_rj import (
     POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
     BirthDeathMoveProbabilities,
     CardinalityPrior,
+    ContinuousBlockStrengthProposal,
     ContinuousStrengthProposal,
     ContinuousSurfacePositionProposal,
     TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
@@ -202,7 +203,7 @@ class PFConfig:
     structural_rj_position_proposal_prior_weight: float = 0.5
     structural_rj_strength_proposal_prior_weight: float = 0.5
     structural_rj_strength_proposal_sigma_fraction: float = 0.15
-    structural_rj_strength_proposal_grid_size: int = 9
+    structural_rj_strength_proposal_grid_size: int = 5
     structural_rj_proposal_chart_batch_size: int = 256
     structural_rj_proposal_score_cache_max_bytes: int = 268_435_456
     structural_rj_local_position_move_probability: float = 1.0
@@ -917,6 +918,17 @@ class IsotopeParticleFilter:
         self._joint_target_evaluator: (
             Callable[..., NDArray[np.float64]] | None
         ) = None
+        self._joint_strength_grid_target_evaluator: (
+            Callable[..., NDArray[np.float64]] | None
+        ) = None
+        self._structural_rj_current_block_strength_centers: (
+            NDArray[np.float64] | None
+        ) = None
+        self._structural_rj_current_block_strength_cardinalities: (
+            NDArray[np.int64] | None
+        ) = None
+        self._structural_rj_device_state: dict[str, "torch.Tensor"] | None = None
+        self.last_structural_device_diagnostics: dict[str, int | str] = {}
         self._joint_proposal_evaluator: (
             Callable[
                 ...,
@@ -2144,6 +2156,212 @@ class IsotopeParticleFilter:
             )
         return proposal
 
+    def _continuous_rj_conditional_block_strength_proposal(
+        self,
+        data: StructuralGeometryBatch,
+        *,
+        chart_ids: NDArray[np.int64],
+        positions: NDArray[np.float64],
+        particle_indices: NDArray[np.int64],
+        target_beta: float,
+        cache_current_state: bool = False,
+    ) -> ContinuousBlockStrengthProposal:
+        """Build an all-history conditional full-support strength proposal.
+
+        The chart-wise residual proposal supplies relative source weights.  A
+        physically defined grid over the proper prior's total-strength scale
+        is then evaluated under the exact current history target in one batch.
+        The best total scale becomes the deterministic center of a block
+        mixture.  This changes proposal efficiency only: both the prior block
+        and conditional block densities are retained explicitly in the MH
+        ratio.
+        """
+        charts = np.asarray(chart_ids, dtype=np.int64)
+        coordinates = np.asarray(positions, dtype=np.float64)
+        indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        if (
+            charts.ndim != 2
+            or coordinates.shape != charts.shape + (3,)
+            or charts.shape[0] != indices.size
+            or charts.shape[1] < 1
+        ):
+            raise ValueError(
+                "Conditional block strengths require aligned nonempty states."
+            )
+        row_count, cardinality = charts.shape
+        scalar_proposal = self._active_continuous_rj_strength_proposal()
+        base = np.asarray(
+            scalar_proposal.data_locations_by_chart[charts],
+            dtype=np.float64,
+        )
+        minimum = float(self._strength_prior.minimum)
+        excess = np.maximum(
+            base - minimum,
+            np.finfo(np.float64).eps
+            * max(1.0, float(self._strength_prior.mean)),
+        )
+        relative = excess / np.sum(excess, axis=1, keepdims=True)
+        grid_size = int(self.config.structural_rj_strength_proposal_grid_size)
+        probabilities = np.linspace(
+            0.005,
+            0.995,
+            grid_size,
+            dtype=np.float64,
+        )
+        if self._strength_prior.family == "shifted_gamma":
+            from scipy.special import gammaincinv
+
+            total_excess = (
+                float(self._strength_prior.gamma_scale)
+                * gammaincinv(
+                    float(cardinality)
+                    * float(self._strength_prior.gamma_shape),
+                    probabilities,
+                )
+            )
+        else:
+            total_excess = (
+                probabilities
+                * float(cardinality)
+                * (
+                    float(self._strength_prior.maximum)
+                    - minimum
+                )
+            )
+        candidate_strengths = (
+            minimum
+            + relative[:, None, :]
+            * total_excess[None, :, None]
+        )
+        if self._strength_prior.family == "bounded_uniform":
+            candidate_strengths = np.minimum(
+                candidate_strengths,
+                float(self._strength_prior.maximum),
+            )
+        centers = np.empty((row_count, cardinality), dtype=np.float64)
+        cached_rows = np.zeros(row_count, dtype=np.bool_)
+        center_cache = self._structural_rj_current_block_strength_centers
+        cardinality_cache = (
+            self._structural_rj_current_block_strength_cardinalities
+        )
+        if cache_current_state and center_cache is not None:
+            if (
+                cardinality_cache is None
+                or center_cache.shape
+                != (len(self.continuous_particles), self.config.hard_max_sources)
+                or cardinality_cache.shape != (len(self.continuous_particles),)
+                or np.any(indices < 0)
+                or np.any(indices >= center_cache.shape[0])
+            ):
+                raise RuntimeError(
+                    "Current block-strength proposal cache is misaligned."
+                )
+            cached_rows = cardinality_cache[indices] == cardinality
+            centers[cached_rows] = center_cache[
+                indices[cached_rows],
+                :cardinality,
+            ]
+        evaluation_rows = np.flatnonzero(~cached_rows)
+        if evaluation_rows.size:
+            evaluation_positions = coordinates[evaluation_rows]
+            evaluation_charts = charts[evaluation_rows]
+            evaluation_strengths = candidate_strengths[evaluation_rows]
+            evaluation_indices = indices[evaluation_rows]
+            if self._joint_strength_grid_target_evaluator is not None:
+                conditional_target = np.asarray(
+                    self._joint_strength_grid_target_evaluator(
+                        filt=self,
+                        data=data,
+                        positions_pks=evaluation_positions,
+                        chart_ids_pk=evaluation_charts,
+                        strengths_pgk=evaluation_strengths,
+                        particle_indices=evaluation_indices,
+                        target_beta=float(target_beta),
+                        tempering_start_row=(
+                            self._structural_rj_tempering_start_row
+                        ),
+                    ),
+                    dtype=np.float64,
+                )
+                if conditional_target.shape != (
+                    evaluation_rows.size,
+                    grid_size,
+                ):
+                    raise ValueError(
+                        "Joint strength-grid target evaluator returned an "
+                        "invalid shape."
+                    )
+            else:
+                candidate_count = evaluation_rows.size * grid_size
+                expanded_positions = np.broadcast_to(
+                    evaluation_positions[:, None, :, :],
+                    (
+                        evaluation_rows.size,
+                        grid_size,
+                        cardinality,
+                        3,
+                    ),
+                ).reshape(candidate_count, cardinality, 3)
+                expanded_charts = np.broadcast_to(
+                    evaluation_charts[:, None, :],
+                    (evaluation_rows.size, grid_size, cardinality),
+                ).reshape(candidate_count, cardinality)
+                expanded_indices = np.repeat(evaluation_indices, grid_size)
+                flat_strengths = evaluation_strengths.reshape(
+                    candidate_count,
+                    cardinality,
+                )
+                conditional_target = (
+                    self._continuous_rj_group_log_likelihood(
+                        data,
+                        expanded_positions,
+                        flat_strengths,
+                        chart_ids=expanded_charts,
+                        particle_indices=expanded_indices,
+                        target_beta=target_beta,
+                    ).reshape(evaluation_rows.size, grid_size)
+                )
+            conditional_target += np.sum(
+                np.asarray(
+                    self._strength_prior.log_prob(evaluation_strengths),
+                    dtype=np.float64,
+                ),
+                axis=2,
+            )
+            valid_rows = np.any(np.isfinite(conditional_target), axis=1)
+            best_columns = np.argmax(
+                np.where(
+                    np.isfinite(conditional_target),
+                    conditional_target,
+                    float("-inf"),
+                ),
+                axis=1,
+            )
+            evaluated_centers = evaluation_strengths[
+                np.arange(evaluation_rows.size, dtype=np.int64),
+                best_columns,
+            ].copy()
+            evaluated_centers[~valid_rows] = base[evaluation_rows][~valid_rows]
+            centers[evaluation_rows] = evaluated_centers
+            if cache_current_state and center_cache is not None:
+                center_cache[
+                    evaluation_indices,
+                    :cardinality,
+                ] = evaluated_centers
+                cardinality_cache[evaluation_indices] = cardinality
+        return ContinuousBlockStrengthProposal(
+            minimum=minimum,
+            maximum=float(self._strength_prior.maximum),
+            data_locations=centers,
+            data_sigma=float(scalar_proposal.data_sigma),
+            prior_component_probability=float(
+                scalar_proposal.prior_component_probability
+            ),
+            prior_family=str(self._strength_prior.family),
+            prior_gamma_shape=float(self._strength_prior.gamma_shape),
+            prior_gamma_scale=float(self._strength_prior.gamma_scale),
+        )
+
 
     def _continuous_rj_line_transport_component_columns(
         self,
@@ -2489,15 +2707,36 @@ class IsotopeParticleFilter:
         """Return chart, UV, derived XYZ, and strength arrays for one K."""
         indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
         source_count = int(cardinality)
-        states = [
-            self.continuous_particles[int(particle_index)].state
-            for particle_index in indices
-        ]
-        cardinalities = np.fromiter(
-            (int(state.num_sources) for state in states),
-            dtype=np.int64,
-            count=indices.size,
-        )
+        device_state = self._structural_rj_device_state
+        if device_state is not None:
+            import torch
+
+            index_tensor = torch.as_tensor(
+                indices,
+                device=device_state["strengths"].device,
+                dtype=torch.long,
+            )
+            cardinalities = (
+                torch.index_select(
+                    device_state["cardinalities"],
+                    0,
+                    index_tensor,
+                )
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.int64, copy=False)
+            )
+        else:
+            states = [
+                self.continuous_particles[int(particle_index)].state
+                for particle_index in indices
+            ]
+            cardinalities = np.fromiter(
+                (int(state.num_sources) for state in states),
+                dtype=np.int64,
+                count=indices.size,
+            )
         if np.any(cardinalities != source_count):
             raise ValueError("Continuous RJ group mixes cardinalities.")
         if indices.size == 0 or source_count == 0:
@@ -2507,38 +2746,74 @@ class IsotopeParticleFilter:
                 np.zeros((indices.size, source_count, 3), dtype=np.float64),
                 np.zeros((indices.size, source_count), dtype=np.float64),
             )
-        charts = np.stack(
-            [
-                np.asarray(state.surface_chart_ids, dtype=np.int64).reshape(
-                    source_count
+        if device_state is not None:
+            selected = {
+                name: (
+                    torch.index_select(values, 0, index_tensor)
+                    .detach()
+                    .cpu()
+                    .numpy()
                 )
-                for state in states
-            ],
-            axis=0,
-        )
-        surface_uv = np.stack(
-            [
-                np.asarray(state.surface_uv, dtype=np.float64).reshape(
-                    source_count,
-                    2,
+                for name, values in (
+                    ("chart_ids", device_state["chart_ids"]),
+                    ("surface_uv", device_state["surface_uv"]),
+                    ("positions", device_state["positions"]),
+                    ("strengths", device_state["strengths"]),
                 )
-                for state in states
-            ],
-            axis=0,
-        )
-        strengths = np.stack(
-            [
-                np.asarray(state.strengths, dtype=np.float64).reshape(
-                    source_count
-                )
-                for state in states
-            ],
-            axis=0,
-        )
-        positions = self._structural_rj_surface_atlas.positions_xyz(
-            charts,
-            surface_uv,
-        )
+            }
+            charts = np.asarray(
+                selected["chart_ids"][:, :source_count],
+                dtype=np.int64,
+            )
+            surface_uv = np.asarray(
+                selected["surface_uv"][:, :source_count],
+                dtype=np.float64,
+            )
+            positions = np.asarray(
+                selected["positions"][:, :source_count],
+                dtype=np.float64,
+            )
+            strengths = np.asarray(
+                selected["strengths"][:, :source_count],
+                dtype=np.float64,
+            )
+            diagnostics = self.last_structural_device_diagnostics
+            diagnostics["group_gather_calls"] = int(
+                diagnostics.get("group_gather_calls", 0)
+            ) + 1
+        else:
+            charts = np.stack(
+                [
+                    np.asarray(state.surface_chart_ids, dtype=np.int64).reshape(
+                        source_count
+                    )
+                    for state in states
+                ],
+                axis=0,
+            )
+            surface_uv = np.stack(
+                [
+                    np.asarray(state.surface_uv, dtype=np.float64).reshape(
+                        source_count,
+                        2,
+                    )
+                    for state in states
+                ],
+                axis=0,
+            )
+            strengths = np.stack(
+                [
+                    np.asarray(state.strengths, dtype=np.float64).reshape(
+                        source_count
+                    )
+                    for state in states
+                ],
+                axis=0,
+            )
+            positions = self._structural_rj_surface_atlas.positions_xyz(
+                charts,
+                surface_uv,
+            )
         canonical = self._continuous_rj_canonicalize_rows(
             charts,
             surface_uv,
@@ -2724,6 +2999,17 @@ class IsotopeParticleFilter:
             raise TypeError("Joint target evaluator must be callable or None.")
         self._joint_target_evaluator = evaluator
 
+    def set_joint_strength_grid_target_evaluator(
+        self,
+        evaluator: Callable[..., NDArray[np.float64]] | None,
+    ) -> None:
+        """Attach the estimator-owned fixed-geometry strength-grid target."""
+        if evaluator is not None and not callable(evaluator):
+            raise TypeError(
+                "Joint strength-grid target evaluator must be callable or None."
+            )
+        self._joint_strength_grid_target_evaluator = evaluator
+
     def set_joint_proposal_evaluator(
         self,
         evaluator: Callable[
@@ -2793,6 +3079,154 @@ class IsotopeParticleFilter:
             np.take_along_axis(q, order, axis=1),
         )
 
+    def _initialize_continuous_rj_device_state(
+        self,
+        reference: object,
+    ) -> bool:
+        """Mirror fixed-capacity RJ state on the active Torch compute device.
+
+        Variable-length :class:`IsotopeState` objects remain the reporting and
+        serialization contract. During one structural sweep, numerical state
+        is also kept in fixed-capacity tensors so accepted rows can be updated
+        with one device scatter and later proposals avoid repacking every
+        Python particle.
+        """
+        if not hasattr(reference, "detach"):
+            self._structural_rj_device_state = None
+            self.last_structural_device_diagnostics = {
+                "backend": "numpy",
+                "mh_acceptance_calls": 0,
+                "mh_acceptance_rows": 0,
+                "state_scatter_calls": 0,
+                "state_scatter_rows": 0,
+                "group_gather_calls": 0,
+            }
+            return False
+        import torch
+
+        if not torch.is_tensor(reference):
+            raise TypeError("RJ device-state reference must be a Torch tensor.")
+        positions, strengths, mask, chart_ids, surface_uv = (
+            self._packed_continuous_surface_state_arrays()
+        )
+        device = reference.device
+        dtype = reference.dtype
+        current = {
+            "positions": torch.as_tensor(
+                positions,
+                device=device,
+                dtype=dtype,
+            ).clone(),
+            "strengths": torch.as_tensor(
+                strengths,
+                device=device,
+                dtype=dtype,
+            ).clone(),
+            "mask": torch.as_tensor(
+                mask,
+                device=device,
+                dtype=torch.bool,
+            ).clone(),
+            "chart_ids": torch.as_tensor(
+                chart_ids,
+                device=device,
+                dtype=torch.long,
+            ).clone(),
+            "surface_uv": torch.as_tensor(
+                surface_uv,
+                device=device,
+                dtype=dtype,
+            ).clone(),
+            "cardinalities": torch.as_tensor(
+                np.sum(mask, axis=1, dtype=np.int64),
+                device=device,
+                dtype=torch.long,
+            ).clone(),
+        }
+        # These immutable tensors describe the transport cache at sweep entry.
+        # Matching against them is exact even after accepted states move.
+        current.update(
+            {
+                f"cache_{name}": value.clone()
+                for name, value in current.items()
+                if name != "cardinalities"
+            }
+        )
+        self._structural_rj_device_state = current
+        self.last_structural_device_diagnostics = {
+            "backend": str(device),
+            "mh_acceptance_calls": 0,
+            "mh_acceptance_rows": 0,
+            "state_scatter_calls": 0,
+            "state_scatter_rows": 0,
+            "group_gather_calls": 0,
+        }
+        return True
+
+    def _clear_continuous_rj_device_state(self) -> None:
+        """Release the sweep-local fixed-capacity Torch state mirror."""
+        self._structural_rj_device_state = None
+
+    def _continuous_rj_mh_acceptance_mask(
+        self,
+        log_ratio: NDArray[np.float64],
+        *,
+        support: NDArray[np.bool_] | None = None,
+    ) -> NDArray[np.bool_]:
+        """Draw one exact batched MH mask on the active compute device.
+
+        Uniform draws and their logarithms stay on NumPy to preserve the
+        established random stream bit-for-bit. Only the vectorized comparison
+        and optional support mask move to Torch/CUDA.
+        """
+        ratios = np.asarray(log_ratio, dtype=np.float64).reshape(-1)
+        uniforms = self._random_generator.random(ratios.size)
+        with np.errstate(divide="ignore"):
+            log_uniforms = np.log(uniforms)
+        thresholds = np.minimum(ratios, 0.0)
+        feasible = None
+        if support is not None:
+            feasible = np.asarray(support, dtype=np.bool_).reshape(-1)
+            if feasible.size != ratios.size:
+                raise ValueError("MH support must align with log_ratio.")
+        state = self._structural_rj_device_state
+        if state is None:
+            accepted = log_uniforms < thresholds
+            if feasible is not None:
+                accepted &= feasible
+            return np.asarray(accepted, dtype=np.bool_)
+        import torch
+
+        device = state["strengths"].device
+        accepted_tensor = torch.as_tensor(
+            log_uniforms,
+            device=device,
+            dtype=torch.float64,
+        ) < torch.as_tensor(
+            thresholds,
+            device=device,
+            dtype=torch.float64,
+        )
+        if feasible is not None:
+            accepted_tensor &= torch.as_tensor(
+                feasible,
+                device=device,
+                dtype=torch.bool,
+            )
+        diagnostics = self.last_structural_device_diagnostics
+        diagnostics["mh_acceptance_calls"] = int(
+            diagnostics.get("mh_acceptance_calls", 0)
+        ) + 1
+        diagnostics["mh_acceptance_rows"] = int(
+            diagnostics.get("mh_acceptance_rows", 0)
+        ) + int(ratios.size)
+        return (
+            accepted_tensor.detach()
+            .cpu()
+            .numpy()
+            .astype(np.bool_, copy=False)
+        )
+
     def _commit_continuous_rj_states(
         self,
         particle_indices: NDArray[np.int64],
@@ -2815,6 +3249,96 @@ class IsotopeParticleFilter:
             raise ValueError("Continuous RJ commit arrays must share P.")
         accepted_rows = np.flatnonzero(acceptance)
         cardinality = int(charts.shape[1])
+        center_cache = self._structural_rj_current_block_strength_centers
+        cardinality_cache = (
+            self._structural_rj_current_block_strength_cardinalities
+        )
+        if center_cache is not None and cardinality_cache is not None:
+            changed_indices = indices[accepted_rows]
+            center_cache[changed_indices] = float("nan")
+            cardinality_cache[changed_indices] = -1
+        device_state = self._structural_rj_device_state
+        if device_state is not None and accepted_rows.size:
+            import torch
+
+            accepted_indices = indices[accepted_rows]
+            maximum = int(self.config.hard_max_sources or 0)
+            row_count = int(accepted_rows.size)
+            device = device_state["strengths"].device
+            dtype = device_state["strengths"].dtype
+            padded_positions = torch.zeros(
+                (row_count, maximum, 3),
+                device=device,
+                dtype=dtype,
+            )
+            padded_strengths = torch.zeros(
+                (row_count, maximum),
+                device=device,
+                dtype=dtype,
+            )
+            padded_mask = torch.zeros(
+                (row_count, maximum),
+                device=device,
+                dtype=torch.bool,
+            )
+            padded_charts = torch.zeros(
+                (row_count, maximum),
+                device=device,
+                dtype=torch.long,
+            )
+            padded_uv = torch.zeros(
+                (row_count, maximum, 2),
+                device=device,
+                dtype=dtype,
+            )
+            if cardinality:
+                selected = accepted_rows
+                padded_positions[:, :cardinality] = torch.as_tensor(
+                    xyz[selected],
+                    device=device,
+                    dtype=dtype,
+                )
+                padded_strengths[:, :cardinality] = torch.as_tensor(
+                    q[selected],
+                    device=device,
+                    dtype=dtype,
+                )
+                padded_mask[:, :cardinality] = True
+                padded_charts[:, :cardinality] = torch.as_tensor(
+                    charts[selected],
+                    device=device,
+                    dtype=torch.long,
+                )
+                padded_uv[:, :cardinality] = torch.as_tensor(
+                    uv[selected],
+                    device=device,
+                    dtype=dtype,
+                )
+            index_tensor = torch.as_tensor(
+                accepted_indices,
+                device=device,
+                dtype=torch.long,
+            )
+            for name, values in (
+                ("positions", padded_positions),
+                ("strengths", padded_strengths),
+                ("mask", padded_mask),
+                ("chart_ids", padded_charts),
+                ("surface_uv", padded_uv),
+            ):
+                device_state[name].index_copy_(0, index_tensor, values)
+            device_state["cardinalities"].index_fill_(
+                0,
+                index_tensor,
+                cardinality,
+            )
+            diagnostics = self.last_structural_device_diagnostics
+            diagnostics["state_scatter_calls"] = int(
+                diagnostics.get("state_scatter_calls", 0)
+            ) + 1
+            diagnostics["state_scatter_rows"] = int(
+                diagnostics.get("state_scatter_rows", 0)
+            ) + row_count
         # All numerical proposal and acceptance work is batched. This loop only
         # commits variable-length state objects for the accepted particle rows.
         for row in accepted_rows.tolist():
@@ -3099,9 +3623,9 @@ class IsotopeParticleFilter:
                         ),
                         log_abs_jacobian=0.0,
                     )
-                    accepted = np.log(
-                        self._random_generator.random(selected_indices.size)
-                    ) < np.minimum(log_ratio, 0.0)
+                    accepted = self._continuous_rj_mh_acceptance_mask(
+                        log_ratio
+                    )
                     birth_prior_ratio = (
                         float(cardinality_prior.log_prob(int(cardinality) + 1))
                         - float(cardinality_prior.log_prob(int(cardinality)))
@@ -3269,9 +3793,7 @@ class IsotopeParticleFilter:
                     ),
                     log_abs_reverse_jacobian=0.0,
                 )
-                accepted = np.log(
-                    self._random_generator.random(selected_indices.size)
-                ) < np.minimum(log_ratio, 0.0)
+                accepted = self._continuous_rj_mh_acceptance_mask(log_ratio)
                 death_prior_ratio = (
                     float(cardinality_prior.log_prob(int(cardinality) - 1))
                     - float(cardinality_prior.log_prob(int(cardinality)))
@@ -3491,9 +4013,7 @@ class IsotopeParticleFilter:
                 ),
                 log_abs_jacobian=0.0,
             )
-            accepted = np.log(
-                self._random_generator.random(particle_indices.size)
-            ) < np.minimum(log_ratio, 0.0)
+            accepted = self._continuous_rj_mh_acceptance_mask(log_ratio)
             accepted_count += self._commit_continuous_rj_states(
                 particle_indices,
                 accepted,
@@ -3628,9 +4148,9 @@ class IsotopeParticleFilter:
                 axis=1,
             )
             movable_count += int(np.count_nonzero(moved))
-            accepted = moved & (
-                np.log(self._random_generator.random(particle_indices.size))
-                < np.minimum(log_ratio, 0.0)
+            accepted = self._continuous_rj_mh_acceptance_mask(
+                log_ratio,
+                support=moved,
             )
             accepted_count += self._commit_continuous_rj_states(
                 particle_indices,
@@ -3722,9 +4242,9 @@ class IsotopeParticleFilter:
                 proposed_ll,
                 base_ll,
             )
-            accepted = np.log(
-                self._random_generator.random(particle_indices.size)
-            ) < np.minimum(log_target_ratio, 0.0)
+            accepted = self._continuous_rj_mh_acceptance_mask(
+                log_target_ratio
+            )
             accepted_count += self._commit_continuous_rj_states(
                 particle_indices,
                 accepted,
@@ -4282,7 +4802,7 @@ class IsotopeParticleFilter:
         target_beta: float,
         global_probability: float,
     ) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
-        """Propose an exact split with a joint nonconserving strength refresh."""
+        """Propose an exact split with conditional block strengths."""
         atlas = self._structural_rj_surface_atlas
         if atlas is None:
             raise RuntimeError("Continuous surface atlas is unavailable.")
@@ -4336,26 +4856,33 @@ class IsotopeParticleFilter:
             axis=1,
         )
         proposed_cardinality = int(cardinality) + int(group_size) - 1
-        proposed_strengths = np.asarray(
-            self._active_continuous_rj_strength_proposal().sample(
-                proposed_charts.reshape(-1),
-                rng=self._random_generator,
-            ),
-            dtype=np.float64,
-        ).reshape(row_count, proposed_cardinality)
-        current_strength_log_proposal = np.sum(
-            self._active_continuous_rj_strength_proposal().log_density(
-                chart_ids,
-                strengths,
-            ),
-            axis=1,
+        proposed_strength_proposal = (
+            self._continuous_rj_conditional_block_strength_proposal(
+                data,
+                chart_ids=proposed_charts,
+                positions=proposed_positions,
+                particle_indices=particle_indices,
+                target_beta=target_beta,
+            )
         )
-        proposed_strength_log_proposal = np.sum(
-            self._active_continuous_rj_strength_proposal().log_density(
-                proposed_charts,
-                proposed_strengths,
-            ),
-            axis=1,
+        proposed_strengths = proposed_strength_proposal.sample(
+            rng=self._random_generator,
+        )
+        current_strength_proposal = (
+            self._continuous_rj_conditional_block_strength_proposal(
+                data,
+                chart_ids=chart_ids,
+                positions=positions,
+                particle_indices=particle_indices,
+                target_beta=target_beta,
+                cache_current_state=True,
+            )
+        )
+        current_strength_log_proposal = (
+            current_strength_proposal.log_density(strengths)
+        )
+        proposed_strength_log_proposal = (
+            proposed_strength_proposal.log_density(proposed_strengths)
         )
         reverse_groups, reverse_probabilities = (
             self._continuous_rj_multi_group_probabilities(
@@ -4467,9 +4994,9 @@ class IsotopeParticleFilter:
                 log_forward_proposal=log_forward[valid_rows],
                 log_reverse_proposal=log_reverse[valid_rows],
             )
-        accepted = feasible & (
-            np.log(self._random_generator.random(row_count))
-            < np.minimum(log_ratio, 0.0)
+        accepted = self._continuous_rj_mh_acceptance_mask(
+            log_ratio,
+            support=feasible,
         )
         self._record_structural_mh_components(
             "multi_split",
@@ -4510,7 +5037,7 @@ class IsotopeParticleFilter:
         target_beta: float,
         global_probability: float,
     ) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
-        """Propose an exact multi-merge with joint nonconserving strengths."""
+        """Propose an exact multi-merge with conditional block strengths."""
         atlas = self._structural_rj_surface_atlas
         if atlas is None:
             raise RuntimeError("Continuous surface atlas is unavailable.")
@@ -4594,26 +5121,33 @@ class IsotopeParticleFilter:
             axis=1,
         )
         proposed_cardinality = cardinality - group_size + 1
-        proposed_strengths = np.asarray(
-            self._active_continuous_rj_strength_proposal().sample(
-                proposed_charts.reshape(-1),
-                rng=self._random_generator,
-            ),
-            dtype=np.float64,
-        ).reshape(row_count, proposed_cardinality)
-        current_strength_log_proposal = np.sum(
-            self._active_continuous_rj_strength_proposal().log_density(
-                chart_ids,
-                strengths,
-            ),
-            axis=1,
+        proposed_strength_proposal = (
+            self._continuous_rj_conditional_block_strength_proposal(
+                data,
+                chart_ids=proposed_charts,
+                positions=proposed_positions,
+                particle_indices=particle_indices,
+                target_beta=target_beta,
+            )
         )
-        proposed_strength_log_proposal = np.sum(
-            self._active_continuous_rj_strength_proposal().log_density(
-                proposed_charts,
-                proposed_strengths,
-            ),
-            axis=1,
+        proposed_strengths = proposed_strength_proposal.sample(
+            rng=self._random_generator,
+        )
+        current_strength_proposal = (
+            self._continuous_rj_conditional_block_strength_proposal(
+                data,
+                chart_ids=chart_ids,
+                positions=positions,
+                particle_indices=particle_indices,
+                target_beta=target_beta,
+                cache_current_state=True,
+            )
+        )
+        current_strength_log_proposal = (
+            current_strength_proposal.log_density(strengths)
+        )
+        proposed_strength_log_proposal = (
+            proposed_strength_proposal.log_density(proposed_strengths)
         )
         split_sizes, _, reverse_split_probability, _ = (
             self._continuous_rj_multi_direction_support(proposed_cardinality)
@@ -4700,9 +5234,9 @@ class IsotopeParticleFilter:
                 log_forward_proposal=log_forward[valid_rows],
                 log_reverse_proposal=log_reverse[valid_rows],
             )
-        accepted = feasible & (
-            np.log(self._random_generator.random(row_count))
-            < np.minimum(log_ratio, 0.0)
+        accepted = self._continuous_rj_mh_acceptance_mask(
+            log_ratio,
+            support=feasible,
         )
         self._record_structural_mh_components(
             "multi_merge",
@@ -4802,7 +5336,29 @@ class IsotopeParticleFilter:
                 strengths,
             )
             current_log_prior[rows] = prior
-            current_log_proposal[rows] = proposal
+            if int(cardinality) == 0:
+                current_log_proposal[rows] = proposal
+            else:
+                block_strength_proposal = (
+                    self._continuous_rj_conditional_block_strength_proposal(
+                        data,
+                        chart_ids=charts,
+                        positions=positions,
+                        particle_indices=particle_indices,
+                        target_beta=target_beta,
+                        cache_current_state=True,
+                    )
+                )
+                current_log_proposal[rows] = (
+                    float(cardinality_prior.log_prob(int(cardinality)))
+                    + math.lgamma(float(cardinality) + 1.0)
+                    + np.sum(
+                        self._active_continuous_rj_position_proposal()
+                        .log_density(charts),
+                        axis=1,
+                    )
+                    + block_strength_proposal.log_density(strengths)
+                )
         accepted_count = 0
         cardinality_change_count = 0
         for cardinality in np.unique(proposed_cardinalities).tolist():
@@ -4818,12 +5374,6 @@ class IsotopeParticleFilter:
                     .chart_probabilities
                 ),
             )
-            strengths_flat = (
-                self._active_continuous_rj_strength_proposal().sample(
-                    charts_flat,
-                    rng=self._random_generator,
-                )
-            )
             charts = charts_flat.reshape(row_count, int(cardinality))
             uv = uv_flat.reshape(row_count, int(cardinality), 2)
             positions = positions_flat.reshape(
@@ -4831,10 +5381,28 @@ class IsotopeParticleFilter:
                 int(cardinality),
                 3,
             )
-            strengths = np.asarray(
-                strengths_flat,
-                dtype=np.float64,
-            ).reshape(row_count, int(cardinality))
+            if int(cardinality) == 0:
+                strengths = np.zeros((row_count, 0), dtype=np.float64)
+                proposed_strength_log_proposal = np.zeros(
+                    row_count,
+                    dtype=np.float64,
+                )
+            else:
+                block_strength_proposal = (
+                    self._continuous_rj_conditional_block_strength_proposal(
+                        data,
+                        chart_ids=charts,
+                        positions=positions,
+                        particle_indices=particle_indices,
+                        target_beta=target_beta,
+                    )
+                )
+                strengths = block_strength_proposal.sample(
+                    rng=self._random_generator,
+                )
+                proposed_strength_log_proposal = (
+                    block_strength_proposal.log_density(strengths)
+                )
             proposed_ll = self._continuous_rj_group_log_likelihood(
                 data,
                 positions,
@@ -4843,12 +5411,26 @@ class IsotopeParticleFilter:
                 particle_indices=particle_indices,
                 target_beta=target_beta,
             )
-            proposed_log_prior, proposed_log_proposal = (
+            proposed_log_prior, _ = (
                 self._continuous_rj_block_log_densities(
                     charts,
                     strengths,
                 )
             )
+            proposed_log_proposal = np.full(
+                row_count,
+                float(cardinality_prior.log_prob(int(cardinality)))
+                + math.lgamma(float(cardinality) + 1.0),
+                dtype=np.float64,
+            )
+            if int(cardinality):
+                proposed_log_proposal += np.sum(
+                    self._active_continuous_rj_position_proposal().log_density(
+                        charts
+                    ),
+                    axis=1,
+                )
+                proposed_log_proposal += proposed_strength_log_proposal
             log_ratio = (
                 _extended_log_target_ratio(proposed_ll, base_ll[rows])
                 + proposed_log_prior
@@ -4856,9 +5438,7 @@ class IsotopeParticleFilter:
                 + current_log_proposal[rows]
                 - proposed_log_proposal
             )
-            accepted = np.log(
-                self._random_generator.random(row_count)
-            ) < np.minimum(log_ratio, 0.0)
+            accepted = self._continuous_rj_mh_acceptance_mask(log_ratio)
             block_support = (
                 np.isfinite(proposed_log_prior)
                 & np.isfinite(proposed_log_proposal)
@@ -5259,11 +5839,9 @@ class IsotopeParticleFilter:
                                 ),
                             )
                         )
-                    accepted = feasible & (
-                        np.log(
-                            self._random_generator.random(particle_indices.size)
-                        )
-                        < np.minimum(log_ratio, 0.0)
+                    accepted = self._continuous_rj_mh_acceptance_mask(
+                        log_ratio,
+                        support=feasible,
                     )
                     accepted_splits += self._commit_continuous_rj_states(
                         particle_indices,
@@ -5546,9 +6124,9 @@ class IsotopeParticleFilter:
                             ),
                         )
                     )
-                accepted = feasible & (
-                    np.log(self._random_generator.random(particle_indices.size))
-                    < np.minimum(log_ratio, 0.0)
+                accepted = self._continuous_rj_mh_acceptance_mask(
+                    log_ratio,
+                    support=feasible,
                 )
                 accepted_merges += self._commit_continuous_rj_states(
                     particle_indices,
@@ -5588,6 +6166,19 @@ class IsotopeParticleFilter:
     ) -> None:
         """Apply continuous RJ/MH and always clear the tempered-target context."""
         self._structural_rj_tempering_start_row = tempering_start_row
+        self._structural_rj_current_block_strength_centers = np.full(
+            (
+                len(self.continuous_particles),
+                self.config.hard_max_sources,
+            ),
+            float("nan"),
+            dtype=np.float64,
+        )
+        self._structural_rj_current_block_strength_cardinalities = np.full(
+            len(self.continuous_particles),
+            -1,
+            dtype=np.int64,
+        )
         if current_target_log_likelihood is None:
             self._structural_rj_current_target_log_likelihood = None
         else:
@@ -5618,6 +6209,9 @@ class IsotopeParticleFilter:
             self._structural_rj_strength_proposal = None
             self._structural_rj_tempering_start_row = None
             self._structural_rj_current_target_log_likelihood = None
+            self._structural_rj_current_block_strength_centers = None
+            self._structural_rj_current_block_strength_cardinalities = None
+            self._clear_continuous_rj_device_state()
 
     def _apply_exact_structural_rj_moves_impl(
         self,
@@ -5897,6 +6491,17 @@ class IsotopeParticleFilter:
             "outer_log_weight_array_equal": float(outer_weight_array_equal),
             "weights_preserved": float(outer_weight_array_equal),
         }
+        device_diagnostics = self.last_structural_device_diagnostics
+        for name in (
+            "mh_acceptance_calls",
+            "mh_acceptance_rows",
+            "state_scatter_calls",
+            "state_scatter_rows",
+            "group_gather_calls",
+        ):
+            self.last_structural_timing_s[f"device_{name}"] = float(
+                device_diagnostics.get(name, 0)
+            )
         self.last_structural_rejection_diagnostics = (
             self._summarize_structural_mh_components()
         )

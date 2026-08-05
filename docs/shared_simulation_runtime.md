@@ -15,11 +15,18 @@ through the same shared runtime implementation; future observations cannot be sh
 after planners choose different actions.
 
 ```bash
-# In Rotating-shield-simulation-runtime
-uv run rotating-shield-sim run-plan /path/to/private-plan.json
+# In Rotating-shield-simulation-runtime: author physics, not actions
+uv run rotating-shield-sim generate-ral-scenario /private/run-001.json \
+  --measurement-log-output /private/logs/run-001 \
+  --run-id run-001 \
+  --runtime-config configs/geant4/variance_reduction_external_no_isaac_32threads.json
 
-# In this repository
-uv run python main.py --full-simulation
+# In this repository: PF owns its planner and mission budget
+uv run rotating-shield-pf-live \
+  --scenario /private/run-001.json \
+  --runtime-root ../Rotating-shield-simulation-runtime \
+  --config configs/pf/pf_strict_3d.json \
+  --output-dir results/pf-live-run-001
 
 # Or replay one already completed shared log
 uv run rotating-shield-pf \
@@ -30,10 +37,11 @@ uv run rotating-shield-pf \
 ```
 
 The online command does not copy or replace acquisition code. Its controller sends
-actions to the sibling runtime, stages each returned raw spectrum through the shared
-MeasurementLog writer, and then calls the PF station update. The simulator receives
-only the physical configuration; PF and planner settings remain local to this
-repository.
+one action to the sibling runtime, waits until that raw spectrum is durably staged,
+and then calls the PF station update. The runtime scenario contains no action list,
+station count, view count, shield program, or estimator stop rule. The 20-station,
+8-view, 160-observation RA-L limits are PF/experiment-harness settings rather than
+physical-runtime settings.
 
-The private simulation plan may contain realized source truth. MeasurementLog v2 and
-all estimator inputs must not.
+The private runtime scenario may contain realized source truth. MeasurementLog v2
+and every estimator-visible adaptive event must not.

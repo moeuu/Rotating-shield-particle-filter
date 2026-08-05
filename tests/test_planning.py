@@ -57,6 +57,23 @@ def _state_on_filter(
     )
 
 
+def test_runtime_candidate_values_remain_aligned_after_filtering() -> None:
+    """Planner filtering must preserve runtime-owned candidate motion costs."""
+    original = np.asarray(
+        [[0.0, 0.0, 0.5], [1.0, 0.0, 0.5], [2.0, 0.0, 0.5]],
+        dtype=float,
+    )
+    retained = original[[2, 0]]
+
+    aligned = dss_pp._align_candidate_values(
+        original,
+        np.asarray([0.0, 3.0, 8.0]),
+        retained,
+    )
+
+    assert np.array_equal(aligned, np.asarray([8.0, 0.0]))
+
+
 def _encoded_surface_state(
     positions_xyz: np.ndarray,
     strengths: np.ndarray,
@@ -2164,11 +2181,26 @@ def test_dss_rejects_mode_capacity_below_pf_cardinality() -> None:
     """Planning cannot silently omit one state-supported source mode."""
     estimator = _build_simple_estimator()
     estimator.pf_config.max_sources = 2
-    with pytest.raises(ValueError, match="at least the PF max_sources"):
+    estimator.pf_config.hard_max_sources = 4
+    with pytest.raises(ValueError, match="at least the PF cardinality capacity"):
         dss_pp._validate_mode_capacity(
             estimator,
-            DSSPPConfig(max_modes_per_isotope=1),
+            DSSPPConfig(max_modes_per_isotope=3),
         )
+
+
+def test_dss_accepts_mode_capacity_equal_to_pf_hard_capacity() -> None:
+    """Planning must accept every state slot, including the thin K tail."""
+    estimator = _build_simple_estimator()
+    estimator.pf_config.max_sources = 5
+    estimator.pf_config.hard_max_sources = 8
+
+    capacity = dss_pp._validate_mode_capacity(
+        estimator,
+        DSSPPConfig(max_modes_per_isotope=8),
+    )
+
+    assert capacity == 8
 
 
 def test_extract_signature_modes_keeps_distinct_pf_posterior_sources() -> None:

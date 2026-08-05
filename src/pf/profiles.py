@@ -69,6 +69,7 @@ _PURE_PF_RUNTIME_KEYS = frozenset(
         "pf_detector_aperture_samples",
         "pf_detector_aperture_sampling",
         "pf_detector_count_radius_m",
+        "pf_detected_isotopes_only",
         "pf_line_resolved_shield_attenuation",
         "pf_max_sources",
         "pf_hard_max_sources",
