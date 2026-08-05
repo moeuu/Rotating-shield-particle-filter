@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -3682,6 +3683,42 @@ def _atomic_write_json(
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def _publish_final_cui_split_views(
+    *,
+    source_robot_path: Path,
+    source_pf_path: Path,
+    final_robot_path: Path,
+    final_pf_path: Path,
+) -> None:
+    """Atomically publish completed CUI split views as stable result artifacts."""
+    source_target_pairs = (
+        (Path(source_robot_path), Path(final_robot_path)),
+        (Path(source_pf_path), Path(final_pf_path)),
+    )
+    missing = [source for source, _ in source_target_pairs if not source.is_file()]
+    if missing:
+        raise RuntimeError(
+            "Final CUI split views are missing: "
+            + ", ".join(path.as_posix() for path in missing)
+        )
+    for source, target in source_target_pairs:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{target.name}.tmp-",
+                dir=target.parent,
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+            shutil.copyfile(source, temporary_path)
+            os.replace(temporary_path, target)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
 
 def _render_optional_outputs_after_artifacts(
@@ -8793,6 +8830,8 @@ def run_live_pf(
             RESULTS_DIR / f"result_spectrum_last{output_suffix}.png"
         )
         estimates_out_path = RESULTS_DIR / f"result_estimates{output_suffix}.png"
+        robot_2d_out_path = RESULTS_DIR / f"result_robot_2d{output_suffix}.png"
+        pf_3d_out_path = RESULTS_DIR / f"result_pf_3d{output_suffix}.png"
         summary_out_path = RESULTS_DIR / f"result_summary{output_suffix}.json"
         pf_posterior_out_path = RESULTS_DIR / f"pf_posterior{output_suffix}.json"
         result_paths = {
@@ -8815,6 +8854,8 @@ def run_live_pf(
                     "cui_split_view": cui_split_viz.index_path.as_posix(),
                     "cui_robot_2d_latest": cui_split_viz.latest_robot_path.as_posix(),
                     "cui_pf_3d_latest": cui_split_viz.latest_pf_path.as_posix(),
+                    "robot_2d_plot": robot_2d_out_path.as_posix(),
+                    "pf_3d_plot": pf_3d_out_path.as_posix(),
                 }
             )
         pf_out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -9407,6 +9448,26 @@ def run_live_pf(
                 title="Last measurement spectrum",
             )
 
+        def _publish_final_cui_views() -> None:
+            """Publish the exact final-step CUI views under stable result names."""
+            if cui_split_viz is None or last_frame is None:
+                raise RuntimeError(
+                    "Final CUI split publication requires a rendered PF frame."
+                )
+            final_step = max(0, int(last_frame.step_index))
+            _publish_final_cui_split_views(
+                source_robot_path=(
+                    cui_split_viz.output_dir
+                    / f"robot_2d_step_{final_step:04d}.png"
+                ),
+                source_pf_path=(
+                    cui_split_viz.output_dir
+                    / f"pf_3d_step_{final_step:04d}.png"
+                ),
+                final_robot_path=robot_2d_out_path,
+                final_pf_path=pf_3d_out_path,
+            )
+
         required_artifacts = [
             pf_posterior_out_path,
             summary_out_path,
@@ -9430,9 +9491,21 @@ def run_live_pf(
         finally:
             if cui_split_viz is not None and hasattr(cui_split_viz, "close"):
                 cui_split_viz.close()
+        if cui_split_viz is not None:
+            optional_plot_failures += _render_optional_outputs_after_artifacts(
+                required_artifacts=required_artifacts,
+                renderers=(
+                    (
+                        "final_cui_split_views",
+                        _publish_final_cui_views,
+                    ),
+                ),
+            )
         for label, output_path in (
             ("Final PF visualization", pf_out_path),
             ("Final estimates-only visualization", estimates_out_path),
+            ("Final robot 2D visualization", robot_2d_out_path),
+            ("Final PF 3D visualization", pf_3d_out_path),
             ("Representative spectrum", spectrum_out_path),
             ("Last spectrum", last_spectrum_out_path),
         ):
