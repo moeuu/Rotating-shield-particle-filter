@@ -3689,13 +3689,16 @@ def _publish_final_cui_split_views(
     *,
     source_robot_path: Path,
     source_pf_path: Path,
+    source_pf_labeled_path: Path,
     final_robot_path: Path,
     final_pf_path: Path,
+    final_pf_labeled_path: Path,
 ) -> None:
     """Atomically publish completed CUI split views as stable result artifacts."""
     source_target_pairs = (
         (Path(source_robot_path), Path(final_robot_path)),
         (Path(source_pf_path), Path(final_pf_path)),
+        (Path(source_pf_labeled_path), Path(final_pf_labeled_path)),
     )
     missing = [source for source, _ in source_target_pairs if not source.is_file()]
     if missing:
@@ -3719,6 +3722,36 @@ def _publish_final_cui_split_views(
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
+
+
+def _prepare_final_visualization_frame(
+    frame: PFFrame,
+    *,
+    step_index: int,
+    elapsed_s: float,
+    final_estimates: Mapping[
+        str,
+        tuple[NDArray[np.float64], NDArray[np.float64]],
+    ],
+) -> PFFrame:
+    """Attach final estimates without replacing the saved travel segment.
+
+    ``frame.path_waypoints_xyz`` is the obstacle-aware segment that reached the
+    final station. Replacing it with the sequence of measurement poses creates
+    false straight-line links through obstacles when the final CUI frame is
+    rendered again.
+    """
+    frame.step_index = max(0, int(step_index))
+    frame.time = float(elapsed_s)
+    frame.estimated_sources = {
+        str(isotope): np.asarray(positions, dtype=np.float64).reshape((-1, 3)).copy()
+        for isotope, (positions, _) in final_estimates.items()
+    }
+    frame.estimated_strengths = {
+        str(isotope): np.asarray(strengths, dtype=np.float64).reshape(-1).copy()
+        for isotope, (_, strengths) in final_estimates.items()
+    }
+    return frame
 
 
 def _render_optional_outputs_after_artifacts(
@@ -8832,6 +8865,9 @@ def run_live_pf(
         estimates_out_path = RESULTS_DIR / f"result_estimates{output_suffix}.png"
         robot_2d_out_path = RESULTS_DIR / f"result_robot_2d{output_suffix}.png"
         pf_3d_out_path = RESULTS_DIR / f"result_pf_3d{output_suffix}.png"
+        pf_3d_labeled_out_path = (
+            RESULTS_DIR / f"result_pf_3d_labeled{output_suffix}.png"
+        )
         summary_out_path = RESULTS_DIR / f"result_summary{output_suffix}.json"
         pf_posterior_out_path = RESULTS_DIR / f"pf_posterior{output_suffix}.json"
         result_paths = {
@@ -8854,8 +8890,12 @@ def run_live_pf(
                     "cui_split_view": cui_split_viz.index_path.as_posix(),
                     "cui_robot_2d_latest": cui_split_viz.latest_robot_path.as_posix(),
                     "cui_pf_3d_latest": cui_split_viz.latest_pf_path.as_posix(),
+                    "cui_pf_3d_labeled_latest": (
+                        cui_split_viz.latest_pf_labeled_path.as_posix()
+                    ),
                     "robot_2d_plot": robot_2d_out_path.as_posix(),
                     "pf_3d_plot": pf_3d_out_path.as_posix(),
+                    "pf_3d_labeled_plot": pf_3d_labeled_out_path.as_posix(),
                 }
             )
         pf_out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8904,19 +8944,12 @@ def run_live_pf(
             canonical_posterior_payload,
         )
         if last_frame is not None:
-            last_frame.step_index = max(0, int(step_counter) - 1)
-            last_frame.time = float(elapsed)
-            last_frame.estimated_sources = {
-                iso: pos
-                for iso, (pos, _) in final_estimates_for_run.items()
-            }
-            last_frame.estimated_strengths = {
-                iso: strength
-                for iso, (_, strength) in final_estimates_for_run.items()
-            }
-            registered_poses = np.asarray(estimator.poses, dtype=np.float64)
-            if registered_poses.ndim == 2 and registered_poses.shape[1] == 3:
-                last_frame.path_waypoints_xyz = registered_poses.copy()
+            _prepare_final_visualization_frame(
+                last_frame,
+                step_index=int(step_counter) - 1,
+                elapsed_s=elapsed,
+                final_estimates=final_estimates_for_run,
+            )
     total_meas_time = float(sum(measurement_live_times_s))
     total_mission_time_s = float(
         total_meas_time + total_motion_time_s + total_rotation_time_s
@@ -9464,8 +9497,13 @@ def run_live_pf(
                     cui_split_viz.output_dir
                     / f"pf_3d_step_{final_step:04d}.png"
                 ),
+                source_pf_labeled_path=(
+                    cui_split_viz.output_dir
+                    / f"pf_3d_labeled_step_{final_step:04d}.png"
+                ),
                 final_robot_path=robot_2d_out_path,
                 final_pf_path=pf_3d_out_path,
+                final_pf_labeled_path=pf_3d_labeled_out_path,
             )
 
         required_artifacts = [
@@ -9506,6 +9544,7 @@ def run_live_pf(
             ("Final estimates-only visualization", estimates_out_path),
             ("Final robot 2D visualization", robot_2d_out_path),
             ("Final PF 3D visualization", pf_3d_out_path),
+            ("Final labeled PF 3D visualization", pf_3d_labeled_out_path),
             ("Representative spectrum", spectrum_out_path),
             ("Last spectrum", last_spectrum_out_path),
         ):

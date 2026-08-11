@@ -1387,6 +1387,7 @@ class CUISplitPFVisualizer:
         true_strengths: Optional[Dict[str, float | Sequence[float]]] = None,
         obstacle_grid: ObstacleGrid | None = None,
         max_particles_per_isotope: int | None = None,
+        source_label_neighborhood_m: float = 1.0,
     ) -> None:
         """Initialize output paths and static scene metadata."""
         self.isotopes = list(isotopes)
@@ -1401,6 +1402,12 @@ class CUISplitPFVisualizer:
             if max_particles_per_isotope is None
             else max(1, int(max_particles_per_isotope))
         )
+        self.source_label_neighborhood_m = float(source_label_neighborhood_m)
+        if (
+            not np.isfinite(self.source_label_neighborhood_m)
+            or self.source_label_neighborhood_m <= 0.0
+        ):
+            raise ValueError("source_label_neighborhood_m must be positive and finite.")
         self.trajectory: list[NDArray[np.float64]] = []
         self.path_segments: list[NDArray[np.float64]] = []
         self.measurement_points: list[NDArray[np.float64]] = []
@@ -1415,6 +1422,9 @@ class CUISplitPFVisualizer:
         self.latest_robot_path = self.output_dir / "latest_robot_2d.png"
         self.latest_overview_path = self.output_dir / "latest_experiment_overview.png"
         self.latest_pf_path = self.output_dir / "latest_pf_3d.png"
+        self.latest_pf_labeled_path = (
+            self.output_dir / "latest_pf_3d_labeled.png"
+        )
         self.latest_spectrum_path = self.output_dir / "latest_spectrum.png"
         self.index_path = self.output_dir / "index.html"
         self._write_index_html()
@@ -1451,13 +1461,21 @@ class CUISplitPFVisualizer:
         robot_step_path = self.output_dir / f"robot_2d_step_{step:04d}.png"
         overview_step_path = self.output_dir / f"experiment_overview_step_{step:04d}.png"
         pf_step_path = self.output_dir / f"pf_3d_step_{step:04d}.png"
+        pf_labeled_step_path = (
+            self.output_dir / f"pf_3d_labeled_step_{step:04d}.png"
+        )
         spectrum_step_path = self.output_dir / f"spectrum_step_{step:04d}.png"
         self._save_robot_2d(frame, robot_step_path)
         shutil.copyfile(robot_step_path, self.latest_robot_path)
         self._save_experiment_overview(frame, overview_step_path)
         shutil.copyfile(overview_step_path, self.latest_overview_path)
-        self._save_pf_3d(frame, pf_step_path)
+        self._save_pf_3d(
+            frame,
+            pf_step_path,
+            labeled_output_path=pf_labeled_step_path,
+        )
         shutil.copyfile(pf_step_path, self.latest_pf_path)
+        shutil.copyfile(pf_labeled_step_path, self.latest_pf_labeled_path)
         self._save_spectrum(frame, spectrum_step_path)
         if spectrum_step_path.exists():
             shutil.copyfile(spectrum_step_path, self.latest_spectrum_path)
@@ -1581,6 +1599,7 @@ class CUISplitPFVisualizer:
     <section class="wide overview"><h2>RA-L experiment overview</h2><img id="overview" src="latest_experiment_overview.png"></section>
     <section><h2>Robot position 2D</h2><img id="robot" src="latest_robot_2d.png"></section>
     <section><h2>Particle filter 3D</h2><img id="pf" src="latest_pf_3d.png"></section>
+    <section class="wide"><h2>Particle filter 3D with source labels</h2><img id="pf-labeled" src="latest_pf_3d_labeled.png"></section>
     <section class="wide"><h2>Raw native full spectrum</h2><img id="spectrum" src="latest_spectrum.png"></section>
   </main>
   <script>
@@ -1589,6 +1608,7 @@ class CUISplitPFVisualizer:
       document.getElementById("overview").src = "latest_experiment_overview.png?t=" + t;
       document.getElementById("robot").src = "latest_robot_2d.png?t=" + t;
       document.getElementById("pf").src = "latest_pf_3d.png?t=" + t;
+      document.getElementById("pf-labeled").src = "latest_pf_3d_labeled.png?t=" + t;
       document.getElementById("spectrum").src = "latest_spectrum.png?t=" + t;
     }
     setInterval(refresh, 2000);
@@ -1867,6 +1887,195 @@ class CUISplitPFVisualizer:
                 depthshade=False,
                 label=f"true {iso}",
             )
+
+    @staticmethod
+    def _isotope_source_prefix(isotope: str) -> str:
+        """Return a compact isotope prefix for per-source plot labels."""
+        prefix = str(isotope).split("-", maxsplit=1)[0].strip()
+        return prefix or str(isotope)
+
+    def _source_label_entries(
+        self,
+        frame: PFFrame,
+        isotope: str,
+    ) -> tuple[
+        list[tuple[NDArray[np.float64], str]],
+        list[tuple[NDArray[np.float64], str]],
+    ]:
+        """Return truth and estimate labels using same-isotope neighborhoods.
+
+        Estimate labels are assigned to the nearest same-isotope truth within
+        ``source_label_neighborhood_m``. Multiple estimates may therefore carry
+        the same source identifier with deterministic ``E1``, ``E2``, ...
+        suffixes. Estimates outside every neighborhood remain explicit remotes.
+        This helper is visualization-only and never changes PF state.
+        """
+        prefix = self._isotope_source_prefix(isotope)
+        truth_raw = np.asarray(
+            self.true_sources.get(isotope, np.zeros((0, 3), dtype=float)),
+            dtype=float,
+        )
+        estimate_raw = np.asarray(
+            frame.estimated_sources.get(
+                isotope,
+                np.zeros((0, 3), dtype=float),
+            ),
+            dtype=float,
+        )
+        truth = (
+            truth_raw.reshape((-1, 3))
+            if truth_raw.size
+            else np.zeros((0, 3), dtype=float)
+        )
+        estimates = (
+            estimate_raw.reshape((-1, 3))
+            if estimate_raw.size
+            else np.zeros((0, 3), dtype=float)
+        )
+        truth_entries = [
+            (position, f"{prefix}-{index + 1} T")
+            for index, position in enumerate(truth)
+        ]
+        if not self.true_sources:
+            estimate_entries = [
+                (position, f"{prefix} E{index + 1}")
+                for index, position in enumerate(estimates)
+            ]
+            return truth_entries, estimate_entries
+
+        assignments: list[int | None] = []
+        for estimate in estimates:
+            if not truth.size:
+                assignments.append(None)
+                continue
+            distances = np.linalg.norm(truth - estimate[None, :], axis=1)
+            nearest_index = int(np.argmin(distances))
+            if float(distances[nearest_index]) <= self.source_label_neighborhood_m:
+                assignments.append(nearest_index)
+            else:
+                assignments.append(None)
+
+        assignment_counts: dict[int, int] = {}
+        for assignment in assignments:
+            if assignment is None:
+                continue
+            assignment_counts[assignment] = (
+                assignment_counts.get(assignment, 0) + 1
+            )
+        assignment_occurrences: dict[int, int] = {}
+        remote_index = 0
+        estimate_entries: list[tuple[NDArray[np.float64], str]] = []
+        for estimate, assignment in zip(estimates, assignments):
+            if assignment is None:
+                remote_index += 1
+                label = f"{prefix} remote-{remote_index}"
+            else:
+                assignment_occurrences[assignment] = (
+                    assignment_occurrences.get(assignment, 0) + 1
+                )
+                estimate_suffix = "E"
+                if assignment_counts[assignment] > 1:
+                    estimate_suffix += str(assignment_occurrences[assignment])
+                label = f"{prefix}-{assignment + 1} {estimate_suffix}"
+            estimate_entries.append((estimate, label))
+        return truth_entries, estimate_entries
+
+    def _annotate_source_labels_3d(
+        self,
+        ax: plt.Axes,
+        frame: PFFrame,
+        *,
+        include_truth: bool,
+        include_estimates: bool,
+    ) -> None:
+        """Annotate selected truth or estimate markers on one 3-D axis."""
+        estimate_label_index = 0
+        for isotope in self.isotopes:
+            truth_entries, estimate_entries = self._source_label_entries(
+                frame,
+                isotope,
+            )
+            color = self.colors.get(isotope, "black")
+            visible_truth_entries = truth_entries if include_truth else []
+            for index, (position, label) in enumerate(visible_truth_entries):
+                projected_x, projected_y, _ = proj3d.proj_transform(
+                    *position,
+                    ax.get_proj(),
+                )
+                annotation = ax.annotate(
+                    label,
+                    xy=(projected_x, projected_y),
+                    xytext=(4, 5 + 3 * (index % 2)),
+                    textcoords="offset points",
+                    ha="left",
+                    va="bottom",
+                    fontsize=6.2,
+                    fontweight="bold",
+                    color=color,
+                    bbox={
+                        "boxstyle": "round,pad=0.18",
+                        "facecolor": "white",
+                        "edgecolor": color,
+                        "linewidth": 0.65,
+                        "alpha": 0.88,
+                    },
+                    zorder=30,
+                )
+                annotation.set_path_effects(
+                    [path_effects.withStroke(linewidth=0.6, foreground="white")]
+                )
+            visible_estimate_entries = estimate_entries if include_estimates else []
+            for position, label in visible_estimate_entries:
+                projected_x, projected_y, _ = proj3d.proj_transform(
+                    *position,
+                    ax.get_proj(),
+                )
+                offset_candidates = (
+                    (6, -10),
+                    (6, 8),
+                    (-6, -10),
+                    (-6, 8),
+                    (12, 0),
+                    (-12, 0),
+                )
+                if label.endswith(" E1"):
+                    offset_x, offset_y = offset_candidates[0]
+                elif label.endswith(" E2"):
+                    offset_x, offset_y = offset_candidates[1]
+                else:
+                    offset_x, offset_y = offset_candidates[
+                        estimate_label_index % len(offset_candidates)
+                    ]
+                estimate_label_index += 1
+                annotation = ax.annotate(
+                    label,
+                    xy=(projected_x, projected_y),
+                    xytext=(offset_x, offset_y),
+                    textcoords="offset points",
+                    ha="left" if offset_x >= 0 else "right",
+                    va="bottom" if offset_y >= 0 else "top",
+                    fontsize=5.8,
+                    color=color,
+                    bbox={
+                        "boxstyle": "round,pad=0.14",
+                        "facecolor": "white",
+                        "edgecolor": color,
+                        "linewidth": 0.5,
+                        "alpha": 0.78,
+                    },
+                    arrowprops={
+                        "arrowstyle": "-",
+                        "color": color,
+                        "linewidth": 0.45,
+                        "alpha": 0.7,
+                        "shrinkA": 1.5,
+                        "shrinkB": 1.5,
+                    },
+                    zorder=29,
+                )
+                annotation.set_path_effects(
+                    [path_effects.withStroke(linewidth=0.5, foreground="white")]
+                )
 
     def _save_robot_2d(self, frame: PFFrame, output_path: Path) -> None:
         """Save the current robot position and trajectory as a 2D PNG."""
@@ -2288,8 +2497,14 @@ class CUISplitPFVisualizer:
                 total += int(arr.reshape((-1, 3)).shape[0])
         return total
 
-    def _save_pf_3d(self, frame: PFFrame, output_path: Path) -> None:
-        """Save the current PF particles and estimates as a 3D PNG."""
+    def _save_pf_3d(
+        self,
+        frame: PFFrame,
+        output_path: Path,
+        *,
+        labeled_output_path: Path | None = None,
+    ) -> None:
+        """Save plain and optionally source-labeled PF 3-D PNGs."""
         fig = plt.figure(figsize=(14.2, 6.6))
         ax_samples = fig.add_subplot(121, projection="3d")
         ax_representatives = fig.add_subplot(122, projection="3d")
@@ -2377,6 +2592,40 @@ class CUISplitPFVisualizer:
         fig.subplots_adjust(left=0.02, right=0.86, top=0.88, bottom=0.04, wspace=0.06)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_path, dpi=160, bbox_inches="tight")
+        if labeled_output_path is not None:
+            self._annotate_source_labels_3d(
+                ax_samples,
+                frame,
+                include_truth=True,
+                include_estimates=False,
+            )
+            self._annotate_source_labels_3d(
+                ax_representatives,
+                frame,
+                include_truth=False,
+                include_estimates=True,
+            )
+            truth_title = "True-source labels (T)"
+            if not self.true_sources:
+                truth_title = "Truth hidden"
+            ax_samples.set_title(
+                f"Source-slot samples (N={sample_count})\n{truth_title}",
+                fontsize=9.5,
+            )
+            estimate_title = "Estimate labels (E; isotope-local indices)"
+            if self.true_sources:
+                estimate_title = (
+                    "Estimate labels (E; nearest same-isotope truth within "
+                    f"{self.source_label_neighborhood_m:.1f} m"
+                    ")"
+                )
+            ax_representatives.set_title(
+                "PF particle active-source medoids "
+                f"(N={representative_count})\n{estimate_title}",
+                fontsize=9.5,
+            )
+            labeled_output_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(labeled_output_path, dpi=160, bbox_inches="tight")
         plt.close(fig)
 
     def _save_spectrum(self, frame: PFFrame, output_path: Path) -> None:
@@ -2457,6 +2706,7 @@ class AsyncCUISplitPFVisualizer:
         true_strengths: Optional[Dict[str, float | Sequence[float]]] = None,
         obstacle_grid: ObstacleGrid | None = None,
         max_particles_per_isotope: int | None = None,
+        source_label_neighborhood_m: float = 1.0,
         queue_size: int = 2,
     ) -> None:
         """Start a renderer process that consumes latest PF frames asynchronously."""
@@ -2467,6 +2717,9 @@ class AsyncCUISplitPFVisualizer:
         self.latest_robot_path = self.output_dir / "latest_robot_2d.png"
         self.latest_overview_path = self.output_dir / "latest_experiment_overview.png"
         self.latest_pf_path = self.output_dir / "latest_pf_3d.png"
+        self.latest_pf_labeled_path = (
+            self.output_dir / "latest_pf_3d_labeled.png"
+        )
         self.latest_spectrum_path = self.output_dir / "latest_spectrum.png"
         self._closed = False
         self._ctx = mp.get_context("spawn")
@@ -2479,6 +2732,7 @@ class AsyncCUISplitPFVisualizer:
             "true_strengths": true_strengths,
             "obstacle_grid": obstacle_grid,
             "max_particles_per_isotope": max_particles_per_isotope,
+            "source_label_neighborhood_m": source_label_neighborhood_m,
         }
         self._process = self._ctx.Process(
             target=_async_cui_split_worker,
