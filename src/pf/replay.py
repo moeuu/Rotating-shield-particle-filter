@@ -287,8 +287,10 @@ def validate_local_full_spectrum_contract(
             "Full-spectrum line isotopes must be nonempty exact strings."
         )
     model_isotopes = tuple(sorted(set(raw_model_isotopes)))
-    if model_isotopes != isotopes:
-        raise PFReplayError("Full-spectrum line isotopes differ from the run manifest.")
+    if not set(isotopes).issubset(model_isotopes):
+        raise PFReplayError(
+            "Full-spectrum line isotopes do not cover the run manifest."
+        )
     manifest_hash = _sha256_string(
         log.run_manifest.get("full_spectrum_contract_hash_sha256"),
         location="run_manifest.full_spectrum_contract_hash_sha256",

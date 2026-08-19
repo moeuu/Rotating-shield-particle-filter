@@ -14,6 +14,7 @@ from pf.replay import (
     build_replay_estimator,
     replay_measurement_log,
     replay_records,
+    validate_local_full_spectrum_contract,
 )
 from runtime.measurement_log import MeasurementLog, load_measurement_log
 from tests.pure_pf_test_support import make_measurement_log
@@ -86,6 +87,57 @@ def _with_records(
         records=records,  # type: ignore[arg-type]
         path=log.path,
     )
+
+
+def test_full_spectrum_model_may_cover_a_candidate_isotope_superset(
+    tmp_path,
+) -> None:
+    """A logged Cs/Co run may use an authenticated Cs/Co/Eu model basis."""
+    log = load_measurement_log(
+        make_measurement_log(tmp_path / "measurement-log", record_count=1)
+    )
+    run_manifest = dict(log.run_manifest)
+    run_manifest["isotopes"] = ["Co-60", "Cs-137"]
+    runtime_config = dict(log.runtime_config)
+    runtime_config["candidate_isotopes"] = ["Co-60", "Cs-137"]
+    subset_log = MeasurementLog(
+        run_manifest=run_manifest,
+        runtime_config=runtime_config,
+        environment=log.environment,
+        forward_model_manifest=log.forward_model_manifest,
+        records=log.records,
+        path=log.path,
+    )
+
+    model = validate_local_full_spectrum_contract(subset_log)
+
+    assert {"Co-60", "Cs-137", "Eu-154"} == {
+        str(row["isotope"]) for row in model.line_identity
+    }
+
+
+def test_full_spectrum_model_must_cover_every_candidate_isotope(
+    tmp_path,
+) -> None:
+    """A candidate missing from the authenticated line basis must fail."""
+    log = load_measurement_log(
+        make_measurement_log(tmp_path / "measurement-log", record_count=1)
+    )
+    run_manifest = dict(log.run_manifest)
+    run_manifest["isotopes"] = ["Co-60", "Cs-137", "Eu-154", "Xe-133"]
+    runtime_config = dict(log.runtime_config)
+    runtime_config["candidate_isotopes"] = list(run_manifest["isotopes"])
+    invalid_log = MeasurementLog(
+        run_manifest=run_manifest,
+        runtime_config=runtime_config,
+        environment=log.environment,
+        forward_model_manifest=log.forward_model_manifest,
+        records=log.records,
+        path=log.path,
+    )
+
+    with pytest.raises(PFReplayError, match="do not cover"):
+        validate_local_full_spectrum_contract(invalid_log)
 
 
 def test_spectrum_record_forwards_only_raw_spectrum_and_action_geometry(
