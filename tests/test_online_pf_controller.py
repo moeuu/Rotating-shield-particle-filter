@@ -39,7 +39,8 @@ def test_standard_online_config_preserves_original_pf_contract() -> None:
     assert online["pf_strength_prior_gamma_shape"] == 2.0
     assert online["joint_strength_block_probability"] > 0.0
     assert online["joint_strength_block_batch_size"] == 128
-    assert online["joint_cross_isotope_transfer_probability"] == 0.0
+    assert online["pf_detected_isotopes_only"] is False
+    assert online["joint_cross_isotope_transfer_probability"] == 0.1
     assert online["structural_rj_multi_component_max_group_size"] == 4
     assert online["joint_guided_initialization"] is True
     assert online["target_ess_ratio"] == 0.4

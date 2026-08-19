@@ -1318,6 +1318,10 @@ class RotatingShieldPFEstimator:
         self.last_joint_guided_initialization_ess: float | None = None
         self.last_joint_cross_isotope_attempted_weight_mass = 0.0
         self.last_joint_cross_isotope_accepted_weight_mass = 0.0
+        self.last_joint_cross_isotope_rejection_diagnostics: dict[
+            str,
+            object,
+        ] = {}
         self.last_joint_cross_isotope_state_attempted_weight_mass = 0.0
         self.last_joint_cross_isotope_state_accepted_weight_mass = 0.0
         self.last_joint_cross_isotope_state_rejection_diagnostics: dict[
@@ -7172,11 +7176,24 @@ class RotatingShieldPFEstimator:
             )
         )
         feasible = attempted & (maximum_group > 0)
+        attempted_rows = np.flatnonzero(attempted)
         rows = np.flatnonzero(feasible)
         self.last_joint_cross_isotope_attempted_weight_mass += float(
-            np.sum(weights[rows])
+            np.sum(weights[attempted_rows])
         )
         if rows.size == 0:
+            self.last_joint_cross_isotope_rejection_diagnostics = {
+                "attempted": int(attempted_rows.size),
+                "accepted": 0,
+                "support_rejected": int(attempted_rows.size),
+                "geometry_support_rejected": 0,
+                "strength_support_rejected": 0,
+                "other_support_rejected": int(attempted_rows.size),
+                "nonfinite_rejected": 0,
+                "mh_random_rejected": 0,
+                "component_quantiles": {},
+                "by_isotope_cardinality_transfer": {},
+            }
             return np.asarray(current_target_log_likelihood, dtype=np.float64)
         group_sizes = np.ones(particle_count, dtype=np.int64)
         group_sizes[rows] = (
@@ -7323,8 +7340,218 @@ class RotatingShieldPFEstimator:
                 np.sum(weights[accepted_rows])
             )
             self._invalidate_posterior_summary_cache()
+        diagnostic_delta_likelihood = np.full(
+            particle_count,
+            float("nan"),
+            dtype=np.float64,
+        )
+        diagnostic_log_ratio = np.full_like(
+            diagnostic_delta_likelihood,
+            float("nan"),
+        )
+        diagnostic_delta_likelihood[rows] = (
+            proposed_target[rows] - current_target_log_likelihood[rows]
+        )
+        diagnostic_log_ratio[rows] = log_ratio
+        diagnostic_accepted = np.zeros(particle_count, dtype=np.bool_)
+        diagnostic_accepted[accepted_rows] = True
+        diagnostic_strength_support = np.ones(
+            particle_count,
+            dtype=np.bool_,
+        )
+        for row in rows.tolist():
+            donor_filter = self.filters[isotope_order[donor_by_row[row]]]
+            receiver_filter = self.filters[isotope_order[receiver_by_row[row]]]
+            diagnostic_strength_support[row] = bool(
+                np.all(
+                    donor_filter._strength_prior.in_support(
+                        donor_states[row].strengths
+                    )
+                )
+                and np.all(
+                    receiver_filter._strength_prior.in_support(
+                        receiver_states[row].strengths
+                    )
+                )
+            )
+        diagnostic_support = (
+            feasible
+            & diagnostic_strength_support
+            & np.isfinite(log_forward)
+            & np.isfinite(log_reverse)
+            & np.isfinite(log_prior_ratio)
+        )
+        self.last_joint_cross_isotope_rejection_diagnostics = (
+            self._summarize_joint_cross_isotope_transfer(
+                attempted_rows=attempted_rows,
+                donor_by_row=donor_by_row,
+                receiver_by_row=receiver_by_row,
+                donor_cardinality=donor_cardinality,
+                receiver_cardinality=receiver_cardinality,
+                group_sizes=group_sizes,
+                isotope_order=isotope_order,
+                delta_log_likelihood=diagnostic_delta_likelihood,
+                delta_log_prior=log_prior_ratio,
+                log_reverse_minus_forward=log_reverse - log_forward,
+                log_acceptance_ratio=diagnostic_log_ratio,
+                support_feasible=diagnostic_support,
+                strength_support_feasible=diagnostic_strength_support,
+                accepted=diagnostic_accepted,
+            )
+        )
         self._assert_joint_particle_alignment()
         return current_target
+
+    @staticmethod
+    def _summarize_joint_cross_isotope_transfer(
+        *,
+        attempted_rows: NDArray[np.int64],
+        donor_by_row: NDArray[np.int64],
+        receiver_by_row: NDArray[np.int64],
+        donor_cardinality: NDArray[np.int64],
+        receiver_cardinality: NDArray[np.int64],
+        group_sizes: NDArray[np.int64],
+        isotope_order: Sequence[str],
+        delta_log_likelihood: NDArray[np.float64],
+        delta_log_prior: NDArray[np.float64],
+        log_reverse_minus_forward: NDArray[np.float64],
+        log_acceptance_ratio: NDArray[np.float64],
+        support_feasible: NDArray[np.bool_],
+        strength_support_feasible: NDArray[np.bool_],
+        accepted: NDArray[np.bool_],
+    ) -> dict[str, object]:
+        """Summarize exact isotope-transfer MH terms on attempted rows."""
+        selected = np.asarray(attempted_rows, dtype=np.int64).reshape(-1)
+        quantile_levels = np.asarray(
+            [0.0, 0.1, 0.5, 0.9, 1.0],
+            dtype=np.float64,
+        )
+        numeric = {
+            "delta_log_likelihood": np.asarray(
+                delta_log_likelihood,
+                dtype=np.float64,
+            ),
+            "delta_log_prior": np.asarray(
+                delta_log_prior,
+                dtype=np.float64,
+            ),
+            "log_reverse_minus_forward": np.asarray(
+                log_reverse_minus_forward,
+                dtype=np.float64,
+            ),
+            "log_jacobian": np.zeros(
+                np.asarray(delta_log_likelihood).shape,
+                dtype=np.float64,
+            ),
+            "log_acceptance_ratio": np.asarray(
+                log_acceptance_ratio,
+                dtype=np.float64,
+            ),
+        }
+        support = np.asarray(support_feasible, dtype=np.bool_)
+        strength_support = np.asarray(
+            strength_support_feasible,
+            dtype=np.bool_,
+        )
+        acceptance = np.asarray(accepted, dtype=np.bool_)
+
+        def _rows_summary(rows: NDArray[np.int64]) -> dict[str, object]:
+            """Summarize one batched subset of transfer attempts."""
+            finite_all = support[rows].copy()
+            component_quantiles: dict[
+                str,
+                dict[str, float | int] | None,
+            ] = {}
+            for name, all_values in numeric.items():
+                values = all_values[rows]
+                finite = np.isfinite(values)
+                finite_all &= finite
+                if not np.any(finite):
+                    component_quantiles[name] = None
+                    continue
+                finite_values = values[finite]
+                resolved = np.quantile(finite_values, quantile_levels)
+                component_quantiles[name] = {
+                    "finite_count": int(finite_values.size),
+                    "mean": float(np.mean(finite_values)),
+                    "std": float(np.std(finite_values)),
+                    **{
+                        label: float(value)
+                        for label, value in zip(
+                            ("min", "p10", "median", "p90", "max"),
+                            resolved,
+                            strict=True,
+                        )
+                    },
+                }
+            return {
+                "attempted": int(rows.size),
+                "accepted": int(np.count_nonzero(acceptance[rows])),
+                "support_rejected": int(np.count_nonzero(~support[rows])),
+                "geometry_support_rejected": 0,
+                "strength_support_rejected": int(
+                    np.count_nonzero(~strength_support[rows])
+                ),
+                "other_support_rejected": int(
+                    np.count_nonzero(strength_support[rows] & ~support[rows])
+                ),
+                "nonfinite_rejected": int(
+                    np.count_nonzero(support[rows] & ~finite_all)
+                ),
+                "mh_random_rejected": int(
+                    np.count_nonzero(
+                        support[rows]
+                        & finite_all
+                        & ~acceptance[rows]
+                    )
+                ),
+                "component_quantiles": component_quantiles,
+            }
+
+        summary = _rows_summary(selected)
+        transitions: dict[str, object] = {}
+        # Isotope pairs and group sizes are bounded by the configured isotope
+        # set and max transfer group, so this packages batched arrays only.
+        if selected.size:
+            labels = np.stack(
+                (
+                    np.asarray(donor_by_row, dtype=np.int64),
+                    np.asarray(receiver_by_row, dtype=np.int64),
+                    np.asarray(donor_cardinality, dtype=np.int64),
+                    np.asarray(receiver_cardinality, dtype=np.int64),
+                    np.asarray(group_sizes, dtype=np.int64),
+                ),
+                axis=1,
+            )
+            for donor, receiver, donor_k, receiver_k, group_size in np.unique(
+                labels[selected],
+                axis=0,
+            ).tolist():
+                matching = selected[
+                    np.all(
+                        labels[selected]
+                        == np.asarray(
+                            (
+                                donor,
+                                receiver,
+                                donor_k,
+                                receiver_k,
+                                group_size,
+                            ),
+                            dtype=np.int64,
+                        ),
+                        axis=1,
+                    )
+                ]
+                key = (
+                    f"{isotope_order[int(donor)]}:{int(donor_k)}"
+                    f"->{int(donor_k) - int(group_size)}|"
+                    f"{isotope_order[int(receiver)]}:{int(receiver_k)}"
+                    f"->{int(receiver_k) + int(group_size)}"
+                )
+                transitions[key] = _rows_summary(matching)
+        summary["by_isotope_cardinality_transfer"] = transitions
+        return summary
 
     def _apply_joint_cross_isotope_state_block(
         self,
@@ -9993,6 +10220,8 @@ class RotatingShieldPFEstimator:
                     "joint_rejuvenation_diagnostics": [],
                     "joint_smc_soft_budget_exceeded": False,
                     "joint_guided_initialization_ess": None,
+                    "joint_cross_isotope_rejection_diagnostics": {},
+                    "joint_cross_isotope_state_rejection_diagnostics": {},
                     "joint_transport_cache": {},
                     "temper_resamples": 0,
                     "temper_min_ess": None,
@@ -10132,6 +10361,9 @@ class RotatingShieldPFEstimator:
                 ),
                 "joint_guided_initialization_ess": (
                     self.last_joint_guided_initialization_ess
+                ),
+                "joint_cross_isotope_rejection_diagnostics": dict(
+                    self.last_joint_cross_isotope_rejection_diagnostics
                 ),
                 "joint_cross_isotope_state_rejection_diagnostics": dict(
                     self.last_joint_cross_isotope_state_rejection_diagnostics
@@ -10380,6 +10612,460 @@ class RotatingShieldPFEstimator:
             "conditional_mark_tail_probability": mark_tail,
             "conditional_mark_upper_tail_probability": mark_upper_tail,
             "confidence": confidence,
+        }
+
+    def posterior_predictive_check(
+        self,
+        *,
+        sample_count: int = 128,
+        confidence: float = 0.95,
+        worst_bin_count: int = 32,
+    ) -> Dict[str, object]:
+        """Return a model-native posterior predictive residual audit.
+
+        Every predictive spectrum is sampled through the immutable generative
+        model, so detector response, background, dead time, and configured
+        discrepancy covariance are preserved. Stations are evaluated one at a
+        time because station-shared latent variables must not be coupled across
+        acquisition boundaries; particles, views, source slots, lines, and
+        energy bins remain batched inside each station call.
+        """
+        count = _strict_nonnegative_integer(
+            sample_count,
+            name="posterior predictive sample_count",
+        )
+        if count < 2:
+            raise ValueError(
+                "posterior predictive sample_count must be at least two."
+            )
+        probability = _strict_config_number(
+            confidence,
+            name="posterior predictive confidence",
+        )
+        if not 0.0 < probability < 1.0:
+            raise ValueError("posterior predictive confidence must lie in (0, 1).")
+        maximum_worst_bins = _strict_nonnegative_integer(
+            worst_bin_count,
+            name="posterior predictive worst_bin_count",
+        )
+        if not self._joint_station_history:
+            return {
+                "available": False,
+                "sample_count": count,
+                "confidence": probability,
+                "stations": [],
+                "shield_pair_summary": {},
+                "obstacle_line_of_sight_summary": {},
+                "worst_standardized_bin_residuals": [],
+            }
+        weights = self._strict_joint_particle_weights()
+        rng = named_random_generator(
+            self.random_seed,
+            "posterior_predictive_residual_audit",
+        )
+        particle_indices = _stratified_categorical_draws(
+            weights,
+            count,
+            rng=rng,
+        )
+        model = self._full_spectrum_model()
+        feature_names = tuple(model.transport_feature_order)
+        obstacle_feature_index = (
+            feature_names.index("tau_obstacle")
+            if "tau_obstacle" in feature_names
+            else None
+        )
+        alpha = 0.5 * (1.0 - probability)
+        station_results: list[dict[str, object]] = []
+        pair_values: dict[int, list[NDArray[np.float64]]] = {}
+        pair_coverages: dict[int, list[NDArray[np.bool_]]] = {}
+        obstacle_values: dict[str, list[NDArray[np.float64]]] = {
+            "crosses_obstacle": [],
+            "clear_line_of_sight": [],
+        }
+        isotope_ablation_values: dict[str, list[float]] = {
+            isotope: [] for isotope in self.joint_isotope_order()
+        }
+        worst_rows: list[dict[str, object]] = []
+        for station in self._joint_station_history:
+            components = tuple(
+                value.detach().cpu().numpy().astype(
+                    np.float64,
+                    copy=False,
+                )
+                for value in self._joint_station_transport_components_torch(
+                    station
+                )
+            )
+            selected_components = tuple(
+                value[particle_indices] for value in components
+            )
+            sampled = np.asarray(
+                model.sample_predictive_numpy(
+                    selected_components[0],
+                    selected_components[1],
+                    selected_components[2],
+                    station.live_times_s,
+                    sample_count=1,
+                    rng=rng,
+                )
+            )
+            expected_shape = (
+                count,
+                1,
+                int(station.fe_indices.size),
+                int(station.energy_axis_keV.size),
+            )
+            if (
+                sampled.shape != expected_shape
+                or not np.issubdtype(sampled.dtype, np.integer)
+                or np.any(sampled < 0)
+            ):
+                raise RuntimeError(
+                    "Posterior predictive sampler returned an invalid batch."
+                )
+            draws = sampled[:, 0].astype(np.float64, copy=False)
+            observed = np.asarray(station.spectrum_vb, dtype=np.float64)
+            predictive_mean = np.mean(draws, axis=0)
+            predictive_std = np.std(draws, axis=0, ddof=1)
+            standardized = (observed - predictive_mean) / np.maximum(
+                predictive_std,
+                1.0,
+            )
+            lower = np.quantile(draws, alpha, axis=0)
+            upper = np.quantile(draws, 1.0 - alpha, axis=0)
+            covered = (observed >= lower) & (observed <= upper)
+            observed_totals = np.sum(observed, axis=1, dtype=np.float64)
+            predictive_totals = np.sum(draws, axis=2, dtype=np.float64)
+            predictive_total_mean = np.mean(predictive_totals, axis=0)
+            predictive_total_std = np.std(
+                predictive_totals,
+                axis=0,
+                ddof=1,
+            )
+            total_standardized = (
+                observed_totals - predictive_total_mean
+            ) / np.maximum(predictive_total_std, 1.0)
+            pair_ids = (
+                np.asarray(station.fe_indices, dtype=np.int64)
+                * int(self.num_orientations)
+                + np.asarray(station.pb_indices, dtype=np.int64)
+            )
+            obstacle_probability = np.zeros(
+                int(station.fe_indices.size),
+                dtype=np.float64,
+            )
+            if obstacle_feature_index is not None:
+                tau_obstacle = selected_components[2][
+                    ..., obstacle_feature_index
+                ]
+                contributes = selected_components[0] > 0.0
+                crosses = np.any(
+                    contributes & (tau_obstacle > 1.0e-12),
+                    axis=(2, 3),
+                )
+                obstacle_probability = np.mean(crosses, axis=0)
+            view_rows: list[dict[str, object]] = []
+            for view_index in range(int(station.fe_indices.size)):
+                pair_id = int(pair_ids[view_index])
+                pair_values.setdefault(pair_id, []).append(
+                    standardized[view_index].copy()
+                )
+                pair_coverages.setdefault(pair_id, []).append(
+                    covered[view_index].copy()
+                )
+                obstacle_label = (
+                    "crosses_obstacle"
+                    if obstacle_probability[view_index] >= 0.5
+                    else "clear_line_of_sight"
+                )
+                obstacle_values[obstacle_label].append(
+                    standardized[view_index].copy()
+                )
+                view_rows.append(
+                    {
+                        "view_index": int(view_index),
+                        "fe_orientation_index": int(
+                            station.fe_indices[view_index]
+                        ),
+                        "pb_orientation_index": int(
+                            station.pb_indices[view_index]
+                        ),
+                        "shield_pair_id": pair_id,
+                        "observed_total_count": float(
+                            observed_totals[view_index]
+                        ),
+                        "predictive_total_mean": float(
+                            predictive_total_mean[view_index]
+                        ),
+                        "predictive_total_std": float(
+                            predictive_total_std[view_index]
+                        ),
+                        "standardized_total_residual": float(
+                            total_standardized[view_index]
+                        ),
+                        "maximum_abs_standardized_bin_residual": float(
+                            np.max(np.abs(standardized[view_index]))
+                        ),
+                        "p95_abs_standardized_bin_residual": float(
+                            np.quantile(
+                                np.abs(standardized[view_index]),
+                                0.95,
+                            )
+                        ),
+                        "marginal_bin_coverage_fraction": float(
+                            np.mean(covered[view_index])
+                        ),
+                        "posterior_obstacle_crossing_probability": float(
+                            obstacle_probability[view_index]
+                        ),
+                    }
+                )
+            flat_count = min(
+                maximum_worst_bins,
+                int(standardized.size),
+            )
+            if flat_count:
+                flat_abs = np.abs(standardized).reshape(-1)
+                candidate_flat = np.argpartition(
+                    flat_abs,
+                    -flat_count,
+                )[-flat_count:]
+                view_indices, bin_indices = np.unravel_index(
+                    candidate_flat,
+                    standardized.shape,
+                )
+                for view_index, bin_index in zip(
+                    view_indices.tolist(),
+                    bin_indices.tolist(),
+                    strict=True,
+                ):
+                    worst_rows.append(
+                        {
+                            "station_sequence_id": int(
+                                station.station_sequence_id
+                            ),
+                            "view_index": int(view_index),
+                            "shield_pair_id": int(pair_ids[view_index]),
+                            "energy_keV": float(
+                                station.energy_axis_keV[bin_index]
+                            ),
+                            "bin_index": int(bin_index),
+                            "observed_count": float(
+                                observed[view_index, bin_index]
+                            ),
+                            "predictive_mean": float(
+                                predictive_mean[view_index, bin_index]
+                            ),
+                            "predictive_std": float(
+                                predictive_std[view_index, bin_index]
+                            ),
+                            "standardized_residual": float(
+                                standardized[view_index, bin_index]
+                            ),
+                        }
+                    )
+            innovation = dict(
+                model.posterior_predictive_innovation_numpy(
+                    observed,
+                    components[0],
+                    components[1],
+                    components[2],
+                    station.live_times_s,
+                    weights,
+                    confidence=probability,
+                )
+            )
+            full_log_likelihood = np.asarray(
+                model.log_likelihood_numpy(
+                    observed,
+                    components[0],
+                    components[1],
+                    components[2],
+                    station.live_times_s,
+                ),
+                dtype=np.float64,
+            )
+            log_weights = np.log(
+                np.maximum(weights, np.finfo(np.float64).tiny)
+            )
+            full_log_predictive_density = float(
+                logsumexp(log_weights + full_log_likelihood)
+            )
+            station_isotope_ablation: dict[str, object] = {}
+            line_identity = tuple(model.line_identity)
+            for isotope in self.joint_isotope_order():
+                isotope_line_mask = np.asarray(
+                    [
+                        str(payload["isotope"]) == isotope
+                        for payload in line_identity
+                    ],
+                    dtype=np.bool_,
+                )
+                if not np.any(isotope_line_mask):
+                    raise RuntimeError(
+                        f"No full-spectrum line columns exist for {isotope}."
+                    )
+                ablated_total = components[0].copy()
+                ablated_uncollided = components[1].copy()
+                ablated_total[..., isotope_line_mask] = 0.0
+                ablated_uncollided[..., isotope_line_mask] = 0.0
+                ablated_log_likelihood = np.asarray(
+                    model.log_likelihood_numpy(
+                        observed,
+                        ablated_total,
+                        ablated_uncollided,
+                        components[2],
+                        station.live_times_s,
+                    ),
+                    dtype=np.float64,
+                )
+                ablated_log_predictive_density = float(
+                    logsumexp(log_weights + ablated_log_likelihood)
+                )
+                density_delta = (
+                    full_log_predictive_density
+                    - ablated_log_predictive_density
+                )
+                isotope_ablation_values[isotope].append(density_delta)
+                ablated_innovation = dict(
+                    model.posterior_predictive_innovation_numpy(
+                        observed,
+                        ablated_total,
+                        ablated_uncollided,
+                        components[2],
+                        station.live_times_s,
+                        weights,
+                        confidence=probability,
+                    )
+                )
+                station_isotope_ablation[isotope] = {
+                    "full_minus_ablation_log_predictive_density": float(
+                        density_delta
+                    ),
+                    "ablated_model_native_innovation": ablated_innovation,
+                }
+            station_results.append(
+                {
+                    "station_sequence_id": int(station.station_sequence_id),
+                    "pose_index": int(station.pose_idx),
+                    "view_count": int(station.fe_indices.size),
+                    "energy_bin_count": int(station.energy_axis_keV.size),
+                    "observed_total_count": float(np.sum(observed_totals)),
+                    "predictive_total_mean": float(
+                        np.sum(predictive_total_mean)
+                    ),
+                    "maximum_abs_standardized_bin_residual": float(
+                        np.max(np.abs(standardized))
+                    ),
+                    "p95_abs_standardized_bin_residual": float(
+                        np.quantile(np.abs(standardized), 0.95)
+                    ),
+                    "marginal_bin_coverage_fraction": float(
+                        np.mean(covered)
+                    ),
+                    "model_native_innovation": innovation,
+                    "isotope_response_ablation": station_isotope_ablation,
+                    "views": view_rows,
+                }
+            )
+
+        def _group_summary(
+            values: Sequence[NDArray[np.float64]],
+            coverage: Sequence[NDArray[np.bool_]] | None = None,
+        ) -> dict[str, float | int | None]:
+            """Summarize residual arrays for one physical view group."""
+            if not values:
+                return {
+                    "view_count": 0,
+                    "mean_standardized_bin_residual": None,
+                    "maximum_abs_standardized_bin_residual": None,
+                    "p95_abs_standardized_bin_residual": None,
+                    "marginal_bin_coverage_fraction": None,
+                }
+            flattened = np.concatenate(
+                [np.asarray(value, dtype=np.float64).reshape(-1) for value in values]
+            )
+            return {
+                "view_count": int(len(values)),
+                "mean_standardized_bin_residual": float(np.mean(flattened)),
+                "maximum_abs_standardized_bin_residual": float(
+                    np.max(np.abs(flattened))
+                ),
+                "p95_abs_standardized_bin_residual": float(
+                    np.quantile(np.abs(flattened), 0.95)
+                ),
+                "marginal_bin_coverage_fraction": (
+                    None
+                    if coverage is None
+                    else float(
+                        np.mean(
+                            np.concatenate(
+                                [
+                                    np.asarray(value, dtype=np.bool_).reshape(-1)
+                                    for value in coverage
+                                ]
+                            )
+                        )
+                    )
+                ),
+            }
+
+        pair_summary = {
+            str(pair_id): _group_summary(
+                pair_values[pair_id],
+                pair_coverages[pair_id],
+            )
+            for pair_id in sorted(pair_values)
+        }
+        obstacle_summary = {
+            label: _group_summary(values)
+            for label, values in obstacle_values.items()
+        }
+        isotope_ablation_summary = {
+            isotope: {
+                "station_count": int(len(values)),
+                "sum_full_minus_ablation_log_predictive_density": float(
+                    np.sum(values, dtype=np.float64)
+                ),
+                "median_full_minus_ablation_log_predictive_density": float(
+                    np.median(values)
+                ),
+                "minimum_full_minus_ablation_log_predictive_density": float(
+                    np.min(values)
+                ),
+                "maximum_full_minus_ablation_log_predictive_density": float(
+                    np.max(values)
+                ),
+            }
+            for isotope, values in isotope_ablation_values.items()
+            if values
+        }
+        worst_rows.sort(
+            key=lambda row: abs(float(row["standardized_residual"])),
+            reverse=True,
+        )
+        return {
+            "available": True,
+            "sampling_semantics": (
+                "stratified_posterior_particle_draw_then_one_exact_"
+                "generative_spectrum_per_draw"
+            ),
+            "sample_count": count,
+            "confidence": probability,
+            "candidate_isotopes": list(self.joint_isotope_order()),
+            "stations": station_results,
+            "shield_pair_summary": pair_summary,
+            "obstacle_line_of_sight_summary": obstacle_summary,
+            "isotope_response_ablation_summary": isotope_ablation_summary,
+            "worst_standardized_bin_residuals": worst_rows[
+                :maximum_worst_bins
+            ],
+            "isotope_response_ablation_semantics": (
+                "diagnostic full-spectrum response-column ablation with all "
+                "other posterior source states and weights held fixed; this "
+                "is not leave-one-isotope-out model evidence"
+            ),
         }
 
     def posterior_convergence_diagnostics(self) -> Dict[str, Any]:

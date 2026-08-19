@@ -473,6 +473,9 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         "cumulative_unique_ancestor_count",
         "r_probability_by_count",
         "transition_weight_mass",
+        "structural_rejection_diagnostics",
+        "joint_cross_isotope_rejection_diagnostics",
+        "joint_cross_isotope_state_rejection_diagnostics",
         "joint_smc_soft_budget_exceeded",
     )
     isotopes = {
@@ -696,8 +699,13 @@ def _write_final_outputs(
         "stop_reason": result.stop_reason,
         "control_budget": asdict(budget),
         "posterior_convergence": estimator.posterior_convergence_diagnostics(),
+        "posterior_predictive_check": estimator.posterior_predictive_check(),
         "structural_transition_provenance": (
             estimator.structural_transition_diagnostics()
+        ),
+        "last_pf_step_diagnostics": estimator.step_diagnostics(
+            top_k=0,
+            include_estimates=False,
         ),
         "detected_isotope_gate": getattr(
             estimator,

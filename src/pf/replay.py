@@ -1141,6 +1141,9 @@ def _write_replay_outputs(
             "reversible_jump_mcmc_used": bool(structural["reversible_jump_mcmc_used"]),
             "structural_transition_provenance": dict(structural),
             "structural_model_manifest": structural_model,
+            "posterior_predictive_check": (
+                estimator.posterior_predictive_check()
+            ),
             "detected_isotope_gate": getattr(
                 estimator,
                 "detected_isotope_gate_diagnostics",

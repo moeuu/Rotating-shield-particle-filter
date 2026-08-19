@@ -3385,30 +3385,98 @@ class IsotopeParticleFilter:
         log_jacobian: NDArray[np.float64],
         support_feasible: NDArray[np.bool_],
         accepted: NDArray[np.bool_],
+        current_cardinality: NDArray[np.int64] | int = -1,
+        proposed_cardinality: NDArray[np.int64] | int = -1,
+        geometry_support_feasible: NDArray[np.bool_] | bool | None = None,
+        strength_support_feasible: NDArray[np.bool_] | bool | None = None,
+        log_acceptance_ratio: NDArray[np.float64] | None = None,
     ) -> None:
-        """Accumulate decomposed exact-MH terms for rejection diagnosis."""
+        """Accumulate batched exact-MH terms for rejection diagnosis."""
+        likelihood = np.asarray(
+            delta_log_likelihood,
+            dtype=np.float64,
+        ).reshape(-1)
+        row_count = int(likelihood.size)
+
+        def _broadcast(
+            value: object,
+            *,
+            dtype: object,
+            name: str,
+        ) -> NDArray[np.generic]:
+            """Broadcast one scalar or aligned diagnostic vector."""
+            array = np.asarray(value, dtype=dtype)
+            try:
+                return np.broadcast_to(array, (row_count,)).copy()
+            except ValueError as exc:
+                raise ValueError(
+                    f"Structural MH diagnostic {name} must align with rows."
+                ) from exc
+
+        prior = _broadcast(
+            delta_log_prior,
+            dtype=np.float64,
+            name="delta_log_prior",
+        )
+        proposal = _broadcast(
+            log_reverse_minus_forward,
+            dtype=np.float64,
+            name="log_reverse_minus_forward",
+        )
+        jacobian = _broadcast(
+            log_jacobian,
+            dtype=np.float64,
+            name="log_jacobian",
+        )
+        support = _broadcast(
+            support_feasible,
+            dtype=np.bool_,
+            name="support_feasible",
+        )
+        geometry_support = _broadcast(
+            support if geometry_support_feasible is None
+            else geometry_support_feasible,
+            dtype=np.bool_,
+            name="geometry_support_feasible",
+        )
+        strength_support = _broadcast(
+            support if strength_support_feasible is None
+            else strength_support_feasible,
+            dtype=np.bool_,
+            name="strength_support_feasible",
+        )
+        if log_acceptance_ratio is None:
+            log_acceptance = likelihood + prior + proposal + jacobian
+        else:
+            log_acceptance = _broadcast(
+                log_acceptance_ratio,
+                dtype=np.float64,
+                name="log_acceptance_ratio",
+            )
         arrays = {
-            "delta_log_likelihood": np.asarray(
-                delta_log_likelihood,
-                dtype=np.float64,
-            ).reshape(-1),
-            "delta_log_prior": np.asarray(
-                delta_log_prior,
-                dtype=np.float64,
-            ).reshape(-1),
-            "log_reverse_minus_forward": np.asarray(
-                log_reverse_minus_forward,
-                dtype=np.float64,
-            ).reshape(-1),
-            "log_jacobian": np.asarray(
-                log_jacobian,
-                dtype=np.float64,
-            ).reshape(-1),
-            "support_feasible": np.asarray(
-                support_feasible,
+            "delta_log_likelihood": likelihood,
+            "delta_log_prior": prior,
+            "log_reverse_minus_forward": proposal,
+            "log_jacobian": jacobian,
+            "log_acceptance_ratio": log_acceptance,
+            "support_feasible": support,
+            "geometry_support_feasible": geometry_support,
+            "strength_support_feasible": strength_support,
+            "accepted": _broadcast(
+                accepted,
                 dtype=np.bool_,
-            ).reshape(-1),
-            "accepted": np.asarray(accepted, dtype=np.bool_).reshape(-1),
+                name="accepted",
+            ),
+            "current_cardinality": _broadcast(
+                current_cardinality,
+                dtype=np.int64,
+                name="current_cardinality",
+            ),
+            "proposed_cardinality": _broadcast(
+                proposed_cardinality,
+                dtype=np.int64,
+                name="proposed_cardinality",
+            ),
         }
         lengths = {int(value.size) for value in arrays.values()}
         if len(lengths) != 1:
@@ -3418,7 +3486,7 @@ class IsotopeParticleFilter:
         )
 
     def _summarize_structural_mh_components(self) -> dict[str, object]:
-        """Return compact rejection counts and finite component quantiles."""
+        """Return compact rejection causes and MH terms by K transition."""
         result: dict[str, object] = {}
         quantile_levels = np.asarray(
             [0.0, 0.1, 0.5, 0.9, 1.0],
@@ -3431,44 +3499,112 @@ class IsotopeParticleFilter:
                 )
                 for key in batches[0]
             }
-            feasible = np.asarray(combined["support_feasible"], dtype=bool)
-            accepted = np.asarray(combined["accepted"], dtype=bool)
             numeric_names = (
                 "delta_log_likelihood",
                 "delta_log_prior",
                 "log_reverse_minus_forward",
                 "log_jacobian",
+                "log_acceptance_ratio",
             )
-            finite_all = feasible.copy()
-            quantiles: dict[str, dict[str, float] | None] = {}
-            for name in numeric_names:
-                values = np.asarray(combined[name], dtype=np.float64)
-                finite = np.isfinite(values)
-                finite_all &= finite
-                if not np.any(finite):
-                    quantiles[name] = None
-                    continue
-                resolved = np.quantile(values[finite], quantile_levels)
-                quantiles[name] = {
-                    label: float(value)
-                    for label, value in zip(
-                        ("min", "p10", "median", "p90", "max"),
-                        resolved,
-                        strict=True,
-                    )
+
+            def _summarize_rows(mask: NDArray[np.bool_]) -> dict[str, object]:
+                """Summarize one vectorized row subset."""
+                feasible = np.asarray(
+                    combined["support_feasible"],
+                    dtype=bool,
+                )[mask]
+                geometry = np.asarray(
+                    combined["geometry_support_feasible"],
+                    dtype=bool,
+                )[mask]
+                strength = np.asarray(
+                    combined["strength_support_feasible"],
+                    dtype=bool,
+                )[mask]
+                accepted = np.asarray(
+                    combined["accepted"],
+                    dtype=bool,
+                )[mask]
+                finite_all = feasible.copy()
+                quantiles: dict[str, dict[str, float | int] | None] = {}
+                for name in numeric_names:
+                    values = np.asarray(
+                        combined[name],
+                        dtype=np.float64,
+                    )[mask]
+                    finite = np.isfinite(values)
+                    finite_all &= finite
+                    if not np.any(finite):
+                        quantiles[name] = None
+                        continue
+                    finite_values = values[finite]
+                    resolved = np.quantile(finite_values, quantile_levels)
+                    quantiles[name] = {
+                        "finite_count": int(finite_values.size),
+                        "mean": float(np.mean(finite_values)),
+                        "std": float(np.std(finite_values)),
+                        **{
+                            label: float(value)
+                            for label, value in zip(
+                                ("min", "p10", "median", "p90", "max"),
+                                resolved,
+                                strict=True,
+                            )
+                        },
+                    }
+                return {
+                    "attempted": int(feasible.size),
+                    "accepted": int(np.count_nonzero(accepted)),
+                    "support_rejected": int(np.count_nonzero(~feasible)),
+                    "geometry_support_rejected": int(
+                        np.count_nonzero(~geometry)
+                    ),
+                    "strength_support_rejected": int(
+                        np.count_nonzero(geometry & ~strength)
+                    ),
+                    "other_support_rejected": int(
+                        np.count_nonzero(geometry & strength & ~feasible)
+                    ),
+                    "nonfinite_rejected": int(
+                        np.count_nonzero(feasible & ~finite_all)
+                    ),
+                    "mh_random_rejected": int(
+                        np.count_nonzero(feasible & finite_all & ~accepted)
+                    ),
+                    "component_quantiles": quantiles,
                 }
-            result[move] = {
-                "attempted": int(feasible.size),
-                "accepted": int(np.count_nonzero(accepted)),
-                "support_rejected": int(np.count_nonzero(~feasible)),
-                "nonfinite_rejected": int(
-                    np.count_nonzero(feasible & ~finite_all)
-                ),
-                "mh_random_rejected": int(
-                    np.count_nonzero(finite_all & ~accepted)
-                ),
-                "component_quantiles": quantiles,
-            }
+
+            all_rows = np.ones(
+                np.asarray(combined["accepted"]).size,
+                dtype=np.bool_,
+            )
+            move_summary = _summarize_rows(all_rows)
+            current = np.asarray(
+                combined["current_cardinality"],
+                dtype=np.int64,
+            )
+            proposed = np.asarray(
+                combined["proposed_cardinality"],
+                dtype=np.int64,
+            )
+            cardinality_rows = (current >= 0) & (proposed >= 0)
+            transition_summaries: dict[str, object] = {}
+            # At most (hard_max_sources + 1)^2 transition labels exist. This
+            # tiny loop only packages already-vectorized numeric summaries.
+            if np.any(cardinality_rows):
+                encoded = np.stack((current, proposed), axis=1)
+                for source_count, destination_count in np.unique(
+                    encoded[cardinality_rows],
+                    axis=0,
+                ).tolist():
+                    transition_mask = cardinality_rows & (
+                        current == int(source_count)
+                    ) & (proposed == int(destination_count))
+                    transition_summaries[
+                        f"{int(source_count)}->{int(destination_count)}"
+                    ] = _summarize_rows(transition_mask)
+            move_summary["by_cardinality_transition"] = transition_summaries
+            result[move] = move_summary
         return result
 
     def _apply_continuous_rj_birth_death(
@@ -3654,6 +3790,14 @@ class IsotopeParticleFilter:
                         np.isfinite(birth_prior_ratio)
                         & np.isfinite(birth_proposal_ratio)
                     )
+                    birth_geometry_support = (
+                        np.isfinite(log_position_density)
+                        & np.isfinite(log_position_proposal)
+                    )
+                    birth_strength_support = (
+                        np.isfinite(log_strength_prior_density)
+                        & np.isfinite(log_strength_proposal_density)
+                    )
                     self._record_structural_mh_components(
                         "birth",
                         delta_log_likelihood=log_target_ratio,
@@ -3665,6 +3809,11 @@ class IsotopeParticleFilter:
                         ),
                         support_feasible=birth_support,
                         accepted=accepted,
+                        current_cardinality=int(cardinality),
+                        proposed_cardinality=int(cardinality) + 1,
+                        geometry_support_feasible=birth_geometry_support,
+                        strength_support_feasible=birth_strength_support,
+                        log_acceptance_ratio=log_ratio,
                     )
                     accepted_births += self._commit_continuous_rj_states(
                         selected_indices,
@@ -3822,6 +3971,14 @@ class IsotopeParticleFilter:
                     np.isfinite(death_prior_ratio)
                     & np.isfinite(death_proposal_ratio)
                 )
+                death_geometry_support = (
+                    np.isfinite(log_position_density)
+                    & np.isfinite(log_reverse_position_proposal)
+                )
+                death_strength_support = (
+                    np.isfinite(log_strength_prior_density)
+                    & np.isfinite(log_reverse_strength_proposal)
+                )
                 self._record_structural_mh_components(
                     "death",
                     delta_log_likelihood=log_target_ratio,
@@ -3833,6 +3990,11 @@ class IsotopeParticleFilter:
                     ),
                     support_feasible=death_support,
                     accepted=accepted,
+                    current_cardinality=int(cardinality),
+                    proposed_cardinality=int(cardinality) - 1,
+                    geometry_support_feasible=death_geometry_support,
+                    strength_support_feasible=death_strength_support,
+                    log_acceptance_ratio=log_ratio,
                 )
                 for row in np.flatnonzero(accepted).tolist():
                     old_state = self.continuous_particles[
@@ -5009,6 +5171,17 @@ class IsotopeParticleFilter:
             log_jacobian=np.zeros(row_count, dtype=np.float64),
             support_feasible=feasible,
             accepted=accepted,
+            current_cardinality=int(cardinality),
+            proposed_cardinality=int(proposed_cardinality),
+            geometry_support_feasible=(
+                np.isfinite(log_forward)
+                & np.isfinite(log_reverse)
+            ),
+            strength_support_feasible=np.all(
+                self._strength_prior.in_support(proposed_strengths),
+                axis=1,
+            ),
+            log_acceptance_ratio=log_ratio,
         )
         self._commit_continuous_rj_states(
             particle_indices,
@@ -5249,6 +5422,17 @@ class IsotopeParticleFilter:
             log_jacobian=np.zeros(row_count, dtype=np.float64),
             support_feasible=feasible,
             accepted=accepted,
+            current_cardinality=int(cardinality),
+            proposed_cardinality=int(proposed_cardinality),
+            geometry_support_feasible=(
+                np.isfinite(log_forward)
+                & np.isfinite(log_reverse)
+            ),
+            strength_support_feasible=np.all(
+                self._strength_prior.in_support(proposed_strengths),
+                axis=1,
+            ),
+            log_acceptance_ratio=log_ratio,
         )
         self._commit_continuous_rj_states(
             particle_indices,
@@ -5460,6 +5644,17 @@ class IsotopeParticleFilter:
                 log_jacobian=np.zeros(row_count, dtype=np.float64),
                 support_feasible=block_support,
                 accepted=accepted,
+                current_cardinality=current_cardinalities[rows],
+                proposed_cardinality=int(cardinality),
+                geometry_support_feasible=(
+                    np.isfinite(proposed_log_proposal)
+                    & np.isfinite(current_log_proposal[rows])
+                ),
+                strength_support_feasible=np.all(
+                    self._strength_prior.in_support(strengths),
+                    axis=1,
+                ) if int(cardinality) else np.ones(row_count, dtype=np.bool_),
+                log_acceptance_ratio=log_ratio,
             )
             accepted_count += self._commit_continuous_rj_states(
                 particle_indices,
@@ -5843,6 +6038,83 @@ class IsotopeParticleFilter:
                         log_ratio,
                         support=feasible,
                     )
+                    split_delta_likelihood = _extended_log_target_ratio(
+                        proposed_ll,
+                        base_ll,
+                    )
+                    split_delta_prior = np.full(
+                        particle_indices.size,
+                        float("nan"),
+                        dtype=np.float64,
+                    )
+                    split_proposal_ratio = np.full_like(
+                        split_delta_prior,
+                        float("nan"),
+                    )
+                    split_log_jacobian = np.full_like(
+                        split_delta_prior,
+                        float("nan"),
+                    )
+                    split_geometry_support = np.ones(
+                        particle_indices.size,
+                        dtype=np.bool_,
+                    )
+                    if valid_rows.size:
+                        split_delta_prior[valid_rows] = (
+                            float(
+                                cardinality_prior.log_prob(
+                                    int(cardinality) + 1
+                                )
+                            )
+                            - float(
+                                cardinality_prior.log_prob(int(cardinality))
+                            )
+                            + math.log(float(int(cardinality) + 1))
+                            + atlas.log_chart_probabilities[
+                                first_child_chart_ids[valid_rows]
+                            ]
+                            + atlas.log_chart_probabilities[
+                                second_child_chart_ids[valid_rows]
+                            ]
+                            - atlas.log_chart_probabilities[
+                                parent_chart_ids[valid_rows]
+                            ]
+                            + self._strength_prior.log_prob(
+                                retained_strength[valid_rows]
+                            )
+                            + self._strength_prior.log_prob(
+                                new_strength[valid_rows]
+                            )
+                            - self._strength_prior.log_prob(
+                                total_strength[valid_rows]
+                            )
+                        )
+                        split_log_jacobian[valid_rows] = np.log(
+                            total_strength[valid_rows]
+                        )
+                        split_proposal_ratio[valid_rows] = (
+                            log_ratio[valid_rows]
+                            - split_delta_likelihood[valid_rows]
+                            - split_delta_prior[valid_rows]
+                            - split_log_jacobian[valid_rows]
+                        )
+                        split_geometry_support[valid_rows] = np.isfinite(
+                            split_proposal_ratio[valid_rows]
+                        )
+                    self._record_structural_mh_components(
+                        "split",
+                        delta_log_likelihood=split_delta_likelihood,
+                        delta_log_prior=split_delta_prior,
+                        log_reverse_minus_forward=split_proposal_ratio,
+                        log_jacobian=split_log_jacobian,
+                        support_feasible=feasible,
+                        accepted=accepted,
+                        current_cardinality=int(cardinality),
+                        proposed_cardinality=int(cardinality) + 1,
+                        geometry_support_feasible=split_geometry_support,
+                        strength_support_feasible=feasible,
+                        log_acceptance_ratio=log_ratio,
+                    )
                     accepted_splits += self._commit_continuous_rj_states(
                         particle_indices,
                         accepted,
@@ -6127,6 +6399,81 @@ class IsotopeParticleFilter:
                 accepted = self._continuous_rj_mh_acceptance_mask(
                     log_ratio,
                     support=feasible,
+                )
+                merge_delta_likelihood = _extended_log_target_ratio(
+                    proposed_ll,
+                    base_ll,
+                )
+                merge_delta_prior = np.full(
+                    particle_indices.size,
+                    float("nan"),
+                    dtype=np.float64,
+                )
+                merge_proposal_ratio = np.full_like(
+                    merge_delta_prior,
+                    float("nan"),
+                )
+                merge_log_jacobian = np.full_like(
+                    merge_delta_prior,
+                    float("nan"),
+                )
+                merge_geometry_support = np.ones(
+                    particle_indices.size,
+                    dtype=np.bool_,
+                )
+                if valid_rows.size:
+                    merge_delta_prior[valid_rows] = (
+                        float(
+                            cardinality_prior.log_prob(int(cardinality) - 1)
+                        )
+                        - float(
+                            cardinality_prior.log_prob(int(cardinality))
+                        )
+                        - math.log(float(int(cardinality)))
+                        + atlas.log_chart_probabilities[
+                            merged_chart_ids[valid_rows]
+                        ]
+                        - atlas.log_chart_probabilities[
+                            first_child_chart_ids[valid_rows]
+                        ]
+                        - atlas.log_chart_probabilities[
+                            second_child_chart_ids[valid_rows]
+                        ]
+                        + self._strength_prior.log_prob(
+                            merged_strength[valid_rows]
+                        )
+                        - self._strength_prior.log_prob(
+                            first_child_strengths[valid_rows]
+                        )
+                        - self._strength_prior.log_prob(
+                            second_child_strengths[valid_rows]
+                        )
+                    )
+                    merge_log_jacobian[valid_rows] = -np.log(
+                        merged_strength[valid_rows]
+                    )
+                    merge_proposal_ratio[valid_rows] = (
+                        log_ratio[valid_rows]
+                        - merge_delta_likelihood[valid_rows]
+                        - merge_delta_prior[valid_rows]
+                        - merge_log_jacobian[valid_rows]
+                    )
+                    merge_geometry_support[valid_rows] = np.isfinite(
+                        merge_proposal_ratio[valid_rows]
+                    )
+                self._record_structural_mh_components(
+                    "merge",
+                    delta_log_likelihood=merge_delta_likelihood,
+                    delta_log_prior=merge_delta_prior,
+                    log_reverse_minus_forward=merge_proposal_ratio,
+                    log_jacobian=merge_log_jacobian,
+                    support_feasible=feasible,
+                    accepted=accepted,
+                    current_cardinality=int(cardinality),
+                    proposed_cardinality=int(cardinality) - 1,
+                    geometry_support_feasible=merge_geometry_support,
+                    strength_support_feasible=feasible,
+                    log_acceptance_ratio=log_ratio,
                 )
                 accepted_merges += self._commit_continuous_rj_states(
                     particle_indices,

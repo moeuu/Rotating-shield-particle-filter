@@ -7,6 +7,7 @@ import math
 import numpy as np
 import pytest
 
+from pf.estimator import RotatingShieldPFEstimator
 from pf.particle_filter import IsotopeParticleFilter
 from pf.structural_rj import (
     BirthDeathMoveProbabilities,
@@ -49,17 +50,58 @@ def test_structural_rejection_diagnostics_decompose_exact_mh_terms() -> None:
         log_jacobian=np.zeros(2, dtype=np.float64),
         support_feasible=np.asarray([True, False]),
         accepted=np.asarray([False, False]),
+        current_cardinality=np.asarray([4, 4]),
+        proposed_cardinality=np.asarray([3, 3]),
+        geometry_support_feasible=np.asarray([True, True]),
+        strength_support_feasible=np.asarray([True, False]),
+        log_acceptance_ratio=np.asarray([-98.5, float("-inf")]),
     )
 
     summary = filt._summarize_structural_mh_components()["multi_merge"]
 
     assert summary["attempted"] == 2
     assert summary["support_rejected"] == 1
+    assert summary["geometry_support_rejected"] == 0
+    assert summary["strength_support_rejected"] == 1
     assert summary["mh_random_rejected"] == 1
     assert summary["component_quantiles"]["delta_log_likelihood"][
         "median"
     ] == pytest.approx(-48.5)
     assert summary["component_quantiles"]["log_jacobian"]["max"] == 0.0
+    assert summary["component_quantiles"]["log_acceptance_ratio"][
+        "median"
+    ] == pytest.approx(-98.5)
+    assert summary["by_cardinality_transition"]["4->3"]["attempted"] == 2
+
+
+def test_cross_isotope_rejection_diagnostics_group_cardinality_transfer() -> None:
+    """Identity-transfer diagnostics must expose isotope and K changes."""
+    summary = RotatingShieldPFEstimator._summarize_joint_cross_isotope_transfer(
+        attempted_rows=np.asarray([0, 1], dtype=np.int64),
+        donor_by_row=np.asarray([0, 0], dtype=np.int64),
+        receiver_by_row=np.asarray([1, 1], dtype=np.int64),
+        donor_cardinality=np.asarray([2, 2], dtype=np.int64),
+        receiver_cardinality=np.asarray([1, 1], dtype=np.int64),
+        group_sizes=np.asarray([1, 1], dtype=np.int64),
+        isotope_order=("Cs-137", "Co-60"),
+        delta_log_likelihood=np.asarray([-5.0, -1.0]),
+        delta_log_prior=np.asarray([0.5, 0.5]),
+        log_reverse_minus_forward=np.asarray([0.0, 0.0]),
+        log_acceptance_ratio=np.asarray([-4.5, -0.5]),
+        support_feasible=np.asarray([True, False]),
+        strength_support_feasible=np.asarray([True, False]),
+        accepted=np.asarray([False, False]),
+    )
+
+    assert summary["attempted"] == 2
+    assert summary["strength_support_rejected"] == 1
+    transfer = summary["by_isotope_cardinality_transfer"][
+        "Cs-137:2->1|Co-60:1->2"
+    ]
+    assert transfer["attempted"] == 2
+    assert transfer["component_quantiles"]["delta_log_likelihood"][
+        "median"
+    ] == pytest.approx(-3.0)
 
 
 def test_poisson_geometric_tail_keeps_five_typical_but_six_possible() -> None:

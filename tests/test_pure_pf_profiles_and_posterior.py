@@ -1177,6 +1177,11 @@ def test_convergence_consumes_native_full_spectrum_innovation_schema(
     )
 
     innovation = estimator._latest_joint_station_innovation()
+    predictive = estimator.posterior_predictive_check(
+        sample_count=4,
+        confidence=0.95,
+        worst_bin_count=2,
+    )
     convergence = estimator.posterior_convergence_diagnostics()
 
     assert innovation["available"] is True
@@ -1184,6 +1189,12 @@ def test_convergence_consumes_native_full_spectrum_innovation_schema(
     assert innovation["dimension"] == bin_count
     assert innovation["renewal_total_max_abs_z"] is not None
     assert "conditional_mark_tail_probability" in innovation
+    assert predictive["available"] is True
+    assert predictive["sample_count"] == 4
+    assert predictive["stations"][0]["view_count"] == 1
+    assert "0" in predictive["shield_pair_summary"]
+    assert "Cs-137" in predictive["isotope_response_ablation_summary"]
+    assert len(predictive["worst_standardized_bin_residuals"]) == 2
     assert convergence["isotopes"]["Cs-137"]["innovation"] == innovation
 
 
