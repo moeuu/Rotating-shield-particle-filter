@@ -7381,6 +7381,14 @@ class RotatingShieldPFEstimator:
             & np.isfinite(log_reverse)
             & np.isfinite(log_prior_ratio)
         )
+        diagnostic_proposal_ratio = np.full(
+            particle_count,
+            float("nan"),
+            dtype=np.float64,
+        )
+        diagnostic_proposal_ratio[rows] = (
+            log_reverse[rows] - log_forward[rows]
+        )
         self.last_joint_cross_isotope_rejection_diagnostics = (
             self._summarize_joint_cross_isotope_transfer(
                 attempted_rows=attempted_rows,
@@ -7392,7 +7400,7 @@ class RotatingShieldPFEstimator:
                 isotope_order=isotope_order,
                 delta_log_likelihood=diagnostic_delta_likelihood,
                 delta_log_prior=log_prior_ratio,
-                log_reverse_minus_forward=log_reverse - log_forward,
+                log_reverse_minus_forward=diagnostic_proposal_ratio,
                 log_acceptance_ratio=diagnostic_log_ratio,
                 support_feasible=diagnostic_support,
                 strength_support_feasible=diagnostic_strength_support,
