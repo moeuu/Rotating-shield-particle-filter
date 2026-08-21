@@ -135,6 +135,11 @@ kernel includes:
 - an exact joint isotope-state block whose isotope priors remain independent
   while the shared full-spectrum likelihood decides one simultaneous move.
 
+The older cross-isotope cardinality-transfer proposal is disabled in the
+strict runtime. It remains available only through the explicitly labelled
+`pf_strict_gamma_legacy_transfer.json` causal diagnostic, where the joint
+isotope-state block is disabled so the two proposal generations are not mixed.
+
 The ordinary cardinality model is defined through `K=5`. A proper geometric
 tail gives `K=6..8` nonzero support so `K=5` is not an artificial absorbing
 boundary; `K=8` is the explicit memory/capacity limit. The standard tail ratio
@@ -183,9 +188,10 @@ exploration absorbing state.
 Particle, source-slot, line, view, spectrum-bin, candidate, and shield-program
 dimensions use batched NumPy/Torch kernels with explicit chunks and caches.
 CUDA uses float64 for the production likelihood. CPU and GPU paths implement
-the same distribution and have equivalence tests. Geant4 uses native worker
-threads. Scalar implementations are limited to tiny deterministic test or
-debug oracles.
+the same distribution and have equivalence tests. CPU execution uses batched
+NumPy or multithreaded Torch-CPU kernels; there is no separate Python-worker
+count. Geant4 uses native worker threads. Scalar implementations are limited
+to tiny deterministic test or debug oracles.
 
 ## MeasurementLog replay
 

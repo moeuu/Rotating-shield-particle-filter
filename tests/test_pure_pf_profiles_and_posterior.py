@@ -753,7 +753,6 @@ def _stable_fixed_k_estimator() -> RotatingShieldPFEstimator:
             np.asarray([10.0], dtype=float),
         )
         particle.log_weight = float(np.log(0.5))
-    estimator.history_estimates = [estimator.estimates(), estimator.estimates()]
     return estimator
 
 
@@ -966,12 +965,19 @@ def test_runtime_schema_rejects_malformed_cardinality_settings(
         "continuous_surface_chart_max_edge_m",
         "count_likelihood_model",
         "delayed_resample_update",
+        "detector_height_sampling_mode",
+        "history_estimate_interval",
         "init_num_sources_min",
         "joint_observation_update",
+        "measurement_pose_clearance_enabled",
+        "path_planner",
+        "pose_selection_workers",
+        "python_worker_count",
         "roughening_k",
         "sparse_poisson_evidence_enable",
         "spectrum_likelihood_bin_chunk",
         "structural_rj_patch_spacing_m",
+        "surface_observability_diagnostic_candidates",
         "refit_after_moves",
         "response_poisson_count_variance_ceiling_enable",
         "spectrum_count_method",
@@ -1132,8 +1138,6 @@ def test_surface_credible_radius_does_not_collapse_on_a_broad_plane() -> None:
         np.asarray([[5.0, 0.0, 0.0]], dtype=float),
         np.asarray([10.0], dtype=float),
     )
-    estimator.history_estimates = [estimator.estimates(), estimator.estimates()]
-
     radii = estimator.credible_surface_radii()
     diagnostics = estimator.posterior_convergence_diagnostics()
 
@@ -1550,8 +1554,8 @@ def test_structural_model_manifest_resolves_priors_and_surface_atlases() -> None
     )
 
 
-def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning() -> None:
-    """The PF-owned config retains budget and 3-D planning policy."""
+def test_strict_profile_keeps_pf_budget_and_retires_runtime_placeholders() -> None:
+    """The PF config keeps its budget without obsolete runtime placeholders."""
     root = Path(__file__).resolve().parents[1]
     resolved = enforce_pure_runtime_settings(
         load_runtime_config(root / "configs/pf/pf_strict_3d.json")
@@ -1567,10 +1571,10 @@ def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning() -> None:
     assert resolved["adaptive_mission_stop"] is False
     assert resolved["measurement_budget_max_steps"] == 160
     assert resolved["mission_stop_max_poses"] == 20
-    assert resolved["detector_height_sampling_mode"] == "continuous"
-    assert resolved["measurement_pose_clearance_enabled"] is True
-    assert resolved["path_planner"] == "dss_pp"
     assert resolved["cui_truth_display_mode"] == "evaluation_live"
+    assert "detector_height_sampling_mode" not in resolved
+    assert "measurement_pose_clearance_enabled" not in resolved
+    assert "path_planner" not in resolved
     assert "spectrum_count_method" not in resolved
     assert "calibration_count_method" not in resolved
     assert "sim_backend" not in resolved
@@ -1582,7 +1586,7 @@ def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning() -> None:
     assert int(dss["max_programs"]) >= 1
 
 
-def test_standard_geant4_config_selects_exact_surface_rj_kernel() -> None:
+def test_standard_pf_config_selects_exact_surface_rj_kernel() -> None:
     """The PF config must select only exact surface RJ-MH."""
     root = Path(__file__).resolve().parents[1]
     payload = load_runtime_config(root / "configs/pf/pf_strict_3d.json")
@@ -1608,17 +1612,44 @@ def test_standard_geant4_config_selects_exact_surface_rj_kernel() -> None:
     assert float(payload["structural_cardinality_prior_mean"]) > 0.0
 
 
-def test_standard_pf_config_selects_parallel_compute_paths() -> None:
-    """The standard PF config must select parallel planning worker paths."""
+def test_standard_pf_config_selects_batched_cuda_compute() -> None:
+    """The standard PF config must select its real batched CUDA backend."""
     root = Path(__file__).resolve().parents[1]
     payload = enforce_pure_runtime_settings(
         load_runtime_config(root / "configs/pf/pf_strict_3d.json")
     )
 
-    assert int(payload["python_worker_count"]) > 1
-    assert int(payload["pose_selection_workers"]) > 1
-    # Standard replay keeps isotope order deterministic; parallel work stays
-    # inside batched PF kernels and independent planner evaluations.
+    assert payload["use_gpu"] is True
+    assert payload["gpu_device"] == "cuda"
+    assert payload["gpu_dtype"] == "float64"
+    assert int(payload["joint_strength_block_batch_size"]) > 1
+    assert int(payload["structural_rj_proposal_chart_batch_size"]) > 1
+    assert float(payload["joint_cross_isotope_state_block_probability"]) > 0.0
+    assert "joint_cross_isotope_transfer_probability" not in payload
+    assert "joint_cross_isotope_transfer_max_group" not in payload
+    assert "python_worker_count" not in payload
+    assert "pose_selection_workers" not in payload
+
+
+def test_legacy_isotope_transfer_is_confined_to_diagnostic_config() -> None:
+    """The old scalar transfer proposal must not run in the strict kernel."""
+    root = Path(__file__).resolve().parents[1]
+    standard = load_runtime_config(root / "configs/pf/pf_strict_3d.json")
+    joint = load_runtime_config(
+        root / "configs/pf/diagnostics/pf_strict_gamma_joint.json"
+    )
+    legacy = load_runtime_config(
+        root / "configs/pf/diagnostics/pf_strict_gamma_legacy_transfer.json"
+    )
+
+    for payload in (standard, joint):
+        assert "joint_cross_isotope_transfer_probability" not in payload
+        assert "joint_cross_isotope_transfer_max_group" not in payload
+        assert float(payload["joint_cross_isotope_state_block_probability"]) > 0.0
+    assert RotatingShieldPFConfig().joint_cross_isotope_transfer_probability == 0.0
+    assert legacy["joint_cross_isotope_state_block_probability"] == 0.0
+    assert legacy["joint_cross_isotope_transfer_probability"] == 0.1
+    assert legacy["joint_cross_isotope_transfer_max_group"] == 3
 
 
 def test_final_estimates_are_projected_directly_from_pf_posterior(

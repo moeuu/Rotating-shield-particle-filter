@@ -189,29 +189,36 @@ class ParticleTemperingMixin:
 
         if logw.ndim != 1 or int(logw.numel()) <= 0:
             raise ValueError("Particle log weights must be a nonempty vector.")
-        if bool(torch.any(torch.isnan(logw)).detach().cpu().item()) or bool(
-            torch.any(torch.isinf(logw) & (logw > 0.0)).detach().cpu().item()
-        ):
+        finite_max = torch.max(logw)
+        shifted = logw - finite_max
+        shifted_normalizer = torch.logsumexp(shifted, dim=0)
+        normalized = shifted - shifted_normalizer
+        status = (
+            torch.stack(
+                (
+                    torch.any(torch.isnan(logw)),
+                    torch.any(torch.isinf(logw) & (logw > 0.0)),
+                    torch.any(torch.isfinite(logw)),
+                    torch.isfinite(finite_max),
+                    torch.isfinite(shifted_normalizer),
+                    torch.any(torch.isnan(normalized)),
+                    torch.any(torch.isinf(normalized) & (normalized > 0.0)),
+                )
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        if bool(status[0]) or bool(status[1]):
             raise RuntimeError("Particle log weights contain NaN or positive infinity.")
-        if not bool(torch.any(torch.isfinite(logw)).detach().cpu().item()):
+        if not bool(status[2]):
             raise RuntimeError(
                 "All particle log weights are negative infinity; posterior "
                 "normalization is undefined."
             )
-        finite_max = torch.max(logw)
-        if not bool(torch.isfinite(finite_max).detach().cpu().item()):
+        if not bool(status[3]) or not bool(status[4]):
             raise RuntimeError("Particle log-weight normalizer is non-finite.")
-        shifted = logw - finite_max
-        shifted_normalizer = torch.logsumexp(shifted, dim=0)
-        if not bool(torch.isfinite(shifted_normalizer).detach().cpu().item()):
-            raise RuntimeError("Particle log-weight normalizer is non-finite.")
-        normalized = shifted - shifted_normalizer
-        if bool(torch.any(torch.isnan(normalized)).detach().cpu().item()) or bool(
-            torch.any(torch.isinf(normalized) & (normalized > 0.0))
-            .detach()
-            .cpu()
-            .item()
-        ):
+        if bool(status[5]) or bool(status[6]):
             raise RuntimeError("Normalized particle log weights are invalid.")
         return normalized
 
@@ -221,13 +228,31 @@ class ParticleTemperingMixin:
 
         if logw.ndim != 1 or int(logw.numel()) <= 0:
             raise ValueError("ESS requires a nonempty normalized log-weight vector.")
-        if (
-            bool(torch.any(torch.isnan(logw)).detach().cpu().item())
-            or bool(torch.any(torch.isinf(logw) & (logw > 0.0)).detach().cpu().item())
-            or not bool(torch.any(torch.isfinite(logw)).detach().cpu().item())
-        ):
+        log_normalizer_tensor = torch.logsumexp(logw, dim=0)
+        w = torch.exp(logw)
+        denominator_tensor = torch.sum(w**2)
+        ess_tensor = torch.reciprocal(denominator_tensor)
+        summary = (
+            torch.stack(
+                (
+                    torch.any(torch.isnan(logw)).to(dtype=logw.dtype),
+                    torch.any(torch.isinf(logw) & (logw > 0.0)).to(
+                        dtype=logw.dtype
+                    ),
+                    torch.any(torch.isfinite(logw)).to(dtype=logw.dtype),
+                    log_normalizer_tensor,
+                    denominator_tensor,
+                    ess_tensor,
+                )
+            )
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
+        )
+        if bool(summary[0]) or bool(summary[1]) or not bool(summary[2]):
             raise RuntimeError("ESS received invalid particle log weights.")
-        log_normalizer = float(torch.logsumexp(logw, dim=0).detach().cpu().item())
+        log_normalizer = float(summary[3])
         if not np.isfinite(log_normalizer) or not np.isclose(
             log_normalizer,
             0.0,
@@ -235,17 +260,117 @@ class ParticleTemperingMixin:
             atol=1.0e-10,
         ):
             raise ValueError("ESS requires already normalized log weights.")
-        w = torch.exp(logw)
-        denominator = float(torch.sum(w**2).detach().cpu().item())
+        denominator = float(summary[4])
         if not np.isfinite(denominator) or denominator <= 0.0:
             raise RuntimeError("ESS denominator must be finite and positive.")
-        ess = 1.0 / denominator
+        ess = float(summary[5])
         if (
             not np.isfinite(ess)
             or not 1.0 - 1.0e-9 <= ess <= int(logw.numel()) + 1.0e-9
         ):
             raise RuntimeError("Effective sample size lies outside its support.")
         return float(ess)
+
+    @staticmethod
+    def _tempering_log_weights_and_ess_torch(
+        logw_prev: "torch.Tensor",
+        ll_t: "torch.Tensor",
+        delta_beta: "torch.Tensor",
+    ) -> tuple["torch.Tensor", "torch.Tensor"]:
+        """Return normalized weights and ESS without leaving the Torch device.
+
+        The caller validates the aligned inputs once before invoking this
+        inner tempering primitive.  Keeping its scalar ESS tensor on-device is
+        important because adaptive bisection otherwise synchronizes CUDA with
+        the host on every one of its fixed 48 iterations.
+        """
+        import torch
+
+        unnormalized = logw_prev + delta_beta * ll_t
+        finite_max = torch.max(unnormalized)
+        shifted = unnormalized - finite_max
+        normalized = shifted - torch.logsumexp(shifted, dim=0)
+        weights = torch.exp(normalized)
+        ess = torch.reciprocal(torch.sum(weights**2))
+        return normalized, ess
+
+    def _validated_tempering_candidate_torch(
+        self,
+        logw_prev: "torch.Tensor",
+        ll_t: "torch.Tensor",
+        delta_beta: float,
+    ) -> tuple["torch.Tensor", float]:
+        """Return one valid candidate using a single normal-case host sync."""
+        import torch
+
+        delta = torch.as_tensor(
+            delta_beta,
+            device=logw_prev.device,
+            dtype=logw_prev.dtype,
+        )
+        normalized, ess_tensor = self._tempering_log_weights_and_ess_torch(
+            logw_prev,
+            ll_t,
+            delta,
+        )
+        ess = float(ess_tensor.detach().cpu().item())
+        if not np.isfinite(ess) or not (
+            1.0 - 1.0e-9 <= ess <= int(logw_prev.numel()) + 1.0e-9
+        ):
+            # Re-enter the detailed validators only on invalid input so the
+            # established exception classes and messages remain unchanged.
+            normalized = self._normalized_log_weights_torch(
+                logw_prev + delta * ll_t
+            )
+            ess = self._ess_from_logw_torch(normalized)
+        return normalized, ess
+
+    def _tempering_bisection_torch(
+        self,
+        logw_prev: "torch.Tensor",
+        ll_t: "torch.Tensor",
+        *,
+        minimum_delta: float,
+        remaining: float,
+        target_ess: float,
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        """Solve the fixed-iteration ESS bisection entirely on the device."""
+        import torch
+
+        low = torch.as_tensor(
+            minimum_delta,
+            device=logw_prev.device,
+            dtype=logw_prev.dtype,
+        )
+        high = torch.as_tensor(
+            remaining,
+            device=logw_prev.device,
+            dtype=logw_prev.dtype,
+        )
+        target = torch.as_tensor(
+            target_ess,
+            device=logw_prev.device,
+            dtype=logw_prev.dtype,
+        )
+        # This loop is a fixed-depth scalar decision tree, not a loop over PF
+        # particles. Every likelihood/weight reduction remains a batched Torch
+        # kernel, and torch.where avoids a per-iteration host synchronization.
+        for _ in range(48):
+            midpoint = 0.5 * (low + high)
+            _, midpoint_ess = self._tempering_log_weights_and_ess_torch(
+                logw_prev,
+                ll_t,
+                midpoint,
+            )
+            keeps_target = midpoint_ess >= target
+            low = torch.where(keeps_target, midpoint, low)
+            high = torch.where(keeps_target, high, midpoint)
+        logw_best, ess_best = self._tempering_log_weights_and_ess_torch(
+            logw_prev,
+            ll_t,
+            low,
+        )
+        return low, logw_best, ess_best
 
     def _select_delta_beta(
         self,
@@ -281,21 +406,34 @@ class ParticleTemperingMixin:
         ):
             raise ValueError("Tempering target ESS lies outside particle support.")
         self._ess_from_logw_torch(logw_prev)
-        if bool(torch.any(torch.isnan(ll_t)).detach().cpu().item()) or bool(
-            torch.any(torch.isinf(ll_t) & (ll_t > 0.0)).detach().cpu().item()
-        ):
+        likelihood_status = (
+            torch.stack(
+                (
+                    torch.any(torch.isnan(ll_t)),
+                    torch.any(torch.isinf(ll_t) & (ll_t > 0.0)),
+                    torch.any(torch.isfinite(ll_t)),
+                )
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        if bool(likelihood_status[0]) or bool(likelihood_status[1]):
             raise RuntimeError(
                 "Tempering likelihood contains NaN or positive infinity."
             )
-        if not bool(torch.any(torch.isfinite(ll_t)).detach().cpu().item()):
+        if not bool(likelihood_status[2]):
             raise RuntimeError(
                 "All particle likelihoods are negative infinity; the "
                 "observation is impossible under the PF model."
             )
         min_delta = float(self.config.min_delta_beta)
         if remaining <= min_delta:
-            logw_new = self._normalized_log_weights_torch(logw_prev + remaining * ll_t)
-            ess = self._ess_from_logw_torch(logw_new)
+            logw_new, ess = self._validated_tempering_candidate_torch(
+                logw_prev,
+                ll_t,
+                remaining,
+            )
             if ess + 1.0e-9 < target_ess:
                 raise TemperingIncrementRequiresRejuvenation(
                     "The final configured tempering increment would violate "
@@ -304,34 +442,40 @@ class ParticleTemperingMixin:
                 )
             return remaining, logw_new, ess
 
-        logw_full = self._normalized_log_weights_torch(logw_prev + remaining * ll_t)
-        ess_full = self._ess_from_logw_torch(logw_full)
+        logw_full, ess_full = self._validated_tempering_candidate_torch(
+            logw_prev,
+            ll_t,
+            remaining,
+        )
         if ess_full >= target_ess:
             return remaining, logw_full, ess_full
 
-        logw_low = self._normalized_log_weights_torch(logw_prev + min_delta * ll_t)
-        ess_low = self._ess_from_logw_torch(logw_low)
+        logw_low, ess_low = self._validated_tempering_candidate_torch(
+            logw_prev,
+            ll_t,
+            min_delta,
+        )
         if ess_low < target_ess:
             raise TemperingIncrementRequiresRejuvenation(
                 "No configured positive tempering increment preserves target "
                 "ESS before rejuvenation at the current intermediate target."
             )
 
-        low = min_delta
-        high = remaining
-        logw_best = logw_low
-        ess_best = ess_low
-        for _ in range(48):
-            mid = 0.5 * (low + high)
-            logw_mid = self._normalized_log_weights_torch(logw_prev + mid * ll_t)
-            ess_mid = self._ess_from_logw_torch(logw_mid)
-            if ess_mid >= target_ess:
-                low = mid
-                logw_best = logw_mid
-                ess_best = ess_mid
-            else:
-                high = mid
-        return low, logw_best, ess_best
+        low, logw_best, ess_best = self._tempering_bisection_torch(
+            logw_prev,
+            ll_t,
+            minimum_delta=min_delta,
+            remaining=remaining,
+            target_ess=target_ess,
+        )
+        summary = (
+            torch.stack((low, ess_best))
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
+        )
+        return float(summary[0]), logw_best, float(summary[1])
 
     @property
     def continuous_weights(self) -> NDArray[np.float64]:

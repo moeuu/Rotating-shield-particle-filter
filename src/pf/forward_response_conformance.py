@@ -102,6 +102,81 @@ def _obstacle_grid(
     )
 
 
+def _detector_pose_table(
+    poses: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[str, ...], NDArray[np.float64], NDArray[np.float64]]:
+    """Return validated pose IDs, detector positions, and live times."""
+    pose_ids: list[str] = []
+    detector_positions = np.empty((len(poses), 3), dtype=np.float64)
+    live_times = np.empty(len(poses), dtype=np.float64)
+    for index, pose in enumerate(poses):
+        pose_id = str(pose.get("pose_id", "")).strip()
+        live_time_s = float(pose.get("live_time_s", np.nan))
+        if not pose_id or not np.isfinite(live_time_s) or live_time_s <= 0.0:
+            raise ForwardResponseFixtureError(
+                "Each detector pose needs a pose_id and positive live_time_s."
+            )
+        pose_ids.append(pose_id)
+        detector_positions[index] = _xyz(
+            pose,
+            field="xyz",
+            owner=f"pose={pose_id}",
+        )
+        live_times[index] = live_time_s
+    return tuple(pose_ids), detector_positions, live_times
+
+
+def _source_point_table(
+    source_points: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[str, ...], NDArray[np.float64]]:
+    """Return validated source IDs and aligned continuous XYZ positions."""
+    source_ids: list[str] = []
+    positions = np.empty((len(source_points), 3), dtype=np.float64)
+    for index, source in enumerate(source_points):
+        source_id = str(source.get("source_id", "")).strip()
+        if not source_id:
+            raise ForwardResponseFixtureError(
+                "Each source point needs a source_id."
+            )
+        source_ids.append(source_id)
+        positions[index] = _xyz(
+            source,
+            field="xyz",
+            owner=f"source={source_id}",
+        )
+    return tuple(source_ids), positions
+
+
+def _case_ids_for_isotope(
+    *,
+    isotope: str,
+    pose_ids: Sequence[str],
+    fe_pair_indices: NDArray[np.int64],
+    pb_pair_indices: NDArray[np.int64],
+    source_ids: Sequence[str],
+    obstacle_ids: Sequence[str],
+) -> NDArray[np.str_]:
+    """Materialize case metadata in the provider-neutral required order."""
+    # This loop creates strings only. All physical pose, pair, source, line,
+    # and obstacle-component transport is evaluated by batched kernels.
+    return np.asarray(
+        [
+            f"{isotope}|pose={pose_id}|fe={int(fe_index):02d}|"
+            f"pb={int(pb_index):02d}|source={source_id}|"
+            f"obstacle={obstacle_id}"
+            for pose_id in pose_ids
+            for fe_index, pb_index in zip(
+                fe_pair_indices,
+                pb_pair_indices,
+                strict=True,
+            )
+            for source_id in source_ids
+            for obstacle_id in obstacle_ids
+        ],
+        dtype=np.str_,
+    )
+
+
 def evaluate_forward_response_fixture(
     payload: Mapping[str, Any],
 ) -> tuple[NDArray[np.str_], NDArray[np.float64]]:
@@ -178,56 +253,96 @@ def evaluate_forward_response_fixture(
         for obstacle_id, grid in grids.items()
     }
 
-    case_ids: list[str] = []
-    unit_response: list[float] = []
-    for isotope in isotopes:
-        for pose in poses:
-            pose_id = str(pose.get("pose_id", "")).strip()
-            detector_xyz = _xyz(pose, field="xyz", owner=f"pose={pose_id}")
-            live_time_s = float(pose.get("live_time_s", np.nan))
-            if not pose_id or not np.isfinite(live_time_s) or live_time_s <= 0.0:
-                raise ForwardResponseFixtureError(
-                    "Each detector pose needs a pose_id and positive live_time_s."
-                )
-            for fe_index in fe_indices:
-                for pb_index in pb_indices:
-                    for source in source_points:
-                        source_id = str(source.get("source_id", "")).strip()
-                        source_xyz = _xyz(
-                            source,
-                            field="xyz",
-                            owner=f"source={source_id}",
-                        )
-                        if not source_id:
-                            raise ForwardResponseFixtureError(
-                                "Each source point needs a source_id."
-                            )
-                        for obstacle in obstacles:
-                            obstacle_id = str(obstacle["obstacle_id"])
-                            case_ids.append(
-                                f"{isotope}|pose={pose_id}|fe={fe_index:02d}|"
-                                f"pb={pb_index:02d}|source={source_id}|"
-                                f"obstacle={obstacle_id}"
-                            )
-                            response = kernels[obstacle_id].expected_counts_pair(
-                                isotope=isotope,
-                                detector_pos=detector_xyz,
-                                sources=source_xyz.reshape(1, 3),
-                                strengths=np.ones(1, dtype=np.float64),
-                                fe_index=fe_index,
-                                pb_index=pb_index,
-                                live_time_s=live_time_s,
-                                background=0.0,
-                            )
-                            if not np.isfinite(response) or response < 0.0:
-                                raise RuntimeError(
-                                    f"PF kernel returned invalid response for {case_ids[-1]}."
-                                )
-                            unit_response.append(float(response))
-    return (
-        np.asarray(case_ids, dtype=np.str_),
-        np.asarray(unit_response, dtype=np.float64),
+    pose_ids, detector_positions, live_times = _detector_pose_table(poses)
+    source_ids, source_positions = _source_point_table(source_points)
+    obstacle_ids = tuple(str(obstacle["obstacle_id"]) for obstacle in obstacles)
+    fe_pair_indices = np.repeat(
+        np.asarray(fe_indices, dtype=np.int64),
+        len(pb_indices),
     )
+    pb_pair_indices = np.tile(
+        np.asarray(pb_indices, dtype=np.int64),
+        len(fe_indices),
+    )
+    fe_program = np.broadcast_to(
+        fe_pair_indices,
+        (detector_positions.shape[0], fe_pair_indices.size),
+    ).copy()
+    pb_program = np.broadcast_to(
+        pb_pair_indices,
+        (detector_positions.shape[0], pb_pair_indices.size),
+    ).copy()
+
+    case_id_parts: list[NDArray[np.str_]] = []
+    response_parts: list[NDArray[np.float64]] = []
+    for isotope in isotopes:
+        reference_kernel = kernels[obstacle_ids[0]]
+        line_indices = reference_kernel.positive_line_indices(isotope)
+        branching_weights = reference_kernel.line_branching_weights(
+            isotope,
+            line_indices,
+        )
+        obstacle_responses: list[NDArray[np.float64]] = []
+        # Each fixture obstacle entry is an alternative complete environment,
+        # not one obstacle component. ContinuousKernel batches every component
+        # inside that environment across all poses, pairs, sources, and lines.
+        for obstacle_id in obstacle_ids:
+            kernel = kernels[obstacle_id]
+            if not np.array_equal(
+                kernel.line_branching_weights(isotope, line_indices),
+                branching_weights,
+            ):
+                raise RuntimeError(
+                    "Conformance obstacle variants changed isotope line weights."
+                )
+            components = kernel.line_transport_components_pair_program_for_detectors(
+                isotope=isotope,
+                detector_positions=detector_positions,
+                sources=source_positions,
+                fe_indices=fe_program,
+                pb_indices=pb_program,
+                positive_line_indices=line_indices,
+            )
+            total_kernel = np.asarray(
+                components.total_kernel,
+                dtype=np.float64,
+            )
+            expected_shape = (
+                detector_positions.shape[0],
+                fe_pair_indices.size,
+                source_positions.shape[0],
+                line_indices.size,
+            )
+            if total_kernel.shape != expected_shape:
+                raise RuntimeError(
+                    "Batched PF conformance transport returned an invalid shape."
+                )
+            response = np.einsum(
+                "pvsl,l->pvs",
+                total_kernel,
+                branching_weights,
+                optimize=True,
+            ) * live_times[:, None, None]
+            obstacle_responses.append(response)
+        ordered_response = np.stack(obstacle_responses, axis=-1)
+        if np.any(~np.isfinite(ordered_response)) or np.any(ordered_response < 0.0):
+            raise RuntimeError(
+                f"PF kernel returned an invalid response for isotope {isotope!r}."
+            )
+        case_id_parts.append(
+            _case_ids_for_isotope(
+                isotope=isotope,
+                pose_ids=pose_ids,
+                fe_pair_indices=fe_pair_indices,
+                pb_pair_indices=pb_pair_indices,
+                source_ids=source_ids,
+                obstacle_ids=obstacle_ids,
+            )
+        )
+        response_parts.append(
+            np.ascontiguousarray(ordered_response.reshape(-1), dtype=np.float64)
+        )
+    return np.concatenate(case_id_parts), np.concatenate(response_parts)
 
 
 def write_forward_response_conformance(

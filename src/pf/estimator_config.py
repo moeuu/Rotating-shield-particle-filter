@@ -58,7 +58,6 @@ class RotatingShieldPFConfig:
     max_sources: int | None = DEFAULT_MAX_SOURCES_PER_ISOTOPE
     hard_max_sources: int | None = None
     variable_cardinality: bool = True
-    history_estimate_interval: int = 1
     surface_diagnostic_response_cache_max_entries: int = 24
     structural_rj_surface_chart_max_edge_m: float = 1.0
     structural_rj_move_probability: float = 1.0
@@ -140,7 +139,6 @@ class RotatingShieldPFConfig:
         """Validate and normalize estimator configuration values."""
         integer_fields = (
             ("num_particles", self.num_particles, 1),
-            ("history_estimate_interval", self.history_estimate_interval, 0),
             (
                 "joint_strength_block_batch_size",
                 self.joint_strength_block_batch_size,
@@ -623,7 +621,6 @@ class RotatingShieldPFConfig:
             raise ValueError(
                 "structural_cardinality_prior_mean must be finite and positive."
             )
-        self.history_estimate_interval = max(0, int(self.history_estimate_interval))
         self.surface_diagnostic_response_cache_max_entries = max(
             0,
             int(self.surface_diagnostic_response_cache_max_entries),

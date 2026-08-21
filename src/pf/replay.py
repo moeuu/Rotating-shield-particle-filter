@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import fields
 import hashlib
 import json
@@ -913,9 +914,12 @@ def _trace_row(
     record: MeasurementLogRecord,
     *,
     record_index: int,
+    state_payload: tuple[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Serialize one causal posterior state at a record boundary."""
-    serialized = estimator.serialized_state()
+    """Return one causal posterior row at a record boundary."""
+    if state_payload is None:
+        state_payload = _trace_state_payload(estimator)
+    state_sha256, posterior = state_payload
     return {
         "schema_version": 2,
         "estimator_family": "pure_particle_filter",
@@ -925,9 +929,17 @@ def _trace_row(
         "action_id": int(record.action_id),
         "station_id": int(record.station_id),
         "station_complete": _station_complete(record),
-        "state_sha256": _sha256_bytes(serialized),
-        "posterior": estimator.posterior_snapshot().to_dict(),
+        "state_sha256": state_sha256,
+        "posterior": copy.deepcopy(posterior),
     }
+
+
+def _trace_state_payload(
+    estimator: PurePFEstimator,
+) -> tuple[str, dict[str, Any]]:
+    """Build the reusable trace payload for one unchanged estimator state."""
+    serialized = estimator.serialized_state()
+    return _sha256_bytes(serialized), estimator.posterior_snapshot().to_dict()
 
 
 def replay_records(
@@ -969,6 +981,7 @@ def replay_records(
     pending_records: list[tuple[object, ...]] = []
     completed_station_ids: set[int] = set()
     previous_station_id: int | None = None
+    trace_state_payload: tuple[str, dict[str, Any]] | None = None
 
     for record_index, record in enumerate(log.records[:limit]):
         step_id = _json_integer(
@@ -1036,6 +1049,7 @@ def replay_records(
             station_pose[station_id] = pose.copy()
             station_quaternion[station_id] = quaternion.copy()
             station_pose_index[station_id] = pose_index
+            trace_state_payload = None
         elif not np.array_equal(station_pose[station_id], pose) or not np.array_equal(
             station_quaternion[station_id],
             quaternion,
@@ -1050,6 +1064,8 @@ def replay_records(
             pending_pose_idx = pose_idx
         if pre_record_callback is not None:
             pre_record_callback(estimator, record, record_index, pose_idx)
+            # Callbacks may mutate estimator internals outside the replay API.
+            trace_state_payload = None
         pending_records.append(spectrum_record)
 
         if station_complete:
@@ -1061,11 +1077,21 @@ def replay_records(
             )
             if station_complete_callback is not None:
                 station_complete_callback(estimator, record, record_index)
+            trace_state_payload = None
             completed_station_ids.add(station_id)
             pending_station_id = None
             pending_pose_idx = None
             pending_records = []
-        trace.append(_trace_row(estimator, record, record_index=record_index))
+        if trace_state_payload is None:
+            trace_state_payload = _trace_state_payload(estimator)
+        trace.append(
+            _trace_row(
+                estimator,
+                record,
+                record_index=record_index,
+                state_payload=trace_state_payload,
+            )
+        )
         previous_station_id = station_id
     if pending_station_id is not None:
         raise PFReplayError(

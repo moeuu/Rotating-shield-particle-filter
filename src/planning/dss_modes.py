@@ -196,11 +196,6 @@ def _validate_eig_likelihood_contract(
         raise RuntimeError("DSS EIG requires aligned joint PF particles.")
 
 
-def _pair_indices(pair_id: int, num_orients: int) -> tuple[int, int]:
-    """Return Fe and Pb indices from a flattened pair id."""
-    return int(pair_id) // int(num_orients), int(pair_id) % int(num_orients)
-
-
 def _continuous_kernel_for_estimator(
     estimator: RotatingShieldPFEstimator,
     *,

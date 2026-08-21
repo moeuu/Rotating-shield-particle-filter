@@ -38,6 +38,7 @@ from planning.dss_eig import (  # noqa: F401
     _information_gain_from_log_likelihood,
     _finite_sample_information_gain_upper_bound,
     _joint_program_action_layout,
+    _selected_program_transport_components,
     _full_spectrum_information_gain,
     _dss_eig_state_chunk_size,
     _dss_eig_likelihood_action_chunk_size,
@@ -55,7 +56,6 @@ from planning.dss_modes import (  # noqa: F401
     _planning_rng,
     _validate_mode_capacity,
     _validate_eig_likelihood_contract,
-    _pair_indices,
     _continuous_kernel_for_estimator,
     _weighted_surface_medoid_index,
     _cluster_source_samples,
@@ -63,12 +63,9 @@ from planning.dss_modes import (  # noqa: F401
     _official_signature_modes,
 )
 from planning.dss_spatial import (  # noqa: F401
-    _DSS_PP_PATH_LENGTH_CACHE,
-    _DSS_PP_PATH_LENGTH_CACHE_MAX,
     _elevation_pair_indices_and_weights,
     _local_orbit_gains_batch,
     _elevation_condition_gains_batch,
-    _node_path_length,
     _node_path_lengths_batch,
     _filter_path_reachable_stations,
     _align_candidate_values,
@@ -239,24 +236,6 @@ def _full_spectrum_joint_program_components(
         or np.any(pair_ids >= orientation_count**2)
     ):
         raise ValueError("DSS shield program contains an invalid pair id.")
-    flat_pair_ids = pair_ids.reshape(-1)
-    active_detectors = np.repeat(detectors, view_count, axis=0)
-    _, sorted_first_indices, sorted_inverse = np.unique(
-        active_detectors,
-        axis=0,
-        return_index=True,
-        return_inverse=True,
-    )
-    stable_order = np.argsort(sorted_first_indices, kind="stable")
-    unique_first_indices = sorted_first_indices[stable_order]
-    sorted_to_stable = np.empty(stable_order.size, dtype=np.int64)
-    sorted_to_stable[stable_order] = np.arange(
-        stable_order.size,
-        dtype=np.int64,
-    )
-    full_to_unique_detector = sorted_to_stable[sorted_inverse]
-    unique_detectors = active_detectors[unique_first_indices]
-    unique_detector_count = int(unique_detectors.shape[0])
     if (
         isinstance(detector_aperture_samples, bool)
         or not isinstance(detector_aperture_samples, (int, np.integer))
@@ -364,15 +343,17 @@ def _full_spectrum_joint_program_components(
             chart_ids[source_mask],
             surface_uv[source_mask],
         )
-        components = kernel.line_transport_components_all_pairs_for_detectors(
+        component_arrays = _selected_program_transport_components(
+            kernel,
             isotope=isotope,
-            detector_positions=unique_detectors,
+            detector_positions=detectors,
+            pair_ids_av=pair_ids,
             sources=active_transport_positions,
             positive_line_indices=local_line_indices,
         )
-        expected_unique_shape = (
-            unique_detector_count,
-            orientation_count**2,
+        expected_program_shape = (
+            action_count,
+            view_count,
             int(active_particle_indices.size),
             int(global_line_indices.size),
         )
@@ -380,17 +361,18 @@ def _full_spectrum_joint_program_components(
         def _local_component(field_name: str) -> NDArray[np.float64]:
             """Return one validated reshaped physical component."""
             values = np.asarray(
-                getattr(components, field_name),
+                component_arrays[field_name],
                 dtype=np.float64,
-            ).reshape(expected_unique_shape)
+            ).reshape(expected_program_shape)
             if np.any(~np.isfinite(values)) or np.any(values < 0.0):
                 raise RuntimeError(
                     f"Full-spectrum component {field_name!r} is invalid."
                 )
-            return values[
-                full_to_unique_detector,
-                flat_pair_ids,
-            ]
+            return values.reshape(
+                flattened_view_count,
+                int(active_particle_indices.size),
+                int(global_line_indices.size),
+            )
 
         total_local = _local_component("total_kernel")
         uncollided_local = _local_component("uncollided_kernel")
@@ -1120,31 +1102,41 @@ def _shield_transition_cost(
     from_pair_id: int | None,
     program: ShieldProgram,
 ) -> float:
-    """Return angular shield-transition cost for a program."""
+    """Return batched Fe/Pb angular transitions for one shield program."""
     if not program.pair_ids:
         return 0.0
     normal_arr = np.asarray(normals, dtype=float)
+    if (
+        normal_arr.ndim != 2
+        or normal_arr.shape[1] != 3
+        or np.any(~np.isfinite(normal_arr))
+    ):
+        raise ValueError("normals must be finite and shaped (N, 3).")
     num_orients = int(normal_arr.shape[0])
-    sequence: list[int] = []
+    sequence_prefix: tuple[int, ...] = ()
     if from_pair_id is not None and int(from_pair_id) >= 0:
-        sequence.append(int(from_pair_id))
-    sequence.extend(int(pair_id) for pair_id in program.pair_ids)
-    if len(sequence) < 2:
+        sequence_prefix = (int(from_pair_id),)
+    pair_sequence = np.asarray(
+        sequence_prefix + tuple(int(pair_id) for pair_id in program.pair_ids),
+        dtype=np.int64,
+    )
+    if pair_sequence.size < 2:
         return 0.0
-    cost = 0.0
-    for prev_id, next_id in zip(sequence[:-1], sequence[1:]):
-        prev_fe, prev_pb = _pair_indices(prev_id, num_orients)
-        next_fe, next_pb = _pair_indices(next_id, num_orients)
-        for prev_idx, next_idx in ((prev_fe, next_fe), (prev_pb, next_pb)):
-            dot = float(
-                np.clip(
-                    np.dot(normal_arr[prev_idx], normal_arr[next_idx]),
-                    -1.0,
-                    1.0,
-                )
-            )
-            cost += float(np.arccos(dot))
-    return cost
+    if np.any(pair_sequence < 0) or np.any(pair_sequence >= num_orients**2):
+        raise ValueError("Shield transition pair IDs are outside the normal table.")
+    previous_pairs = pair_sequence[:-1]
+    next_pairs = pair_sequence[1:]
+    previous_indices = np.column_stack(
+        (previous_pairs // num_orients, previous_pairs % num_orients)
+    )
+    next_indices = np.column_stack(
+        (next_pairs // num_orients, next_pairs % num_orients)
+    )
+    dots = np.sum(
+        normal_arr[previous_indices] * normal_arr[next_indices],
+        axis=2,
+    )
+    return float(np.sum(np.arccos(np.clip(dots, -1.0, 1.0))))
 
 
 def _compose_transition_score(
@@ -1160,7 +1152,13 @@ def _compose_transition_score(
 ) -> tuple[float, float]:
     """Return node score and path length for a specific predecessor."""
     if path_length_override_m is None:
-        path_length = _node_path_length(map_api, previous_pose_xyz, node.pose_xyz)
+        path_length = float(
+            _node_path_lengths_batch(
+                map_api,
+                previous_pose_xyz,
+                np.asarray(node.pose_xyz, dtype=np.float64).reshape(1, 3),
+            )[0]
+        )
     else:
         path_length = float(path_length_override_m)
         if np.isnan(path_length) or path_length < 0.0:
@@ -1376,7 +1374,6 @@ def _build_nodes(
     map_has_native_motion = (
         map_api is None
         or callable(getattr(map_api, "motion_path_lengths_batch", None))
-        or callable(getattr(map_api, "motion_waypoints", None))
     )
     runtime_motion_time_only = motion_times is not None and not map_has_native_motion
     if runtime_motion_time_only:

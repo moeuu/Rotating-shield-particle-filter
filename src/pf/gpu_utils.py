@@ -34,7 +34,7 @@ def torch_device_available(device: str | None = None) -> bool:
 
 
 def resolve_device(device: str | None) -> "torch.device":
-    """Resolve a torch device string with CUDA fallback."""
+    """Resolve a torch device string without a silent CUDA fallback."""
     if torch is None:
         raise RuntimeError("torch is not available")
     if device is None:

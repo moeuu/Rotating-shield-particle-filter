@@ -162,7 +162,10 @@ def _build_simple_estimator(
     return estimator
 
 
-def _build_full_spectrum_planning_estimator() -> RotatingShieldPFEstimator:
+def _build_full_spectrum_planning_estimator(
+    *,
+    shield_normals: np.ndarray | None = None,
+) -> RotatingShieldPFEstimator:
     """Build a production-approved tiny estimator for DSS spectrum tests."""
     isotope = "Cs-137"
     model = approved_full_spectrum_model()
@@ -182,7 +185,11 @@ def _build_full_spectrum_planning_estimator() -> RotatingShieldPFEstimator:
             [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             dtype=float,
         ),
-        shield_normals=np.asarray([[0.0, 0.0, 1.0]], dtype=float),
+        shield_normals=(
+            np.asarray([[0.0, 0.0, 1.0]], dtype=float)
+            if shield_normals is None
+            else np.asarray(shield_normals, dtype=float)
+        ),
         mu_by_isotope={isotope: {"fe": 0.0, "pb": 0.0}},
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
@@ -339,27 +346,46 @@ def test_dss_full_spectrum_components_and_eig_share_pf_model(
 def test_dss_transport_deduplicates_identical_pose_pair_views(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Repeated program views must share one deterministic transport call."""
-    estimator = _build_full_spectrum_planning_estimator()
+    """Repeated program views must share one selected-program transport call."""
+    estimator = _build_full_spectrum_planning_estimator(
+        shield_normals=np.asarray(
+            [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+    )
     joint = estimator.planning_joint_particles()
     kernel = _continuous_kernel_for_estimator(
         estimator,
         detector_aperture_samples=121,
     )
-    evaluate_components = kernel.line_transport_components_all_pairs_for_detectors
-    evaluated_detector_counts: list[int] = []
+    evaluate_components = (
+        kernel.line_transport_components_pair_program_for_detectors
+    )
+    evaluated_program_shapes: list[tuple[int, int]] = []
 
     def _record_components(**kwargs: object) -> object:
-        """Record unique detectors and preserve the physical result."""
-        evaluated_detector_counts.append(
-            int(np.asarray(kwargs["detector_positions"]).shape[0])
+        """Record deduplicated detector programs and preserve the result."""
+        evaluated_program_shapes.append(
+            (
+                int(np.asarray(kwargs["detector_positions"]).shape[0]),
+                int(np.asarray(kwargs["fe_indices"]).shape[1]),
+            )
         )
         return evaluate_components(**kwargs)
 
+    def _reject_all_pairs(**_kwargs: object) -> object:
+        """Reject the obsolete full shield-pair transport path."""
+        raise AssertionError("obsolete all-pair transport path was selected")
+
+    monkeypatch.setattr(
+        kernel,
+        "line_transport_components_pair_program_for_detectors",
+        _record_components,
+    )
     monkeypatch.setattr(
         kernel,
         "line_transport_components_all_pairs_for_detectors",
-        _record_components,
+        _reject_all_pairs,
     )
     monkeypatch.setattr(
         dss_pp,
@@ -383,7 +409,7 @@ def test_dss_transport_deduplicates_identical_pose_pair_views(
         detector_aperture_samples=121,
     )
 
-    assert evaluated_detector_counts == [1]
+    assert evaluated_program_shapes == [(1, 1)]
     np.testing.assert_array_equal(
         components.total_pnvsl[0],
         components.total_pnvsl[1],
@@ -398,11 +424,189 @@ def test_dss_transport_deduplicates_identical_pose_pair_views(
     )
 
 
+def test_dss_selected_transport_retains_dense_all_pair_gpu_kernel() -> None:
+    """A genuinely complete pair union must select the optimized dense path."""
+
+    class DenseKernel:
+        """Record dense dispatch while returning deterministic components."""
+
+        def __init__(self) -> None:
+            """Initialize two orientations and backend call counters."""
+            self.orientations = np.eye(2, 3, dtype=np.float64)
+            self.all_pair_calls = 0
+            self.selected_pair_calls = 0
+
+        def line_transport_components_all_pairs_for_detectors(
+            self,
+            *,
+            isotope: str,
+            detector_positions: np.ndarray,
+            sources: np.ndarray,
+            positive_line_indices: np.ndarray,
+        ) -> SimpleNamespace:
+            """Return all four pair identifiers as response components."""
+            assert isotope == "Cs-137"
+            self.all_pair_calls += 1
+            shape = (
+                np.asarray(detector_positions).shape[0],
+                4,
+                np.asarray(sources).shape[0],
+                np.asarray(positive_line_indices).size,
+            )
+            values = np.broadcast_to(
+                np.arange(4, dtype=np.float64)[None, :, None, None],
+                shape,
+            ).copy()
+            return SimpleNamespace(
+                total_kernel=values,
+                uncollided_kernel=values,
+                tau_fe=values,
+                tau_pb=values,
+                tau_obstacle=values,
+                distance_m=values,
+            )
+
+        def line_transport_components_pair_program_for_detectors(
+            self,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            """Reject selected-pair work for a complete physical pair union."""
+            self.selected_pair_calls += 1
+            raise AssertionError("dense unions must use the all-pair kernel")
+
+    kernel = DenseKernel()
+    actual = dss_pp._selected_program_transport_components(
+        kernel,  # type: ignore[arg-type]
+        isotope="Cs-137",
+        detector_positions=np.asarray(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        pair_ids_av=np.asarray([[0, 1], [2, 3]], dtype=np.int64),
+        sources=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
+        positive_line_indices=np.asarray([0], dtype=np.int64),
+    )
+
+    assert kernel.all_pair_calls == 1
+    assert kernel.selected_pair_calls == 0
+    np.testing.assert_array_equal(
+        actual["total_kernel"].reshape(2, 2),
+        np.asarray([[0.0, 1.0], [2.0, 3.0]]),
+    )
+
+
+def test_dss_selected_program_transport_matches_legacy_all_pair_physics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selected programs must preserve the old full-pair physical responses."""
+    estimator = _build_full_spectrum_planning_estimator(
+        shield_normals=np.asarray(
+            [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+    )
+    joint = estimator.planning_joint_particles()
+    detectors = np.asarray(
+        [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+    programs = [
+        dss_pp.ShieldProgram(name="a", pair_ids=(0, 1), kind="test"),
+        dss_pp.ShieldProgram(name="b", pair_ids=(1, 3), kind="test"),
+        dss_pp.ShieldProgram(name="c", pair_ids=(2, 3), kind="test"),
+    ]
+    kernel = _continuous_kernel_for_estimator(
+        estimator,
+        detector_aperture_samples=1,
+    )
+    all_pair_evaluator = kernel.line_transport_components_all_pairs_for_detectors
+    monkeypatch.setattr(
+        dss_pp,
+        "_continuous_kernel_for_estimator",
+        lambda *_args, **_kwargs: kernel,
+    )
+    selected = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        detectors,
+        programs,
+        joint,
+        live_time_s=3.0,
+        detector_aperture_samples=1,
+    )
+
+    def _legacy_all_pair_adapter(**kwargs: object) -> SimpleNamespace:
+        """Select requested program rows from the legacy full-pair tensor."""
+        fe = np.asarray(kwargs["fe_indices"], dtype=np.int64)
+        pb = np.asarray(kwargs["pb_indices"], dtype=np.int64)
+        pair_ids = fe * 2 + pb
+        full = all_pair_evaluator(
+            isotope=str(kwargs["isotope"]),
+            detector_positions=np.asarray(kwargs["detector_positions"]),
+            sources=np.asarray(kwargs["sources"]),
+            positive_line_indices=np.asarray(kwargs["positive_line_indices"]),
+        )
+        detector_rows = np.arange(pair_ids.shape[0], dtype=np.int64)[:, None]
+        return SimpleNamespace(
+            **{
+                field_name: np.asarray(getattr(full, field_name))[
+                    detector_rows,
+                    pair_ids,
+                ]
+                for field_name in (
+                    "total_kernel",
+                    "uncollided_kernel",
+                    "tau_fe",
+                    "tau_pb",
+                    "tau_obstacle",
+                    "distance_m",
+                )
+            }
+        )
+
+    monkeypatch.setattr(
+        kernel,
+        "line_transport_components_pair_program_for_detectors",
+        _legacy_all_pair_adapter,
+    )
+    legacy = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        detectors,
+        programs,
+        joint,
+        live_time_s=3.0,
+        detector_aperture_samples=1,
+    )
+
+    np.testing.assert_allclose(
+        selected.total_pnvsl,
+        legacy.total_pnvsl,
+        rtol=1.0e-12,
+        atol=1.0e-15,
+    )
+    np.testing.assert_allclose(
+        selected.uncollided_pnvsl,
+        legacy.uncollided_pnvsl,
+        rtol=1.0e-12,
+        atol=1.0e-15,
+    )
+    np.testing.assert_allclose(
+        selected.features_pnvslf,
+        legacy.features_pnvslf,
+        rtol=1.0e-12,
+        atol=1.0e-15,
+    )
+
+
 def test_dss_transport_skips_inactive_padded_source_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Padded source slots must not enter the expensive physical kernel."""
-    estimator = _build_full_spectrum_planning_estimator()
+    estimator = _build_full_spectrum_planning_estimator(
+        shield_normals=np.asarray(
+            [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+    )
     original = estimator.planning_joint_particles()
     isotope = "Cs-137"
     particle_count = int(original.weights_n.size)
@@ -429,7 +633,9 @@ def test_dss_transport_skips_inactive_padded_source_slots(
         estimator,
         detector_aperture_samples=121,
     )
-    evaluate_components = kernel.line_transport_components_all_pairs_for_detectors
+    evaluate_components = (
+        kernel.line_transport_components_pair_program_for_detectors
+    )
     evaluated_source_counts: list[int] = []
 
     def _record_components(**kwargs: object) -> object:
@@ -439,7 +645,7 @@ def test_dss_transport_skips_inactive_padded_source_slots(
 
     monkeypatch.setattr(
         kernel,
-        "line_transport_components_all_pairs_for_detectors",
+        "line_transport_components_pair_program_for_detectors",
         _record_components,
     )
     monkeypatch.setattr(
@@ -1303,6 +1509,22 @@ def test_dss_batch_path_length_helper_requires_native_map_motion() -> None:
             self.batch_calls += 1
             return np.linalg.norm(goals_xyz - start_xyz[None, :], axis=1) + 0.25
 
+    class LegacyWaypointMap:
+        """Expose only the removed candidate-by-candidate path interface."""
+
+        def __init__(self) -> None:
+            """Initialize the forbidden scalar-call counter."""
+            self.waypoint_calls = 0
+
+        def motion_waypoints(
+            self,
+            start_xyz: np.ndarray,
+            goal_xyz: np.ndarray,
+        ) -> list[np.ndarray]:
+            """Reject any accidental selection of scalar waypoint planning."""
+            self.waypoint_calls += 1
+            return [start_xyz, goal_xyz]
+
     start = np.array([0.0, 0.0, 0.5], dtype=float)
     goals = np.array(
         [[1.0, 0.0, 0.5], [0.0, 2.0, 1.5]],
@@ -1324,6 +1546,10 @@ def test_dss_batch_path_length_helper_requires_native_map_motion() -> None:
     )
     with pytest.raises(TypeError, match="must provide motion_path_lengths_batch"):
         dss_pp._node_path_lengths_batch(object(), start, goals)
+    legacy_map = LegacyWaypointMap()
+    with pytest.raises(TypeError, match="candidate-by-candidate"):
+        dss_pp._node_path_lengths_batch(legacy_map, start, goals)
+    assert legacy_map.waypoint_calls == 0
 
 
 def test_dss_selection_uses_batch_lengths_for_filter_and_node_build() -> None:
@@ -1542,6 +1768,44 @@ def test_shield_program_batch_schedule_matches_scalar_test_oracle(
             expected.append((f"all_pair_balanced_{index:02d}", tuple(selected)))
 
     assert [(program.name, program.pair_ids) for program in programs] == expected
+
+
+def test_shield_transition_batch_matches_scalar_test_oracle() -> None:
+    """Vectorized Fe/Pb rotation cost must match the scalar angle sequence."""
+    normals = np.asarray(generate_octant_orientations(), dtype=np.float64)
+    from_pair_id = 7
+    program = dss_pp.ShieldProgram(
+        name="transition_test",
+        pair_ids=(0, 9, 18, 63, 27),
+        kind="test",
+    )
+    sequence = (from_pair_id,) + program.pair_ids
+    expected = 0.0
+    for previous_pair, next_pair in zip(sequence[:-1], sequence[1:]):
+        for previous_index, next_index in (
+            (previous_pair // 8, next_pair // 8),
+            (previous_pair % 8, next_pair % 8),
+        ):
+            expected += float(
+                np.arccos(
+                    np.clip(
+                        np.dot(
+                            normals[previous_index],
+                            normals[next_index],
+                        ),
+                        -1.0,
+                        1.0,
+                    )
+                )
+            )
+
+    actual = dss_pp._shield_transition_cost(
+        normals,
+        from_pair_id,
+        program,
+    )
+
+    assert actual == pytest.approx(expected, rel=1.0e-14, abs=1.0e-14)
 
 
 def test_dss_pp_program_library_rejects_insufficient_pair_capacity() -> None:

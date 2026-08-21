@@ -28,10 +28,165 @@ if TYPE_CHECKING:
 
 
 JOINT_HISTORY_STATION_ACTION_BATCH_SIZE = 4
+JOINT_DEVICE_UNIT_TRANSPORT_CACHE_MAX_BYTES = 268_435_456
 
 
 class JointLikelihoodMixin:
     """Provide batched joint-station construction and likelihood evaluation."""
+
+    @staticmethod
+    def _joint_device_unit_transport_state_signature(
+        *,
+        positions: NDArray[np.float64],
+        active_mask: NDArray[np.bool_],
+        chart_ids: NDArray[np.int64],
+    ) -> str:
+        """Hash the exact fixed-slot geometry represented by one PF state."""
+        digest = hashlib.sha256(b"joint_device_unit_transport_state_v1\0")
+        mask = np.ascontiguousarray(active_mask, dtype=np.bool_)
+        active_positions = np.ascontiguousarray(
+            np.asarray(positions, dtype=np.float64)[mask],
+            dtype=np.float64,
+        )
+        active_chart_ids = np.ascontiguousarray(
+            np.asarray(chart_ids, dtype=np.int64)[mask],
+            dtype=np.int64,
+        )
+        for values in (mask, active_positions, active_chart_ids):
+            digest.update(str(values.dtype).encode("ascii"))
+            digest.update(np.asarray(values.shape, dtype="<i8").tobytes())
+            digest.update(values.tobytes(order="C"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _joint_device_unit_transport_entry_bytes(
+        components: tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"],
+    ) -> int:
+        """Return live tensor storage owned by one device mirror entry."""
+        return int(
+            sum(
+                int(value.numel()) * int(value.element_size())
+                for value in components
+            )
+        )
+
+    @property
+    def joint_device_unit_transport_cache_bytes(self) -> int:
+        """Return live tensor bytes retained by the device unit mirror."""
+        cache = getattr(self, "_joint_device_unit_transport_cache", {})
+        return int(
+            sum(
+                self._joint_device_unit_transport_entry_bytes(components)
+                for components in cache.values()
+            )
+        )
+
+    def _joint_cached_device_unit_transport(
+        self,
+        cache_key: tuple[str, str, str, str, str],
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"] | None:
+        """Return one exact device mirror entry and refresh its own LRU age.
+
+        The host sparse-unit cache and this dense CUDA mirror have independent
+        eviction schedules.  A CUDA hit intentionally does not touch or copy
+        host values; later eviction from both caches can cost recomputation but
+        cannot change transport values or reuse stale geometry.
+        """
+        cache = getattr(self, "_joint_device_unit_transport_cache", None)
+        if cache is None:
+            cache = {}
+            self._joint_device_unit_transport_cache = cache
+        cached = cache.pop(cache_key, None)
+        if cached is None:
+            self.last_joint_device_unit_cache_misses = int(
+                getattr(self, "last_joint_device_unit_cache_misses", 0)
+            ) + 1
+            return None
+        cache[cache_key] = cached
+        self.last_joint_device_unit_cache_hits = int(
+            getattr(self, "last_joint_device_unit_cache_hits", 0)
+        ) + 1
+        return cached
+
+    def _store_joint_device_unit_transport(
+        self,
+        cache_key: tuple[str, str, str, str, str],
+        components: tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"],
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        """Store one exact device mirror entry under a strict byte-bound LRU."""
+        cache = getattr(self, "_joint_device_unit_transport_cache", None)
+        if cache is None:
+            cache = {}
+            self._joint_device_unit_transport_cache = cache
+        cache.pop(cache_key, None)
+        entry_bytes = self._joint_device_unit_transport_entry_bytes(components)
+        if entry_bytes > JOINT_DEVICE_UNIT_TRANSPORT_CACHE_MAX_BYTES:
+            return components
+        while (
+            cache
+            and self.joint_device_unit_transport_cache_bytes + entry_bytes
+            > JOINT_DEVICE_UNIT_TRANSPORT_CACHE_MAX_BYTES
+        ):
+            oldest_key = next(iter(cache))
+            cache.pop(oldest_key)
+        cache[cache_key] = components
+        if (
+            self.joint_device_unit_transport_cache_bytes
+            > JOINT_DEVICE_UNIT_TRANSPORT_CACHE_MAX_BYTES
+        ):
+            raise RuntimeError("Device unit-transport cache exceeded its byte bound.")
+        return components
+
+    @staticmethod
+    def _joint_dense_unit_transport_numpy(
+        unit_components: tuple[NDArray[np.float64], ...],
+        *,
+        active_mask: NDArray[np.bool_],
+        particle_count: int,
+        slot_count: int,
+        view_count: int,
+        local_line_count: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Expand sparse active-source units into the fixed-slot layout."""
+        if len(unit_components) != 6:
+            raise RuntimeError("Unit transport must contain six physical components.")
+        dense = np.zeros(
+            (
+                particle_count,
+                slot_count,
+                view_count,
+                local_line_count,
+                6,
+            ),
+            dtype=np.float64,
+        )
+        sparse = np.stack(unit_components, axis=-1)
+        dense[active_mask] = np.transpose(sparse, (1, 0, 2, 3))
+        view_major = np.transpose(dense, (0, 2, 1, 3, 4))
+        return view_major[..., 0], view_major[..., 1], view_major[..., 2:]
+
+    @staticmethod
+    def _validate_torch_transport_components(
+        total: "torch.Tensor",
+        uncollided: "torch.Tensor",
+        features: "torch.Tensor",
+        *,
+        error_message: str,
+    ) -> None:
+        """Validate one device transport batch with a single host sync."""
+        import torch
+
+        invalid = torch.stack(
+            (
+                torch.any(~torch.isfinite(total)),
+                torch.any(~torch.isfinite(uncollided)),
+                torch.any(~torch.isfinite(features)),
+                torch.any(total < 0.0),
+                torch.any(uncollided < 0.0),
+            )
+        ).any()
+        if bool(invalid.item()):
+            raise RuntimeError(error_message)
 
     def _full_spectrum_model(self) -> FullSpectrumGenerativeModel:
         """Return the required independently validated generative model."""
@@ -313,67 +468,109 @@ class JointLikelihoodMixin:
                 dtype=np.int64,
             ),
         )
-        unit_components = self._joint_cached_continuous_unit_components(
-            filt=filt,
-            data=station_geometry,
-            positions_s3=positions[active_mask],
-            chart_ids_s=chart_ids[active_mask],
-            positive_line_indices=local_indices,
-        )
         particle_count, slot_count = active_mask.shape
         local_line_count = int(local_indices.size)
-        dense_components = []
-        for values in unit_components:
-            dense = np.zeros(
-                (
-                    particle_count,
-                    slot_count,
-                    view_count,
-                    local_line_count,
-                ),
-                dtype=np.float64,
-            )
-            dense[active_mask] = np.transpose(values, (1, 0, 2))
-            dense_components.append(np.transpose(dense, (0, 2, 1, 3)))
-        total_numpy = (
-            dense_components[0]
-            * strengths[:, None, :, None]
-            * branching_weights.reshape(1, 1, 1, -1)
-        )
-        uncollided_numpy = (
-            dense_components[1]
-            * strengths[:, None, :, None]
-            * branching_weights.reshape(1, 1, 1, -1)
-        )
-        feature_numpy = np.stack(
-            (
-                dense_components[2],
-                dense_components[3],
-                dense_components[4],
-                dense_components[5],
-            ),
-            axis=-1,
-        )
-        device = None
+        device = torch.device("cpu")
         if filt._can_use_gpu():
             from pf import gpu_utils
 
             device = gpu_utils.resolve_device(filt.config.gpu_device)
-        total_local = torch.as_tensor(
-            total_numpy,
-            dtype=torch.float64,
-            device=device,
-        )
-        uncollided_local = torch.as_tensor(
-            uncollided_numpy,
-            dtype=torch.float64,
-            device=device,
-        )
-        feature_local = torch.as_tensor(
-            feature_numpy,
-            dtype=torch.float64,
-            device=device,
-        )
+            if device.type == "cuda" and device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+        dtype = torch.float64
+        cached_units = None
+        cache_key = None
+        if device.type == "cuda":
+            geometry_signature = self._joint_structural_unit_cache_signature(
+                filt=filt,
+                data=station_geometry,
+                positive_line_indices=local_indices,
+            )
+            state_signature = self._joint_device_unit_transport_state_signature(
+                positions=positions,
+                active_mask=active_mask,
+                chart_ids=chart_ids,
+            )
+            cache_key = (
+                isotope_key,
+                geometry_signature,
+                state_signature,
+                str(device),
+                str(dtype),
+            )
+            cached_units = self._joint_cached_device_unit_transport(cache_key)
+        dense_units = None
+        if cached_units is None:
+            unit_components = self._joint_cached_continuous_unit_components(
+                filt=filt,
+                data=station_geometry,
+                positions_s3=positions[active_mask],
+                chart_ids_s=chart_ids[active_mask],
+                positive_line_indices=local_indices,
+            )
+            dense_units = self._joint_dense_unit_transport_numpy(
+                unit_components,
+                active_mask=active_mask,
+                particle_count=particle_count,
+                slot_count=slot_count,
+                view_count=view_count,
+                local_line_count=local_line_count,
+            )
+            if cache_key is not None:
+                cached_units = self._store_joint_device_unit_transport(
+                    cache_key,
+                    (
+                        torch.as_tensor(
+                            dense_units[0],
+                            dtype=dtype,
+                            device=device,
+                        ),
+                        torch.as_tensor(
+                            dense_units[1],
+                            dtype=dtype,
+                            device=device,
+                        ),
+                        torch.as_tensor(
+                            dense_units[2],
+                            dtype=dtype,
+                            device=device,
+                        ),
+                    ),
+                )
+        if cached_units is not None:
+            unit_total, unit_uncollided, feature_local = cached_units
+            strength_tensor = torch.as_tensor(
+                strengths,
+                dtype=dtype,
+                device=device,
+            )[:, None, :, None]
+            branch_tensor = torch.as_tensor(
+                branching_weights,
+                dtype=dtype,
+                device=device,
+            ).reshape(1, 1, 1, -1)
+            total_local = unit_total * strength_tensor * branch_tensor
+            uncollided_local = unit_uncollided * strength_tensor * branch_tensor
+        else:
+            if dense_units is None:
+                raise RuntimeError("Host unit-transport assembly is unavailable.")
+            branch_numpy = branching_weights.reshape(1, 1, 1, -1)
+            strength_numpy = strengths[:, None, :, None]
+            total_local = torch.as_tensor(
+                dense_units[0] * strength_numpy * branch_numpy,
+                dtype=dtype,
+                device=device,
+            )
+            uncollided_local = torch.as_tensor(
+                dense_units[1] * strength_numpy * branch_numpy,
+                dtype=dtype,
+                device=device,
+            )
+            feature_local = torch.as_tensor(
+                dense_units[2],
+                dtype=dtype,
+                device=device,
+            )
         expected_local_shape = tuple(total_local.shape)
         expected_slots = self.pf_config.cardinality_capacity
         if (
@@ -401,17 +598,15 @@ class JointLikelihoodMixin:
         global_total[..., global_columns] = total_local
         global_uncollided[..., global_columns] = uncollided_local
         global_features[..., global_columns, :] = feature_local
-        if (
-            bool(torch.any(~torch.isfinite(global_total)))
-            or bool(torch.any(~torch.isfinite(global_uncollided)))
-            or bool(torch.any(~torch.isfinite(global_features)))
-            or bool(torch.any(global_total < 0.0))
-            or bool(torch.any(global_uncollided < 0.0))
-        ):
-            raise RuntimeError(
+        self._validate_torch_transport_components(
+            global_total,
+            global_uncollided,
+            global_features,
+            error_message=(
                 "Full-spectrum transport components must be finite, "
                 "nonnegative source-slot contributions."
-            )
+            ),
+        )
         return global_total, global_uncollided, global_features
 
     def _joint_station_transport_components_torch(
@@ -448,17 +643,15 @@ class JointLikelihoodMixin:
         total = torch.cat(total_parts, dim=2)
         uncollided = torch.cat(uncollided_parts, dim=2)
         features = torch.cat(feature_parts, dim=2)
-        if (
-            bool(torch.any(~torch.isfinite(total)))
-            or bool(torch.any(~torch.isfinite(uncollided)))
-            or bool(torch.any(~torch.isfinite(features)))
-            or bool(torch.any(total < 0.0))
-            or bool(torch.any(uncollided < 0.0))
-        ):
-            raise RuntimeError(
+        self._validate_torch_transport_components(
+            total,
+            uncollided,
+            features,
+            error_message=(
                 "Full-spectrum transport components must be finite, "
                 "nonnegative source-slot contributions."
-            )
+            ),
+        )
         return total, uncollided, features
 
     def _joint_station_expected_means_np(
@@ -496,13 +689,23 @@ class JointLikelihoodMixin:
             )
         import torch
 
-        if bool(torch.any(torch.isnan(result)).detach().cpu().item()) or bool(
-            torch.any(torch.isinf(result) & (result > 0.0)).detach().cpu().item()
-        ):
+        status = (
+            torch.stack(
+                (
+                    torch.any(torch.isnan(result)),
+                    torch.any(torch.isinf(result) & (result > 0.0)),
+                    torch.any(torch.isfinite(result)),
+                )
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        if bool(status[0]) or bool(status[1]):
             raise RuntimeError(
                 "Full-spectrum likelihood contains NaN or positive infinity."
             )
-        if not bool(torch.any(torch.isfinite(result)).detach().cpu().item()):
+        if not bool(status[2]):
             raise RuntimeError(
                 "Full-spectrum likelihood is negative infinity for every "
                 "particle; the observation is outside model support."
@@ -535,13 +738,23 @@ class JointLikelihoodMixin:
             )
         import torch
 
-        if bool(torch.any(torch.isnan(result)).item()) or bool(
-            torch.any(torch.isinf(result) & (result > 0.0)).item()
-        ):
+        status = (
+            torch.stack(
+                (
+                    torch.any(torch.isnan(result)),
+                    torch.any(torch.isinf(result) & (result > 0.0)),
+                    torch.all(result[0] == 0.0),
+                )
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        if bool(status[0]) or bool(status[1]):
             raise RuntimeError(
                 "Full-spectrum prefix likelihood is numerically invalid."
             )
-        if not bool(torch.all(result[0] == 0.0).item()):
+        if not bool(status[2]):
             raise RuntimeError(
                 "The empty full-spectrum prefix must have zero log likelihood."
             )

@@ -21,10 +21,6 @@ from planning.dss_modes import (
 from planning.dss_types import DSSPPConfig, SignatureMode
 
 
-_DSS_PP_PATH_LENGTH_CACHE: dict[tuple[object, ...], float] = {}
-_DSS_PP_PATH_LENGTH_CACHE_MAX = 20000
-
-
 def _elevation_pair_indices_and_weights(
     modes: Sequence[SignatureMode],
     mode_weights: NDArray[np.float64],
@@ -159,67 +155,12 @@ def _elevation_condition_gains_batch(
     )
 
 
-def _node_path_length(
-    map_api: object | None,
-    start_xyz: NDArray[np.float64],
-    goal_xyz: NDArray[np.float64],
-) -> float:
-    """Return a runtime-native motion length or explicit free-space length."""
-    start = np.asarray(start_xyz, dtype=float)
-    goal = np.asarray(goal_xyz, dtype=float)
-    if map_api is None:
-        return float(np.linalg.norm(goal - start))
-    batch_function = getattr(map_api, "motion_path_lengths_batch", None)
-    if callable(batch_function):
-        lengths = np.asarray(
-            batch_function(start, goal.reshape(1, 3)),
-            dtype=float,
-        ).reshape(-1)
-        if lengths.shape != (1,) or np.isnan(lengths[0]) or lengths[0] < 0.0:
-            raise ValueError(
-                "motion_path_lengths_batch must return one nonnegative "
-                "non-NaN path length per goal."
-            )
-        return float(lengths[0])
-    motion_waypoints = getattr(map_api, "motion_waypoints", None)
-    if callable(motion_waypoints):
-        start_key = tuple(float(value) for value in start.reshape(3))
-        goal_key = tuple(float(value) for value in goal.reshape(3))
-        cache_key = ("motion", id(map_api), start_key, goal_key)
-        cached = _DSS_PP_PATH_LENGTH_CACHE.get(cache_key)
-        if cached is not None:
-            return float(cached)
-        path = motion_waypoints(start, goal)
-        if path is None:
-            length = float("inf")
-        else:
-            points = np.asarray(path, dtype=float)
-            if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
-                length = float("inf")
-            elif points.shape[0] == 1:
-                length = 0.0
-            else:
-                length = float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
-        if len(_DSS_PP_PATH_LENGTH_CACHE) >= _DSS_PP_PATH_LENGTH_CACHE_MAX:
-            _DSS_PP_PATH_LENGTH_CACHE.clear()
-        _DSS_PP_PATH_LENGTH_CACHE[cache_key] = float(length)
-        _DSS_PP_PATH_LENGTH_CACHE[("motion", id(map_api), goal_key, start_key)] = float(
-            length
-        )
-        return float(length)
-    raise TypeError(
-        "A non-None planning map must provide motion_path_lengths_batch or "
-        "motion_waypoints; obstacle-aware motion cannot fall back to a "
-        "Euclidean path."
-    )
-
-
 def _node_path_lengths_batch(
     map_api: object | None,
     start_xyz: NDArray[np.float64],
     goals_xyz: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Return candidate path lengths, preferring a map-native batch API."""
+    """Return path lengths through explicit free space or a map-native batch."""
     start = np.asarray(start_xyz, dtype=float).reshape(-1)
     goals = np.asarray(goals_xyz, dtype=float)
     if start.shape != (3,) or np.any(~np.isfinite(start)):
@@ -248,15 +189,9 @@ def _node_path_lengths_batch(
                 "non-NaN path length per goal."
             )
         return lengths
-    if not callable(getattr(map_api, "motion_waypoints", None)):
-        raise TypeError(
-            "A non-None planning map must provide motion_path_lengths_batch "
-            "or motion_waypoints."
-        )
-    return np.fromiter(
-        (_node_path_length(map_api, start, goal) for goal in goals),
-        dtype=float,
-        count=goals.shape[0],
+    raise TypeError(
+        "A non-None planning map must provide motion_path_lengths_batch; "
+        "candidate-by-candidate waypoint evaluation is not a runtime path."
     )
 
 

@@ -38,6 +38,8 @@ class _RecordingEstimator:
         self.poses: list[np.ndarray] = []
         self.kernel_cache: object | None = object()
         self.updates: list[tuple[tuple[tuple[object, ...], ...], int, str]] = []
+        self.serialization_calls = 0
+        self.posterior_calls = 0
 
     def add_measurement_pose(
         self,
@@ -67,10 +69,12 @@ class _RecordingEstimator:
 
     def serialized_state(self) -> bytes:
         """Return stable bytes for trace hashing."""
+        self.serialization_calls += 1
         return f"updates={len(self.updates)}".encode("ascii")
 
     def posterior_snapshot(self) -> _Posterior:
         """Return the deterministic test posterior."""
+        self.posterior_calls += 1
         return _Posterior()
 
 
@@ -87,6 +91,27 @@ def _with_records(
         records=records,  # type: ignore[arg-type]
         path=log.path,
     )
+
+
+def _as_single_completed_station(log: MeasurementLog) -> MeasurementLog:
+    """Return a log whose records form one completed detector station."""
+    first = log.records[0]
+    station_records = []
+    for index, record in enumerate(log.records):
+        metadata = dict(record.metadata)
+        metadata.pop("station_complete", None)
+        if index == len(log.records) - 1:
+            metadata["station_complete"] = True
+        station_records.append(
+            replace(
+                record,
+                station_id=0,
+                detector_pose_xyz=first.detector_pose_xyz,
+                detector_quat_wxyz=first.detector_quat_wxyz,
+                metadata=metadata,
+            )
+        )
+    return _with_records(log, tuple(station_records))
 
 
 def test_full_spectrum_model_may_cover_a_candidate_isotope_superset(
@@ -220,6 +245,56 @@ def test_replay_groups_records_at_durable_station_boundaries(tmp_path) -> None:
         == log.run_manifest["full_spectrum_contract_hash_sha256"]
         for update in estimator.updates
     )
+
+
+def test_replay_reuses_trace_payload_while_estimator_state_is_unchanged(
+    tmp_path,
+) -> None:
+    """Intermediate shield views must not reserialize an unchanged PF state."""
+    source_log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=4,
+            station_complete_markers=True,
+        )
+    )
+    log = _as_single_completed_station(source_log)
+    estimator = _RecordingEstimator()
+
+    trace = replay_records(log, estimator)
+
+    assert len(trace) == 4
+    assert estimator.serialization_calls == 2
+    assert estimator.posterior_calls == 2
+    assert len({row["state_sha256"] for row in trace[:3]}) == 1
+    assert trace[2]["state_sha256"] != trace[3]["state_sha256"]
+    trace[0]["posterior"]["cardinality"]["Cs-137"]["0"] = 0.0
+    assert trace[1]["posterior"]["cardinality"]["Cs-137"]["0"] == 1.0
+
+
+def test_replay_trace_cache_is_invalidated_for_callbacks(tmp_path) -> None:
+    """An external callback must force a fresh trace state at every record."""
+    source_log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=4,
+            station_complete_markers=True,
+        )
+    )
+    log = _as_single_completed_station(source_log)
+    estimator = _RecordingEstimator()
+
+    def callback(*_args: object) -> None:
+        """Exercise the conservative callback invalidation boundary."""
+
+    replay_records(
+        log,
+        estimator,
+        pre_record_callback=callback,
+    )
+
+    assert estimator.serialization_calls == len(log.records)
+    assert estimator.posterior_calls == len(log.records)
 
 
 def test_replay_rejects_an_uncommitted_final_station(tmp_path) -> None:

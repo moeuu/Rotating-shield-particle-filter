@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 import pf.estimator as estimator_module
+import pf.estimator_likelihood as estimator_likelihood_module
 from pf.estimator import (
     JointStationObservation,
     RotatingShieldPFConfig,
@@ -94,6 +95,29 @@ def _station() -> JointStationObservation:
         live_times_s=np.asarray([1.0, 2.0], dtype=np.float64),
         station_sequence_id=0,
     )
+
+
+def _set_single_source_states(
+    estimator: RotatingShieldPFEstimator,
+    isotope: str,
+    *,
+    strength_cps_1m: float,
+    surface_u: float = 0.25,
+) -> None:
+    """Set deterministic aligned one-source rows without changing identities."""
+    filt = estimator.filters[isotope]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    for row, particle in enumerate(filt.continuous_particles):
+        particle.state = IsotopeState(
+            num_sources=1,
+            strengths=np.asarray([strength_cps_1m], dtype=np.float64),
+            surface_chart_ids=np.asarray(
+                [row % int(atlas.chart_count)],
+                dtype=np.int64,
+            ),
+            surface_uv=np.asarray([[surface_u, 0.5]], dtype=np.float64),
+        )
 
 
 def _conditional_target(
@@ -541,6 +565,261 @@ def test_cached_fixed_state_transport_matches_direct_batch_kernel() -> None:
             rtol=0.0,
             atol=0.0,
         )
+
+
+def test_cuda_device_unit_cache_reuses_geometry_across_strengths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warm CUDA mirror must skip host assembly and rescale exactly."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    estimator = _estimator(
+        use_gpu=True,
+        gpu_device="cuda",
+        num_particles=8,
+    )
+    isotope = "Cs-137"
+    _set_single_source_states(
+        estimator,
+        isotope,
+        strength_cps_1m=5_000.0,
+    )
+    original = estimator._joint_cached_continuous_unit_components
+    host_assembly_calls = 0
+
+    def _counted_host_assembly(*args: object, **kwargs: object) -> object:
+        """Count host-cache assembly without changing transport values."""
+        nonlocal host_assembly_calls
+        host_assembly_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        estimator,
+        "_joint_cached_continuous_unit_components",
+        _counted_host_assembly,
+    )
+    station = _station()
+    first = estimator._joint_isotope_station_transport_components_torch(
+        station,
+        isotope,
+    )
+    second = estimator._joint_isotope_station_transport_components_torch(
+        station,
+        isotope,
+    )
+    assert host_assembly_calls == 1
+    assert estimator.last_joint_device_unit_cache_misses == 1
+    assert estimator.last_joint_device_unit_cache_hits == 1
+    assert len(estimator._joint_device_unit_transport_cache) == 1
+    cache_key = next(iter(estimator._joint_device_unit_transport_cache))
+    assert cache_key[-2:] == (
+        f"cuda:{torch.cuda.current_device()}",
+        "torch.float64",
+    )
+    for first_values, second_values in zip(first, second, strict=True):
+        np.testing.assert_array_equal(
+            second_values.detach().cpu().numpy(),
+            first_values.detach().cpu().numpy(),
+        )
+
+    for particle in estimator.filters[isotope].continuous_particles:
+        particle.state.strengths[:] = 6_000.0
+    rescaled = estimator._joint_isotope_station_transport_components_torch(
+        station,
+        isotope,
+    )
+    assert host_assembly_calls == 1
+    assert estimator.last_joint_device_unit_cache_hits == 2
+    np.testing.assert_allclose(
+        rescaled[0].detach().cpu().numpy(),
+        1.2 * first[0].detach().cpu().numpy(),
+        rtol=2.0e-15,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(
+        rescaled[1].detach().cpu().numpy(),
+        1.2 * first[1].detach().cpu().numpy(),
+        rtol=2.0e-15,
+        atol=0.0,
+    )
+    np.testing.assert_array_equal(
+        rescaled[2].detach().cpu().numpy(),
+        first[2].detach().cpu().numpy(),
+    )
+
+    changed_station = replace(
+        station,
+        fe_indices=np.asarray([1, 4], dtype=np.int64),
+        pb_indices=np.asarray([6, 0], dtype=np.int64),
+    )
+    estimator._joint_isotope_station_transport_components_torch(
+        changed_station,
+        isotope,
+    )
+    assert host_assembly_calls == 2
+    assert estimator.last_joint_device_unit_cache_misses == 2
+
+    _set_single_source_states(
+        estimator,
+        isotope,
+        strength_cps_1m=6_000.0,
+        surface_u=0.75,
+    )
+    estimator._joint_isotope_station_transport_components_torch(station, isotope)
+    assert host_assembly_calls == 3
+    assert estimator.last_joint_device_unit_cache_misses == 3
+
+
+def test_torch_cpu_transport_does_not_retain_device_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Torch-CPU must keep the existing host LRU without a dense duplicate."""
+    pytest.importorskip("torch")
+    estimator = _estimator(use_gpu=True, gpu_device="cpu", num_particles=8)
+    isotope = "Cs-137"
+    _set_single_source_states(
+        estimator,
+        isotope,
+        strength_cps_1m=5_000.0,
+    )
+    original = estimator._joint_cached_continuous_unit_components
+    host_assembly_calls = 0
+
+    def _counted_host_assembly(*args: object, **kwargs: object) -> object:
+        """Count host assembly without changing CPU transport values."""
+        nonlocal host_assembly_calls
+        host_assembly_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        estimator,
+        "_joint_cached_continuous_unit_components",
+        _counted_host_assembly,
+    )
+    first = estimator._joint_isotope_station_transport_components_torch(
+        _station(),
+        isotope,
+    )
+    second = estimator._joint_isotope_station_transport_components_torch(
+        _station(),
+        isotope,
+    )
+    assert host_assembly_calls == 2
+    assert estimator._joint_device_unit_transport_cache == {}
+    assert estimator.last_joint_device_unit_cache_hits == 0
+    assert estimator.last_joint_device_unit_cache_misses == 0
+    for first_values, second_values in zip(first, second, strict=True):
+        np.testing.assert_array_equal(
+            second_values.detach().numpy(),
+            first_values.detach().numpy(),
+        )
+
+
+def test_device_unit_transport_cache_matches_torch_cpu_and_cuda() -> None:
+    """The CUDA mirror must preserve the exact Torch-CPU transport model."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    station = _station()
+    results = []
+    for device_name in ("cpu", "cuda"):
+        estimator = _estimator(
+            use_gpu=True,
+            gpu_device=device_name,
+            num_particles=8,
+        )
+        _set_single_source_states(
+            estimator,
+            "Cs-137",
+            strength_cps_1m=5_000.0,
+        )
+        estimator._joint_isotope_station_transport_components_torch(
+            station,
+            "Cs-137",
+        )
+        warm = estimator._joint_isotope_station_transport_components_torch(
+            station,
+            "Cs-137",
+        )
+        expected_hits = 0 if device_name == "cpu" else 1
+        assert estimator.last_joint_device_unit_cache_hits == expected_hits
+        assert bool(estimator._joint_device_unit_transport_cache) == (
+            device_name == "cuda"
+        )
+        results.append(
+            tuple(value.detach().cpu().numpy() for value in warm)
+        )
+    for cpu_values, cuda_values in zip(results[0], results[1], strict=True):
+        np.testing.assert_allclose(
+            cuda_values,
+            cpu_values,
+            rtol=2.0e-12,
+            atol=1.0e-12,
+        )
+
+
+def test_device_unit_transport_cache_is_content_invalidated_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changed geometry must miss and LRU eviction must enforce its byte cap."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    estimator = _estimator(use_gpu=True, gpu_device="cuda", num_particles=8)
+    isotope = "Cs-137"
+    _set_single_source_states(
+        estimator,
+        isotope,
+        strength_cps_1m=5_000.0,
+        surface_u=0.25,
+    )
+    station = _station()
+    original = estimator._joint_cached_continuous_unit_components
+    host_assembly_calls = 0
+
+    def _counted_host_assembly(*args: object, **kwargs: object) -> object:
+        """Count exact host assembly for each device-cache miss."""
+        nonlocal host_assembly_calls
+        host_assembly_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        estimator,
+        "_joint_cached_continuous_unit_components",
+        _counted_host_assembly,
+    )
+    estimator._joint_isotope_station_transport_components_torch(station, isotope)
+    entry_bytes = estimator.joint_device_unit_transport_cache_bytes
+    assert entry_bytes > 0
+    monkeypatch.setattr(
+        estimator_likelihood_module,
+        "JOINT_DEVICE_UNIT_TRANSPORT_CACHE_MAX_BYTES",
+        entry_bytes,
+    )
+
+    _set_single_source_states(
+        estimator,
+        isotope,
+        strength_cps_1m=5_000.0,
+        surface_u=0.75,
+    )
+    estimator._joint_isotope_station_transport_components_torch(station, isotope)
+    assert host_assembly_calls == 2
+    assert len(estimator._joint_device_unit_transport_cache) == 1
+    assert estimator.joint_device_unit_transport_cache_bytes <= entry_bytes
+
+    _set_single_source_states(
+        estimator,
+        isotope,
+        strength_cps_1m=5_000.0,
+        surface_u=0.25,
+    )
+    estimator._joint_isotope_station_transport_components_torch(station, isotope)
+    assert host_assembly_calls == 3
+    assert estimator.last_joint_device_unit_cache_misses == 3
+    assert len(estimator._joint_device_unit_transport_cache) == 1
+    assert estimator.joint_device_unit_transport_cache_bytes <= entry_bytes
 
 
 def test_exact_rj_candidate_target_matches_numpy_and_cuda() -> None:

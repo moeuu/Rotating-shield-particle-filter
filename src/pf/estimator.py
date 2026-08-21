@@ -268,9 +268,6 @@ class RotatingShieldPFEstimator(
                 "surface_diagnostic_points must contain only finite values."
             )
         self.surface_diagnostic_points = np.ascontiguousarray(diagnostic_points)
-        self.history_estimates: list[
-            dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]
-        ] = []
         self._posterior_point_estimate_cache: dict[str, PFPointEstimate] | None = None
         self._posterior_point_estimate_cache_fingerprint: str | None = None
         self.measurements: list[MeasurementRecord] = []
@@ -300,6 +297,12 @@ class RotatingShieldPFEstimator(
             str,
             dict[str, dict[str, Any]],
         ] = {}
+        self._joint_device_unit_transport_cache: dict[
+            tuple[str, str, str, str, str],
+            tuple[object, object, object],
+        ] = {}
+        self.last_joint_device_unit_cache_hits = 0
+        self.last_joint_device_unit_cache_misses = 0
         self._joint_cuda_accepted_unit_transport_cache: dict[
             tuple[str, str], dict[str, object]
         ] = {}
@@ -362,10 +365,8 @@ class RotatingShieldPFEstimator(
         self.last_joint_station_unique_ancestor_count: int | None = None
         self.last_joint_cumulative_unique_ancestor_count: int | None = None
         self._joint_cumulative_lineage_ids: NDArray[np.int64] | None = None
-        self.last_pair_sequence_update_workers = 1
         self.last_pair_sequence_update_wall_s = 0.0
         self.last_pair_sequence_stage_wall_s: dict[str, float] = {}
-        self.last_structural_update_workers = 1
         self.last_structural_update_wall_s = 0.0
         self._surface_diagnostic_response_cache: dict[
             tuple[Any, ...],
@@ -392,21 +393,9 @@ class RotatingShieldPFEstimator(
             *components,
         )
 
-    def _record_history_estimate(self, measurement_count: int) -> None:
-        (
-            "Record an exact report estimate when the configured history "
-            "stride allows it."
-        )
-        interval = max(
-            0,
-            int(getattr(self.pf_config, "history_estimate_interval", 1)),
-        )
-        if interval <= 0:
-            return
-        count = max(0, int(measurement_count))
-        if count <= 0 or count % interval != 0:
-            return
-        self.history_estimates.append(self.estimates())
+    def _refresh_posterior_summary(self) -> None:
+        """Prepare the exact cached summary used by reporting and planning."""
+        self.estimates()
 
     def _invalidate_posterior_summary_cache(self) -> None:
         """Discard report-only summaries after posterior state changes."""
@@ -1600,9 +1589,7 @@ class RotatingShieldPFEstimator(
         update_start = time.perf_counter()
         self._joint_tempered_station_update(station)
         update_wall = time.perf_counter() - update_start
-        self.last_pair_sequence_update_workers = 1
         self.last_pair_sequence_update_wall_s = float(update_wall)
-        self.last_structural_update_workers = 1
         self.last_structural_update_wall_s = float(
             sum(
                 float(
@@ -1634,7 +1621,7 @@ class RotatingShieldPFEstimator(
                 )
             )
         report_start = time.perf_counter()
-        self._record_history_estimate(len(self.measurements))
+        self._refresh_posterior_summary()
         report_wall = time.perf_counter() - report_start
         self.last_pair_sequence_stage_wall_s = {
             "normalize_and_validate": float(update_start - sequence_start),

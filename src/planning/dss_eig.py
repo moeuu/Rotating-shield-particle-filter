@@ -8,6 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.special import logsumexp
 
+from measurement.continuous_kernels import ContinuousKernel
 from pf.estimator import RotatingShieldPFEstimator
 from pf.full_spectrum import validate_full_spectrum_model
 from planning.dss_modes import _normalise_weights
@@ -198,6 +199,182 @@ def _joint_program_action_layout(
         max_length=int(pair_ids.shape[1]) if pair_ids.ndim == 2 else 0,
     )
     return flattened, pose_indices, pair_ids, view_mask, offsets
+
+
+def _selected_program_transport_components(
+    kernel: ContinuousKernel,
+    *,
+    isotope: str,
+    detector_positions: NDArray[np.float64],
+    pair_ids_av: NDArray[np.int64],
+    sources: NDArray[np.float64],
+    positive_line_indices: NDArray[np.int64],
+) -> dict[str, NDArray[np.float64]]:
+    """Evaluate each distinct detector/pair response exactly once in batches.
+
+    The number of distinct union sizes is bounded by the physical shield-pair
+    count (64 for the canonical octants). Grouping on that tiny dimension lets
+    the shared runtime evaluate one dense pair program per detector while
+    avoiding scalar candidate loops and unnecessary full-pair response
+    tensors. CPU execution uses the runtime's batched selected-pair kernel; GPU
+    execution reuses detector/source geometry across each requested program.
+    A detector that genuinely requests every pair retains the optimized dense
+    all-pair kernel, so batching never replaces a complete union with a slower
+    selected-pair emulation.
+    """
+    detectors = np.asarray(detector_positions, dtype=np.float64)
+    pair_ids = np.asarray(pair_ids_av)
+    source_positions = np.asarray(sources, dtype=np.float64)
+    line_indices = np.asarray(positive_line_indices)
+    orientation_count = int(len(kernel.orientations))
+    pair_count = orientation_count**2
+    if (
+        detectors.ndim != 2
+        or detectors.shape[1] != 3
+        or np.any(~np.isfinite(detectors))
+    ):
+        raise ValueError("detector_positions must be finite and shaped (A, 3).")
+    if (
+        pair_ids.ndim != 2
+        or pair_ids.shape[0] != detectors.shape[0]
+        or pair_ids.shape[1] <= 0
+        or not np.issubdtype(pair_ids.dtype, np.integer)
+        or np.any(pair_ids < 0)
+        or np.any(pair_ids >= pair_count)
+    ):
+        raise ValueError("pair_ids_av must contain valid aligned shield programs.")
+    if (
+        source_positions.ndim != 2
+        or source_positions.shape[1] != 3
+        or np.any(~np.isfinite(source_positions))
+    ):
+        raise ValueError("sources must be finite and shaped (S, 3).")
+    if (
+        line_indices.ndim != 1
+        or not np.issubdtype(line_indices.dtype, np.integer)
+        or np.any(line_indices < 0)
+    ):
+        raise ValueError("positive_line_indices must be nonnegative integers.")
+
+    _, sorted_first_indices, sorted_inverse = np.unique(
+        detectors,
+        axis=0,
+        return_index=True,
+        return_inverse=True,
+    )
+    stable_order = np.argsort(sorted_first_indices, kind="stable")
+    unique_first_indices = sorted_first_indices[stable_order]
+    sorted_to_stable = np.empty(stable_order.size, dtype=np.int64)
+    sorted_to_stable[stable_order] = np.arange(
+        stable_order.size,
+        dtype=np.int64,
+    )
+    action_detector_ids = sorted_to_stable[sorted_inverse]
+    unique_detectors = detectors[unique_first_indices]
+    detector_pair_mask = np.zeros(
+        (unique_detectors.shape[0], pair_count),
+        dtype=bool,
+    )
+    detector_pair_mask[action_detector_ids[:, None], pair_ids] = True
+    union_sizes = np.sum(detector_pair_mask, axis=1, dtype=np.int64)
+    output_shape = (
+        detectors.shape[0],
+        pair_ids.shape[1],
+        source_positions.shape[0],
+        line_indices.size,
+    )
+    field_names = (
+        "total_kernel",
+        "uncollided_kernel",
+        "tau_fe",
+        "tau_pb",
+        "tau_obstacle",
+        "distance_m",
+    )
+    outputs = {
+        field_name: np.empty(output_shape, dtype=np.float64)
+        for field_name in field_names
+    }
+    pair_column_lookup = np.full(
+        detector_pair_mask.shape,
+        -1,
+        dtype=np.int64,
+    )
+    detector_group_lookup = np.empty(
+        unique_detectors.shape[0],
+        dtype=np.int64,
+    )
+    for union_size_raw in np.unique(union_sizes):
+        union_size = int(union_size_raw)
+        if union_size <= 0:
+            raise RuntimeError("Every DSS action must request a shield pair.")
+        detector_ids = np.flatnonzero(union_sizes == union_size)
+        group_pair_ids = np.nonzero(detector_pair_mask[detector_ids])[1].reshape(
+            detector_ids.size,
+            union_size,
+        )
+        pair_column_lookup[
+            detector_ids[:, None],
+            group_pair_ids,
+        ] = np.arange(union_size, dtype=np.int64)[None, :]
+        detector_group_lookup[detector_ids] = np.arange(
+            detector_ids.size,
+            dtype=np.int64,
+        )
+        if union_size == pair_count:
+            components = kernel.line_transport_components_all_pairs_for_detectors(
+                isotope=isotope,
+                detector_positions=unique_detectors[detector_ids],
+                sources=source_positions,
+                positive_line_indices=line_indices,
+            )
+        else:
+            components = (
+                kernel.line_transport_components_pair_program_for_detectors(
+                    isotope=isotope,
+                    detector_positions=unique_detectors[detector_ids],
+                    sources=source_positions,
+                    fe_indices=group_pair_ids // orientation_count,
+                    pb_indices=group_pair_ids % orientation_count,
+                    positive_line_indices=line_indices,
+                )
+            )
+        selected_actions = np.flatnonzero(
+            np.isin(action_detector_ids, detector_ids)
+        )
+        local_detector_rows = detector_group_lookup[
+            action_detector_ids[selected_actions]
+        ]
+        local_pair_columns = pair_column_lookup[
+            action_detector_ids[selected_actions, None],
+            pair_ids[selected_actions],
+        ]
+        if np.any(local_pair_columns < 0):
+            raise RuntimeError("DSS pair-program lookup is incomplete.")
+        for field_name in field_names:
+            values = np.asarray(
+                getattr(components, field_name),
+                dtype=np.float64,
+            )
+            expected_shape = (
+                detector_ids.size,
+                union_size,
+                source_positions.shape[0],
+                line_indices.size,
+            )
+            if values.shape != expected_shape:
+                raise RuntimeError(
+                    "Pair-program transport returned an invalid component shape."
+                )
+            outputs[field_name][selected_actions] = values[
+                local_detector_rows[:, None],
+                local_pair_columns,
+            ]
+    if any(np.any(~np.isfinite(values)) for values in outputs.values()) or any(
+        np.any(values < 0.0) for values in outputs.values()
+    ):
+        raise RuntimeError("Pair-program transport components must be nonnegative.")
+    return outputs
 
 
 def _full_spectrum_information_gain(
