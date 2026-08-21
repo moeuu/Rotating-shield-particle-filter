@@ -11,7 +11,6 @@ requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.7",
     "numpy>=2.3.5",
-    "pytest>=9.0.1",
     "rotating-shield-simulation-runtime",
     "scipy>=1.16.3",
     "torch",
@@ -29,3 +28,8 @@ where = ["src"]
 
 [tool.uv.sources]
 rotating-shield-simulation-runtime = { path = "../Rotating-shield-simulation-runtime", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

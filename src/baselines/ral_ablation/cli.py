@@ -6,28 +6,48 @@ import argparse
 from pathlib import Path
 
 from baselines.ral_ablation.config_factory import (
-    DEFAULT_BASE_CONFIG,
     DEFAULT_OUTPUT_DIR,
-    DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M,
+    DEFAULT_PF_CONFIG,
+    DEFAULT_PRIVATE_ROOT,
+    DEFAULT_RUNTIME_CONFIG,
+    DEFAULT_RUNTIME_ROOT,
     build_ablation_plan,
     write_ablation_plan,
 )
 
 
 def main() -> None:
-    """Generate RA-L ablation config/source files and command manifests."""
+    """Generate RA-L PF configs and shared-runtime command manifests."""
     parser = argparse.ArgumentParser(description="Generate RA-L ablation trials.")
     parser.add_argument(
-        "--base-config",
+        "--runtime-root",
         type=Path,
-        default=DEFAULT_BASE_CONFIG,
-        help="Base Geant4/PF runtime config.",
+        default=DEFAULT_RUNTIME_ROOT,
+        help="Sibling shared-runtime repository root.",
+    )
+    parser.add_argument(
+        "--runtime-config",
+        type=Path,
+        default=DEFAULT_RUNTIME_CONFIG,
+        help="Canonical shared-runtime Geant4 config inherited by each trial.",
+    )
+    parser.add_argument(
+        "--pf-config",
+        type=Path,
+        default=DEFAULT_PF_CONFIG,
+        help="Base pure-PF configuration.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
-        help="Directory for generated configs, sources, and manifests.",
+        help="Directory for generated PF configs, logs, runs, and manifests.",
+    )
+    parser.add_argument(
+        "--private-root",
+        type=Path,
+        default=DEFAULT_PRIVATE_ROOT,
+        help="Ignored sibling-runtime directory for truth-bearing scenarios.",
     )
     parser.add_argument(
         "--seeds",
@@ -40,46 +60,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--intensity-cps-1m",
-        type=float,
-        default=None,
-        help="Fixed detector cps@1m assigned to generated sources.",
-    )
-    parser.add_argument(
-        "--intensity-min-cps-1m",
-        type=float,
-        default=float(DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M[0]),
-        help="Minimum detector cps@1m for uniformly sampled generated sources.",
-    )
-    parser.add_argument(
-        "--intensity-max-cps-1m",
-        type=float,
-        default=float(DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M[1]),
-        help="Maximum detector cps@1m for uniformly sampled generated sources.",
-    )
-    parser.add_argument(
         "--output-tag-suffix",
         default="",
         help="Optional safe suffix for isolated result and measurement-log paths.",
     )
     args = parser.parse_args()
-    intensity_spec: float | tuple[float, float]
-    if args.intensity_cps_1m is not None:
-        intensity_spec = float(args.intensity_cps_1m)
-    else:
-        intensity_spec = (
-            float(args.intensity_min_cps_1m),
-            float(args.intensity_max_cps_1m),
-        )
     entries = build_ablation_plan(
-        base_config_path=args.base_config,
+        runtime_root=args.runtime_root,
+        runtime_config_path=args.runtime_config,
+        pf_config_path=args.pf_config,
         output_dir=args.output_dir,
-        seeds=(
-            None
-            if args.seeds is None
-            else tuple(int(seed) for seed in args.seeds)
-        ),
-        intensity_cps_1m=intensity_spec,
+        private_root=args.private_root,
+        seeds=(None if args.seeds is None else tuple(int(seed) for seed in args.seeds)),
         output_tag_suffix=str(args.output_tag_suffix),
     )
     manifest_path, script_path = write_ablation_plan(
@@ -88,15 +80,10 @@ def main() -> None:
     print(f"Wrote {len(entries)} ablation trials.")
     print(
         "Scene seeds: "
-        + ", ".join(
-            str(seed) for seed in sorted({entry.seed for entry in entries})
-        )
+        + ", ".join(str(seed) for seed in sorted({entry.seed for entry in entries}))
     )
     print(
-        "Source seeds: "
-        + ", ".join(
-            str(seed) for seed in sorted({entry.source_seed for entry in entries})
-        )
+        "Private scenario root: " + str(Path(args.private_root).expanduser().resolve())
     )
     print(f"Manifest: {manifest_path}")
     print(f"Run script: {script_path}")

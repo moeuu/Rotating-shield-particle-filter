@@ -10,7 +10,11 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from pf.replay import main
+def main() -> int:
+    """Run the truth-free PF replay command through the compatibility shim."""
+    from pf.replay import main as replay_main
+
+    return replay_main()
 
 
 if __name__ == "__main__":

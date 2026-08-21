@@ -820,11 +820,6 @@ def measurement_record_to_spectrum_input(
     )
 
 
-def _spectrum_record(record: MeasurementLogRecord) -> tuple[object, ...]:
-    """Retain the private compatibility name for existing replay tests."""
-    return measurement_record_to_spectrum_input(record)
-
-
 def detect_replay_isotopes(
     log: MeasurementLog,
     config: Mapping[str, Any],
@@ -1021,7 +1016,7 @@ def replay_records(
                 "logged environment."
             )
         station_complete = _station_complete(record)
-        spectrum_record = _spectrum_record(record)
+        spectrum_record = measurement_record_to_spectrum_input(record)
         if station_id in completed_station_ids:
             raise PFReplayError(
                 f"station_id {station_id} has records after station_complete."

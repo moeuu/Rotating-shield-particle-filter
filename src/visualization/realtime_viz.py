@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List, Any, Sequence
+from typing import Any, Sequence
 
 from pathlib import Path
 import multiprocessing as mp
@@ -19,44 +19,7 @@ from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from measurement.obstacles import ObstacleGrid
-@dataclass
-class PFFrame:
-    """
-    Snapshot of the PF state and measurement at one time step.
-
-    - step_index: integer step
-    - time: cumulative measurement time (s)
-    - robot_position: detector position q_k (3,)
-    - robot_orientation: optional robot orientation (e.g., quaternion or R)
-    - RFe, RPb: incoming octant normals (3,) or legacy active material
-      rotations (3x3) for the iron/lead shields
-    - duration: acquisition time T_k
-    - particle_positions: isotope -> source-slot sample positions (N_points, 3)
-    - particle_weights: isotope -> source-slot sample weights (N_points,)
-    - estimated_sources: isotope -> (N_est, 3)
-    - estimated_strengths: isotope -> (N_est,)
-    - path_waypoints_xyz: optional obstacle-aware robot path segment (M, 3)
-    - spectrum_energy_keV/spectrum_counts: optional raw native spectrum data
-    - record_measurement: whether this rendering corresponds to a new acquisition
-    """
-
-    step_index: int
-    time: float
-    robot_position: NDArray[np.float64]
-    robot_orientation: Optional[NDArray[np.float64]]
-    RFe: NDArray[np.float64]
-    RPb: NDArray[np.float64]
-    duration: float
-    particle_positions: Dict[str, NDArray[np.float64]]
-    particle_weights: Dict[str, NDArray[np.float64]]
-    estimated_sources: Dict[str, NDArray[np.float64]]
-    estimated_strengths: Dict[str, NDArray[np.float64]]
-    path_waypoints_xyz: Optional[NDArray[np.float64]] = None
-    spectrum_energy_keV: Optional[NDArray[np.float64]] = None
-    spectrum_counts: Optional[NDArray[np.float64]] = None
-    particle_representative_positions: Optional[Dict[str, NDArray[np.float64]]] = None
-    particle_representative_weights: Optional[Dict[str, NDArray[np.float64]]] = None
-    record_measurement: bool = True
+from visualization.frame import PFFrame
 
 
 def _shield_material_normal(
@@ -90,15 +53,15 @@ def frame_to_isaac_pf_payload(
     frame: PFFrame,
     *,
     max_particles_per_isotope: int | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return a JSON-serializable PF marker payload for Isaac Sim."""
     max_particles = (
         None
         if max_particles_per_isotope is None
         else max(0, int(max_particles_per_isotope))
     )
-    particle_positions: Dict[str, list[list[float]]] = {}
-    particle_weights: Dict[str, list[float]] = {}
+    particle_positions: dict[str, list[list[float]]] = {}
+    particle_weights: dict[str, list[float]] = {}
     for isotope, positions_raw in frame.particle_positions.items():
         positions = np.asarray(positions_raw, dtype=float).reshape((-1, 3))
         weights = np.asarray(
@@ -107,7 +70,11 @@ def frame_to_isaac_pf_payload(
         ).reshape(-1)
         if weights.size != positions.shape[0]:
             weights = np.ones(positions.shape[0], dtype=float)
-        if max_particles is not None and max_particles > 0 and positions.shape[0] > max_particles:
+        if (
+            max_particles is not None
+            and max_particles > 0
+            and positions.shape[0] > max_particles
+        ):
             order = np.argsort(weights)[::-1][:max_particles]
             positions = positions[order]
             weights = weights[order]
@@ -118,13 +85,18 @@ def frame_to_isaac_pf_payload(
         for isotope, positions in frame.estimated_sources.items()
     }
     estimated_strengths = {
-        isotope: [float(value) for value in np.asarray(strengths, dtype=float).reshape(-1)]
+        isotope: [
+            float(value) for value in np.asarray(strengths, dtype=float).reshape(-1)
+        ]
         for isotope, strengths in frame.estimated_strengths.items()
     }
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "step_index": int(frame.step_index),
         "time_s": float(frame.time),
-        "robot_position": [float(value) for value in np.asarray(frame.robot_position, dtype=float).reshape(-1)[:3]],
+        "robot_position": [
+            float(value)
+            for value in np.asarray(frame.robot_position, dtype=float).reshape(-1)[:3]
+        ],
         "particle_positions": particle_positions,
         "particle_weights": particle_weights,
         "estimated_sources": estimated_sources,
@@ -132,14 +104,15 @@ def frame_to_isaac_pf_payload(
     }
     if frame.particle_representative_positions is not None:
         payload["particle_representative_positions"] = {
-            isotope: _array2_to_list(np.asarray(positions, dtype=float).reshape((-1, 3)))
+            isotope: _array2_to_list(
+                np.asarray(positions, dtype=float).reshape((-1, 3))
+            )
             for isotope, positions in frame.particle_representative_positions.items()
         }
     if frame.particle_representative_weights is not None:
         payload["particle_representative_weights"] = {
             isotope: [
-                float(value)
-                for value in np.asarray(weights, dtype=float).reshape(-1)
+                float(value) for value in np.asarray(weights, dtype=float).reshape(-1)
             ]
             for isotope, weights in frame.particle_representative_weights.items()
         }
@@ -162,10 +135,10 @@ def _array2_to_list(values: NDArray[np.float64]) -> list[list[float]]:
 class LayoutGeometry:
     """Figure size and axes positions for the PF visualization layout."""
 
-    fig_size: Tuple[float, float]
-    pf_pos: Tuple[float, float, float, float]
-    counts_pos: Tuple[float, float, float, float] | None
-    labels_pos: Tuple[float, float, float, float]
+    fig_size: tuple[float, float]
+    pf_pos: tuple[float, float, float, float]
+    counts_pos: tuple[float, float, float, float] | None
+    labels_pos: tuple[float, float, float, float]
 
 
 DEFAULT_ISOTOPE_COLORS = {
@@ -187,9 +160,7 @@ def _normalize_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
         )
     total = float(np.sum(w))
     if not np.isfinite(total) or total <= 0.0:
-        raise ValueError(
-            "PF visualization requires strictly positive posterior mass."
-        )
+        raise ValueError("PF visualization requires strictly positive posterior mass.")
     return w / total
 
 
@@ -280,10 +251,7 @@ def _active_display_positions(
             "PF visualization requires the continuous surface-state resolver."
         )
     positions = np.asarray(resolver(state), dtype=float)
-    if (
-        positions.shape != (num_sources, 3)
-        or np.any(~np.isfinite(positions))
-    ):
+    if positions.shape != (num_sources, 3) or np.any(~np.isfinite(positions)):
         raise RuntimeError(
             "PF visualization received an invalid continuous surface state."
         )
@@ -350,9 +318,7 @@ def _batched_particle_display_arrays(
             )
             representative_weights.append(float(weight))
             flat_positions.extend(active_positions)
-            flat_weights.extend(
-                [float(weight)] * int(active_positions.shape[0])
-            )
+            flat_weights.extend([float(weight)] * int(active_positions.shape[0]))
         return (
             np.vstack(flat_positions)
             if flat_positions
@@ -364,9 +330,7 @@ def _batched_particle_display_arrays(
             np.asarray(representative_weights, dtype=float),
         )
 
-    packed_positions, _strengths, active_mask, _chart_ids, _surface_uv = (
-        packer()
-    )
+    packed_positions, _strengths, active_mask, _chart_ids, _surface_uv = packer()
     positions = np.asarray(packed_positions, dtype=float)
     mask = np.asarray(active_mask, dtype=bool)
     if (
@@ -448,10 +412,10 @@ class RealTimePFVisualizer:
 
     def __init__(
         self,
-        isotopes: List[str],
-        world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None,
-        true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
-        true_strengths: Optional[Dict[str, float | Sequence[float]]] = None,
+        isotopes: list[str],
+        world_bounds: tuple[float, float, float, float, float, float] | None = None,
+        true_sources: dict[str, NDArray[np.float64]] | None = None,
+        true_strengths: dict[str, float | Sequence[float]] | None = None,
         obstacle_grid: ObstacleGrid | None = None,
     ) -> None:
         """Initialize the visualizer and optional obstacle overlay."""
@@ -486,16 +450,16 @@ class RealTimePFVisualizer:
         self._init_label_axis()
         self._apply_layout()
         self._attach_draw_handler()
-        self._particle_artists: Dict[str, Any] = {}
-        self._est_artists: Dict[str, Any] = {}
-        self._estimate_text_artists: Dict[str, list] = {}
-        self._estimate_text_positions: Dict[str, NDArray[np.float64]] = {}
-        self._true_text_artists: Dict[str, list] = {}
-        self._true_text_positions: Dict[str, NDArray[np.float64]] = {}
+        self._particle_artists: dict[str, Any] = {}
+        self._est_artists: dict[str, Any] = {}
+        self._estimate_text_artists: dict[str, list] = {}
+        self._estimate_text_positions: dict[str, NDArray[np.float64]] = {}
+        self._true_text_artists: dict[str, list] = {}
+        self._true_text_positions: dict[str, NDArray[np.float64]] = {}
         self._true_halo_artists: list = []
         self._robot_artist = None
         self._traj_line = None
-        self._shield_arrows: Dict[str, Any] = {}
+        self._shield_arrows: dict[str, Any] = {}
         self._traj_history: list[NDArray[np.float64]] = []
         self._last_frame: PFFrame | None = None
         self._true_artists: list = []
@@ -513,7 +477,9 @@ class RealTimePFVisualizer:
             if pos.size:
                 strength = self.true_strengths.get(iso, None)
                 label = f"True {iso}"
-                if strength is not None and not isinstance(strength, (list, tuple, np.ndarray)):
+                if strength is not None and not isinstance(
+                    strength, (list, tuple, np.ndarray)
+                ):
                     label = f"{label} pos={_format_pos(pos)} q={strength:.1f} cps@1m"
                 halo = self.ax3d.scatter(
                     pos[:, 0],
@@ -542,10 +508,14 @@ class RealTimePFVisualizer:
                     zorder=27,
                 )
                 self._true_artists.append(art)
-                self._true_projection_artists.extend(self._axis_projection_lines(pos, self.colors.get(iso, "black")))
+                self._true_projection_artists.extend(
+                    self._axis_projection_lines(pos, self.colors.get(iso, "black"))
+                )
                 self._update_true_texts(iso, pos, self.colors.get(iso, "black"))
         for iso in self.isotopes:
-            self.estimate_colors[iso] = self._estimate_color(self.colors.get(iso, "black"))
+            self.estimate_colors[iso] = self._estimate_color(
+                self.colors.get(iso, "black")
+            )
 
     def set_active_isotopes(self, isotopes: Sequence[str] | None) -> None:
         """Restrict legend/label reporting to the given isotopes."""
@@ -554,7 +524,7 @@ class RealTimePFVisualizer:
             return
         self._active_isotopes = set(isotopes)
 
-    def _iter_active_isotopes(self) -> List[str]:
+    def _iter_active_isotopes(self) -> list[str]:
         """Return the list of isotopes to display in legends/labels."""
         if self._active_isotopes is None:
             return list(self.isotopes)
@@ -588,7 +558,7 @@ class RealTimePFVisualizer:
             labels_pos=labels_pos,
         )
 
-    def _axis_line_style(self) -> Tuple[str, float]:
+    def _axis_line_style(self) -> tuple[str, float]:
         """Return line color and width that match the axis lines."""
         color = "black"
         linewidth = 1.2
@@ -660,7 +630,7 @@ class RealTimePFVisualizer:
         self._update_x_label_position(event)
         self._position_all_estimate_texts()
 
-    def _set_box_aspect(self, aspect: Tuple[float, float, float]) -> None:
+    def _set_box_aspect(self, aspect: tuple[float, float, float]) -> None:
         """Set the 3D box aspect ratio with the configured zoom."""
         if self.ax3d is None:
             return
@@ -725,7 +695,9 @@ class RealTimePFVisualizer:
         polygons = self.obstacle_grid.blocked_polygons(z=0.0)
         if not polygons:
             return
-        collection = Poly3DCollection(polygons, facecolors="black", edgecolors="none", alpha=0.75)
+        collection = Poly3DCollection(
+            polygons, facecolors="black", edgecolors="none", alpha=0.75
+        )
         collection.set_zorder(0)
         collection.set_clip_on(False)
         try:
@@ -755,9 +727,9 @@ class RealTimePFVisualizer:
         if self.ax_labels is not None:
             self.ax_labels.set_position(layout.labels_pos)
 
-    def _legend_lines(self) -> List[Tuple[str, str, str, str]]:
+    def _legend_lines(self) -> list[tuple[str, str, str, str]]:
         """Build legend-style label lines with matching colors and markers."""
-        lines: List[Tuple[str, str, str, str]] = []
+        lines: list[tuple[str, str, str, str]] = []
         active = set(self._iter_active_isotopes())
         for iso, pos in self.true_sources.items():
             if iso not in active:
@@ -778,12 +750,14 @@ class RealTimePFVisualizer:
         for iso in self._iter_active_isotopes():
             color = self.colors.get(iso, "black")
             lines.append((f"{iso} particles", color, ".", "None"))
-            lines.append((f"{iso} est", self.estimate_colors.get(iso, color), "x", "None"))
+            lines.append(
+                (f"{iso} est", self.estimate_colors.get(iso, color), "x", "None")
+            )
         return lines
 
-    def _legend_lines_estimates_only(self) -> List[Tuple[str, str, str, str]]:
+    def _legend_lines_estimates_only(self) -> list[tuple[str, str, str, str]]:
         """Build legend lines for the estimates-only view."""
-        lines: List[Tuple[str, str, str, str]] = []
+        lines: list[tuple[str, str, str, str]] = []
         active = set(self._iter_active_isotopes())
         for iso, pos in self.true_sources.items():
             if iso not in active:
@@ -806,7 +780,7 @@ class RealTimePFVisualizer:
             lines.append((f"{iso} est", color, "x", "None"))
         return lines
 
-    def _true_strengths_for_iso(self, iso: str, count: int) -> List[float | None]:
+    def _true_strengths_for_iso(self, iso: str, count: int) -> list[float | None]:
         """Return per-source true strengths for an isotope."""
         strengths = self.true_strengths.get(iso, None)
         if strengths is None:
@@ -821,9 +795,9 @@ class RealTimePFVisualizer:
             values.extend([None] * (count - len(values)))
         return [float(v) if v is not None else None for v in values[:count]]
 
-    def _estimate_lines(self, frame: PFFrame) -> List[Tuple[str, str]]:
+    def _estimate_lines(self, frame: PFFrame) -> list[tuple[str, str]]:
         """Build estimate text lines for the strongest source per isotope."""
-        lines: List[Tuple[str, str]] = []
+        lines: list[tuple[str, str]] = []
         for iso in self._iter_active_isotopes():
             est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
             strengths = frame.estimated_strengths.get(iso, np.zeros(0))
@@ -834,12 +808,14 @@ class RealTimePFVisualizer:
                 text = f"{iso}: pos={_format_pos(pos)} q={strength:.1f} cps@1m"
             else:
                 text = f"{iso}: no estimate"
-            lines.append((text, self.estimate_colors.get(iso, self.colors.get(iso, "black"))))
+            lines.append(
+                (text, self.estimate_colors.get(iso, self.colors.get(iso, "black")))
+            )
         return lines
 
-    def _estimate_lines_all(self, frame: PFFrame) -> List[Tuple[str, str]]:
+    def _estimate_lines_all(self, frame: PFFrame) -> list[tuple[str, str]]:
         """Build estimate text lines for all sources per isotope."""
-        lines: List[Tuple[str, str]] = []
+        lines: list[tuple[str, str]] = []
         for iso in self._iter_active_isotopes():
             est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
             strengths = frame.estimated_strengths.get(iso, np.zeros(0))
@@ -852,7 +828,7 @@ class RealTimePFVisualizer:
                 lines.append((f"{iso}: no estimate", color))
         return lines
 
-    def _estimate_color(self, base_color: str) -> Tuple[float, float, float]:
+    def _estimate_color(self, base_color: str) -> tuple[float, float, float]:
         """Return a darker variant of the base color for estimate markers."""
         rgb = np.array(mcolors.to_rgb(base_color))
         hsv = mcolors.rgb_to_hsv(rgb)
@@ -860,7 +836,9 @@ class RealTimePFVisualizer:
         hsv[2] = max(0.2, hsv[2] * 0.6)
         return tuple(mcolors.hsv_to_rgb(hsv))
 
-    def _update_estimate_texts(self, iso: str, positions: NDArray[np.float64], color: str) -> None:
+    def _update_estimate_texts(
+        self, iso: str, positions: NDArray[np.float64], color: str
+    ) -> None:
         """Update estimate position text above markers for one isotope."""
         if self.ax3d is None:
             return
@@ -880,7 +858,12 @@ class RealTimePFVisualizer:
                     ha="center",
                     va="bottom",
                     rotation=0,
-                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.35, boxstyle="round,pad=0.15"),
+                    bbox=dict(
+                        facecolor="white",
+                        edgecolor="none",
+                        alpha=0.35,
+                        boxstyle="round,pad=0.15",
+                    ),
                 )
                 art.set_path_effects([])
                 art.set_clip_on(False)
@@ -895,7 +878,9 @@ class RealTimePFVisualizer:
         for extra in artists[len(positions) :]:
             extra.set_visible(False)
 
-    def _update_true_texts(self, iso: str, positions: NDArray[np.float64], color: str) -> None:
+    def _update_true_texts(
+        self, iso: str, positions: NDArray[np.float64], color: str
+    ) -> None:
         """Update true position text above markers for one isotope."""
         if self.ax3d is None:
             return
@@ -915,7 +900,12 @@ class RealTimePFVisualizer:
                     ha="center",
                     va="bottom",
                     rotation=0,
-                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.35, boxstyle="round,pad=0.15"),
+                    bbox=dict(
+                        facecolor="white",
+                        edgecolor="none",
+                        alpha=0.35,
+                        boxstyle="round,pad=0.15",
+                    ),
                 )
                 art.set_path_effects(
                     [
@@ -1053,8 +1043,8 @@ class RealTimePFVisualizer:
     def _update_labels(
         self,
         frame: PFFrame,
-        legend_lines: List[Tuple[str, str, str, str]] | None = None,
-        estimate_lines: List[Tuple[str, str]] | None = None,
+        legend_lines: list[tuple[str, str, str, str]] | None = None,
+        estimate_lines: list[tuple[str, str]] | None = None,
     ) -> None:
         """Update the label panel with legend entries and estimates."""
         if self.ax_labels is None:
@@ -1071,7 +1061,11 @@ class RealTimePFVisualizer:
         )
         self.ax_labels.axis("off")
         legend_lines = self._legend_lines() if legend_lines is None else legend_lines
-        estimate_lines = self._estimate_lines_all(frame) if estimate_lines is None else estimate_lines
+        estimate_lines = (
+            self._estimate_lines_all(frame)
+            if estimate_lines is None
+            else estimate_lines
+        )
         gap_lines = 1
         total_lines = len(legend_lines) + len(estimate_lines) + 2 + gap_lines
         self._ensure_label_height(total_lines)
@@ -1148,7 +1142,9 @@ class RealTimePFVisualizer:
             )
             y -= line_height
 
-    def _particle_style(self, weights: NDArray[np.float64], base_color: str) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    def _particle_style(
+        self, weights: NDArray[np.float64], base_color: str
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Map particle weights to marker sizes and RGBA colors."""
         if weights.size == 0:
             return np.zeros(0), np.zeros((0, 4))
@@ -1309,7 +1305,9 @@ class RealTimePFVisualizer:
         for iso in self.isotopes:
             est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
             est_color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
-            self._projection_artists.extend(self._axis_projection_lines(est_pos, est_color))
+            self._projection_artists.extend(
+                self._axis_projection_lines(est_pos, est_color)
+            )
         self.ax3d.set_title("")
         self._ensure_x_label()
         self._update_x_label_position()
@@ -1379,12 +1377,12 @@ class CUISplitPFVisualizer:
 
     def __init__(
         self,
-        isotopes: List[str],
+        isotopes: list[str],
         output_dir: str | Path,
         *,
-        world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None,
-        true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
-        true_strengths: Optional[Dict[str, float | Sequence[float]]] = None,
+        world_bounds: tuple[float, float, float, float, float, float] | None = None,
+        true_sources: dict[str, NDArray[np.float64]] | None = None,
+        true_strengths: dict[str, float | Sequence[float]] | None = None,
         obstacle_grid: ObstacleGrid | None = None,
         max_particles_per_isotope: int | None = None,
         source_label_neighborhood_m: float = 1.0,
@@ -1422,9 +1420,7 @@ class CUISplitPFVisualizer:
         self.latest_robot_path = self.output_dir / "latest_robot_2d.png"
         self.latest_overview_path = self.output_dir / "latest_experiment_overview.png"
         self.latest_pf_path = self.output_dir / "latest_pf_3d.png"
-        self.latest_pf_labeled_path = (
-            self.output_dir / "latest_pf_3d_labeled.png"
-        )
+        self.latest_pf_labeled_path = self.output_dir / "latest_pf_3d_labeled.png"
         self.latest_spectrum_path = self.output_dir / "latest_spectrum.png"
         self.index_path = self.output_dir / "index.html"
         self._write_index_html()
@@ -1435,8 +1431,8 @@ class CUISplitPFVisualizer:
 
     def set_truth(
         self,
-        true_sources: Dict[str, NDArray[np.float64]],
-        true_strengths: Dict[str, float | Sequence[float]],
+        true_sources: dict[str, NDArray[np.float64]],
+        true_strengths: dict[str, float | Sequence[float]],
     ) -> None:
         """Attach evaluation-only truth without exposing it to the estimator."""
         self.true_sources = {
@@ -1459,11 +1455,11 @@ class CUISplitPFVisualizer:
             self._record_measurement_point(frame)
         step = max(0, int(frame.step_index))
         robot_step_path = self.output_dir / f"robot_2d_step_{step:04d}.png"
-        overview_step_path = self.output_dir / f"experiment_overview_step_{step:04d}.png"
-        pf_step_path = self.output_dir / f"pf_3d_step_{step:04d}.png"
-        pf_labeled_step_path = (
-            self.output_dir / f"pf_3d_labeled_step_{step:04d}.png"
+        overview_step_path = (
+            self.output_dir / f"experiment_overview_step_{step:04d}.png"
         )
+        pf_step_path = self.output_dir / f"pf_3d_step_{step:04d}.png"
+        pf_labeled_step_path = self.output_dir / f"pf_3d_labeled_step_{step:04d}.png"
         spectrum_step_path = self.output_dir / f"spectrum_step_{step:04d}.png"
         self._save_robot_2d(frame, robot_step_path)
         shutil.copyfile(robot_step_path, self.latest_robot_path)
@@ -1518,14 +1514,19 @@ class CUISplitPFVisualizer:
                     distances = np.linalg.norm(station_arr - point[None, :], axis=1)
                     if float(np.min(distances)) <= 1e-6:
                         continue
-                if any(float(np.linalg.norm(point - existing)) <= 1e-6 for existing in waypoints):
+                if any(
+                    float(np.linalg.norm(point - existing)) <= 1e-6
+                    for existing in waypoints
+                ):
                     continue
                 waypoints.append(np.asarray(point, dtype=float).reshape(3).copy())
         if not waypoints:
             return np.zeros((0, 3), dtype=float)
         return np.vstack(waypoints).astype(float)
 
-    def _station_label_offsets(self, points: NDArray[np.float64]) -> NDArray[np.float64]:
+    def _station_label_offsets(
+        self, points: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
         """Return small deterministic xy offsets for overlapping station labels."""
         point_arr = np.asarray(points, dtype=float)
         if point_arr.size == 0:
@@ -1863,9 +1864,7 @@ class CUISplitPFVisualizer:
                 .reshape((-1, 3))
                 .shape[0]
             )
-            lines.append(
-                f"{iso}: truth={truth_label} estimate={est_count}"
-            )
+            lines.append(f"{iso}: truth={truth_label} estimate={est_count}")
         return "\n".join(lines)
 
     def _plot_true_sources_3d(self, ax: plt.Axes) -> None:
@@ -1959,9 +1958,7 @@ class CUISplitPFVisualizer:
         for assignment in assignments:
             if assignment is None:
                 continue
-            assignment_counts[assignment] = (
-                assignment_counts.get(assignment, 0) + 1
-            )
+            assignment_counts[assignment] = assignment_counts.get(assignment, 0) + 1
         assignment_occurrences: dict[int, int] = {}
         remote_index = 0
         estimate_entries: list[tuple[NDArray[np.float64], str]] = []
@@ -2320,10 +2317,12 @@ class CUISplitPFVisualizer:
             return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
         if w.shape != (pts.shape[0],):
             raise ValueError(
-                "PF visualization requires one posterior weight per displayed "
-                "particle."
+                "PF visualization requires one posterior weight per displayed particle."
             )
-        if self.max_particles_per_isotope is None or pts.shape[0] <= self.max_particles_per_isotope:
+        if (
+            self.max_particles_per_isotope is None
+            or pts.shape[0] <= self.max_particles_per_isotope
+        ):
             return pts, w
         indices = np.argsort(w)[::-1][: self.max_particles_per_isotope]
         return pts[indices], w[indices]
@@ -2386,9 +2385,7 @@ class CUISplitPFVisualizer:
                 color="cyan",
                 linewidth=1.6,
                 alpha=0.68,
-                label="traversed path"
-                if idx == 0 and show_legend_context
-                else None,
+                label="traversed path" if idx == 0 and show_legend_context else None,
             )
         path_waypoints = self._unique_path_waypoints()
         if path_waypoints.size:
@@ -2488,7 +2485,7 @@ class CUISplitPFVisualizer:
         ax.view_init(elev=26.0, azim=-58.0)
 
     @staticmethod
-    def _point_count(points_by_isotope: Dict[str, NDArray[np.float64]]) -> int:
+    def _point_count(points_by_isotope: dict[str, NDArray[np.float64]]) -> int:
         """Return the total number of display points across isotope arrays."""
         total = 0
         for points in points_by_isotope.values():
@@ -2698,12 +2695,12 @@ class AsyncCUISplitPFVisualizer:
 
     def __init__(
         self,
-        isotopes: List[str],
+        isotopes: list[str],
         output_dir: str | Path,
         *,
-        world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None,
-        true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
-        true_strengths: Optional[Dict[str, float | Sequence[float]]] = None,
+        world_bounds: tuple[float, float, float, float, float, float] | None = None,
+        true_sources: dict[str, NDArray[np.float64]] | None = None,
+        true_strengths: dict[str, float | Sequence[float]] | None = None,
         obstacle_grid: ObstacleGrid | None = None,
         max_particles_per_isotope: int | None = None,
         source_label_neighborhood_m: float = 1.0,
@@ -2717,9 +2714,7 @@ class AsyncCUISplitPFVisualizer:
         self.latest_robot_path = self.output_dir / "latest_robot_2d.png"
         self.latest_overview_path = self.output_dir / "latest_experiment_overview.png"
         self.latest_pf_path = self.output_dir / "latest_pf_3d.png"
-        self.latest_pf_labeled_path = (
-            self.output_dir / "latest_pf_3d_labeled.png"
-        )
+        self.latest_pf_labeled_path = self.output_dir / "latest_pf_3d_labeled.png"
         self.latest_spectrum_path = self.output_dir / "latest_spectrum.png"
         self._closed = False
         self._ctx = mp.get_context("spawn")
@@ -2758,8 +2753,8 @@ class AsyncCUISplitPFVisualizer:
 
     def set_truth(
         self,
-        true_sources: Dict[str, NDArray[np.float64]],
-        true_strengths: Dict[str, float | Sequence[float]],
+        true_sources: dict[str, NDArray[np.float64]],
+        true_strengths: dict[str, float | Sequence[float]],
     ) -> None:
         """Queue evaluation truth for post-run rendering only."""
         if self._closed or not self._process.is_alive():
@@ -2813,17 +2808,17 @@ def build_frame_from_pf(
         spectrum_counts: Raw nonnegative native histogram.
     """
     if hasattr(pf, "visualization_estimates"):
-        est: Dict[str, object] = pf.visualization_estimates()
+        est: dict[str, object] = pf.visualization_estimates()
     elif hasattr(pf, "estimate_all"):
         est = pf.estimate_all()
     else:
         est = pf.estimates()  # type: ignore[attr-defined]
-    particle_positions: Dict[str, NDArray[np.float64]] = {}
-    particle_weights: Dict[str, NDArray[np.float64]] = {}
-    particle_representative_positions: Dict[str, NDArray[np.float64]] = {}
-    particle_representative_weights: Dict[str, NDArray[np.float64]] = {}
-    estimated_sources: Dict[str, NDArray[np.float64]] = {}
-    estimated_strengths: Dict[str, NDArray[np.float64]] = {}
+    particle_positions: dict[str, NDArray[np.float64]] = {}
+    particle_weights: dict[str, NDArray[np.float64]] = {}
+    particle_representative_positions: dict[str, NDArray[np.float64]] = {}
+    particle_representative_weights: dict[str, NDArray[np.float64]] = {}
+    estimated_sources: dict[str, NDArray[np.float64]] = {}
+    estimated_strengths: dict[str, NDArray[np.float64]] = {}
 
     for iso, filt in pf.filters.items():
         cont_particles = getattr(filt, "continuous_particles", [])
@@ -2873,9 +2868,7 @@ def build_frame_from_pf(
                 f"source for isotope {iso}."
             )
         if np.any(~np.isfinite(est_pos)) or np.any(~np.isfinite(est_str)):
-            raise ValueError(
-                f"PF estimate_all() returned non-finite values for {iso}."
-            )
+            raise ValueError(f"PF estimate_all() returned non-finite values for {iso}.")
         estimated_sources[iso] = est_pos
         estimated_strengths[iso] = est_str
 
@@ -2886,14 +2879,10 @@ def build_frame_from_pf(
     if not np.isfinite(duration) or duration <= 0.0:
         raise ValueError("live_time_s must be finite and positive.")
     rotation_fe = (
-        np.eye(3, dtype=float)
-        if RFe is None
-        else np.asarray(RFe, dtype=float)
+        np.eye(3, dtype=float) if RFe is None else np.asarray(RFe, dtype=float)
     )
     rotation_pb = (
-        np.eye(3, dtype=float)
-        if RPb is None
-        else np.asarray(RPb, dtype=float)
+        np.eye(3, dtype=float) if RPb is None else np.asarray(RPb, dtype=float)
     )
 
     return PFFrame(

@@ -134,6 +134,50 @@ class _FakeRuntimeClient:
         """Expose the runtime cleanup method."""
 
 
+class _FakeResumeRuntimeClient(_FakeRuntimeClient):
+    """Return one complete prefix and no new acquisition actions."""
+
+    def read_event(self) -> dict[str, object]:
+        """Return the schema-v2 resume handshake."""
+        record = {
+            "step_id": 0,
+            "action_id": 0,
+            "station_id": 0,
+            "detector_pose_xyz": [0.5, 0.5, 0.5],
+            "detector_quat_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "fe_orientation_index": 0,
+            "pb_orientation_index": 0,
+            "live_time_s": 30.0,
+            "travel_time_s": 0.0,
+            "shield_actuation_time_s": 0.0,
+            "energy_bin_edges_keV": [0.0, 1.0, 2.0],
+            "spectrum_counts": [2, 3],
+            "metadata": {
+                "full_spectrum_contract_hash_sha256": "b" * 64,
+                "station_complete": True,
+            },
+        }
+        return {
+            "type": "ready",
+            "schema_version": 2,
+            "context": _context_payload(),
+            "candidates": self.candidates,
+            "resume": {
+                "record_count": 1,
+                "records": [record],
+                "next_station_id": 1,
+            },
+        }
+
+    def finalize(self) -> dict[str, object]:
+        """Publish the unchanged one-record prefix."""
+        return {
+            "type": "published",
+            "path": "/tmp/pf-live-log",
+            "record_count": 1,
+        }
+
+
 class _FakeEstimator:
     """Expose only PF operations needed for the one-station controller test."""
 
@@ -194,6 +238,47 @@ def test_pf_budget_requires_one_complete_estimator_station() -> None:
 
     with pytest.raises(ValueError, match="complete station"):
         PFControlBudget.from_settings(settings, planner)
+
+
+def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
+    """RA-L passive policy must bypass PF EIG for both action dimensions."""
+    from pf import closed_loop
+
+    estimator = SimpleNamespace(
+        normals=np.asarray(generate_octant_orientations(), dtype=float)
+    )
+    settings = {
+        "baseline_path_policy": {"name": "passive_serpentine", "row_count": 2},
+        "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
+        "dss_pp": {"program_length": 2},
+    }
+    planner = dss_config_from_pf_settings(settings, runtime_owned_candidates=True)
+    candidates = {
+        "candidate_poses_xyz": np.asarray(
+            [[0.0, 0.0, 0.5], [2.0, 2.0, 0.5]], dtype=float
+        ),
+        "travel_costs": np.asarray([1.0, 1.0]),
+        "current_pair_id": 63,
+    }
+
+    result = closed_loop._plan(
+        estimator,
+        candidates,
+        current_pose=np.asarray([1.0, 1.0, 0.5]),
+        visited_poses=[],
+        obstacle_grid=None,
+        room_bounds=(np.asarray([0.0, 0.0, 0.5]), np.asarray([2.0, 2.0, 0.5])),
+        height_bounds=None,
+        planner=planner,
+        rng=np.random.default_rng(7),
+        settings=settings,
+        station_index=0,
+    )
+
+    assert result.next_pose_index == 0
+    assert result.shield_program.pair_ids == (0, 0)
+    assert result.sequence == ()
+    assert result.diagnostics["selection_mode"] == "ral_baseline_path"
 
 
 def test_pf_closed_loop_owns_budget_and_shield_program(
@@ -289,6 +374,74 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
         == 1
     )
     assert station_trace["posterior_snapshot"]["publishable"] is False
+
+
+def test_pf_closed_loop_replays_runtime_resume_prefix(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Schema-v2 resume should rebuild PF state before final publication."""
+    from pf import closed_loop
+
+    config = tmp_path / "pf.json"
+    config.write_text(
+        json.dumps(
+            {
+                "pure_pf_schema_version": 1,
+                "estimator_profile": "pf_strict",
+                "mission_stop_max_poses": 1,
+                "measurement_budget_max_steps": 1,
+                "orientation_k": 1,
+                "measurement_live_time_s": 30.0,
+                "cui_split_view": False,
+                "dss_pp": {"program_length": 1, "max_programs": 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+    estimator = _FakeEstimator()
+    fake_log = SimpleNamespace(
+        path=Path("/tmp/pf-live-log"),
+        run_id="pf-live-test",
+        records=(SimpleNamespace(station_id=0),),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "AdaptiveRuntimeClient",
+        _FakeResumeRuntimeClient,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "build_live_estimator",
+        lambda *args, **kwargs: estimator,
+    )
+    monkeypatch.setattr(closed_loop, "load_measurement_log", lambda path: fake_log)
+    monkeypatch.setattr(
+        closed_loop,
+        "bind_finalized_measurement_log",
+        lambda estimator, log: None,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "_write_final_outputs",
+        lambda *args, **kwargs: None,
+    )
+
+    result = run_pf_closed_loop(
+        tmp_path / "private-scenario.json",
+        runtime_root=tmp_path,
+        pf_config_path=config,
+        output_dir=tmp_path / "output",
+        resume_stage_path=tmp_path / "stage",
+    )
+
+    client = _FakeResumeRuntimeClient.instance
+    assert client is not None
+    assert client.requests == []
+    assert len(estimator.measurements) == 1
+    assert result.record_count == 1
+    assert result.station_count == 1
+    assert result.stop_reason == "maximum_measurement_budget"
 
 
 def test_detected_isotope_gate_builds_only_active_pf(

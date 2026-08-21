@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from collections.abc import Mapping
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -13,124 +12,17 @@ from scipy.optimize import linear_sum_assignment
 from measurement.source_surfaces import SOURCE_SURFACE_REPORT_LABELS
 from measurement.surface_charts import surface_chart_geometry_sha256
 from measurement.surface_atlas import ContinuousSurfaceAtlas
+from pf.atomic_io import atomic_write_json
+from evaluation.source_normalization import (
+    Source,
+    non_negative_finite as _non_negative_finite,
+    normalize_sources as _normalize_sources,
+    unit_interval_probability as _unit_interval_probability,
+)
 
 POSITION_ERROR_TARGET_M = 0.5
 SURFACE_LABELS = SOURCE_SURFACE_REPORT_LABELS
 ROOM_SURFACE_LABELS = ("floor", "wall", "ceiling")
-PROBABILITY_ROUNDOFF_ATOL = 1.0e-12
-
-
-@dataclass(frozen=True)
-class Source:
-    """Lightweight source representation for evaluation."""
-
-    pos: NDArray[np.float64]
-    strength: float
-    surface_kind: str | None = None
-
-
-def _as_array(value: Sequence[float]) -> NDArray[np.float64]:
-    """Return a NumPy array for a position sequence."""
-    arr = np.asarray(value, dtype=float)
-    if arr.shape != (3,):
-        raise ValueError("Position must be a 3-element sequence.")
-    if np.any(~np.isfinite(arr)):
-        raise ValueError("Position coordinates must be finite.")
-    return arr
-
-
-def _non_negative_finite(value: Any, *, name: str) -> float:
-    """Return a finite non-negative scalar for a physical metric input."""
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be finite and non-negative.") from exc
-    if not np.isfinite(numeric) or numeric < 0.0:
-        raise ValueError(f"{name} must be finite and non-negative.")
-    return numeric
-
-
-def _unit_interval_probability(value: Any, *, name: str) -> float:
-    """Return a probability, clipping only floating-point boundary roundoff."""
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be finite and in [0, 1].") from exc
-    if (
-        not np.isfinite(numeric)
-        or numeric < -PROBABILITY_ROUNDOFF_ATOL
-        or numeric > 1.0 + PROBABILITY_ROUNDOFF_ATOL
-    ):
-        raise ValueError(f"{name} must be finite and in [0, 1].")
-    return float(np.clip(numeric, 0.0, 1.0))
-
-
-def _extract_strength(obj: Any) -> float | None:
-    """Extract strength from a dict/object if present."""
-    for key in ("strength", "intensity_cps_1m", "intensity"):
-        if isinstance(obj, Mapping) and key in obj:
-            return float(obj[key])
-        if hasattr(obj, key):
-            return float(getattr(obj, key))
-    return None
-
-
-def _extract_position(obj: Any) -> NDArray[np.float64] | None:
-    """Extract a position array from a dict/object if present."""
-    if isinstance(obj, Mapping):
-        if "pos" in obj:
-            return _as_array(obj["pos"])
-        if "position" in obj:
-            return _as_array(obj["position"])
-    if hasattr(obj, "pos"):
-        return _as_array(getattr(obj, "pos"))
-    if hasattr(obj, "position"):
-        return _as_array(getattr(obj, "position"))
-    return None
-
-
-def _extract_surface_kind(obj: Any) -> str | None:
-    """Extract an optional physical-surface label from a source-like object."""
-    for key in ("surface_kind", "surface", "source_surface_kind"):
-        if isinstance(obj, Mapping) and obj.get(key) is not None:
-            return str(obj[key]).strip().lower()
-        if hasattr(obj, key) and getattr(obj, key) is not None:
-            return str(getattr(obj, key)).strip().lower()
-    return None
-
-
-def _normalize_source(entry: Any) -> Source:
-    """Convert various source-like entries to Source."""
-    if isinstance(entry, Source):
-        return Source(
-            pos=_as_array(entry.pos),
-            strength=_non_negative_finite(entry.strength, name="source strength"),
-            surface_kind=(
-                None
-                if entry.surface_kind is None
-                else str(entry.surface_kind).strip().lower()
-            ),
-        )
-    if isinstance(entry, (tuple, list, np.ndarray)) and len(entry) == 4:
-        pos = _as_array(entry[:3])
-        strength = _non_negative_finite(entry[3], name="source strength")
-        return Source(pos=pos, strength=strength)
-    pos = _extract_position(entry)
-    strength = _extract_strength(entry)
-    if pos is None or strength is None:
-        raise ValueError("Unsupported source entry format.")
-    return Source(
-        pos=pos,
-        strength=_non_negative_finite(strength, name="source strength"),
-        surface_kind=_extract_surface_kind(entry),
-    )
-
-
-def _normalize_sources(entries: Iterable[Any] | None) -> List[Source]:
-    """Normalize a list of source-like entries."""
-    if entries is None:
-        return []
-    return [_normalize_source(entry) for entry in entries]
 
 
 def _resolution_cluster_sources(
@@ -140,15 +32,13 @@ def _resolution_cluster_sources(
     surface_atlas: ContinuousSurfaceAtlas,
     maximum_surface_distance_m: float,
     minimum_response_cosine_similarity: float,
-) -> tuple[List[Source], List[Dict[str, Any]]]:
+) -> tuple[list[Source], list[dict[str, Any]]]:
     """Cluster only intrinsically nearby, response-indistinguishable sources."""
     source_list = list(sources)
     source_count = len(source_list)
     signatures = np.asarray(response_signatures_rs, dtype=np.float64)
     if signatures.ndim != 2 or signatures.shape[1] != source_count:
-        raise ValueError(
-            "response signatures must have one column per source."
-        )
+        raise ValueError("response signatures must have one column per source.")
     if np.any(~np.isfinite(signatures)):
         raise ValueError("response signatures must be finite.")
     if source_count == 0:
@@ -180,9 +70,9 @@ def _resolution_cluster_sources(
         & (distances <= maximum_surface_distance_m)
         & (cosine >= minimum_response_cosine_similarity)
     )
-    groups: List[List[int]] = [[index] for index in range(source_count)]
+    groups: list[list[int]] = [[index] for index in range(source_count)]
     while True:
-        candidates: List[Tuple[float, float, int, int]] = []
+        candidates: list[tuple[float, float, int, int]] = []
         for left in range(len(groups)):
             for right in range(left + 1, len(groups)):
                 left_members = np.asarray(groups[left], dtype=np.int64)
@@ -202,8 +92,8 @@ def _resolution_cluster_sources(
         _, _, left, right = min(candidates)
         groups[left] = sorted((*groups[left], *groups[right]))
         del groups[right]
-    clustered: List[Source] = []
-    payload: List[Dict[str, Any]] = []
+    clustered: list[Source] = []
+    payload: list[dict[str, Any]] = []
     for member_indices in groups:
         members = np.asarray(member_indices, dtype=np.int64)
         member_strengths = np.asarray(
@@ -212,8 +102,7 @@ def _resolution_cluster_sources(
         )
         total_strength = float(np.sum(member_strengths, dtype=np.float64))
         medoid_cost = np.sum(
-            distances[np.ix_(members, members)]
-            * member_strengths[None, :],
+            distances[np.ix_(members, members)] * member_strengths[None, :],
             axis=1,
             dtype=np.float64,
         )
@@ -236,20 +125,16 @@ def _resolution_cluster_sources(
                     float(value) for value in representative.pos
                 ],
                 "combined_strength_cps_1m": total_strength,
-                "maximum_intrinsic_diameter_m": float(
-                    np.max(pair_distance)
-                ),
-                "minimum_response_cosine_similarity": float(
-                    np.min(pair_cosine)
-                ),
+                "maximum_intrinsic_diameter_m": float(np.max(pair_distance)),
+                "minimum_response_cosine_similarity": float(np.min(pair_cosine)),
             }
         )
     return clustered, payload
 
 
 def compute_resolution_aware_cluster_metrics(
-    gt_by_iso: Dict[str, List[Any]],
-    est_by_iso: Dict[str, List[Any]],
+    gt_by_iso: dict[str, list[Any]],
+    est_by_iso: dict[str, list[Any]],
     *,
     match_radius_m: float,
     surface_atlas: ContinuousSurfaceAtlas,
@@ -257,7 +142,7 @@ def compute_resolution_aware_cluster_metrics(
     est_response_signatures_by_iso: Mapping[str, NDArray[np.float64]],
     maximum_surface_distance_m: float = 2.0,
     minimum_response_cosine_similarity: float = 0.995,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Report effective sources without changing raw PF cardinality.
 
     The same predeclared rule is applied independently to truth and estimate.
@@ -274,9 +159,9 @@ def compute_resolution_aware_cluster_metrics(
         name="minimum_response_cosine_similarity",
     )
     isotopes = sorted(set(gt_by_iso) | set(est_by_iso))
-    clustered_gt: Dict[str, List[Source]] = {}
-    clustered_est: Dict[str, List[Source]] = {}
-    mappings: Dict[str, Dict[str, Any]] = {}
+    clustered_gt: dict[str, list[Source]] = {}
+    clustered_est: dict[str, list[Source]] = {}
+    mappings: dict[str, dict[str, Any]] = {}
     for isotope in isotopes:
         truth = _normalize_sources(gt_by_iso.get(isotope))
         estimate = _normalize_sources(est_by_iso.get(isotope))
@@ -334,8 +219,8 @@ def compute_resolution_aware_cluster_metrics(
 
 
 def _pairwise_distances(
-    gt: List[Source],
-    est: List[Source],
+    gt: list[Source],
+    est: list[Source],
 ) -> NDArray[np.float64]:
     """Return pairwise distance matrix between GT and EST sources."""
     gt_pos = np.vstack([s.pos for s in gt]) if gt else np.zeros((0, 3), dtype=float)
@@ -382,12 +267,12 @@ def _pairwise_surface_path_distances(
 
 
 def compute_truth_proximity_operational_metrics(
-    gt_by_iso: Dict[str, List[Any]],
-    est_by_iso: Dict[str, List[Any]],
+    gt_by_iso: dict[str, list[Any]],
+    est_by_iso: dict[str, list[Any]],
     *,
     distance_thresholds_m: Sequence[float] = (0.5, 1.0, 1.5, 2.0),
     surface_atlas: ContinuousSurfaceAtlas | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Aggregate evaluation-only split components around isotope truth.
 
     Every estimate is assigned to its nearest same-isotope truth when the
@@ -402,9 +287,9 @@ def compute_truth_proximity_operational_metrics(
     if len(set(thresholds)) != len(thresholds):
         raise ValueError("Operational distance thresholds must be unique.")
     isotopes = sorted(set(gt_by_iso) | set(est_by_iso))
-    threshold_rows: List[Dict[str, Any]] = []
+    threshold_rows: list[dict[str, Any]] = []
     for threshold in thresholds:
-        isotope_rows: Dict[str, Dict[str, Any]] = {}
+        isotope_rows: dict[str, dict[str, Any]] = {}
         total_estimated_strength = 0.0
         total_remote_strength = 0.0
         total_truth_count = 0
@@ -423,7 +308,7 @@ def compute_truth_proximity_operational_metrics(
                     surface_atlas,
                 )
             )
-            assignments: List[List[int]] = [[] for _ in truth]
+            assignments: list[list[int]] = [[] for _ in truth]
             nearest_truth_indices = np.full(len(estimate), -1, dtype=np.int64)
             nearest_distances = np.full(len(estimate), np.inf, dtype=np.float64)
             if truth and estimate:
@@ -436,13 +321,12 @@ def compute_truth_proximity_operational_metrics(
                     np.arange(len(estimate), dtype=np.int64),
                 ]
                 for estimate_index in np.flatnonzero(
-                    np.isfinite(nearest_distances)
-                    & (nearest_distances <= threshold)
+                    np.isfinite(nearest_distances) & (nearest_distances <= threshold)
                 ):
                     assignments[int(nearest_truth_indices[estimate_index])].append(
                         int(estimate_index)
                     )
-            truth_rows: List[Dict[str, Any]] = []
+            truth_rows: list[dict[str, Any]] = []
             covered_truth_count = 0
             assigned_estimate_indices: set[int] = set()
             for truth_index, estimate_indices in enumerate(assignments):
@@ -477,7 +361,7 @@ def compute_truth_proximity_operational_metrics(
                         "covered": covered,
                     }
                 )
-            remote_rows: List[Dict[str, Any]] = []
+            remote_rows: list[dict[str, Any]] = []
             for estimate_index, source in enumerate(estimate):
                 if estimate_index in assigned_estimate_indices:
                     continue
@@ -492,9 +376,7 @@ def compute_truth_proximity_operational_metrics(
                             nearest_index if nearest_index >= 0 else None
                         ),
                         "nearest_truth_distance_m": (
-                            nearest_distance
-                            if np.isfinite(nearest_distance)
-                            else None
+                            nearest_distance if np.isfinite(nearest_distance) else None
                         ),
                     }
                 )
@@ -518,9 +400,7 @@ def compute_truth_proximity_operational_metrics(
                 "total_estimated_strength_cps_1m": estimated_total,
                 "remote_unmatched_strength_cps_1m": remote_strength,
                 "remote_unmatched_strength_ratio": (
-                    remote_strength / estimated_total
-                    if estimated_total > 0.0
-                    else 0.0
+                    remote_strength / estimated_total if estimated_total > 0.0 else 0.0
                 ),
                 "truth_aggregates": truth_rows,
                 "remote_unmatched_estimates": remote_rows,
@@ -543,9 +423,7 @@ def compute_truth_proximity_operational_metrics(
                     "raw_truth_count": total_truth_count,
                     "raw_estimate_count": total_raw_estimate_count,
                     "covered_truth_count": total_covered_truth_count,
-                    "remote_unmatched_estimate_count": (
-                        total_remote_estimate_count
-                    ),
+                    "remote_unmatched_estimate_count": (total_remote_estimate_count),
                     "operational_effective_estimate_count": (
                         total_covered_truth_count + total_remote_estimate_count
                     ),
@@ -570,7 +448,7 @@ def compute_truth_proximity_operational_metrics(
     }
 
 
-def _hungarian_assignment(cost: NDArray[np.float64]) -> List[Tuple[int, int]]:
+def _hungarian_assignment(cost: NDArray[np.float64]) -> list[tuple[int, int]]:
     """Return deterministic minimal-cost Hungarian assignment pairs."""
     if cost.size == 0:
         return []
@@ -584,7 +462,7 @@ def _gated_distance_assignment(
     distances: NDArray[np.float64],
     *,
     radius_m: float,
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     """Maximize gated match cardinality, then minimize 3-D distance."""
     distance_matrix = np.asarray(distances, dtype=float)
     if distance_matrix.ndim != 2:
@@ -592,9 +470,7 @@ def _gated_distance_assignment(
     if distance_matrix.size == 0:
         return []
     if np.any(np.isnan(distance_matrix)) or np.any(distance_matrix < 0.0):
-        raise ValueError(
-            "distances must be non-negative finite values or infinity."
-        )
+        raise ValueError("distances must be non-negative finite values or infinity.")
     radius = _non_negative_finite(radius_m, name="matching radius")
     valid = distance_matrix <= radius
     assignment_count = min(distance_matrix.shape)
@@ -613,7 +489,7 @@ def _gated_distance_assignment(
     ]
 
 
-def _summary_stats(values: Sequence[float]) -> Dict[str, float | None]:
+def _summary_stats(values: Sequence[float]) -> dict[str, float | None]:
     """Return summary statistics for a list of values."""
     if not values:
         return {
@@ -627,11 +503,7 @@ def _summary_stats(values: Sequence[float]) -> Dict[str, float | None]:
     if np.any(~np.isfinite(arr)):
         raise ValueError("Metric summaries require finite values.")
     scale = float(np.max(np.abs(arr), initial=0.0))
-    rmse = (
-        0.0
-        if scale == 0.0
-        else float(scale * np.sqrt(np.mean((arr / scale) ** 2)))
-    )
+    rmse = 0.0 if scale == 0.0 else float(scale * np.sqrt(np.mean((arr / scale) ** 2)))
     if not np.isfinite(rmse):
         raise ValueError("Metric summary overflowed to a non-finite value.")
     mean = 0.0 if scale == 0.0 else float(scale * np.mean(arr / scale))
@@ -647,7 +519,7 @@ def _summary_stats(values: Sequence[float]) -> Dict[str, float | None]:
     return summary
 
 
-def _summary_abs(values: Sequence[float]) -> Dict[str, float | None]:
+def _summary_abs(values: Sequence[float]) -> dict[str, float | None]:
     """Return summary statistics for absolute errors."""
     if not values:
         return {
@@ -672,7 +544,7 @@ def _summary_abs(values: Sequence[float]) -> Dict[str, float | None]:
     return summary
 
 
-def _summary_signed(values: Sequence[float]) -> Dict[str, float | None]:
+def _summary_signed(values: Sequence[float]) -> dict[str, float | None]:
     """Return signed-error summaries without discarding bias direction."""
     if not values:
         return {
@@ -705,7 +577,7 @@ def _precision_recall_f1(
     true_positive: int,
     false_positive: int,
     false_negative: int,
-) -> Dict[str, float | int]:
+) -> dict[str, float | int]:
     """Return detection counts and precision, recall, and F1."""
     tp = max(int(true_positive), 0)
     fp = max(int(false_positive), 0)
@@ -727,7 +599,7 @@ def _precision_recall_f1(
     }
 
 
-def _position_error_summary(values: Sequence[float]) -> Dict[str, float | bool | None]:
+def _position_error_summary(values: Sequence[float]) -> dict[str, float | bool | None]:
     """Return position-error summary stats augmented with the fixed target check."""
     summary = _summary_stats(values)
     mean_error = summary["mean"]
@@ -744,9 +616,9 @@ def _threshold_count_summary(
     est_count: int,
     distances: NDArray[np.float64],
     thresholds_m: Sequence[float],
-) -> Dict[str, Dict[str, float | int]]:
+) -> dict[str, dict[str, float | int]]:
     """Recompute gated distance-only matching at every reporting threshold."""
-    payload: Dict[str, Dict[str, float | int]] = {}
+    payload: dict[str, dict[str, float | int]] = {}
     for threshold in thresholds_m:
         radius = _non_negative_finite(threshold, name="distance threshold")
         assignments = _gated_distance_assignment(distances, radius_m=radius)
@@ -771,7 +643,7 @@ def _threshold_count_summary(
 def _hotspot_distance_summary(
     gt: Sequence[Source],
     est: Sequence[Source],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return each estimated hotspot's distance to its nearest truth source."""
     if not est:
         return {
@@ -800,11 +672,11 @@ def _hotspot_distance_summary(
 def _close_pair_separation_summary(
     gt: Sequence[Source],
     est: Sequence[Source],
-    assignments: Sequence[Tuple[int, int, float]],
+    assignments: Sequence[tuple[int, int, float]],
     *,
     close_pair_distance_m: float,
     min_estimated_separation_m: float,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Score whether close truth pairs map to two sufficiently separate modes."""
     close_distance = _non_negative_finite(
         close_pair_distance_m,
@@ -835,13 +707,12 @@ def _close_pair_separation_summary(
     eligible = upper & (distances <= close_distance)
     eligible_i, eligible_j = np.nonzero(eligible)
     assignment_by_truth = {
-        int(gt_index): int(est_index)
-        for gt_index, est_index, _ in assignments
+        int(gt_index): int(est_index) for gt_index, est_index, _ in assignments
     }
-    pair_rows: List[Dict[str, Any]] = []
-    estimated_separations: List[float] = []
-    separation_errors: List[float] = []
-    separation_ratios: List[float] = []
+    pair_rows: list[dict[str, Any]] = []
+    estimated_separations: list[float] = []
+    separation_errors: list[float] = []
+    separation_ratios: list[float] = []
     separated_count = 0
     matched_pair_count = 0
     for first, second in zip(eligible_i.tolist(), eligible_j.tolist()):
@@ -904,10 +775,10 @@ def _close_pair_separation_summary(
 def _surface_classification_summary(
     gt: Sequence[Source],
     est: Sequence[Source],
-    assignments: Sequence[Tuple[int, int, float]],
+    assignments: Sequence[tuple[int, int, float]],
     *,
     diagnostics: Sequence[Mapping[str, Any]] | None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return hard surface confusion and optional posterior proper scores."""
     labels = SURFACE_LABELS
     confusion = {
@@ -918,8 +789,7 @@ def _surface_classification_summary(
         index for index, source in enumerate(gt) if source.surface_kind in labels
     ]
     assignment_by_truth = {
-        int(gt_index): int(est_index)
-        for gt_index, est_index, _ in assignments
+        int(gt_index): int(est_index) for gt_index, est_index, _ in assignments
     }
     diagnostic_by_mode = {
         int(item.get("mode_index", index)): item
@@ -931,8 +801,8 @@ def _surface_classification_summary(
     ceiling_total = 0
     ceiling_localized = 0
     ceiling_correct = 0
-    posterior_brier: List[float] = []
-    posterior_log_scores: List[float] = []
+    posterior_brier: list[float] = []
+    posterior_log_scores: list[float] = []
     posterior_skipped_count = 0
     for gt_index in eligible_truth:
         truth = str(gt[gt_index].surface_kind)
@@ -953,10 +823,7 @@ def _surface_classification_summary(
             if truth == "ceiling":
                 ceiling_correct += 1
         diagnostic = diagnostic_by_mode.get(est_index)
-        if (
-            diagnostic is None
-            or diagnostic.get("surface_posterior_available") is False
-        ):
+        if diagnostic is None or diagnostic.get("surface_posterior_available") is False:
             posterior_skipped_count += 1
             continue
         probabilities_raw = diagnostic.get("surface_kind_posterior")
@@ -1010,9 +877,7 @@ def _surface_classification_summary(
                 float(np.mean(posterior_brier)) if posterior_brier else None
             ),
             "negative_log_score": (
-                float(np.mean(posterior_log_scores))
-                if posterior_log_scores
-                else None
+                float(np.mean(posterior_log_scores)) if posterior_log_scores else None
             ),
             "brier_definition": "sum_over_surface_labels_of_squared_probability_error",
         },
@@ -1039,13 +904,11 @@ def _excluded_room_surface_category(surface_kind: str | None) -> str:
 def _room_surface_3class_summary(
     gt: Sequence[Source],
     est: Sequence[Source],
-    assignments: Sequence[Tuple[int, int, float]],
-) -> Dict[str, Any]:
+    assignments: Sequence[tuple[int, int, float]],
+) -> dict[str, Any]:
     """Score floor/wall/ceiling only and document all excluded examples."""
     labels = ROOM_SURFACE_LABELS
-    confusion = {
-        truth: {prediction: 0 for prediction in labels} for truth in labels
-    }
+    confusion = {truth: {prediction: 0 for prediction in labels} for truth in labels}
     per_class_counts = {
         label: {
             "truth_count": 0,
@@ -1055,8 +918,8 @@ def _room_surface_3class_summary(
         }
         for label in labels
     }
-    excluded_truth_by_label: Dict[str, int] = {}
-    excluded_prediction_by_label: Dict[str, int] = {}
+    excluded_truth_by_label: dict[str, int] = {}
+    excluded_prediction_by_label: dict[str, int] = {}
     excluded_truth_by_category = {
         "obstacle": 0,
         "reference": 0,
@@ -1065,8 +928,7 @@ def _room_surface_3class_summary(
     }
     excluded_prediction_by_category = dict(excluded_truth_by_category)
     assignment_by_truth = {
-        int(gt_index): int(est_index)
-        for gt_index, est_index, _ in assignments
+        int(gt_index): int(est_index) for gt_index, est_index, _ in assignments
     }
     eligible_count = 0
     localized_count = 0
@@ -1092,9 +954,7 @@ def _room_surface_3class_summary(
         per_class_counts[truth]["localized_count"] += 1
         prediction = est[est_index].surface_kind
         if prediction not in labels:
-            prediction_label = (
-                "unknown" if prediction is None else str(prediction)
-            )
+            prediction_label = "unknown" if prediction is None else str(prediction)
             excluded_prediction_by_label[prediction_label] = (
                 excluded_prediction_by_label.get(prediction_label, 0) + 1
             )
@@ -1108,7 +968,7 @@ def _room_surface_3class_summary(
         if prediction == truth:
             correct_count += 1
             per_class_counts[truth]["correct_count"] += 1
-    per_class: Dict[str, Dict[str, Any]] = {}
+    per_class: dict[str, dict[str, Any]] = {}
     for label, counts in per_class_counts.items():
         truth_count = int(counts["truth_count"])
         evaluable = int(counts["evaluable_localized_count"])
@@ -1155,16 +1015,13 @@ def _room_surface_3class_summary(
 
 def _aggregate_room_surface_3class(
     rows: Sequence[Mapping[str, Any]],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Aggregate floor/wall/ceiling classification summaries across isotopes."""
     labels = ROOM_SURFACE_LABELS
     confusion = {
         truth: {
             prediction: int(
-                sum(
-                    int(row["confusion_matrix"][truth][prediction])
-                    for row in rows
-                )
+                sum(int(row["confusion_matrix"][truth][prediction]) for row in rows)
             )
             for prediction in labels
         }
@@ -1176,10 +1033,8 @@ def _aggregate_room_surface_3class(
         "evaluable_localized_count",
         "correct_count",
     )
-    counts = {
-        key: int(sum(int(row[key]) for row in rows)) for key in count_keys
-    }
-    per_class: Dict[str, Dict[str, Any]] = {}
+    counts = {key: int(sum(int(row[key]) for row in rows)) for key in count_keys}
+    per_class: dict[str, dict[str, Any]] = {}
     for label in labels:
         truth_count = int(
             sum(int(row["per_class"][label]["truth_count"]) for row in rows)
@@ -1201,22 +1056,16 @@ def _aggregate_room_surface_3class(
             "localized_count": localized_count,
             "evaluable_localized_count": evaluable_count,
             "correct_count": correct_count,
-            "recall": (
-                correct_count / float(truth_count) if truth_count else None
-            ),
+            "recall": (correct_count / float(truth_count) if truth_count else None),
             "accuracy_among_evaluable_localized": (
                 correct_count / float(evaluable_count) if evaluable_count else None
             ),
         }
 
-    def sum_dynamic_counts(section: str) -> Dict[str, int]:
+    def sum_dynamic_counts(section: str) -> dict[str, int]:
         """Sum a dynamic excluded-count mapping across isotope summaries."""
         keys = sorted(
-            {
-                str(key)
-                for row in rows
-                for key in row["excluded"].get(section, {})
-            }
+            {str(key) for row in rows for key in row["excluded"].get(section, {})}
         )
         return {
             key: int(
@@ -1228,9 +1077,7 @@ def _aggregate_room_surface_3class(
     excluded_truth_by_label = sum_dynamic_counts("truth_count_by_label")
     excluded_prediction_by_label = sum_dynamic_counts("prediction_count_by_label")
     excluded_truth_by_category = sum_dynamic_counts("truth_count_by_category")
-    excluded_prediction_by_category = sum_dynamic_counts(
-        "prediction_count_by_category"
-    )
+    excluded_prediction_by_category = sum_dynamic_counts("prediction_count_by_category")
     for category in ("obstacle", "reference", "unknown", "other"):
         excluded_truth_by_category.setdefault(category, 0)
         excluded_prediction_by_category.setdefault(category, 0)
@@ -1298,11 +1145,11 @@ def _ellipsoid_contains_position(
 
 def _uncertainty_coverage_summary(
     gt: Sequence[Source],
-    assignments: Sequence[Tuple[int, int, float]],
+    assignments: Sequence[tuple[int, int, float]],
     diagnostics: Sequence[Mapping[str, Any]] | None,
     *,
     est_count: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return conditional and end-to-end interval and existence calibration."""
     if diagnostics is None:
         return {
@@ -1341,14 +1188,13 @@ def _uncertainty_coverage_summary(
         for index, item in enumerate(diagnostics)
         if isinstance(item, Mapping)
     }
-    position_results: List[bool] = []
-    z_results: List[bool] = []
-    position_end_to_end: List[bool] = []
-    z_end_to_end: List[bool] = []
-    excluded_reasons: Dict[str, int] = {}
+    position_results: list[bool] = []
+    z_results: list[bool] = []
+    position_end_to_end: list[bool] = []
+    z_end_to_end: list[bool] = []
+    excluded_reasons: dict[str, int] = {}
     assignment_by_truth = {
-        int(gt_index): int(est_index)
-        for gt_index, est_index, _ in assignments
+        int(gt_index): int(est_index) for gt_index, est_index, _ in assignments
     }
     matched_est = set(assignment_by_truth.values())
     matched_count = int(len(assignment_by_truth))
@@ -1393,11 +1239,7 @@ def _uncertainty_coverage_summary(
             if lower is not None and upper is not None:
                 lower_f = float(lower)
                 upper_f = float(upper)
-                if (
-                    np.isfinite(lower_f)
-                    and np.isfinite(upper_f)
-                    and lower_f <= upper_f
-                ):
+                if np.isfinite(lower_f) and np.isfinite(upper_f) and lower_f <= upper_f:
                     z_value = float(source.pos[2])
                     z_inside = bool(lower_f <= z_value <= upper_f)
         if z_inside is not None:
@@ -1406,8 +1248,8 @@ def _uncertainty_coverage_summary(
         else:
             z_end_to_end.append(False)
 
-    existence_probabilities: List[float] = []
-    existence_labels: List[int] = []
+    existence_probabilities: list[float] = []
+    existence_labels: list[int] = []
     missing_mass_count = 0
     for est_index in range(max(int(est_count), 0)):
         diagnostic = by_mode.get(est_index)
@@ -1460,12 +1302,8 @@ def _uncertainty_coverage_summary(
         "position_interval_90_coverage_conditioned_on_match": (
             float(np.mean(position_results)) if position_results else None
         ),
-        "position_interval_end_to_end_evaluable_count": int(
-            len(position_end_to_end)
-        ),
-        "position_interval_end_to_end_covered_count": int(
-            sum(position_end_to_end)
-        ),
+        "position_interval_end_to_end_evaluable_count": int(len(position_end_to_end)),
+        "position_interval_end_to_end_covered_count": int(sum(position_end_to_end)),
         "position_interval_90_coverage_end_to_end": (
             float(np.mean(position_end_to_end)) if position_end_to_end else None
         ),
@@ -1486,9 +1324,7 @@ def _uncertainty_coverage_summary(
             "available": bool(existence_probabilities),
             "evaluable_count": int(len(existence_probabilities)),
             "positive_label_count": int(sum(existence_labels)),
-            "negative_label_count": int(
-                len(existence_labels) - sum(existence_labels)
-            ),
+            "negative_label_count": int(len(existence_labels) - sum(existence_labels)),
             "brier_score": brier,
             "negative_log_score": negative_log,
             "missing_mass_count": int(missing_mass_count),
@@ -1506,7 +1342,7 @@ def _isotope_confusion_summary(
     *,
     match_radius_m: float,
     surface_atlas: ContinuousSurfaceAtlas | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return global spatial matching and the resulting isotope confusion matrix."""
     isotopes = sorted(set(gt_by_iso) | set(est_by_iso))
     gt_flat = [
@@ -1572,8 +1408,8 @@ def _isotope_confusion_summary(
 
 
 def compute_metrics(
-    gt_by_iso: Dict[str, List[Any]],
-    est_by_iso: Dict[str, List[Any]],
+    gt_by_iso: dict[str, list[Any]],
+    est_by_iso: dict[str, list[Any]],
     *,
     match_radius_m: float,
     distance_thresholds_m: Sequence[float] = (0.5, 1.0, 2.0, 3.0),
@@ -1581,7 +1417,7 @@ def compute_metrics(
     close_pair_min_estimated_separation_m: float = 0.5,
     uncertainty_by_iso: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     surface_atlas: ContinuousSurfaceAtlas | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Compute surface-gated source, Cartesian, and uncertainty metrics.
 
     Production evaluation supplies the exact PF/truth surface atlas and uses
@@ -1604,24 +1440,24 @@ def compute_metrics(
         for value in distance_thresholds_m
     ]
     isotopes = sorted(set(gt_by_iso.keys()) | set(est_by_iso.keys()))
-    metrics: Dict[str, Dict[str, Any]] = {}
-    normalized_gt: Dict[str, List[Source]] = {}
-    normalized_est: Dict[str, List[Source]] = {}
-    global_position_errors: List[float] = []
-    global_surface_path_errors: List[float] = []
-    global_xy_errors: List[float] = []
-    global_z_errors: List[float] = []
-    global_abs_strength_errors: List[float] = []
-    global_rel_strength_errors: List[float] = []
-    global_signed_rel_strength_errors: List[float] = []
-    global_hotspot_distances: List[float] = []
+    metrics: dict[str, dict[str, Any]] = {}
+    normalized_gt: dict[str, list[Source]] = {}
+    normalized_est: dict[str, list[Source]] = {}
+    global_position_errors: list[float] = []
+    global_surface_path_errors: list[float] = []
+    global_xy_errors: list[float] = []
+    global_z_errors: list[float] = []
+    global_abs_strength_errors: list[float] = []
+    global_rel_strength_errors: list[float] = []
+    global_signed_rel_strength_errors: list[float] = []
+    global_hotspot_distances: list[float] = []
     global_tp = 0
     global_gt_count = 0
     global_est_count = 0
     global_close_pairs = 0
     global_matched_close_pairs = 0
     global_separated_pairs = 0
-    global_close_pair_rows: List[Dict[str, Any]] = []
+    global_close_pair_rows: list[dict[str, Any]] = []
     surface_labels = SURFACE_LABELS
     global_surface_confusion = {
         truth: {prediction: 0 for prediction in (*surface_labels, "other", "missed")}
@@ -1637,7 +1473,7 @@ def compute_metrics(
     global_surface_brier_sum = 0.0
     global_surface_log_sum = 0.0
     global_surface_posterior_skipped = 0
-    isotope_bias: Dict[str, Dict[str, float | None]] = {}
+    isotope_bias: dict[str, dict[str, float | None]] = {}
     for iso in isotopes:
         gt = _normalize_sources(gt_by_iso.get(iso, []))
         est = _normalize_sources(est_by_iso.get(iso, []))
@@ -1658,10 +1494,7 @@ def compute_metrics(
             association_dist,
             radius_m=match_radius,
         )
-        matched = [
-            (i, j, float(association_dist[i, j]))
-            for i, j in matched_pairs
-        ]
+        matched = [(i, j, float(association_dist[i, j])) for i, j in matched_pairs]
         assigned_all_details = [
             {
                 "gt_index": int(i),
@@ -1676,19 +1509,14 @@ def compute_metrics(
                         else float(association_dist[i, j])
                     )
                 ),
-                "within_radius": bool(
-                    float(association_dist[i, j]) <= match_radius
-                ),
+                "within_radius": bool(float(association_dist[i, j]) <= match_radius),
             }
             for i, j in assigned_all_pairs
         ]
         fp = max(0, len(est) - len(matched))
         fn = max(0, len(gt) - len(matched))
         surface_path_errors = [d for _, _, d in matched]
-        pos_errors = [
-            float(euclidean_dist[i, j])
-            for i, j, _ in matched
-        ]
+        pos_errors = [float(euclidean_dist[i, j]) for i, j, _ in matched]
         localized_tp = int(len(matched))
         localized_fp = max(0, len(est) - localized_tp)
         localized_fn = max(0, len(gt) - localized_tp)
@@ -1697,12 +1525,12 @@ def compute_metrics(
             localized_fp,
             localized_fn,
         )
-        xy_errors: List[float] = []
-        z_errors: List[float] = []
-        abs_errors: List[float] = []
-        rel_errors: List[float] = []
-        signed_rel_errors: List[float] = []
-        match_details: List[Dict[str, Any]] = []
+        xy_errors: list[float] = []
+        z_errors: list[float] = []
+        abs_errors: list[float] = []
+        rel_errors: list[float] = []
+        signed_rel_errors: list[float] = []
+        match_details: list[dict[str, Any]] = []
         for i, j, surface_distance in matched:
             d = float(euclidean_dist[i, j])
             q_true = float(gt[i].strength)
@@ -1754,9 +1582,7 @@ def compute_metrics(
             min_estimated_separation_m=close_pair_minimum,
         )
         isotope_diagnostics = (
-            None
-            if uncertainty_by_iso is None
-            else uncertainty_by_iso.get(iso, ())
+            None if uncertainty_by_iso is None else uncertainty_by_iso.get(iso, ())
         )
         surface_summary = _surface_classification_summary(
             gt,
@@ -1817,9 +1643,7 @@ def compute_metrics(
                 thresholds_m=thresholds,
             ),
             "position_error": _position_error_summary(pos_errors),
-            "surface_path_error": _position_error_summary(
-                surface_path_errors
-            ),
+            "surface_path_error": _position_error_summary(surface_path_errors),
             "xy_error": _summary_stats(xy_errors),
             "z_abs_error": _summary_abs(z_errors),
             "hotspot_to_ground_truth_distance": hotspot_summary,
@@ -1881,9 +1705,7 @@ def compute_metrics(
             )
     global_fp = max(0, global_est_count - global_tp)
     global_fn = max(0, global_gt_count - global_tp)
-    uncertainty_rows = [
-        payload["uncertainty_coverage"] for payload in metrics.values()
-    ]
+    uncertainty_rows = [payload["uncertainty_coverage"] for payload in metrics.values()]
     uncertainty_count_keys = (
         "ground_truth_count",
         "matched_truth_count",
@@ -1900,19 +1722,17 @@ def compute_metrics(
         key: int(sum(int(row.get(key, 0)) for row in uncertainty_rows))
         for key in uncertainty_count_keys
     }
-    excluded_reasons: Dict[str, int] = {}
+    excluded_reasons: dict[str, int] = {}
     for row in uncertainty_rows:
         for reason, count in row.get(
             "excluded_diagnostic_count_by_reason",
             {},
         ).items():
-            excluded_reasons[str(reason)] = (
-                excluded_reasons.get(str(reason), 0) + int(count)
+            excluded_reasons[str(reason)] = excluded_reasons.get(str(reason), 0) + int(
+                count
             )
     existence_rows = [row["existence_mass_calibration"] for row in uncertainty_rows]
-    existence_count = int(
-        sum(int(row["evaluable_count"]) for row in existence_rows)
-    )
+    existence_count = int(sum(int(row["evaluable_count"]) for row in existence_rows))
     existence_brier_sum = sum(
         int(row["evaluable_count"]) * float(row["brier_score"])
         for row in existence_rows
@@ -1986,9 +1806,7 @@ def compute_metrics(
                 else None
             ),
             "negative_log_score": (
-                float(existence_log_sum / existence_count)
-                if existence_count
-                else None
+                float(existence_log_sum / existence_count) if existence_count else None
             ),
             "missing_mass_count": int(
                 sum(int(row["missing_mass_count"]) for row in existence_rows)
@@ -2041,9 +1859,7 @@ def compute_metrics(
     global_summary = {
         "available": bool(isotopes),
         "position_error": _position_error_summary(global_position_errors),
-        "surface_path_error": _position_error_summary(
-            global_surface_path_errors
-        ),
+        "surface_path_error": _position_error_summary(global_surface_path_errors),
         "xy_error": _summary_stats(global_xy_errors),
         "z_abs_error": _summary_abs(global_z_errors),
         "hotspot_to_ground_truth_distance": {
@@ -2083,13 +1899,13 @@ def compute_metrics(
                 if cardinality_available
                 else None
             ),
-            "all_isotopes_exact_match": (
-                run_cardinality_exact
-            ),
+            "all_isotopes_exact_match": (run_cardinality_exact),
             "ground_truth_source_count": int(global_gt_count),
             "estimated_source_count": int(global_est_count),
             "source_count_error": int(global_est_count - global_gt_count),
-            "source_count_abs_error": int(sum(abs(value) for value in cardinality_errors)),
+            "source_count_abs_error": int(
+                sum(abs(value) for value in cardinality_errors)
+            ),
             "overestimated_source_count": int(
                 sum(max(value, 0) for value in cardinality_errors)
             ),
@@ -2121,9 +1937,7 @@ def compute_metrics(
             ),
             "estimated_separation_m": _summary_stats(close_pair_estimated),
             "separation_abs_error_m": _summary_abs(close_pair_errors),
-            "estimated_to_truth_separation_ratio": _summary_stats(
-                close_pair_ratios
-            ),
+            "estimated_to_truth_separation_ratio": _summary_stats(close_pair_ratios),
             "pairs": global_close_pair_rows,
         },
         "surface_classification": {
@@ -2193,9 +2007,7 @@ def compute_metrics(
             ),
             "cartesian_xyz_error_reported_separately": True,
             "primary_localization_accuracy_metric": (
-                "surface_path_error"
-                if surface_atlas is not None
-                else "position_error"
+                "surface_path_error" if surface_atlas is not None else "position_error"
             ),
             "surface_atlas_sha256": (
                 None
@@ -2231,7 +2043,7 @@ def _format_value(value: float | None) -> str:
     return f"{value:.4g}"
 
 
-def print_metrics_report(metrics: Dict[str, Any]) -> None:
+def print_metrics_report(metrics: dict[str, Any]) -> None:
     """Print a human-readable metrics report."""
     isotopes = metrics.get("isotopes", {})
     print("=== Evaluation Metrics (PF Final) ===")
@@ -2319,12 +2131,6 @@ def print_metrics_report(metrics: Dict[str, Any]) -> None:
             )
 
 
-def save_metrics_json(metrics: Dict[str, Any], out_path: str) -> None:
-    """Save metrics to a JSON file."""
-    import json
-    from pathlib import Path
-
-    path = Path(out_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(metrics, handle, indent=2, sort_keys=True, allow_nan=False)
+def save_metrics_json(metrics: dict[str, Any], out_path: str) -> None:
+    """Atomically save strict metrics JSON."""
+    atomic_write_json(out_path, metrics)

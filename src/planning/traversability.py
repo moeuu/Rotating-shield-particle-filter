@@ -17,6 +17,7 @@ from matplotlib.patches import Rectangle
 import numpy as np
 
 from measurement.obstacles import ObstacleGrid
+from pf.atomic_io import atomic_write_json
 
 
 def _finite_real(
@@ -295,11 +296,8 @@ class TraversabilityMap:
         }
 
     def save(self, path: Path) -> None:
-        """Save the traversability map to JSON."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(self.to_dict(), handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        """Atomically save the traversability map to strict JSON."""
+        atomic_write_json(path, self.to_dict())
 
     @classmethod
     def from_dict(cls, data: dict) -> TraversabilityMap:

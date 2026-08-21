@@ -6,8 +6,8 @@ Codex sessions should use this plan unless the user explicitly changes it.
 ## Decision
 
 Generate one fresh scene seed for each new experiment batch. Record that seed
-in the generated config, source metadata, and manifest so the batch remains
-exactly reproducible after generation.
+in the generated PF config, private runtime scenario, and manifest so the batch
+remains exactly reproducible after generation.
 
 - Omit `--seeds` for a new independent batch.
 - Use an explicit `--seeds <recorded-seed>` only for exact replay.
@@ -87,9 +87,15 @@ The paper subset files are:
 - `results/ral_ablation/ral_paper_subset_manifest.csv`
 - `results/ral_ablation/run_paper_subset.sh`
 
-Each generated full-simulation config writes a unique truth-free MeasurementLog
-below `results/ral_ablation/measurement_logs/<output-tag>`. The target directory
-must not already exist when the run starts; archive a previous log before rerun.
+Each row first invokes the sibling runtime's
+`rotating-shield-sim generate-ral-scenario`, then starts the PF-owned causal
+session with `rotating-shield-pf-live`. Truth-bearing scenarios and physical
+runtime overrides are kept below the sibling repository's ignored
+`private_runs/ral_ablation/`; they are never written under this repository's
+`results/`. Each session publishes a unique truth-free MeasurementLog v2 below
+`results/ral_ablation/measurement_logs/<output-tag>` and PF outputs below
+`results/ral_ablation/runs/<output-tag>`. These targets must not already exist
+when the run starts; archive them before an exact replay.
 
 Run the selected full simulations with:
 

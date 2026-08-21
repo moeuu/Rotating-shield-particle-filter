@@ -12,7 +12,6 @@ from numpy.typing import NDArray
 import pytest
 
 import pf.estimator as pf_estimator_module
-from mission_control import resolve_mission_max_poses, resolve_mission_max_steps
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import source_surface_kind
@@ -1568,8 +1567,6 @@ def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning() -> None:
     assert resolved["adaptive_mission_stop"] is False
     assert resolved["measurement_budget_max_steps"] == 160
     assert resolved["mission_stop_max_poses"] == 20
-    assert resolve_mission_max_steps(None, resolved) == 160
-    assert resolve_mission_max_poses(None, resolved) == 20
     assert resolved["detector_height_sampling_mode"] == "continuous"
     assert resolved["measurement_pose_clearance_enabled"] is True
     assert resolved["path_planner"] == "dss_pp"
@@ -1583,20 +1580,6 @@ def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning() -> None:
     # not accidentally replaced by a three-key shallow override.
     assert int(dss["program_length"]) >= 1
     assert int(dss["max_programs"]) >= 1
-
-
-@pytest.mark.parametrize("value", (0, -1, True, 2.0, "2"))
-@pytest.mark.parametrize(
-    "resolver",
-    (resolve_mission_max_steps, resolve_mission_max_poses),
-)
-def test_mission_budget_rejects_unbounded_fail_open_values(
-    resolver: object,
-    value: object,
-) -> None:
-    """Invalid caps must not be reinterpreted as an unlimited simulation."""
-    with pytest.raises(ValueError):
-        resolver(value, {})
 
 
 def test_standard_geant4_config_selects_exact_surface_rj_kernel() -> None:

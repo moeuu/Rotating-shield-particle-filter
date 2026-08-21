@@ -15,7 +15,7 @@ from runtime.adaptive import AdaptiveCandidateProvider, cui_truth_overlay_from_s
 from sim.isaacsim_app.scene_builder import build_scene_description
 from sim.runtime import load_runtime_config
 
-from cui_runtime import ensure_cui_view_server
+from pf.cui_runtime import ensure_cui_view_server
 from visualization.realtime_viz import CUISplitPFVisualizer, PFFrame
 
 
@@ -118,12 +118,10 @@ def _route_waypoints(
 ) -> np.ndarray | None:
     """Return a CUI route segment between two station poses."""
     start = tuple(
-        float(value)
-        for value in np.asarray(start_pose, dtype=float).reshape(3)
+        float(value) for value in np.asarray(start_pose, dtype=float).reshape(3)
     )
     target = tuple(
-        float(value)
-        for value in np.asarray(target_pose, dtype=float).reshape(3)
+        float(value) for value in np.asarray(target_pose, dtype=float).reshape(3)
     )
     if float(np.linalg.norm(np.asarray(target) - np.asarray(start))) <= 1.0e-12:
         return None
@@ -206,8 +204,7 @@ def _frame_from_record(
         RPb=normals[pb_index],
         duration=float(record["live_time_s"].reshape(-1)[0]),
         particle_positions={
-            isotope: np.zeros((0, 3), dtype=np.float64)
-            for isotope in positions
+            isotope: np.zeros((0, 3), dtype=np.float64) for isotope in positions
         },
         particle_weights={
             isotope: np.zeros(0, dtype=np.float64) for isotope in positions
@@ -256,9 +253,7 @@ def render_current_view(
         raise TypeError("Runtime environment must be a JSON object.")
     obstacle_raw = environment.get("obstacle_grid")
     obstacle_grid = (
-        None
-        if obstacle_raw is None
-        else ObstacleGrid.from_dict(dict(obstacle_raw))
+        None if obstacle_raw is None else ObstacleGrid.from_dict(dict(obstacle_raw))
     )
     isotopes, positions, strengths = _estimate_arrays(trace[-1])
     true_sources, true_strengths = _truth_arrays_from_scenario(scenario_path)

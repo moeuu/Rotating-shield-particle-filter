@@ -3,25 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Mapping, Sequence
 from hashlib import sha256
-import json
-import os
 from pathlib import Path
-import tempfile
 from typing import Any
 
 import numpy as np
-
-from evaluation_metrics import compute_metrics
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import source_surface_kinds
+from runtime.measurement_log import MeasurementLog, load_measurement_log
+
+from evaluation_metrics import compute_metrics
+from pf.atomic_io import atomic_write_bytes
 from pf.provenance import canonical_json_bytes
 from pf.pure_estimator import PurePFEstimator
 from pf.replay import replay_measurement_log
-from runtime.measurement_log import MeasurementLog, load_measurement_log
-
 
 ARTIFACT_TYPE = "pure_pf_measurement_log_replay_evaluation"
 
@@ -404,24 +402,7 @@ def write_evaluation_json(output: Path, payload: Mapping[str, Any]) -> Path:
     target = output.expanduser().resolve()
     if target.exists():
         raise FileExistsError(f"Refusing to replace evaluation output {target}.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.tmp-",
-        dir=target.parent,
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(canonical_json_bytes(dict(payload)))
-            handle.flush()
-            os.fsync(handle.fileno())
-        if target.exists():
-            raise FileExistsError(f"Refusing to replace evaluation output {target}.")
-        os.replace(temporary, target)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    return target
+    return atomic_write_bytes(target, canonical_json_bytes(dict(payload)))
 
 
 def evaluate_and_write(

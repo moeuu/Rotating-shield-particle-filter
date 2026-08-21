@@ -6,8 +6,6 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
-
 from planning.dss_pp import DSSPPResult
 
 
@@ -55,7 +53,9 @@ def build_planner_audit(
     ranked = diagnostics.get("ranked_nodes", [])
     if not isinstance(ranked, Sequence) or isinstance(ranked, (str, bytes)):
         raise TypeError("ranked_nodes must be a sequence.")
-    selected_eig = float(result.sequence[0].information_gain)
+    selected_eig = (
+        None if not result.sequence else float(result.sequence[0].information_gain)
+    )
     information_leader = _leader(leaders, "information_gain")
     best_exact_eig = (
         selected_eig
@@ -86,19 +86,14 @@ def build_planner_audit(
         "selected_information_gain": selected_eig,
         "best_exact_information_gain": best_exact_eig,
         "total_action_count": int(shortlist.get("total_action_count", 0)),
-        "selected_proxy_rank": int(
-            shortlist.get("shortlist_selected_proxy_rank", 0)
-        ),
+        "selected_proxy_rank": int(shortlist.get("shortlist_selected_proxy_rank", 0)),
         "exact_action_count": int(shortlist.get("exact_action_count", 0)),
         "proxy_action_count": int(shortlist.get("proxy_action_count", 0)),
-        "planning_particle_count": int(
-            diagnostics.get("planning_particle_count", 0)
-        ),
+        "planning_particle_count": int(diagnostics.get("planning_particle_count", 0)),
         "score_leader": _leader(leaders, "score"),
         "information_gain_leader": information_leader,
         "top_ranked_actions": [
-            dict(_mapping(value, name="ranked node"))
-            for value in ranked[:top_k]
+            dict(_mapping(value, name="ranked node")) for value in ranked[:top_k]
         ],
         "shortlist_certificate": {
             "available": bool(

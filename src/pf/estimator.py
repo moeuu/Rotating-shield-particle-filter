@@ -7,7 +7,7 @@ import hashlib
 import math
 import re
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -25,6 +25,11 @@ from measurement.source_surfaces import (
     source_surface_kinds,
 )
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
+from pf.estimator_types import (
+    JointPlanningParticles,
+    JointStationObservation,
+    MeasurementRecord,
+)
 from pf.full_spectrum import (
     FullSpectrumGenerativeModel,
     validate_full_spectrum_model,
@@ -268,8 +273,8 @@ class RotatingShieldPFConfig:
     joint_cross_isotope_state_block_probability: float = 0.0
     detected_isotopes_only: bool = False
     detected_isotope_false_activation_probability: float = 1.0e-3
-    position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
-    init_num_sources: Tuple[int, int] = (
+    position_max: tuple[float, float, float] = (10.0, 10.0, 10.0)
+    init_num_sources: tuple[int, int] = (
         0,
         DEFAULT_MAX_SOURCES_PER_ISOTOPE,
     )
@@ -867,50 +872,6 @@ class RotatingShieldPFConfig:
 
 
 @dataclass(frozen=True)
-class MeasurementRecord:
-    """Store one full-spectrum shield-view measurement and provenance."""
-
-    spectrum_counts_b: NDArray[np.float64]
-    pose_idx: int
-    live_time_s: float
-    fe_index: int
-    pb_index: int
-    detector_position_xyz_m: tuple[float, float, float]
-    station_sequence_id: int
-    station_view_index: int
-    generative_contract_hash_sha256: str
-
-
-@dataclass(frozen=True)
-class JointStationObservation:
-    """Store one joint view-major full-spectrum station observation."""
-
-    spectrum_vb: NDArray[np.float64]
-    energy_axis_keV: NDArray[np.float64]
-    generative_contract_hash_sha256: str
-    pose_idx: int
-    detector_position_xyz_m: tuple[float, float, float]
-    fe_indices: NDArray[np.int64]
-    pb_indices: NDArray[np.int64]
-    live_times_s: NDArray[np.float64]
-    station_sequence_id: int
-
-
-@dataclass(frozen=True)
-class JointPlanningParticles:
-    """Expose one aligned joint-particle subset as padded numeric arrays."""
-
-    isotope_order: tuple[str, ...]
-    weights_n: NDArray[np.float64]
-    positions_nk3_by_isotope: Dict[str, NDArray[np.float64]]
-    surface_chart_ids_nk_by_isotope: Dict[str, NDArray[np.int64]]
-    surface_uv_nk2_by_isotope: Dict[str, NDArray[np.float64]]
-    strengths_nk_by_isotope: Dict[str, NDArray[np.float64]]
-    source_mask_nk_by_isotope: Dict[str, NDArray[np.bool_]]
-    original_particle_indices: NDArray[np.int64]
-
-
-@dataclass(frozen=True)
 class SurfaceAtlasQuadrature:
     """Represent a complete area-weighted chart-center surface quadrature."""
 
@@ -1093,12 +1054,12 @@ class RotatingShieldPFEstimator:
         isotopes: Sequence[str],
         surface_diagnostic_points: NDArray[np.float64],
         shield_normals: NDArray[np.float64] | None,
-        mu_by_isotope: Dict[str, object] | None,
+        mu_by_isotope: dict[str, object] | None,
         pf_config: RotatingShieldPFConfig | None = None,
         shield_params: ShieldParams | None = None,
         obstacle_grid: ObstacleGrid | None = None,
         obstacle_height_m: float = 2.0,
-        obstacle_mu_by_isotope: Dict[str, float] | None = None,
+        obstacle_mu_by_isotope: dict[str, float] | None = None,
         obstacle_buildup_coeff: float = 0.0,
         detector_radius_m: float = 0.0,
         detector_aperture_radius_m: float | None = None,
@@ -1106,7 +1067,7 @@ class RotatingShieldPFEstimator:
         detector_aperture_sampling: str = "solid_angle_cone",
         source_extent_radius_m: float = 0.0,
         source_extent_samples: int = 1,
-        line_mu_by_isotope: Dict[str, object] | None = None,
+        line_mu_by_isotope: dict[str, object] | None = None,
         full_spectrum_generative_model: object | None = None,
         random_seed: int = 0,
         candidate_isotopes: Sequence[str] | None = None,
@@ -1215,7 +1176,7 @@ class RotatingShieldPFEstimator:
             None,
         )
         # Measurement poses are appended incrementally.
-        self.poses: List[NDArray[np.float64]] = []
+        self.poses: list[NDArray[np.float64]] = []
         if shield_normals is None:
             from measurement.shielding import generate_octant_orientations
 
@@ -1224,7 +1185,7 @@ class RotatingShieldPFEstimator:
             self.normals = shield_normals
         self.mu_by_isotope = self._resolve_mu_by_isotope(mu_by_isotope)
         self.kernel_cache: MeasurementGeometry | None = None
-        self.filters: Dict[str, IsotopeParticleFilter] = {}
+        self.filters: dict[str, IsotopeParticleFilter] = {}
         self._joint_particles_initialized = False
         self._joint_row_identity_root_sha256: str | None = None
         self._joint_row_generation: int | None = None
@@ -1239,12 +1200,12 @@ class RotatingShieldPFEstimator:
                 "surface_diagnostic_points must contain only finite values."
             )
         self.surface_diagnostic_points = np.ascontiguousarray(diagnostic_points)
-        self.history_estimates: List[
-            Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]
+        self.history_estimates: list[
+            dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]
         ] = []
-        self._posterior_point_estimate_cache: Dict[str, PFPointEstimate] | None = None
+        self._posterior_point_estimate_cache: dict[str, PFPointEstimate] | None = None
         self._posterior_point_estimate_cache_fingerprint: str | None = None
-        self.measurements: List[MeasurementRecord] = []
+        self.measurements: list[MeasurementRecord] = []
         self._joint_station_history: list[JointStationObservation] = []
         self._active_joint_station_history: (
             tuple[JointStationObservation, ...] | None
@@ -1279,9 +1240,7 @@ class RotatingShieldPFEstimator:
         self.last_joint_structural_unit_cache_misses = 0
         self.last_joint_strength_grid_source_slots_before = 0
         self.last_joint_strength_grid_source_slots_after = 0
-        self._joint_strength_grid_batch_size_cache: dict[
-            tuple[object, ...], int
-        ] = {}
+        self._joint_strength_grid_batch_size_cache: dict[tuple[object, ...], int] = {}
         self._joint_torch_observation_context_cache: dict[
             tuple[object, ...], object
         ] = {}
@@ -1289,9 +1248,7 @@ class RotatingShieldPFEstimator:
         self._joint_torch_history_layout_cache: dict[
             tuple[object, ...], tuple[object, ...]
         ] = {}
-        self.last_joint_strength_grid_batch_diagnostics: dict[
-            str, object
-        ] = {}
+        self.last_joint_strength_grid_batch_diagnostics: dict[str, object] = {}
         self._joint_birth_proposal_station_score_cache: dict[
             tuple[str, str],
             NDArray[np.float64],
@@ -1339,7 +1296,7 @@ class RotatingShieldPFEstimator:
         self._joint_cumulative_lineage_ids: NDArray[np.int64] | None = None
         self.last_pair_sequence_update_workers = 1
         self.last_pair_sequence_update_wall_s = 0.0
-        self.last_pair_sequence_stage_wall_s: Dict[str, float] = {}
+        self.last_pair_sequence_stage_wall_s: dict[str, float] = {}
         self.last_structural_update_workers = 1
         self.last_structural_update_wall_s = 0.0
         self._surface_diagnostic_response_cache: dict[
@@ -1414,7 +1371,7 @@ class RotatingShieldPFEstimator:
         self,
         *,
         validate_state: bool = True,
-    ) -> Dict[str, PFPointEstimate] | None:
+    ) -> dict[str, PFPointEstimate] | None:
         """Return a shallow copy of the immutable cached posterior summary."""
         if self._posterior_point_estimate_cache is None:
             return None
@@ -1429,7 +1386,7 @@ class RotatingShieldPFEstimator:
     def _store_posterior_point_estimate(
         self,
         estimate: Mapping[str, PFPointEstimate],
-    ) -> Dict[str, PFPointEstimate]:
+    ) -> dict[str, PFPointEstimate]:
         """Store and return one exact posterior summary generation."""
         cached = {
             str(isotope): point_estimate for isotope, point_estimate in estimate.items()
@@ -1443,11 +1400,11 @@ class RotatingShieldPFEstimator:
     @staticmethod
     def _project_posterior_point_estimates(
         point_estimates: Mapping[str, PFPointEstimate],
-    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
+    ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Project immutable posterior summaries into visualization arrays."""
-        projected: Dict[
+        projected: dict[
             str,
-            Tuple[NDArray[np.float64], NDArray[np.float64]],
+            tuple[NDArray[np.float64], NDArray[np.float64]],
         ] = {}
         for isotope, point_estimate in point_estimates.items():
             projected[str(isotope)] = (
@@ -1467,7 +1424,7 @@ class RotatingShieldPFEstimator:
 
     def visualization_estimates(
         self,
-    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
+    ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Return the latest committed exact summary without recomputation.
 
         Frames collected before the first completed station intentionally show
@@ -1732,8 +1689,8 @@ class RotatingShieldPFEstimator:
         )
 
     def _resolve_mu_by_isotope(
-        self, mu_by_isotope: Dict[str, object] | None
-    ) -> Dict[str, object]:
+        self, mu_by_isotope: dict[str, object] | None
+    ) -> dict[str, object]:
         """
         Ensure per-isotope attenuation coefficients are available for all isotopes.
 
@@ -1751,15 +1708,15 @@ class RotatingShieldPFEstimator:
             "EU154": "Eu-154",
         }
 
-        resolved: Dict[str, object] = {}
+        resolved: dict[str, object] = {}
         if mu_by_isotope is not None:
             resolved.update(mu_by_isotope)
-        normalized: Dict[str, object] = {}
+        normalized: dict[str, object] = {}
         for key, value in resolved.items():
             normalized[_norm_key(key)] = value
         isotope_names = self.isotopes
         if isotope_names:
-            still_missing: List[str] = []
+            still_missing: list[str] = []
             for iso in isotope_names:
                 if iso in resolved:
                     continue
@@ -2427,7 +2384,7 @@ class RotatingShieldPFEstimator:
 
     def _joint_line_layout(
         self,
-    ) -> Dict[
+    ) -> dict[
         str,
         tuple[
             NDArray[np.int64],
@@ -2438,7 +2395,7 @@ class RotatingShieldPFEstimator:
         """Return global columns, isotope line indices, and branching weights."""
         model = self._full_spectrum_model()
         line_identity = tuple(model.line_identity)
-        layout: Dict[
+        layout: dict[
             str,
             tuple[
                 NDArray[np.int64],
@@ -3314,10 +3271,7 @@ class RotatingShieldPFEstimator:
             for station_index, station in enumerate(stations):
                 view_count = int(station.fe_indices.size)
                 view_stop = view_start + view_count
-                if (
-                    prefix_count is not None
-                    and station_index == len(stations) - 1
-                ):
+                if prefix_count is not None and station_index == len(stations) - 1:
                     newest_slice = slice(view_start, view_stop)
                     view_start = view_stop
                     continue
@@ -3605,10 +3559,7 @@ class RotatingShieldPFEstimator:
             for station_index, station in enumerate(stations):
                 view_count = int(station.fe_indices.size)
                 view_stop = view_start + view_count
-                if (
-                    prefix_count is not None
-                    and station_index == len(stations) - 1
-                ):
+                if prefix_count is not None and station_index == len(stations) - 1:
                     newest_slice = slice(view_start, view_stop)
                     view_start = view_stop
                     continue
@@ -3681,10 +3632,8 @@ class RotatingShieldPFEstimator:
                 str(total.device),
                 str(total.dtype),
             )
-            prepared_observation = (
-                self._joint_torch_observation_context_cache.get(
-                    observation_key
-                )
+            prepared_observation = self._joint_torch_observation_context_cache.get(
+                observation_key
             )
             if prepared_observation is None:
                 observed = torch.as_tensor(
@@ -3705,9 +3654,9 @@ class RotatingShieldPFEstimator:
                     observed,
                     reference=total,
                 )
-                self._joint_torch_observation_context_cache[
-                    observation_key
-                ] = prepared_observation
+                self._joint_torch_observation_context_cache[observation_key] = (
+                    prepared_observation
+                )
             else:
                 observed = prepared_observation.observed_asvb
             group_ll = model.cross_log_likelihood_torch(
@@ -3729,9 +3678,7 @@ class RotatingShieldPFEstimator:
             )
             expected_shape = (len(entries), 1, particle_count)
             if tuple(group_ll.shape) != expected_shape:
-                raise RuntimeError(
-                    "Torch station-history likelihood shape is invalid."
-                )
+                raise RuntimeError("Torch station-history likelihood shape is invalid.")
             powers = torch.as_tensor(
                 [beta if bool(entry[3]) else 1.0 for entry in entries],
                 device=total.device,
@@ -4143,7 +4090,7 @@ class RotatingShieldPFEstimator:
         *,
         pose_idx: int,
         generative_contract_hash_sha256: str,
-    ) -> Dict[str, NDArray[np.float64]]:
+    ) -> dict[str, NDArray[np.float64]]:
         """Return truth-free chart-by-strength detection scores for one station."""
         if not records:
             raise ValueError(
@@ -4159,7 +4106,7 @@ class RotatingShieldPFEstimator:
             generative_contract_hash_sha256=(generative_contract_hash_sha256),
         )
         strength_grid, _ = self._strength_birth_proposal_grid()
-        result: Dict[str, NDArray[np.float64]] = {}
+        result: dict[str, NDArray[np.float64]] = {}
         for isotope in self.joint_isotope_order():
             filt = self.filters[isotope]
             atlas = filt._structural_rj_surface_atlas
@@ -5141,21 +5088,21 @@ class RotatingShieldPFEstimator:
         cache["features"][accepted_indices] = 0.0
         if cardinality:
             cache["mask"][accepted_indices, :cardinality] = True
-            cache["positions"][accepted_indices, :cardinality] = pending[
-                "positions"
-            ][accepted]
-            cache["chart_ids"][accepted_indices, :cardinality] = pending[
-                "chart_ids"
-            ][accepted]
-            cache["total"][accepted_indices, :, :cardinality] = pending[
-                "total"
-            ][accepted]
+            cache["positions"][accepted_indices, :cardinality] = pending["positions"][
+                accepted
+            ]
+            cache["chart_ids"][accepted_indices, :cardinality] = pending["chart_ids"][
+                accepted
+            ]
+            cache["total"][accepted_indices, :, :cardinality] = pending["total"][
+                accepted
+            ]
             cache["uncollided"][accepted_indices, :, :cardinality] = pending[
                 "uncollided"
             ][accepted]
-            cache["features"][accepted_indices, :, :cardinality] = pending[
-                "features"
-            ][accepted]
+            cache["features"][accepted_indices, :, :cardinality] = pending["features"][
+                accepted
+            ]
         cache["pending"] = None
 
     @staticmethod
@@ -5456,7 +5403,8 @@ class RotatingShieldPFEstimator:
                 )
                 ratio_tensor = torch.where(
                     matched,
-                    proposed_strength_tensor / torch.where(
+                    proposed_strength_tensor
+                    / torch.where(
                         matched,
                         accepted_strength_tensor,
                         torch.ones_like(accepted_strength_tensor),
@@ -5807,15 +5755,11 @@ class RotatingShieldPFEstimator:
         grid_count = int(strengths.shape[1])
         if row_count == 0:
             return np.empty((0, grid_count), dtype=np.float64)
-        configured_batch_size = int(
-            self.pf_config.joint_strength_block_batch_size
-        )
+        configured_batch_size = int(self.pf_config.joint_strength_block_batch_size)
         batch_size = configured_batch_size
         maximum_batch_size = configured_batch_size
         cache_key: tuple[object, ...] | None = None
-        cache_is_cuda = hasattr(cached_total, "detach") and bool(
-            cached_total.is_cuda
-        )
+        cache_is_cuda = hasattr(cached_total, "detach") and bool(cached_total.is_cuda)
         if cache_is_cuda:
             import torch
 
@@ -5939,8 +5883,7 @@ class RotatingShieldPFEstimator:
                 "shape_key": cache_key,
             }
             trial_summary = ",".join(
-                f"{int(trial['batch_size'])}:"
-                f"{float(trial['rows_per_second']):.3g}row/s"
+                f"{int(trial['batch_size'])}:{float(trial['rows_per_second']):.3g}row/s"
                 for trial in successful
             )
             print(
@@ -6477,9 +6420,9 @@ class RotatingShieldPFEstimator:
                 uncollided_view[..., target_slice, :][..., column_selection] = (
                     unit_uncollided[:, None] * strength_tensor
                 )
-                features_view[..., target_slice, :, :][
-                    ..., column_selection, :
-                ] = unit_features[:, None]
+                features_view[..., target_slice, :, :][..., column_selection, :] = (
+                    unit_features[:, None]
+                )
             total = total_view.reshape(
                 row_count * grid_count,
                 total_views,
@@ -6487,9 +6430,7 @@ class RotatingShieldPFEstimator:
                 line_count,
             )
             uncollided = uncollided_view.reshape_as(total)
-            features = features_view.reshape(
-                tuple(total.shape) + (feature_count,)
-            )
+            features = features_view.reshape(tuple(total.shape) + (feature_count,))
             self.last_joint_strength_grid_source_slots_before = int(
                 selected_total.shape[2]
             )
@@ -6988,12 +6929,7 @@ class RotatingShieldPFEstimator:
             )
         self.last_joint_device_mh_acceptance_calls += 1
         self.last_joint_device_mh_acceptance_rows += int(ratios.size)
-        return (
-            accepted_tensor.detach()
-            .cpu()
-            .numpy()
-            .astype(np.bool_, copy=False)
-        )
+        return accepted_tensor.detach().cpu().numpy().astype(np.bool_, copy=False)
 
     def _apply_joint_strength_block(
         self,
@@ -7364,9 +7300,7 @@ class RotatingShieldPFEstimator:
             receiver_filter = self.filters[isotope_order[receiver_by_row[row]]]
             diagnostic_strength_support[row] = bool(
                 np.all(
-                    donor_filter._strength_prior.in_support(
-                        donor_states[row].strengths
-                    )
+                    donor_filter._strength_prior.in_support(donor_states[row].strengths)
                 )
                 and np.all(
                     receiver_filter._strength_prior.in_support(
@@ -7386,9 +7320,7 @@ class RotatingShieldPFEstimator:
             float("nan"),
             dtype=np.float64,
         )
-        diagnostic_proposal_ratio[rows] = (
-            log_reverse[rows] - log_forward[rows]
-        )
+        diagnostic_proposal_ratio[rows] = log_reverse[rows] - log_forward[rows]
         self.last_joint_cross_isotope_rejection_diagnostics = (
             self._summarize_joint_cross_isotope_transfer(
                 attempted_rows=attempted_rows,
@@ -7507,11 +7439,7 @@ class RotatingShieldPFEstimator:
                     np.count_nonzero(support[rows] & ~finite_all)
                 ),
                 "mh_random_rejected": int(
-                    np.count_nonzero(
-                        support[rows]
-                        & finite_all
-                        & ~acceptance[rows]
-                    )
+                    np.count_nonzero(support[rows] & finite_all & ~acceptance[rows])
                 ),
                 "component_quantiles": component_quantiles,
             }
@@ -9427,11 +9355,11 @@ class RotatingShieldPFEstimator:
                 f"Unknown joint planning particle selection method: {method}"
             )
         max_sources = self.pf_config.cardinality_capacity
-        positions_by_isotope: Dict[str, NDArray[np.float64]] = {}
-        chart_ids_by_isotope: Dict[str, NDArray[np.int64]] = {}
-        surface_uv_by_isotope: Dict[str, NDArray[np.float64]] = {}
-        strengths_by_isotope: Dict[str, NDArray[np.float64]] = {}
-        masks_by_isotope: Dict[str, NDArray[np.bool_]] = {}
+        positions_by_isotope: dict[str, NDArray[np.float64]] = {}
+        chart_ids_by_isotope: dict[str, NDArray[np.int64]] = {}
+        surface_uv_by_isotope: dict[str, NDArray[np.float64]] = {}
+        strengths_by_isotope: dict[str, NDArray[np.float64]] = {}
+        masks_by_isotope: dict[str, NDArray[np.bool_]] = {}
         for isotope in self.joint_isotope_order():
             filt = self.filters[isotope]
             (
@@ -9498,7 +9426,7 @@ class RotatingShieldPFEstimator:
         max_particles: int | None = None,
         method: str | None = None,
         rng: np.random.Generator | None = None,
-    ) -> Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]]:
+    ) -> dict[str, tuple[list[IsotopeState], NDArray[np.float64]]]:
         """
         Select per-isotope particle subsets for orientation evaluation.
 
@@ -9910,7 +9838,7 @@ class RotatingShieldPFEstimator:
             maximum_hausdorff_bound_m=float(maximum_hausdorff_bound_m),
         )
 
-    def posterior_point_estimate(self) -> Dict[str, PFPointEstimate]:
+    def posterior_point_estimate(self) -> dict[str, PFPointEstimate]:
         """Return deterministic posterior summaries for every isotope.
 
         The pure runtime subclass overrides this method to select one aligned
@@ -9922,7 +9850,7 @@ class RotatingShieldPFEstimator:
         cached = self._cached_posterior_point_estimate()
         if cached is not None:
             return cached
-        estimates: Dict[str, PFPointEstimate] = {}
+        estimates: dict[str, PFPointEstimate] = {}
         for isotope, filt in self.filters.items():
             filt.validate_continuous_surface_states()
             atlas = getattr(filt, "_structural_rj_surface_atlas", None)
@@ -9966,7 +9894,7 @@ class RotatingShieldPFEstimator:
 
     def estimates(
         self,
-    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
+    ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Return the canonical MAP-cardinality PF posterior projection."""
         return self._project_posterior_point_estimates(self.posterior_point_estimate())
 
@@ -9996,13 +9924,13 @@ class RotatingShieldPFEstimator:
         self,
         reported_estimates: Mapping[
             str,
-            Tuple[NDArray[np.float64], NDArray[np.float64]],
+            tuple[NDArray[np.float64], NDArray[np.float64]],
         ]
         | None = None,
         *,
         match_radius_m: float | None = None,
         surface_tolerance_m: float = 1.0e-5,
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    ) -> dict[str, list[dict[str, Any]]]:
         """Return JSON-safe posterior 3-D diagnostics for reported source modes.
 
         Particle source slots are matched to the nearest reported mode in one
@@ -10038,7 +9966,7 @@ class RotatingShieldPFEstimator:
         radius = 0.8 if match_radius_m is None else float(match_radius_m)
         environment = self._source_prior_environment()
         reporting_indices = self._posterior_reporting_particle_indices()
-        output: Dict[str, List[Dict[str, Any]]] = {}
+        output: dict[str, list[dict[str, Any]]] = {}
         for isotope, estimate in estimate_map.items():
             positions = np.asarray(estimate[0], dtype=float)
             strengths = np.asarray(estimate[1], dtype=float).reshape(-1)
@@ -10187,7 +10115,7 @@ class RotatingShieldPFEstimator:
 
     def estimate_all(
         self,
-    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
+    ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Alias for estimates() to align with visualization helpers."""
         return self.estimates()
 
@@ -10196,7 +10124,7 @@ class RotatingShieldPFEstimator:
         top_k: int = 3,
         *,
         include_estimates: bool = True,
-    ) -> Dict[str, Dict[str, Any]]:
+    ) -> dict[str, dict[str, Any]]:
         """
         Return per-isotope diagnostics for the current PF state.
 
@@ -10204,7 +10132,7 @@ class RotatingShieldPFEstimator:
         count distribution. When include_estimates is false, the routine avoids
         the posterior point-estimate projection.
         """
-        diagnostics: Dict[str, Dict[str, Any]] = {}
+        diagnostics: dict[str, dict[str, Any]] = {}
         eps = 1e-12
         k = max(0, int(top_k))
         posterior_estimates = self.estimates() if include_estimates else {}
@@ -10310,7 +10238,7 @@ class RotatingShieldPFEstimator:
             else:
                 posterior_positions = np.zeros((0, 3), dtype=float)
                 posterior_strengths = np.zeros(0, dtype=float)
-            top_entries: List[Dict[str, Any]] = []
+            top_entries: list[dict[str, Any]] = []
             if k > 0 and weights.size:
                 order = np.argsort(weights)[::-1][:k]
                 for idx in order:
@@ -10461,7 +10389,7 @@ class RotatingShieldPFEstimator:
     def credible_surface_radii(
         self,
         confidence: float = 0.95,
-    ) -> Dict[str, List[float]]:
+    ) -> dict[str, list[float]]:
         """Return conservative path radii along connected physical surfaces.
 
         Each radius is computed inside the MAP-cardinality stratum after
@@ -10475,7 +10403,7 @@ class RotatingShieldPFEstimator:
         probability = float(confidence)
         if not np.isfinite(probability) or not 0.0 < probability <= 1.0:
             raise ValueError("confidence must be in (0, 1].")
-        radii: Dict[str, List[float]] = {}
+        radii: dict[str, list[float]] = {}
         point_estimates = self.posterior_point_estimate()
         for isotope, filt in self.filters.items():
             if not filt.continuous_particles:
@@ -10513,7 +10441,7 @@ class RotatingShieldPFEstimator:
 
     def _latest_joint_station_innovation(
         self,
-    ) -> Dict[str, float | int | bool | None]:
+    ) -> dict[str, float | int | bool | None]:
         """Return strict renewal-total and conditional-mark innovation gates."""
         if not self._joint_station_history:
             return {
@@ -10628,7 +10556,7 @@ class RotatingShieldPFEstimator:
         sample_count: int = 128,
         confidence: float = 0.95,
         worst_bin_count: int = 32,
-    ) -> Dict[str, object]:
+    ) -> dict[str, object]:
         """Return a model-native posterior predictive residual audit.
 
         Every predictive spectrum is sampled through the immutable generative
@@ -10643,9 +10571,7 @@ class RotatingShieldPFEstimator:
             name="posterior predictive sample_count",
         )
         if count < 2:
-            raise ValueError(
-                "posterior predictive sample_count must be at least two."
-            )
+            raise ValueError("posterior predictive sample_count must be at least two.")
         probability = _strict_config_number(
             confidence,
             name="posterior predictive confidence",
@@ -10697,17 +10623,16 @@ class RotatingShieldPFEstimator:
         worst_rows: list[dict[str, object]] = []
         for station in self._joint_station_history:
             components = tuple(
-                value.detach().cpu().numpy().astype(
+                value.detach()
+                .cpu()
+                .numpy()
+                .astype(
                     np.float64,
                     copy=False,
                 )
-                for value in self._joint_station_transport_components_torch(
-                    station
-                )
+                for value in self._joint_station_transport_components_torch(station)
             )
-            selected_components = tuple(
-                value[particle_indices] for value in components
-            )
+            selected_components = tuple(value[particle_indices] for value in components)
             sampled = np.asarray(
                 model.sample_predictive_numpy(
                     selected_components[0],
@@ -10751,22 +10676,18 @@ class RotatingShieldPFEstimator:
                 axis=0,
                 ddof=1,
             )
-            total_standardized = (
-                observed_totals - predictive_total_mean
-            ) / np.maximum(predictive_total_std, 1.0)
-            pair_ids = (
-                np.asarray(station.fe_indices, dtype=np.int64)
-                * int(self.num_orientations)
-                + np.asarray(station.pb_indices, dtype=np.int64)
+            total_standardized = (observed_totals - predictive_total_mean) / np.maximum(
+                predictive_total_std, 1.0
             )
+            pair_ids = np.asarray(station.fe_indices, dtype=np.int64) * int(
+                self.num_orientations
+            ) + np.asarray(station.pb_indices, dtype=np.int64)
             obstacle_probability = np.zeros(
                 int(station.fe_indices.size),
                 dtype=np.float64,
             )
             if obstacle_feature_index is not None:
-                tau_obstacle = selected_components[2][
-                    ..., obstacle_feature_index
-                ]
+                tau_obstacle = selected_components[2][..., obstacle_feature_index]
                 contributes = selected_components[0] > 0.0
                 crosses = np.any(
                     contributes & (tau_obstacle > 1.0e-12),
@@ -10787,28 +10708,18 @@ class RotatingShieldPFEstimator:
                     if obstacle_probability[view_index] >= 0.5
                     else "clear_line_of_sight"
                 )
-                obstacle_values[obstacle_label].append(
-                    standardized[view_index].copy()
-                )
+                obstacle_values[obstacle_label].append(standardized[view_index].copy())
                 view_rows.append(
                     {
                         "view_index": int(view_index),
-                        "fe_orientation_index": int(
-                            station.fe_indices[view_index]
-                        ),
-                        "pb_orientation_index": int(
-                            station.pb_indices[view_index]
-                        ),
+                        "fe_orientation_index": int(station.fe_indices[view_index]),
+                        "pb_orientation_index": int(station.pb_indices[view_index]),
                         "shield_pair_id": pair_id,
-                        "observed_total_count": float(
-                            observed_totals[view_index]
-                        ),
+                        "observed_total_count": float(observed_totals[view_index]),
                         "predictive_total_mean": float(
                             predictive_total_mean[view_index]
                         ),
-                        "predictive_total_std": float(
-                            predictive_total_std[view_index]
-                        ),
+                        "predictive_total_std": float(predictive_total_std[view_index]),
                         "standardized_total_residual": float(
                             total_standardized[view_index]
                         ),
@@ -10850,18 +10761,12 @@ class RotatingShieldPFEstimator:
                 ):
                     worst_rows.append(
                         {
-                            "station_sequence_id": int(
-                                station.station_sequence_id
-                            ),
+                            "station_sequence_id": int(station.station_sequence_id),
                             "view_index": int(view_index),
                             "shield_pair_id": int(pair_ids[view_index]),
-                            "energy_keV": float(
-                                station.energy_axis_keV[bin_index]
-                            ),
+                            "energy_keV": float(station.energy_axis_keV[bin_index]),
                             "bin_index": int(bin_index),
-                            "observed_count": float(
-                                observed[view_index, bin_index]
-                            ),
+                            "observed_count": float(observed[view_index, bin_index]),
                             "predictive_mean": float(
                                 predictive_mean[view_index, bin_index]
                             ),
@@ -10894,9 +10799,7 @@ class RotatingShieldPFEstimator:
                 ),
                 dtype=np.float64,
             )
-            log_weights = np.log(
-                np.maximum(weights, np.finfo(np.float64).tiny)
-            )
+            log_weights = np.log(np.maximum(weights, np.finfo(np.float64).tiny))
             full_log_predictive_density = float(
                 logsumexp(log_weights + full_log_likelihood)
             )
@@ -10904,10 +10807,7 @@ class RotatingShieldPFEstimator:
             line_identity = tuple(model.line_identity)
             for isotope in self.joint_isotope_order():
                 isotope_line_mask = np.asarray(
-                    [
-                        str(payload["isotope"]) == isotope
-                        for payload in line_identity
-                    ],
+                    [str(payload["isotope"]) == isotope for payload in line_identity],
                     dtype=np.bool_,
                 )
                 if not np.any(isotope_line_mask):
@@ -10932,8 +10832,7 @@ class RotatingShieldPFEstimator:
                     logsumexp(log_weights + ablated_log_likelihood)
                 )
                 density_delta = (
-                    full_log_predictive_density
-                    - ablated_log_predictive_density
+                    full_log_predictive_density - ablated_log_predictive_density
                 )
                 isotope_ablation_values[isotope].append(density_delta)
                 ablated_innovation = dict(
@@ -10948,9 +10847,7 @@ class RotatingShieldPFEstimator:
                     )
                 )
                 station_isotope_ablation[isotope] = {
-                    "full_minus_ablation_log_predictive_density": float(
-                        density_delta
-                    ),
+                    "full_minus_ablation_log_predictive_density": float(density_delta),
                     "ablated_model_native_innovation": ablated_innovation,
                 }
             station_results.append(
@@ -10960,18 +10857,14 @@ class RotatingShieldPFEstimator:
                     "view_count": int(station.fe_indices.size),
                     "energy_bin_count": int(station.energy_axis_keV.size),
                     "observed_total_count": float(np.sum(observed_totals)),
-                    "predictive_total_mean": float(
-                        np.sum(predictive_total_mean)
-                    ),
+                    "predictive_total_mean": float(np.sum(predictive_total_mean)),
                     "maximum_abs_standardized_bin_residual": float(
                         np.max(np.abs(standardized))
                     ),
                     "p95_abs_standardized_bin_residual": float(
                         np.quantile(np.abs(standardized), 0.95)
                     ),
-                    "marginal_bin_coverage_fraction": float(
-                        np.mean(covered)
-                    ),
+                    "marginal_bin_coverage_fraction": float(np.mean(covered)),
                     "model_native_innovation": innovation,
                     "isotope_response_ablation": station_isotope_ablation,
                     "views": view_rows,
@@ -11027,8 +10920,7 @@ class RotatingShieldPFEstimator:
             for pair_id in sorted(pair_values)
         }
         obstacle_summary = {
-            label: _group_summary(values)
-            for label, values in obstacle_values.items()
+            label: _group_summary(values) for label, values in obstacle_values.items()
         }
         isotope_ablation_summary = {
             isotope: {
@@ -11066,9 +10958,7 @@ class RotatingShieldPFEstimator:
             "shield_pair_summary": pair_summary,
             "obstacle_line_of_sight_summary": obstacle_summary,
             "isotope_response_ablation_summary": isotope_ablation_summary,
-            "worst_standardized_bin_residuals": worst_rows[
-                :maximum_worst_bins
-            ],
+            "worst_standardized_bin_residuals": worst_rows[:maximum_worst_bins],
             "isotope_response_ablation_semantics": (
                 "diagnostic full-spectrum response-column ablation with all "
                 "other posterior source states and weights held fixed; this "
@@ -11076,9 +10966,9 @@ class RotatingShieldPFEstimator:
             ),
         }
 
-    def posterior_convergence_diagnostics(self) -> Dict[str, Any]:
+    def posterior_convergence_diagnostics(self) -> dict[str, Any]:
         """Return fail-closed PF convergence gates without using simulation truth."""
-        isotope_diagnostics: Dict[str, Dict[str, Any]] = {}
+        isotope_diagnostics: dict[str, dict[str, Any]] = {}
         all_ready = True
         joint_innovation = self._latest_joint_station_innovation()
         point_estimates = self.posterior_point_estimate()

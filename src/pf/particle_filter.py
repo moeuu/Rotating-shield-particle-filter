@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import hashlib
 import itertools
 import math
-from typing import TYPE_CHECKING, Callable, List, Tuple
+from typing import TYPE_CHECKING, Callable
 import os
 import time
 
@@ -32,6 +32,7 @@ from measurement.surface_charts import (
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.diagnostics import build_source_event_record, reset_step_diagnostics
 from pf.posterior import posterior_point_estimate_from_states
+from pf.particle_types import StructuralGeometryBatch, TorchLineTransportComponents
 from pf.randomness import isotope_random_generator, normalize_pf_random_seed
 from pf.state import IsotopeState
 from pf.strength_prior import StrengthPrior
@@ -229,8 +230,8 @@ class PFConfig:
     max_temper_steps: int = 256
     min_delta_beta: float = 1e-10
     # Continuous PF priors (Sec. 3.3.2)
-    position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
-    init_num_sources: Tuple[int, int] = (
+    position_max: tuple[float, float, float] = (10.0, 10.0, 10.0)
+    init_num_sources: tuple[int, int] = (
         0,
         DEFAULT_MAX_SOURCES_PER_ISOTOPE,
     )
@@ -332,9 +333,7 @@ class PFConfig:
         ):
             _strict_config_number(getattr(self, name), name=name)
         if self.structural_cardinality_prior_probs is not None:
-            for index, value in enumerate(
-                self.structural_cardinality_prior_probs
-            ):
+            for index, value in enumerate(self.structural_cardinality_prior_probs):
                 _strict_config_number(
                     value,
                     name=f"structural_cardinality_prior_probs[{index}]",
@@ -343,10 +342,13 @@ class PFConfig:
         if position_max.shape != (3,):
             raise ValueError("position_max must contain three values.")
         for index, value in enumerate(position_max):
-            if _strict_config_number(
-                value,
-                name=f"position_max[{index}]",
-            ) <= 0.0:
+            if (
+                _strict_config_number(
+                    value,
+                    name=f"position_max[{index}]",
+                )
+                <= 0.0
+            ):
                 raise ValueError("position_max values must be positive.")
         if not isinstance(self.gpu_device, str) or not self.gpu_device.strip():
             raise TypeError("gpu_device must be a nonempty string.")
@@ -356,9 +358,7 @@ class PFConfig:
         if self.num_particles < 1:
             raise ValueError("num_particles must be positive.")
         if str(self.gpu_dtype).strip().lower() != "float64":
-            raise ValueError(
-                "Pure PF production kernels require gpu_dtype='float64'."
-            )
+            raise ValueError("Pure PF production kernels require gpu_dtype='float64'.")
         self.gpu_dtype = "float64"
         self.variable_cardinality = bool(self.variable_cardinality)
         self.structural_cardinality_tail_ratio = float(
@@ -369,9 +369,7 @@ class PFConfig:
             == POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY
             and not 0.0 < self.structural_cardinality_tail_ratio < 1.0
         ):
-            raise ValueError(
-                "structural_cardinality_tail_ratio must lie in (0, 1)."
-            )
+            raise ValueError("structural_cardinality_tail_ratio must lie in (0, 1).")
         self.structural_rj_surface_chart_max_edge_m = float(
             self.structural_rj_surface_chart_max_edge_m
         )
@@ -396,37 +394,29 @@ class PFConfig:
             self.structural_rj_position_proposal_prior_weight
         )
         if (
-            not np.isfinite(
-                self.structural_rj_position_proposal_prior_weight
-            )
+            not np.isfinite(self.structural_rj_position_proposal_prior_weight)
             or self.structural_rj_position_proposal_prior_weight <= 0.0
             or self.structural_rj_position_proposal_prior_weight > 1.0
         ):
             raise ValueError(
-                "structural_rj_position_proposal_prior_weight must lie in "
-                "(0, 1]."
+                "structural_rj_position_proposal_prior_weight must lie in (0, 1]."
             )
         self.structural_rj_strength_proposal_prior_weight = float(
             self.structural_rj_strength_proposal_prior_weight
         )
         if (
-            not np.isfinite(
-                self.structural_rj_strength_proposal_prior_weight
-            )
+            not np.isfinite(self.structural_rj_strength_proposal_prior_weight)
             or self.structural_rj_strength_proposal_prior_weight <= 0.0
             or self.structural_rj_strength_proposal_prior_weight > 1.0
         ):
             raise ValueError(
-                "structural_rj_strength_proposal_prior_weight must lie in "
-                "(0, 1]."
+                "structural_rj_strength_proposal_prior_weight must lie in (0, 1]."
             )
         self.structural_rj_strength_proposal_sigma_fraction = float(
             self.structural_rj_strength_proposal_sigma_fraction
         )
         if (
-            not np.isfinite(
-                self.structural_rj_strength_proposal_sigma_fraction
-            )
+            not np.isfinite(self.structural_rj_strength_proposal_sigma_fraction)
             or self.structural_rj_strength_proposal_sigma_fraction <= 0.0
         ):
             raise ValueError(
@@ -478,9 +468,7 @@ class PFConfig:
             "structural_rj_merge_uniform_pair_probability",
         ):
             if getattr(self, full_support_probability_name) <= 0.0:
-                raise ValueError(
-                    f"{full_support_probability_name} must lie in (0, 1]."
-                )
+                raise ValueError(f"{full_support_probability_name} must lie in (0, 1].")
         self.structural_rj_merge_distance_sigma_m = float(
             self.structural_rj_merge_distance_sigma_m
         )
@@ -528,13 +516,11 @@ class PFConfig:
         self.strength_prior_family = strength_prior.family
         self.strength_prior_gamma_shape = strength_prior.gamma_shape
         self.strength_prior_gamma_scale_cps_1m = strength_prior.gamma_scale
-        self.structural_cardinality_prior_policy = (
-            validate_cardinality_prior_policy(
-                self.structural_cardinality_prior_policy,
-                has_explicit_probabilities=(
-                    self.structural_cardinality_prior_probs is not None
-                ),
-            )
+        self.structural_cardinality_prior_policy = validate_cardinality_prior_policy(
+            self.structural_cardinality_prior_policy,
+            has_explicit_probabilities=(
+                self.structural_cardinality_prior_probs is not None
+            ),
         )
         if self.structural_cardinality_prior_probs is not None:
             cardinality_prior = np.asarray(
@@ -550,9 +536,7 @@ class PFConfig:
                     "structural_cardinality_prior_probs must contain "
                     "hard_max_sources + 1 finite positive values."
                 )
-            cardinality_prior /= math.fsum(
-                float(value) for value in cardinality_prior
-            )
+            cardinality_prior /= math.fsum(float(value) for value in cardinality_prior)
             self.structural_cardinality_prior_probs = tuple(
                 float(value) for value in cardinality_prior
             )
@@ -610,11 +594,9 @@ class PFConfig:
         if self.max_temper_steps < 1:
             raise ValueError("max_temper_steps must be positive.")
         self.min_delta_beta = float(self.min_delta_beta)
-        if (
-            not np.isfinite(self.min_delta_beta)
-            or not 0.0 < self.min_delta_beta <= 1.0
-        ):
+        if not np.isfinite(self.min_delta_beta) or not 0.0 < self.min_delta_beta <= 1.0:
             raise ValueError("min_delta_beta must lie in (0, 1].")
+
 
 @dataclass(frozen=True)
 class JointRowIdentity:
@@ -649,19 +631,13 @@ class JointRowIdentity:
             ):
                 raise TypeError(f"Joint row identity {name} must be an integer.")
             if int(value) < 0 or int(value) >= 1 << 64:
-                raise ValueError(
-                    f"Joint row identity {name} must lie in uint64 range."
-                )
+                raise ValueError(f"Joint row identity {name} must lie in uint64 range.")
         parent = self.parent_row_sha256
         if int(self.generation) == 0:
             if parent is not None:
-                raise ValueError(
-                    "Initial joint row identities cannot have a parent."
-                )
+                raise ValueError("Initial joint row identities cannot have a parent.")
         elif parent is None:
-            raise ValueError(
-                "Resampled joint row identities require a parent digest."
-            )
+            raise ValueError("Resampled joint row identities require a parent digest.")
         if parent is not None:
             parent = _canonical_sha256(
                 parent,
@@ -750,89 +726,6 @@ class IsotopeParticle:
         object.__setattr__(self, name, value)
 
 
-@dataclass(frozen=True)
-class StructuralGeometryBatch:
-    """Store only geometry needed by continuous structural PF proposals."""
-
-    detector_positions: NDArray[np.float64]
-    fe_indices: NDArray[np.int64]
-    pb_indices: NDArray[np.int64]
-    live_times: NDArray[np.float64]
-    station_sequence_ids: NDArray[np.int64]
-
-    def __post_init__(self) -> None:
-        """Validate, copy, and freeze one aligned geometry batch."""
-        detector_positions = np.array(
-            self.detector_positions,
-            dtype=np.float64,
-            copy=True,
-        )
-        fe_indices = np.array(self.fe_indices, dtype=np.int64, copy=True).reshape(
-            -1
-        )
-        pb_indices = np.array(self.pb_indices, dtype=np.int64, copy=True).reshape(
-            -1
-        )
-        live_times = np.array(
-            self.live_times,
-            dtype=np.float64,
-            copy=True,
-        ).reshape(-1)
-        station_ids = np.array(
-            self.station_sequence_ids,
-            dtype=np.int64,
-            copy=True,
-        ).reshape(-1)
-        row_count = int(fe_indices.size)
-        if (
-            row_count == 0
-            or detector_positions.shape != (row_count, 3)
-            or pb_indices.size != row_count
-            or live_times.size != row_count
-            or station_ids.size != row_count
-            or np.any(~np.isfinite(detector_positions))
-            or np.any(~np.isfinite(live_times))
-            or np.any(live_times <= 0.0)
-            or np.any(fe_indices < 0)
-            or np.any(pb_indices < 0)
-            or np.any(station_ids < 0)
-        ):
-            raise ValueError(
-                "Structural geometry must contain aligned finite detector, "
-                "shield, positive-live-time, and station-ID rows."
-            )
-        for values in (
-            detector_positions,
-            fe_indices,
-            pb_indices,
-            live_times,
-            station_ids,
-        ):
-            values.setflags(write=False)
-        object.__setattr__(self, "detector_positions", detector_positions)
-        object.__setattr__(self, "fe_indices", fe_indices)
-        object.__setattr__(self, "pb_indices", pb_indices)
-        object.__setattr__(self, "live_times", live_times)
-        object.__setattr__(self, "station_sequence_ids", station_ids)
-
-    @property
-    def row_count(self) -> int:
-        """Return the number of aligned geometry rows."""
-        return int(np.asarray(self.fe_indices).size)
-
-
-@dataclass(frozen=True)
-class TorchLineTransportComponents:
-    """Store source-resolved line-rate components as Torch tensors."""
-
-    total_kernel: "torch.Tensor"
-    uncollided_kernel: "torch.Tensor"
-    tau_fe: "torch.Tensor"
-    tau_pb: "torch.Tensor"
-    tau_obstacle: "torch.Tensor"
-    distance_m: "torch.Tensor"
-
-
 class IsotopeParticleFilter:
     """Per-isotope particle filter (continuous state is the primary mode)."""
 
@@ -852,9 +745,7 @@ class IsotopeParticleFilter:
         source_extent_radius_m: float = 0.0,
         source_extent_samples: int = 1,
         line_mu_by_isotope: dict[str, object] | None = None,
-        additive_scatter_response: (
-            AdditiveNoncollidedTransportResponse | None
-        ) = None,
+        additive_scatter_response: (AdditiveNoncollidedTransportResponse | None) = None,
         random_seed: int = 0,
     ) -> None:
         """Initialize particle state, priors, and continuous measurement kernels."""
@@ -900,9 +791,7 @@ class IsotopeParticleFilter:
         self._last_structural_rj_position_proposal: (
             ContinuousSurfacePositionProposal | None
         ) = None
-        self._structural_rj_strength_proposal: (
-            ContinuousStrengthProposal | None
-        ) = None
+        self._structural_rj_strength_proposal: ContinuousStrengthProposal | None = None
         self._last_structural_rj_strength_proposal: (
             ContinuousStrengthProposal | None
         ) = None
@@ -912,12 +801,8 @@ class IsotopeParticleFilter:
         self._structural_rj_current_target_log_likelihood: (
             NDArray[np.float64] | None
         ) = None
-        self.last_structural_target_log_likelihood: (
-            NDArray[np.float64] | None
-        ) = None
-        self._joint_target_evaluator: (
-            Callable[..., NDArray[np.float64]] | None
-        ) = None
+        self.last_structural_target_log_likelihood: NDArray[np.float64] | None = None
+        self._joint_target_evaluator: Callable[..., NDArray[np.float64]] | None = None
         self._joint_strength_grid_target_evaluator: (
             Callable[..., NDArray[np.float64]] | None
         ) = None
@@ -956,7 +841,7 @@ class IsotopeParticleFilter:
         self._continuous_kernel_physics_signature = (
             self._incoming_kernel_physics_signature(kernel)
         )
-        self.continuous_particles: List[IsotopeParticle] = []
+        self.continuous_particles: list[IsotopeParticle] = []
         self.last_ess: float | None = None
         self.last_ess_pre: float | None = None
         self.last_ess_post: float | None = None
@@ -993,9 +878,7 @@ class IsotopeParticleFilter:
             maximum=float(self.config.strength_prior_max_cps_1m),
             family=str(self.config.strength_prior_family),
             gamma_shape=float(self.config.strength_prior_gamma_shape),
-            gamma_scale=float(
-                self.config.strength_prior_gamma_scale_cps_1m
-            ),
+            gamma_scale=float(self.config.strength_prior_gamma_scale_cps_1m),
         )
 
     def _build_structural_cardinality_prior(self) -> NDArray[np.float64]:
@@ -1032,9 +915,7 @@ class IsotopeParticleFilter:
         chart_geometry = build_surface_chart_geometry(
             self._source_prior_environment(),
             self.obstacle_grid,
-            max_edge_m=float(
-                self.config.structural_rj_surface_chart_max_edge_m
-            ),
+            max_edge_m=float(self.config.structural_rj_surface_chart_max_edge_m),
             obstacle_height_m=self.obstacle_height_m,
         )
         if not chart_geometry.obstacle_surfaces_available:
@@ -1044,11 +925,9 @@ class IsotopeParticleFilter:
             raise ValueError(
                 f"rj_mh requires complete obstacle component geometry: {warning}"
             )
-        self._structural_rj_surface_atlas = ContinuousSurfaceAtlas(
+        self._structural_rj_surface_atlas = ContinuousSurfaceAtlas(chart_geometry)
+        self._structural_rj_surface_atlas_sha256 = surface_chart_geometry_sha256(
             chart_geometry
-        )
-        self._structural_rj_surface_atlas_sha256 = (
-            surface_chart_geometry_sha256(chart_geometry)
         )
         max_sources = int(self.config.hard_max_sources or 0)
         self._structural_rj_cardinality_prior = CardinalityPrior(
@@ -1059,12 +938,10 @@ class IsotopeParticleFilter:
             birth_weight=float(self.config.structural_rj_birth_probability),
             death_weight=float(self.config.structural_rj_death_probability),
         )
-        self._structural_rj_split_merge_probabilities = (
-            SplitMergeMoveProbabilities(
-                max_cardinality=max_sources,
-                split_weight=float(self.config.structural_rj_split_probability),
-                merge_weight=float(self.config.structural_rj_merge_probability),
-            )
+        self._structural_rj_split_merge_probabilities = SplitMergeMoveProbabilities(
+            max_cardinality=max_sources,
+            split_weight=float(self.config.structural_rj_split_probability),
+            merge_weight=float(self.config.structural_rj_merge_probability),
         )
 
     @property
@@ -1105,9 +982,7 @@ class IsotopeParticleFilter:
         atlas = self._structural_rj_surface_atlas
         if atlas is None:
             raise RuntimeError("The continuous surface atlas is unavailable.")
-        states = [
-            particle.state for particle in self.continuous_particles
-        ]
+        states = [particle.state for particle in self.continuous_particles]
         if not states:
             return
         cardinalities = np.asarray(
@@ -1115,16 +990,12 @@ class IsotopeParticleFilter:
             dtype=np.int64,
         )
         maximum_cardinality = int(self.config.hard_max_sources or 0)
-        if np.any(cardinalities < 0) or np.any(
-            cardinalities > maximum_cardinality
-        ):
+        if np.any(cardinalities < 0) or np.any(cardinalities > maximum_cardinality):
             raise ValueError(
                 "PF state cardinalities must lie inside configured support."
             )
         for cardinality in np.unique(cardinalities).tolist():
-            indices = np.flatnonzero(
-                cardinalities == int(cardinality)
-            )
+            indices = np.flatnonzero(cardinalities == int(cardinality))
             selected = [states[int(index)] for index in indices]
             strengths = np.stack(
                 [
@@ -1135,10 +1006,12 @@ class IsotopeParticleFilter:
                 ],
                 axis=0,
             )
-            if np.any(~np.asarray(
-                self._strength_prior.in_support(strengths),
-                dtype=bool,
-            )):
+            if np.any(
+                ~np.asarray(
+                    self._strength_prior.in_support(strengths),
+                    dtype=bool,
+                )
+            ):
                 raise ValueError(
                     "PF source strengths must lie inside configured prior support."
                 )
@@ -1166,11 +1039,10 @@ class IsotopeParticleFilter:
                 chart_ids,
                 surface_uv,
             )
-            if (
-                validated_ids.shape != (indices.size, int(cardinality))
-                or validated_uv.shape
-                != (indices.size, int(cardinality), 2)
-            ):
+            if validated_ids.shape != (
+                indices.size,
+                int(cardinality),
+            ) or validated_uv.shape != (indices.size, int(cardinality), 2):
                 raise ValueError(
                     "PF chart/UV arrays do not match their source cardinality."
                 )
@@ -1262,9 +1134,7 @@ class IsotopeParticleFilter:
         components.
         """
         self.validate_continuous_surface_states()
-        states = [
-            particle.state for particle in self.continuous_particles
-        ]
+        states = [particle.state for particle in self.continuous_particles]
         particle_count = len(states)
         slot_count = int(self.config.hard_max_sources or 0)
         chart_ids = np.zeros(
@@ -1649,7 +1519,6 @@ class IsotopeParticleFilter:
             return False
         return self._gpu_enabled()
 
-
     def _continuous_expected_line_transport_components_pair_sequence_torch(
         self,
         pose_idx: int,
@@ -1676,13 +1545,9 @@ class IsotopeParticleFilter:
             positive_line_indices,
             dtype=np.int64,
         ).reshape(-1)
-        if not (
-            fe_arr.size == pb_arr.size == live_arr.size
-            and fe_arr.size > 0
-        ):
+        if not (fe_arr.size == pb_arr.size == live_arr.size and fe_arr.size > 0):
             raise ValueError(
-                "Fe, Pb, and live-time arrays must have one common positive "
-                "view count."
+                "Fe, Pb, and live-time arrays must have one common positive view count."
             )
         if np.any(~np.isfinite(live_arr)) or np.any(live_arr <= 0.0):
             raise ValueError("Full-spectrum live times must be positive.")
@@ -1692,8 +1557,7 @@ class IsotopeParticleFilter:
             or np.any(line_indices < 0)
         ):
             raise ValueError(
-                "positive_line_indices must be nonempty, unique, and "
-                "nonnegative."
+                "positive_line_indices must be nonempty, unique, and nonnegative."
             )
         if self.kernel is None:
             raise RuntimeError("Continuous line transport requires PF poses.")
@@ -1720,9 +1584,7 @@ class IsotopeParticleFilter:
             slot_count,
             line_count,
         )
-        arrays = [
-            np.zeros(output_shape, dtype=np.float64) for _ in range(6)
-        ]
+        arrays = [np.zeros(output_shape, dtype=np.float64) for _ in range(6)]
         if np.any(mask):
             active_positions = self._surface_transport_positions(
                 positions[mask],
@@ -1739,16 +1601,13 @@ class IsotopeParticleFilter:
                 self.kernel.poses[int(pose_idx)],
                 dtype=np.float64,
             )
-            components = (
-                self.continuous_kernel
-                .line_transport_components_pair_program_for_detectors(
-                    isotope=self.isotope,
-                    detector_positions=detector_position.reshape(1, 3),
-                    sources=unique_positions,
-                    fe_indices=fe_arr.reshape(1, view_count),
-                    pb_indices=pb_arr.reshape(1, view_count),
-                    positive_line_indices=line_indices,
-                )
+            components = self.continuous_kernel.line_transport_components_pair_program_for_detectors(
+                isotope=self.isotope,
+                detector_positions=detector_position.reshape(1, 3),
+                sources=unique_positions,
+                fe_indices=fe_arr.reshape(1, view_count),
+                pb_indices=pb_arr.reshape(1, view_count),
+                positive_line_indices=line_indices,
             )
             component_total = np.asarray(
                 components.total_kernel,
@@ -1767,12 +1626,8 @@ class IsotopeParticleFilter:
                 (1, 0, 2),
             )
             rate_scale = active_strengths[:, None, None]
-            arrays[0][particle_ids, :, source_slots, :] = (
-                total_active * rate_scale
-            )
-            arrays[1][particle_ids, :, source_slots, :] = (
-                uncollided_active * rate_scale
-            )
+            arrays[0][particle_ids, :, source_slots, :] = total_active * rate_scale
+            arrays[1][particle_ids, :, source_slots, :] = uncollided_active * rate_scale
             for output, values in zip(
                 arrays[2:],
                 (
@@ -1796,7 +1651,6 @@ class IsotopeParticleFilter:
         ]
         return TorchLineTransportComponents(*tensors)
 
-
     def _current_log_weights_torch(self, device: "torch.device") -> "torch.Tensor":
         """Return log-weights as a float64 torch tensor on the requested device."""
         import torch
@@ -1816,9 +1670,7 @@ class IsotopeParticleFilter:
         if bool(torch.any(torch.isnan(logw)).detach().cpu().item()) or bool(
             torch.any(torch.isinf(logw) & (logw > 0.0)).detach().cpu().item()
         ):
-            raise RuntimeError(
-                "Particle log weights contain NaN or positive infinity."
-            )
+            raise RuntimeError("Particle log weights contain NaN or positive infinity.")
         if not bool(torch.any(torch.isfinite(logw)).detach().cpu().item()):
             raise RuntimeError(
                 "All particle log weights are negative infinity; posterior "
@@ -1829,9 +1681,7 @@ class IsotopeParticleFilter:
             raise RuntimeError("Particle log-weight normalizer is non-finite.")
         shifted = logw - finite_max
         shifted_normalizer = torch.logsumexp(shifted, dim=0)
-        if not bool(
-            torch.isfinite(shifted_normalizer).detach().cpu().item()
-        ):
+        if not bool(torch.isfinite(shifted_normalizer).detach().cpu().item()):
             raise RuntimeError("Particle log-weight normalizer is non-finite.")
         normalized = shifted - shifted_normalizer
         if bool(torch.any(torch.isnan(normalized)).detach().cpu().item()) or bool(
@@ -1848,24 +1698,19 @@ class IsotopeParticleFilter:
         import torch
 
         if logw.ndim != 1 or int(logw.numel()) <= 0:
-            raise ValueError(
-                "ESS requires a nonempty normalized log-weight vector."
-            )
-        if bool(torch.any(torch.isnan(logw)).detach().cpu().item()) or bool(
-            torch.any(torch.isinf(logw) & (logw > 0.0)).detach().cpu().item()
-        ) or not bool(torch.any(torch.isfinite(logw)).detach().cpu().item()):
-            raise RuntimeError("ESS received invalid particle log weights.")
-        log_normalizer = float(
-            torch.logsumexp(logw, dim=0).detach().cpu().item()
-        )
+            raise ValueError("ESS requires a nonempty normalized log-weight vector.")
         if (
-            not np.isfinite(log_normalizer)
-            or not np.isclose(
-                log_normalizer,
-                0.0,
-                rtol=0.0,
-                atol=1.0e-10,
-            )
+            bool(torch.any(torch.isnan(logw)).detach().cpu().item())
+            or bool(torch.any(torch.isinf(logw) & (logw > 0.0)).detach().cpu().item())
+            or not bool(torch.any(torch.isfinite(logw)).detach().cpu().item())
+        ):
+            raise RuntimeError("ESS received invalid particle log weights.")
+        log_normalizer = float(torch.logsumexp(logw, dim=0).detach().cpu().item())
+        if not np.isfinite(log_normalizer) or not np.isclose(
+            log_normalizer,
+            0.0,
+            rtol=0.0,
+            atol=1.0e-10,
         ):
             raise ValueError("ESS requires already normalized log weights.")
         w = torch.exp(logw)
@@ -1873,9 +1718,10 @@ class IsotopeParticleFilter:
         if not np.isfinite(denominator) or denominator <= 0.0:
             raise RuntimeError("ESS denominator must be finite and positive.")
         ess = 1.0 / denominator
-        if not np.isfinite(ess) or not 1.0 - 1.0e-9 <= ess <= int(
-            logw.numel()
-        ) + 1.0e-9:
+        if (
+            not np.isfinite(ess)
+            or not 1.0 - 1.0e-9 <= ess <= int(logw.numel()) + 1.0e-9
+        ):
             raise RuntimeError("Effective sample size lies outside its support.")
         return float(ess)
 
@@ -1902,8 +1748,7 @@ class IsotopeParticleFilter:
             or int(logw_prev.numel()) <= 0
         ):
             raise ValueError(
-                "Tempering requires aligned nonempty log-weight and likelihood "
-                "vectors."
+                "Tempering requires aligned nonempty log-weight and likelihood vectors."
             )
         if not np.isfinite(remaining) or not 0.0 < remaining <= 1.0:
             raise ValueError("Tempering remaining beta must lie in (0, 1].")
@@ -1915,10 +1760,7 @@ class IsotopeParticleFilter:
             raise ValueError("Tempering target ESS lies outside particle support.")
         self._ess_from_logw_torch(logw_prev)
         if bool(torch.any(torch.isnan(ll_t)).detach().cpu().item()) or bool(
-            torch.any(torch.isinf(ll_t) & (ll_t > 0.0))
-            .detach()
-            .cpu()
-            .item()
+            torch.any(torch.isinf(ll_t) & (ll_t > 0.0)).detach().cpu().item()
         ):
             raise RuntimeError(
                 "Tempering likelihood contains NaN or positive infinity."
@@ -2049,15 +1891,11 @@ class IsotopeParticleFilter:
                 ~np.asarray(self._strength_prior.in_support(locations), dtype=bool)
             )
         ):
-            raise ValueError(
-                "Full-spectrum residual proposal arrays are invalid."
-            )
+            raise ValueError("Full-spectrum residual proposal arrays are invalid.")
         proposal = ContinuousSurfacePositionProposal(
             area_prior_probabilities=prior_probabilities,
             alignment_scores=(
-                alignment
-                if bool(informative)
-                else np.zeros_like(alignment)
+                alignment if bool(informative) else np.zeros_like(alignment)
             ),
             prior_component_probability=float(
                 self.config.structural_rj_position_proposal_prior_weight
@@ -2067,9 +1905,7 @@ class IsotopeParticleFilter:
             minimum=float(self._strength_prior.minimum),
             maximum=float(self._strength_prior.maximum),
             data_locations_by_chart=locations,
-            data_sigma=float(
-                self.config.structural_rj_strength_proposal_sigma_fraction
-            )
+            data_sigma=float(self.config.structural_rj_strength_proposal_sigma_fraction)
             * (
                 float(self._strength_prior.finite_upper_quantile())
                 - float(self._strength_prior.minimum)
@@ -2102,9 +1938,7 @@ class IsotopeParticleFilter:
         strength_proposal: ContinuousStrengthProposal,
     ) -> str:
         """Hash every frozen parameter used by birth/death proposal densities."""
-        digest = hashlib.sha256(
-            b"continuous_surface_birth_proposal_snapshot_v2\0"
-        )
+        digest = hashlib.sha256(b"continuous_surface_birth_proposal_snapshot_v2\0")
         digest.update(str(strength_proposal.prior_family).encode("utf-8"))
         digest.update(b"\0")
         arrays = (
@@ -2128,9 +1962,7 @@ class IsotopeParticleFilter:
         )
         for value in arrays:
             array = np.ascontiguousarray(value, dtype="<f8")
-            digest.update(
-                np.asarray(array.shape, dtype="<i8").tobytes(order="C")
-            )
+            digest.update(np.asarray(array.shape, dtype="<i8").tobytes(order="C"))
             digest.update(array.tobytes(order="C"))
         return digest.hexdigest()
 
@@ -2197,8 +2029,7 @@ class IsotopeParticleFilter:
         minimum = float(self._strength_prior.minimum)
         excess = np.maximum(
             base - minimum,
-            np.finfo(np.float64).eps
-            * max(1.0, float(self._strength_prior.mean)),
+            np.finfo(np.float64).eps * max(1.0, float(self._strength_prior.mean)),
         )
         relative = excess / np.sum(excess, axis=1, keepdims=True)
         grid_size = int(self.config.structural_rj_strength_proposal_grid_size)
@@ -2211,27 +2042,18 @@ class IsotopeParticleFilter:
         if self._strength_prior.family == "shifted_gamma":
             from scipy.special import gammaincinv
 
-            total_excess = (
-                float(self._strength_prior.gamma_scale)
-                * gammaincinv(
-                    float(cardinality)
-                    * float(self._strength_prior.gamma_shape),
-                    probabilities,
-                )
+            total_excess = float(self._strength_prior.gamma_scale) * gammaincinv(
+                float(cardinality) * float(self._strength_prior.gamma_shape),
+                probabilities,
             )
         else:
             total_excess = (
                 probabilities
                 * float(cardinality)
-                * (
-                    float(self._strength_prior.maximum)
-                    - minimum
-                )
+                * (float(self._strength_prior.maximum) - minimum)
             )
         candidate_strengths = (
-            minimum
-            + relative[:, None, :]
-            * total_excess[None, :, None]
+            minimum + relative[:, None, :] * total_excess[None, :, None]
         )
         if self._strength_prior.family == "bounded_uniform":
             candidate_strengths = np.minimum(
@@ -2241,9 +2063,7 @@ class IsotopeParticleFilter:
         centers = np.empty((row_count, cardinality), dtype=np.float64)
         cached_rows = np.zeros(row_count, dtype=np.bool_)
         center_cache = self._structural_rj_current_block_strength_centers
-        cardinality_cache = (
-            self._structural_rj_current_block_strength_cardinalities
-        )
+        cardinality_cache = self._structural_rj_current_block_strength_cardinalities
         if cache_current_state and center_cache is not None:
             if (
                 cardinality_cache is None
@@ -2277,9 +2097,7 @@ class IsotopeParticleFilter:
                         strengths_pgk=evaluation_strengths,
                         particle_indices=evaluation_indices,
                         target_beta=float(target_beta),
-                        tempering_start_row=(
-                            self._structural_rj_tempering_start_row
-                        ),
+                        tempering_start_row=(self._structural_rj_tempering_start_row),
                     ),
                     dtype=np.float64,
                 )
@@ -2311,16 +2129,14 @@ class IsotopeParticleFilter:
                     candidate_count,
                     cardinality,
                 )
-                conditional_target = (
-                    self._continuous_rj_group_log_likelihood(
-                        data,
-                        expanded_positions,
-                        flat_strengths,
-                        chart_ids=expanded_charts,
-                        particle_indices=expanded_indices,
-                        target_beta=target_beta,
-                    ).reshape(evaluation_rows.size, grid_size)
-                )
+                conditional_target = self._continuous_rj_group_log_likelihood(
+                    data,
+                    expanded_positions,
+                    flat_strengths,
+                    chart_ids=expanded_charts,
+                    particle_indices=expanded_indices,
+                    target_beta=target_beta,
+                ).reshape(evaluation_rows.size, grid_size)
             conditional_target += np.sum(
                 np.asarray(
                     self._strength_prior.log_prob(evaluation_strengths),
@@ -2361,7 +2177,6 @@ class IsotopeParticleFilter:
             prior_gamma_shape=float(self._strength_prior.gamma_shape),
             prior_gamma_scale=float(self._strength_prior.gamma_scale),
         )
-
 
     def _continuous_rj_line_transport_component_columns(
         self,
@@ -2425,13 +2240,10 @@ class IsotopeParticleFilter:
             or np.any(live_times <= 0.0)
         ):
             raise ValueError(
-                "Line-component measurement geometry and live times are "
-                "invalid."
+                "Line-component measurement geometry and live times are invalid."
             )
         if self._can_use_gpu():
-            orientation_count = int(
-                len(self.continuous_kernel.orientations)
-            )
+            orientation_count = int(len(self.continuous_kernel.orientations))
             if (
                 orientation_count <= 0
                 or np.any(fe_indices < 0)
@@ -2440,12 +2252,11 @@ class IsotopeParticleFilter:
                 or np.any(pb_indices >= orientation_count)
             ):
                 raise ValueError(
-                    "Continuous RJ shield indices lie outside the orientation "
-                    "support."
+                    "Continuous RJ shield indices lie outside the orientation support."
                 )
-            pair_indices = (
-                fe_indices * orientation_count + pb_indices
-            ).astype(np.int64, copy=False)
+            pair_indices = (fe_indices * orientation_count + pb_indices).astype(
+                np.int64, copy=False
+            )
             unique_sequences, sequence_inverse = np.unique(
                 sequence_ids,
                 return_inverse=True,
@@ -2465,18 +2276,13 @@ class IsotopeParticleFilter:
             if np.unique(view_counts).size == 1:
                 for rows in station_rows:
                     if not np.all(
-                        detector_positions[rows]
-                        == detector_positions[int(rows[0])]
+                        detector_positions[rows] == detector_positions[int(rows[0])]
                     ):
                         raise ValueError(
-                            "One station sequence contains multiple detector "
-                            "positions."
+                            "One station sequence contains multiple detector positions."
                         )
                 station_detectors = np.stack(
-                    [
-                        detector_positions[int(rows[0])]
-                        for rows in station_rows
-                    ],
+                    [detector_positions[int(rows[0])] for rows in station_rows],
                     axis=0,
                 )
                 fe_program = np.stack(
@@ -2487,17 +2293,14 @@ class IsotopeParticleFilter:
                     [pb_indices[rows] for rows in station_rows],
                     axis=0,
                 )
-                program_components = (
-                    self.continuous_kernel
-                    .line_transport_components_pair_program_for_detectors(
-                        isotope=self.isotope,
-                        detector_positions=station_detectors,
-                        sources=requested_transport,
-                        fe_indices=fe_program,
-                        pb_indices=pb_program,
-                        positive_line_indices=line_indices,
-                        device_resident=device_resident,
-                    )
+                program_components = self.continuous_kernel.line_transport_components_pair_program_for_detectors(
+                    isotope=self.isotope,
+                    detector_positions=station_detectors,
+                    sources=requested_transport,
+                    fe_indices=fe_program,
+                    pb_indices=pb_program,
+                    positive_line_indices=line_indices,
+                    device_resident=device_resident,
                 )
                 row_view_indices = np.empty(
                     measurement_count,
@@ -2536,26 +2339,22 @@ class IsotopeParticleFilter:
                         values = getattr(program_components, field_name)
                         if tuple(values.shape) != expected_program_shape:
                             raise RuntimeError(
-                                "Pair-program continuous RJ component shape "
-                                "is invalid."
+                                "Pair-program continuous RJ component shape is invalid."
                             )
                         return values[sequence_index, view_index]
 
                     components = TorchLineTransportComponents(
-                        total_kernel=_selected_device_component(
-                            "total_kernel"
-                        ),
+                        total_kernel=_selected_device_component("total_kernel"),
                         uncollided_kernel=_selected_device_component(
                             "uncollided_kernel"
                         ),
                         tau_fe=_selected_device_component("tau_fe"),
                         tau_pb=_selected_device_component("tau_pb"),
-                        tau_obstacle=_selected_device_component(
-                            "tau_obstacle"
-                        ),
+                        tau_obstacle=_selected_device_component("tau_obstacle"),
                         distance_m=_selected_device_component("distance_m"),
                     )
                 else:
+
                     def _selected_component(
                         field_name: str,
                     ) -> NDArray[np.float64]:
@@ -2566,8 +2365,7 @@ class IsotopeParticleFilter:
                         )
                         if values.shape != expected_program_shape:
                             raise RuntimeError(
-                                "Pair-program continuous RJ component shape "
-                                "is invalid."
+                                "Pair-program continuous RJ component shape is invalid."
                             )
                         return np.asarray(
                             values[sequence_inverse, row_view_indices],
@@ -2576,12 +2374,8 @@ class IsotopeParticleFilter:
 
                     components = LineTransportComponents(
                         total_kernel=_selected_component("total_kernel"),
-                        unattenuated_kernel=_selected_component(
-                            "unattenuated_kernel"
-                        ),
-                        uncollided_kernel=_selected_component(
-                            "uncollided_kernel"
-                        ),
+                        unattenuated_kernel=_selected_component("unattenuated_kernel"),
+                        uncollided_kernel=_selected_component("uncollided_kernel"),
                         tau_fe=_selected_component("tau_fe"),
                         tau_pb=_selected_component("tau_pb"),
                         tau_obstacle=_selected_component("tau_obstacle"),
@@ -2601,14 +2395,11 @@ class IsotopeParticleFilter:
                     axis=0,
                     return_inverse=True,
                 )
-                all_pair_components = (
-                    self.continuous_kernel
-                    .line_transport_components_all_pairs_for_detectors(
-                        isotope=self.isotope,
-                        detector_positions=unique_detectors,
-                        sources=requested_transport,
-                        positive_line_indices=line_indices,
-                    )
+                all_pair_components = self.continuous_kernel.line_transport_components_all_pairs_for_detectors(
+                    isotope=self.isotope,
+                    detector_positions=unique_detectors,
+                    sources=requested_transport,
+                    positive_line_indices=line_indices,
                 )
                 expected_all_pair_shape = (
                     int(unique_detectors.shape[0]),
@@ -2636,35 +2427,24 @@ class IsotopeParticleFilter:
 
                 components = LineTransportComponents(
                     total_kernel=_selected_component("total_kernel"),
-                    unattenuated_kernel=_selected_component(
-                        "unattenuated_kernel"
-                    ),
-                    uncollided_kernel=_selected_component(
-                        "uncollided_kernel"
-                    ),
+                    unattenuated_kernel=_selected_component("unattenuated_kernel"),
+                    uncollided_kernel=_selected_component("uncollided_kernel"),
                     tau_fe=_selected_component("tau_fe"),
                     tau_pb=_selected_component("tau_pb"),
                     tau_obstacle=_selected_component("tau_obstacle"),
-                    tau_obstacle_compton=_selected_component(
-                        "tau_obstacle_compton"
-                    ),
+                    tau_obstacle_compton=_selected_component("tau_obstacle_compton"),
                     distance_m=_selected_component("distance_m"),
                 )
         else:
             if device_resident:
-                raise ValueError(
-                    "Device-resident structural transport requires CUDA."
-                )
-            components = (
-                self.continuous_kernel
-                .line_transport_components_selected_pairs_for_detectors(
-                    isotope=self.isotope,
-                    detector_positions=detector_positions,
-                    sources=requested_transport,
-                    fe_indices=fe_indices,
-                    pb_indices=pb_indices,
-                    positive_line_indices=line_indices,
-                )
+                raise ValueError("Device-resident structural transport requires CUDA.")
+            components = self.continuous_kernel.line_transport_components_selected_pairs_for_detectors(
+                isotope=self.isotope,
+                detector_positions=detector_positions,
+                sources=requested_transport,
+                fe_indices=fe_indices,
+                pb_indices=pb_indices,
+                positive_line_indices=line_indices,
             )
         if isinstance(components, TorchLineTransportComponents):
             return components
@@ -2749,10 +2529,7 @@ class IsotopeParticleFilter:
         if device_state is not None:
             selected = {
                 name: (
-                    torch.index_select(values, 0, index_tensor)
-                    .detach()
-                    .cpu()
-                    .numpy()
+                    torch.index_select(values, 0, index_tensor).detach().cpu().numpy()
                 )
                 for name, values in (
                     ("chart_ids", device_state["chart_ids"]),
@@ -2778,9 +2555,9 @@ class IsotopeParticleFilter:
                 dtype=np.float64,
             )
             diagnostics = self.last_structural_device_diagnostics
-            diagnostics["group_gather_calls"] = int(
-                diagnostics.get("group_gather_calls", 0)
-            ) + 1
+            diagnostics["group_gather_calls"] = (
+                int(diagnostics.get("group_gather_calls", 0)) + 1
+            )
         else:
             charts = np.stack(
                 [
@@ -2803,9 +2580,7 @@ class IsotopeParticleFilter:
             )
             strengths = np.stack(
                 [
-                    np.asarray(state.strengths, dtype=np.float64).reshape(
-                        source_count
-                    )
+                    np.asarray(state.strengths, dtype=np.float64).reshape(source_count)
                     for state in states
                 ],
                 axis=0,
@@ -2827,9 +2602,7 @@ class IsotopeParticleFilter:
                 canonical,
             )
         ):
-            raise RuntimeError(
-                "Continuous RJ state sources must already be canonical."
-            )
+            raise RuntimeError("Continuous RJ state sources must already be canonical.")
         if not np.all(self._strength_prior.in_support(strengths)):
             raise ValueError("Continuous RJ strength lies outside its prior.")
         return (
@@ -2951,9 +2724,7 @@ class IsotopeParticleFilter:
             or np.any(indices < 0)
             or np.any(indices >= cached.size)
         ):
-            raise RuntimeError(
-                "Continuous RJ current-target cache is misaligned."
-            )
+            raise RuntimeError("Continuous RJ current-target cache is misaligned.")
         result = np.asarray(cached[indices], dtype=np.float64)
         if np.any(np.isnan(result)) or np.any(np.isposinf(result)):
             raise RuntimeError(
@@ -2985,9 +2756,7 @@ class IsotopeParticleFilter:
             or np.any(np.isnan(proposed[acceptance]))
             or np.any(np.isposinf(proposed[acceptance]))
         ):
-            raise RuntimeError(
-                "Accepted continuous RJ target values are invalid."
-            )
+            raise RuntimeError("Accepted continuous RJ target values are invalid.")
         cached[indices[acceptance]] = proposed[acceptance]
 
     def set_joint_target_evaluator(
@@ -3024,9 +2793,7 @@ class IsotopeParticleFilter:
     ) -> None:
         """Attach the estimator-owned full-spectrum residual proposal."""
         if evaluator is not None and not callable(evaluator):
-            raise TypeError(
-                "Joint proposal evaluator must be callable or None."
-            )
+            raise TypeError("Joint proposal evaluator must be callable or None.")
         self._joint_proposal_evaluator = evaluator
 
     def _continuous_rj_canonicalize_rows(
@@ -3214,18 +2981,13 @@ class IsotopeParticleFilter:
                 dtype=torch.bool,
             )
         diagnostics = self.last_structural_device_diagnostics
-        diagnostics["mh_acceptance_calls"] = int(
-            diagnostics.get("mh_acceptance_calls", 0)
-        ) + 1
+        diagnostics["mh_acceptance_calls"] = (
+            int(diagnostics.get("mh_acceptance_calls", 0)) + 1
+        )
         diagnostics["mh_acceptance_rows"] = int(
             diagnostics.get("mh_acceptance_rows", 0)
         ) + int(ratios.size)
-        return (
-            accepted_tensor.detach()
-            .cpu()
-            .numpy()
-            .astype(np.bool_, copy=False)
-        )
+        return accepted_tensor.detach().cpu().numpy().astype(np.bool_, copy=False)
 
     def _commit_continuous_rj_states(
         self,
@@ -3250,9 +3012,7 @@ class IsotopeParticleFilter:
         accepted_rows = np.flatnonzero(acceptance)
         cardinality = int(charts.shape[1])
         center_cache = self._structural_rj_current_block_strength_centers
-        cardinality_cache = (
-            self._structural_rj_current_block_strength_cardinalities
-        )
+        cardinality_cache = self._structural_rj_current_block_strength_cardinalities
         if center_cache is not None and cardinality_cache is not None:
             changed_indices = indices[accepted_rows]
             center_cache[changed_indices] = float("nan")
@@ -3333,12 +3093,12 @@ class IsotopeParticleFilter:
                 cardinality,
             )
             diagnostics = self.last_structural_device_diagnostics
-            diagnostics["state_scatter_calls"] = int(
-                diagnostics.get("state_scatter_calls", 0)
-            ) + 1
-            diagnostics["state_scatter_rows"] = int(
-                diagnostics.get("state_scatter_rows", 0)
-            ) + row_count
+            diagnostics["state_scatter_calls"] = (
+                int(diagnostics.get("state_scatter_calls", 0)) + 1
+            )
+            diagnostics["state_scatter_rows"] = (
+                int(diagnostics.get("state_scatter_rows", 0)) + row_count
+            )
         # All numerical proposal and acceptance work is batched. This loop only
         # commits variable-length state objects for the accepted particle rows.
         for row in accepted_rows.tolist():
@@ -3368,12 +3128,12 @@ class IsotopeParticleFilter:
             selected = indices[acceptance]
         key = f"{name}_weight_mass"
         mass = float(np.sum(weights[selected], dtype=np.float64))
-        self._structural_rj_move_counts[key] = float(
-            self._structural_rj_move_counts.get(key, 0.0)
-        ) + mass
-        self.last_structural_transition_weight_mass[key] = float(
-            self.last_structural_transition_weight_mass.get(key, 0.0)
-        ) + mass
+        self._structural_rj_move_counts[key] = (
+            float(self._structural_rj_move_counts.get(key, 0.0)) + mass
+        )
+        self.last_structural_transition_weight_mass[key] = (
+            float(self.last_structural_transition_weight_mass.get(key, 0.0)) + mass
+        )
 
     def _record_structural_mh_components(
         self,
@@ -3434,14 +3194,12 @@ class IsotopeParticleFilter:
             name="support_feasible",
         )
         geometry_support = _broadcast(
-            support if geometry_support_feasible is None
-            else geometry_support_feasible,
+            support if geometry_support_feasible is None else geometry_support_feasible,
             dtype=np.bool_,
             name="geometry_support_feasible",
         )
         strength_support = _broadcast(
-            support if strength_support_feasible is None
-            else strength_support_feasible,
+            support if strength_support_feasible is None else strength_support_feasible,
             dtype=np.bool_,
             name="strength_support_feasible",
         )
@@ -3481,9 +3239,7 @@ class IsotopeParticleFilter:
         lengths = {int(value.size) for value in arrays.values()}
         if len(lengths) != 1:
             raise ValueError("Structural MH diagnostic arrays must align.")
-        self._structural_mh_component_samples.setdefault(str(move), []).append(
-            arrays
-        )
+        self._structural_mh_component_samples.setdefault(str(move), []).append(arrays)
 
     def _summarize_structural_mh_components(self) -> dict[str, object]:
         """Return compact rejection causes and MH terms by K transition."""
@@ -3494,9 +3250,7 @@ class IsotopeParticleFilter:
         )
         for move, batches in self._structural_mh_component_samples.items():
             combined = {
-                key: np.concatenate(
-                    [np.asarray(batch[key]) for batch in batches]
-                )
+                key: np.concatenate([np.asarray(batch[key]) for batch in batches])
                 for key in batches[0]
             }
             numeric_names = (
@@ -3556,18 +3310,14 @@ class IsotopeParticleFilter:
                     "attempted": int(feasible.size),
                     "accepted": int(np.count_nonzero(accepted)),
                     "support_rejected": int(np.count_nonzero(~feasible)),
-                    "geometry_support_rejected": int(
-                        np.count_nonzero(~geometry)
-                    ),
+                    "geometry_support_rejected": int(np.count_nonzero(~geometry)),
                     "strength_support_rejected": int(
                         np.count_nonzero(geometry & ~strength)
                     ),
                     "other_support_rejected": int(
                         np.count_nonzero(geometry & strength & ~feasible)
                     ),
-                    "nonfinite_rejected": int(
-                        np.count_nonzero(feasible & ~finite_all)
-                    ),
+                    "nonfinite_rejected": int(np.count_nonzero(feasible & ~finite_all)),
                     "mh_random_rejected": int(
                         np.count_nonzero(feasible & finite_all & ~accepted)
                     ),
@@ -3597,9 +3347,11 @@ class IsotopeParticleFilter:
                     encoded[cardinality_rows],
                     axis=0,
                 ).tolist():
-                    transition_mask = cardinality_rows & (
-                        current == int(source_count)
-                    ) & (proposed == int(destination_count))
+                    transition_mask = (
+                        cardinality_rows
+                        & (current == int(source_count))
+                        & (proposed == int(destination_count))
+                    )
                     transition_summaries[
                         f"{int(source_count)}->{int(destination_count)}"
                     ] = _summarize_rows(transition_mask)
@@ -3639,9 +3391,7 @@ class IsotopeParticleFilter:
             ).astype(np.int64, copy=False)
             if group_indices.size == 0:
                 continue
-            birth_probability, _ = move_probabilities.probabilities(
-                int(cardinality)
-            )
+            birth_probability, _ = move_probabilities.probabilities(int(cardinality))
             birth_move = self._random_generator.random(group_indices.size) < float(
                 birth_probability
             )
@@ -3676,9 +3426,7 @@ class IsotopeParticleFilter:
                     new_chart_ids, new_uv, new_positions = atlas.sample(
                         selected_indices.size,
                         rng=self._random_generator,
-                        chart_probabilities=(
-                            position_proposal.chart_probabilities
-                        ),
+                        chart_probabilities=(position_proposal.chart_probabilities),
                     )
                     new_strengths = np.asarray(
                         strength_proposal.sample(
@@ -3722,21 +3470,15 @@ class IsotopeParticleFilter:
                         particle_indices=selected_indices,
                         target_beta=target_beta,
                     )
-                    log_position_density = atlas.log_chart_probabilities[
-                        new_chart_ids
-                    ]
-                    log_position_proposal = position_proposal.log_density(
-                        new_chart_ids
-                    )
+                    log_position_density = atlas.log_chart_probabilities[new_chart_ids]
+                    log_position_proposal = position_proposal.log_density(new_chart_ids)
                     log_strength_prior_density = np.asarray(
                         self._strength_prior.log_prob(new_strengths),
                         dtype=np.float64,
                     )
-                    log_strength_proposal_density = (
-                        strength_proposal.log_density(
-                            new_chart_ids,
-                            new_strengths,
-                        )
+                    log_strength_proposal_density = strength_proposal.log_density(
+                        new_chart_ids,
+                        new_strengths,
                     )
                     log_target_ratio = _extended_log_target_ratio(
                         proposed_ll,
@@ -3748,20 +3490,12 @@ class IsotopeParticleFilter:
                         cardinality_prior=cardinality_prior,
                         move_probabilities=move_probabilities,
                         log_position_prior_density=log_position_density,
-                        log_strength_prior_density=(
-                            log_strength_prior_density
-                        ),
-                        log_forward_position_proposal=(
-                            log_position_proposal
-                        ),
-                        log_forward_strength_proposal=(
-                            log_strength_proposal_density
-                        ),
+                        log_strength_prior_density=(log_strength_prior_density),
+                        log_forward_position_proposal=(log_position_proposal),
+                        log_forward_strength_proposal=(log_strength_proposal_density),
                         log_abs_jacobian=0.0,
                     )
-                    accepted = self._continuous_rj_mh_acceptance_mask(
-                        log_ratio
-                    )
+                    accepted = self._continuous_rj_mh_acceptance_mask(log_ratio)
                     birth_prior_ratio = (
                         float(cardinality_prior.log_prob(int(cardinality) + 1))
                         - float(cardinality_prior.log_prob(int(cardinality)))
@@ -3786,18 +3520,15 @@ class IsotopeParticleFilter:
                         - log_position_proposal
                         - log_strength_proposal_density
                     )
-                    birth_support = (
-                        np.isfinite(birth_prior_ratio)
-                        & np.isfinite(birth_proposal_ratio)
+                    birth_support = np.isfinite(birth_prior_ratio) & np.isfinite(
+                        birth_proposal_ratio
                     )
-                    birth_geometry_support = (
-                        np.isfinite(log_position_density)
-                        & np.isfinite(log_position_proposal)
-                    )
-                    birth_strength_support = (
-                        np.isfinite(log_strength_prior_density)
-                        & np.isfinite(log_strength_proposal_density)
-                    )
+                    birth_geometry_support = np.isfinite(
+                        log_position_density
+                    ) & np.isfinite(log_position_proposal)
+                    birth_strength_support = np.isfinite(
+                        log_strength_prior_density
+                    ) & np.isfinite(log_strength_proposal_density)
                     self._record_structural_mh_components(
                         "birth",
                         delta_log_likelihood=log_target_ratio,
@@ -3841,8 +3572,7 @@ class IsotopeParticleFilter:
                             np.asarray(state.surface_chart_ids)
                             == int(new_chart_ids[row])
                         ) & np.all(
-                            np.asarray(state.surface_uv)
-                            == new_uv[row],
+                            np.asarray(state.surface_uv) == new_uv[row],
                             axis=1,
                         )
                         source_column = int(np.flatnonzero(matches)[0])
@@ -3875,10 +3605,7 @@ class IsotopeParticleFilter:
                 removed_chart_ids = chart_ids[rows, death_columns]
                 removed_uv = surface_uv[rows, death_columns]
                 removed_strengths = strengths[rows, death_columns]
-                keep = (
-                    np.arange(int(cardinality))[None, :]
-                    != death_columns[:, None]
-                )
+                keep = np.arange(int(cardinality))[None, :] != death_columns[:, None]
                 proposed_chart_ids = chart_ids[keep].reshape(
                     selected_indices.size,
                     int(cardinality) - 1,
@@ -3905,21 +3632,17 @@ class IsotopeParticleFilter:
                     particle_indices=selected_indices,
                     target_beta=target_beta,
                 )
-                log_position_density = atlas.log_chart_probabilities[
+                log_position_density = atlas.log_chart_probabilities[removed_chart_ids]
+                log_reverse_position_proposal = position_proposal.log_density(
                     removed_chart_ids
-                ]
-                log_reverse_position_proposal = (
-                    position_proposal.log_density(removed_chart_ids)
                 )
                 log_strength_prior_density = np.asarray(
                     self._strength_prior.log_prob(removed_strengths),
                     dtype=np.float64,
                 )
-                log_reverse_strength_proposal = (
-                    strength_proposal.log_density(
-                        removed_chart_ids,
-                        removed_strengths,
-                    )
+                log_reverse_strength_proposal = strength_proposal.log_density(
+                    removed_chart_ids,
+                    removed_strengths,
                 )
                 log_target_ratio = _extended_log_target_ratio(
                     proposed_ll,
@@ -3931,15 +3654,9 @@ class IsotopeParticleFilter:
                     cardinality_prior=cardinality_prior,
                     move_probabilities=move_probabilities,
                     log_removed_position_prior_density=log_position_density,
-                    log_removed_strength_prior_density=(
-                        log_strength_prior_density
-                    ),
-                    log_reverse_position_proposal=(
-                        log_reverse_position_proposal
-                    ),
-                    log_reverse_strength_proposal=(
-                        log_reverse_strength_proposal
-                    ),
+                    log_removed_strength_prior_density=(log_strength_prior_density),
+                    log_reverse_position_proposal=(log_reverse_position_proposal),
+                    log_reverse_strength_proposal=(log_reverse_strength_proposal),
                     log_abs_reverse_jacobian=0.0,
                 )
                 accepted = self._continuous_rj_mh_acceptance_mask(log_ratio)
@@ -3967,18 +3684,15 @@ class IsotopeParticleFilter:
                         )
                     )
                 )
-                death_support = (
-                    np.isfinite(death_prior_ratio)
-                    & np.isfinite(death_proposal_ratio)
+                death_support = np.isfinite(death_prior_ratio) & np.isfinite(
+                    death_proposal_ratio
                 )
-                death_geometry_support = (
-                    np.isfinite(log_position_density)
-                    & np.isfinite(log_reverse_position_proposal)
-                )
-                death_strength_support = (
-                    np.isfinite(log_strength_prior_density)
-                    & np.isfinite(log_reverse_strength_proposal)
-                )
+                death_geometry_support = np.isfinite(
+                    log_position_density
+                ) & np.isfinite(log_reverse_position_proposal)
+                death_strength_support = np.isfinite(
+                    log_strength_prior_density
+                ) & np.isfinite(log_reverse_strength_proposal)
                 self._record_structural_mh_components(
                     "death",
                     delta_log_likelihood=log_target_ratio,
@@ -4167,12 +3881,8 @@ class IsotopeParticleFilter:
                 log_new_strength_prior_density=new_strength_log_prior,
                 log_reverse_position_proposal_density=old_log_proposal,
                 log_forward_position_proposal_density=new_log_proposal,
-                log_reverse_strength_proposal_density=(
-                    old_strength_log_proposal
-                ),
-                log_forward_strength_proposal_density=(
-                    new_strength_log_proposal
-                ),
+                log_reverse_strength_proposal_density=(old_strength_log_proposal),
+                log_forward_strength_proposal_density=(new_strength_log_proposal),
                 log_abs_jacobian=0.0,
             )
             accepted = self._continuous_rj_mh_acceptance_mask(log_ratio)
@@ -4256,9 +3966,7 @@ class IsotopeParticleFilter:
             ) = atlas.tangent_geodesic_portal_proposal(
                 selected_chart_ids,
                 old_uv,
-                sigma_m=float(
-                    self.config.structural_rj_local_position_sigma_m
-                ),
+                sigma_m=float(self.config.structural_rj_local_position_sigma_m),
                 rng=self._random_generator,
             )
             new_positions = atlas.positions_xyz(new_chart_ids, new_uv)
@@ -4287,12 +3995,8 @@ class IsotopeParticleFilter:
                 particle_indices=particle_indices,
                 target_beta=target_beta,
             )
-            old_chart_log_density = atlas.log_chart_probabilities[
-                selected_chart_ids
-            ]
-            new_chart_log_density = atlas.log_chart_probabilities[
-                new_chart_ids
-            ]
+            old_chart_log_density = atlas.log_chart_probabilities[selected_chart_ids]
+            new_chart_log_density = atlas.log_chart_probabilities[new_chart_ids]
             zeros = np.zeros(particle_indices.size, dtype=np.float64)
             log_ratio = continuous_position_log_acceptance_ratio(
                 log_likelihood_ratio=_extended_log_target_ratio(
@@ -4404,9 +4108,7 @@ class IsotopeParticleFilter:
                 proposed_ll,
                 base_ll,
             )
-            accepted = self._continuous_rj_mh_acceptance_mask(
-                log_target_ratio
-            )
+            accepted = self._continuous_rj_mh_acceptance_mask(log_target_ratio)
             accepted_count += self._commit_continuous_rj_states(
                 particle_indices,
                 accepted,
@@ -4443,11 +4145,7 @@ class IsotopeParticleFilter:
             raise RuntimeError("Continuous surface atlas is unavailable.")
         charts = np.asarray(chart_ids, dtype=np.int64)
         uv = np.asarray(surface_uv, dtype=np.float64)
-        if (
-            charts.ndim != 2
-            or charts.shape[1] < 2
-            or uv.shape != charts.shape + (2,)
-        ):
+        if charts.ndim != 2 or charts.shape[1] < 2 or uv.shape != charts.shape + (2,):
             raise ValueError(
                 "Merge-pair probabilities require aligned P x K chart/UV arrays."
             )
@@ -4462,9 +4160,7 @@ class IsotopeParticleFilter:
         )
         probabilities = distance_weighted_ordered_pair_probabilities(
             distances,
-            sigma_m=float(
-                self.config.structural_rj_merge_distance_sigma_m
-            ),
+            sigma_m=float(self.config.structural_rj_merge_distance_sigma_m),
             uniform_component_probability=float(
                 self.config.structural_rj_merge_uniform_pair_probability
             ),
@@ -4502,9 +4198,7 @@ class IsotopeParticleFilter:
             dtype=np.float64,
         )
         minimum_response_cosine = np.ones_like(maximum_surface_distance)
-        line_indices = self.continuous_kernel.positive_line_indices(
-            self.isotope
-        )
+        line_indices = self.continuous_kernel.positive_line_indices(self.isotope)
         branching_weights = self.continuous_kernel.line_branching_weights(
             self.isotope,
             line_indices,
@@ -4538,9 +4232,7 @@ class IsotopeParticleFilter:
             physical_response,
             (1, 2, 0, 3),
         ).reshape(row_count, cardinality, -1)
-        norms = np.sqrt(
-            np.sum(np.square(signatures), axis=-1, keepdims=True)
-        )
+        norms = np.sqrt(np.sum(np.square(signatures), axis=-1, keepdims=True))
         signatures = signatures / np.maximum(
             norms,
             np.finfo(np.float64).tiny,
@@ -4573,7 +4265,7 @@ class IsotopeParticleFilter:
         response_sigma = float(self.config.structural_rj_merge_response_sigma)
         scores = np.exp(
             -0.5 * np.square(maximum_surface_distance / distance_sigma)
-            -0.5 * np.square(response_distance / response_sigma)
+            - 0.5 * np.square(response_distance / response_sigma)
         )
         score_sums = np.sum(scores, axis=1, keepdims=True)
         cohesive_probabilities = np.divide(
@@ -4606,16 +4298,9 @@ class IsotopeParticleFilter:
             out=np.full_like(scores, 1.0 / float(groups.shape[0])),
             where=cleanup_sums > 0.0,
         )
-        normalized = 0.5 * (
-            cohesive_probabilities + cleanup_probabilities
-        )
-        uniform = float(
-            self.config.structural_rj_merge_uniform_pair_probability
-        )
-        probabilities = (
-            (1.0 - uniform) * normalized
-            + uniform / float(groups.shape[0])
-        )
+        normalized = 0.5 * (cohesive_probabilities + cleanup_probabilities)
+        uniform = float(self.config.structural_rj_merge_uniform_pair_probability)
+        probabilities = (1.0 - uniform) * normalized + uniform / float(groups.shape[0])
         probabilities /= np.sum(probabilities, axis=1, keepdims=True)
         return groups, probabilities
 
@@ -4633,14 +4318,11 @@ class IsotopeParticleFilter:
             for size in range(3, maximum_group + 1)
             if (
                 int(cardinality) >= 1
-                and int(cardinality) + size - 1
-                <= int(self.config.hard_max_sources)
+                and int(cardinality) + size - 1 <= int(self.config.hard_max_sources)
             )
         )
         merge_sizes = tuple(
-            size
-            for size in range(3, maximum_group + 1)
-            if size <= int(cardinality)
+            size for size in range(3, maximum_group + 1) if size <= int(cardinality)
         )
         if split_sizes and merge_sizes:
             return split_sizes, merge_sizes, 0.5, 0.5
@@ -4675,13 +4357,8 @@ class IsotopeParticleFilter:
             row_maximum = np.max(log_evidence, axis=1, keepdims=True)
             evidence = np.exp(np.clip(log_evidence - row_maximum, -745.0, 0.0))
         evidence /= np.sum(evidence, axis=1, keepdims=True)
-        uniform = float(
-            self.config.structural_rj_merge_uniform_pair_probability
-        )
-        probabilities = (
-            (1.0 - uniform) * evidence
-            + uniform / float(charts.shape[1])
-        )
+        uniform = float(self.config.structural_rj_merge_uniform_pair_probability)
+        probabilities = (1.0 - uniform) * evidence + uniform / float(charts.shape[1])
         probabilities /= np.sum(probabilities, axis=1, keepdims=True)
         return probabilities
 
@@ -4711,12 +4388,11 @@ class IsotopeParticleFilter:
                 size=rows.size,
             )
             child_strengths = draws * values[rows, None]
-            valid = (
-                np.all(child_strengths >= self._strength_prior.minimum, axis=1)
-                & np.all(
-                    child_strengths <= self._strength_prior.support_maximum,
-                    axis=1,
-                )
+            valid = np.all(
+                child_strengths >= self._strength_prior.minimum, axis=1
+            ) & np.all(
+                child_strengths <= self._strength_prior.support_maximum,
+                axis=1,
             )
             fractions[rows[valid]] = draws[valid]
             pending[rows[valid]] = False
@@ -4783,9 +4459,7 @@ class IsotopeParticleFilter:
         bounded-simplex density, position density, and strength Jacobian are
         all included in the forward/reverse ratio.
         """
-        probability = float(
-            self.config.structural_rj_multi_component_probability
-        )
+        probability = float(self.config.structural_rj_multi_component_probability)
         if probability <= 0.0:
             return 0, 0
         atlas = self._structural_rj_surface_atlas
@@ -4793,16 +4467,12 @@ class IsotopeParticleFilter:
             raise RuntimeError("Continuous surface atlas is unavailable.")
         particle_count = len(self.continuous_particles)
         cardinalities = np.asarray(
-            [
-                particle.state.num_sources
-                for particle in self.continuous_particles
-            ],
+            [particle.state.num_sources for particle in self.continuous_particles],
             dtype=np.int64,
         )
         available = np.asarray(
             [
-                sum(self._continuous_rj_multi_direction_support(int(value))[2:])
-                > 0.0
+                sum(self._continuous_rj_multi_direction_support(int(value))[2:]) > 0.0
                 for value in cardinalities
             ],
             dtype=bool,
@@ -4844,9 +4514,7 @@ class IsotopeParticleFilter:
                     replace=True,
                 )
                 for group_size in np.unique(chosen_sizes).tolist():
-                    local_rows = direction_rows[
-                        chosen_sizes == int(group_size)
-                    ]
+                    local_rows = direction_rows[chosen_sizes == int(group_size)]
                     indices = particle_indices[local_rows]
                     (
                         chart_ids,
@@ -4887,9 +4555,7 @@ class IsotopeParticleFilter:
                             base_ll=base_ll,
                             current_prior=current_prior,
                             split_sizes=split_sizes,
-                            split_direction_probability=(
-                                split_direction_probability
-                            ),
+                            split_direction_probability=(split_direction_probability),
                             target_beta=target_beta,
                             global_probability=global_probability,
                         )
@@ -4991,10 +4657,7 @@ class IsotopeParticleFilter:
             child_uv.append(sampled[1])
             child_positions.append(sampled[2])
             child_log_density.append(sampled[3])
-        keep = (
-            np.arange(int(cardinality))[None, :]
-            != parent_columns[:, None]
-        )
+        keep = np.arange(int(cardinality))[None, :] != parent_columns[:, None]
         retained_count = int(cardinality) - 1
         proposed_charts = np.concatenate(
             (
@@ -5040,11 +4703,9 @@ class IsotopeParticleFilter:
                 cache_current_state=True,
             )
         )
-        current_strength_log_proposal = (
-            current_strength_proposal.log_density(strengths)
-        )
-        proposed_strength_log_proposal = (
-            proposed_strength_proposal.log_density(proposed_strengths)
+        current_strength_log_proposal = current_strength_proposal.log_density(strengths)
+        proposed_strength_log_proposal = proposed_strength_proposal.log_density(
+            proposed_strengths
         )
         reverse_groups, reverse_probabilities = (
             self._continuous_rj_multi_group_probabilities(
@@ -5061,17 +4722,13 @@ class IsotopeParticleFilter:
             dtype=np.int64,
         )
         reverse_group_column = int(
-            np.flatnonzero(
-                np.all(reverse_groups == child_columns[None, :], axis=1)
-            )[0]
+            np.flatnonzero(np.all(reverse_groups == child_columns[None, :], axis=1))[0]
         )
         reverse_group_log_probability = np.log(
             reverse_probabilities[:, reverse_group_column]
         )
-        reverse_anchor_probabilities = (
-            self._continuous_rj_merge_anchor_probabilities(
-                np.stack(child_charts, axis=1)
-            )
+        reverse_anchor_probabilities = self._continuous_rj_merge_anchor_probabilities(
+            np.stack(child_charts, axis=1)
         )
         reverse_merged_log_density = np.logaddexp.reduce(
             np.stack(
@@ -5112,9 +4769,7 @@ class IsotopeParticleFilter:
             proposed_positions,
             proposed_strengths,
         )
-        proposed_charts, proposed_uv, proposed_positions, proposed_strengths = (
-            canonical
-        )
+        proposed_charts, proposed_uv, proposed_positions, proposed_strengths = canonical
         proposed_ll = np.full(row_count, float("-inf"), dtype=np.float64)
         log_ratio = np.full(row_count, float("-inf"), dtype=np.float64)
         delta_prior = np.full(row_count, np.nan, dtype=np.float64)
@@ -5140,9 +4795,7 @@ class IsotopeParticleFilter:
                 proposed_charts[valid_rows],
                 proposed_strengths[valid_rows],
             )
-            delta_prior[valid_rows] = (
-                proposed_prior - current_prior[valid_rows]
-            )
+            delta_prior[valid_rows] = proposed_prior - current_prior[valid_rows]
             target_ratio = (
                 _extended_log_target_ratio(
                     proposed_ll[valid_rows],
@@ -5174,8 +4827,7 @@ class IsotopeParticleFilter:
             current_cardinality=int(cardinality),
             proposed_cardinality=int(proposed_cardinality),
             geometry_support_feasible=(
-                np.isfinite(log_forward)
-                & np.isfinite(log_reverse)
+                np.isfinite(log_forward) & np.isfinite(log_reverse)
             ),
             strength_support_feasible=np.all(
                 self._strength_prior.in_support(proposed_strengths),
@@ -5238,8 +4890,7 @@ class IsotopeParticleFilter:
         anchor_cumulative = np.cumsum(anchor_probabilities, axis=1)
         anchor_cumulative[:, -1] = 1.0
         anchor_offsets = np.sum(
-            self._random_generator.random(row_count)[:, None]
-            > anchor_cumulative,
+            self._random_generator.random(row_count)[:, None] > anchor_cumulative,
             axis=1,
             dtype=np.int64,
         )
@@ -5316,11 +4967,9 @@ class IsotopeParticleFilter:
                 cache_current_state=True,
             )
         )
-        current_strength_log_proposal = (
-            current_strength_proposal.log_density(strengths)
-        )
-        proposed_strength_log_proposal = (
-            proposed_strength_proposal.log_density(proposed_strengths)
+        current_strength_log_proposal = current_strength_proposal.log_density(strengths)
+        proposed_strength_log_proposal = proposed_strength_proposal.log_density(
+            proposed_strengths
         )
         split_sizes, _, reverse_split_probability, _ = (
             self._continuous_rj_multi_direction_support(proposed_cardinality)
@@ -5371,9 +5020,7 @@ class IsotopeParticleFilter:
             proposed_positions,
             proposed_strengths,
         )
-        proposed_charts, proposed_uv, proposed_positions, proposed_strengths = (
-            canonical
-        )
+        proposed_charts, proposed_uv, proposed_positions, proposed_strengths = canonical
         proposed_ll = np.full(row_count, float("-inf"), dtype=np.float64)
         log_ratio = np.full(row_count, float("-inf"), dtype=np.float64)
         delta_prior = np.full(row_count, np.nan, dtype=np.float64)
@@ -5391,9 +5038,7 @@ class IsotopeParticleFilter:
                 proposed_charts[valid_rows],
                 proposed_strengths[valid_rows],
             )
-            delta_prior[valid_rows] = (
-                proposed_prior - current_prior[valid_rows]
-            )
+            delta_prior[valid_rows] = proposed_prior - current_prior[valid_rows]
             target_ratio = (
                 _extended_log_target_ratio(
                     proposed_ll[valid_rows],
@@ -5425,8 +5070,7 @@ class IsotopeParticleFilter:
             current_cardinality=int(cardinality),
             proposed_cardinality=int(proposed_cardinality),
             geometry_support_feasible=(
-                np.isfinite(log_forward)
-                & np.isfinite(log_reverse)
+                np.isfinite(log_forward) & np.isfinite(log_reverse)
             ),
             strength_support_feasible=np.all(
                 self._strength_prior.in_support(proposed_strengths),
@@ -5461,9 +5105,7 @@ class IsotopeParticleFilter:
         union of the continuous ``K``-source spaces and requires no implicit
         dimension-matching Jacobian.
         """
-        probability = float(
-            self.config.structural_rj_block_independence_probability
-        )
+        probability = float(self.config.structural_rj_block_independence_probability)
         if probability <= 0.0:
             return 0, 0
         atlas = self._structural_rj_surface_atlas
@@ -5537,8 +5179,9 @@ class IsotopeParticleFilter:
                     float(cardinality_prior.log_prob(int(cardinality)))
                     + math.lgamma(float(cardinality) + 1.0)
                     + np.sum(
-                        self._active_continuous_rj_position_proposal()
-                        .log_density(charts),
+                        self._active_continuous_rj_position_proposal().log_density(
+                            charts
+                        ),
                         axis=1,
                     )
                     + block_strength_proposal.log_density(strengths)
@@ -5554,8 +5197,7 @@ class IsotopeParticleFilter:
                 source_count,
                 rng=self._random_generator,
                 chart_probabilities=(
-                    self._active_continuous_rj_position_proposal()
-                    .chart_probabilities
+                    self._active_continuous_rj_position_proposal().chart_probabilities
                 ),
             )
             charts = charts_flat.reshape(row_count, int(cardinality))
@@ -5584,8 +5226,8 @@ class IsotopeParticleFilter:
                 strengths = block_strength_proposal.sample(
                     rng=self._random_generator,
                 )
-                proposed_strength_log_proposal = (
-                    block_strength_proposal.log_density(strengths)
+                proposed_strength_log_proposal = block_strength_proposal.log_density(
+                    strengths
                 )
             proposed_ll = self._continuous_rj_group_log_likelihood(
                 data,
@@ -5595,11 +5237,9 @@ class IsotopeParticleFilter:
                 particle_indices=particle_indices,
                 target_beta=target_beta,
             )
-            proposed_log_prior, _ = (
-                self._continuous_rj_block_log_densities(
-                    charts,
-                    strengths,
-                )
+            proposed_log_prior, _ = self._continuous_rj_block_log_densities(
+                charts,
+                strengths,
             )
             proposed_log_proposal = np.full(
                 row_count,
@@ -5609,9 +5249,7 @@ class IsotopeParticleFilter:
             )
             if int(cardinality):
                 proposed_log_proposal += np.sum(
-                    self._active_continuous_rj_position_proposal().log_density(
-                        charts
-                    ),
+                    self._active_continuous_rj_position_proposal().log_density(charts),
                     axis=1,
                 )
                 proposed_log_proposal += proposed_strength_log_proposal
@@ -5635,9 +5273,7 @@ class IsotopeParticleFilter:
                     proposed_ll,
                     base_ll[rows],
                 ),
-                delta_log_prior=(
-                    proposed_log_prior - current_log_prior[rows]
-                ),
+                delta_log_prior=(proposed_log_prior - current_log_prior[rows]),
                 log_reverse_minus_forward=(
                     current_log_proposal[rows] - proposed_log_proposal
                 ),
@@ -5653,7 +5289,9 @@ class IsotopeParticleFilter:
                 strength_support_feasible=np.all(
                     self._strength_prior.in_support(strengths),
                     axis=1,
-                ) if int(cardinality) else np.ones(row_count, dtype=np.bool_),
+                )
+                if int(cardinality)
+                else np.ones(row_count, dtype=np.bool_),
                 log_acceptance_ratio=log_ratio,
             )
             accepted_count += self._commit_continuous_rj_states(
@@ -5664,9 +5302,7 @@ class IsotopeParticleFilter:
                 positions,
                 strengths,
             )
-            changed = accepted & (
-                current_cardinalities[rows] != int(cardinality)
-            )
+            changed = accepted & (current_cardinalities[rows] != int(cardinality))
             cardinality_change_count += int(np.sum(changed))
             self._update_continuous_rj_current_log_likelihood(
                 particle_indices,
@@ -5718,8 +5354,8 @@ class IsotopeParticleFilter:
             [particle.state.num_sources for particle in self.continuous_particles],
             dtype=np.int64,
         )
-        split_probabilities, merge_probabilities = (
-            move_probabilities.probabilities(cardinalities)
+        split_probabilities, merge_probabilities = move_probabilities.probabilities(
+            cardinalities
         )
         direction_available = (
             np.asarray(split_probabilities, dtype=np.float64)
@@ -5737,9 +5373,7 @@ class IsotopeParticleFilter:
             group_indices = np.flatnonzero(
                 attempt & (cardinalities == int(cardinality))
             ).astype(np.int64, copy=False)
-            split_probability, _ = move_probabilities.probabilities(
-                int(cardinality)
-            )
+            split_probability, _ = move_probabilities.probabilities(int(cardinality))
             split_move = self._random_generator.random(group_indices.size) < float(
                 split_probability
             )
@@ -5800,8 +5434,7 @@ class IsotopeParticleFilter:
                     ) = atlas.sample_local_chart_mixture(
                         parent_chart_ids,
                         global_component_probability=float(
-                            self.config
-                            .structural_rj_split_global_position_probability
+                            self.config.structural_rj_split_global_position_probability
                         ),
                         rng=self._random_generator,
                     )
@@ -5813,14 +5446,12 @@ class IsotopeParticleFilter:
                     ) = atlas.sample_local_chart_mixture(
                         parent_chart_ids,
                         global_component_probability=float(
-                            self.config
-                            .structural_rj_split_global_position_probability
+                            self.config.structural_rj_split_global_position_probability
                         ),
                         rng=self._random_generator,
                     )
                     keep = (
-                        np.arange(int(cardinality))[None, :]
-                        != source_columns[:, None]
+                        np.arange(int(cardinality))[None, :] != source_columns[:, None]
                     )
                     retained_chart_ids = chart_ids[keep].reshape(
                         particle_indices.size,
@@ -5881,18 +5512,9 @@ class IsotopeParticleFilter:
                         proposed_uv,
                     )
                     reverse_pair_matches = (
-                        (
-                            reverse_donor_columns[None, :]
-                            == int(cardinality)
-                        )
-                        & (
-                            reverse_receiver_columns[None, :]
-                            == int(cardinality) - 1
-                        )
-                    )
-                    if not np.all(
-                        np.sum(reverse_pair_matches, axis=1) == 1
-                    ):
+                        reverse_donor_columns[None, :] == int(cardinality)
+                    ) & (reverse_receiver_columns[None, :] == int(cardinality) - 1)
+                    if not np.all(np.sum(reverse_pair_matches, axis=1) == 1):
                         raise RuntimeError(
                             "Reverse merge pair was not uniquely represented."
                         )
@@ -5907,28 +5529,20 @@ class IsotopeParticleFilter:
                         ]
                     )
                     global_probability = float(
-                        self.config
-                        .structural_rj_split_global_position_probability
+                        self.config.structural_rj_split_global_position_probability
                     )
-                    log_reverse_merged_position_proposal = (
-                        np.logaddexp(
-                            atlas.local_chart_mixture_log_density(
-                                first_child_chart_ids,
-                                parent_chart_ids,
-                                global_component_probability=(
-                                    global_probability
-                                ),
-                            ),
-                            atlas.local_chart_mixture_log_density(
-                                second_child_chart_ids,
-                                parent_chart_ids,
-                                global_component_probability=(
-                                    global_probability
-                                ),
-                            ),
-                        )
-                        - math.log(2.0)
-                    )
+                    log_reverse_merged_position_proposal = np.logaddexp(
+                        atlas.local_chart_mixture_log_density(
+                            first_child_chart_ids,
+                            parent_chart_ids,
+                            global_component_probability=(global_probability),
+                        ),
+                        atlas.local_chart_mixture_log_density(
+                            second_child_chart_ids,
+                            parent_chart_ids,
+                            global_component_probability=(global_probability),
+                        ),
+                    ) - math.log(2.0)
                     (
                         proposed_chart_ids,
                         proposed_uv,
@@ -6005,14 +5619,10 @@ class IsotopeParticleFilter:
                                     )
                                 ),
                                 log_forward_first_position_proposal=(
-                                    log_forward_first_position_proposal[
-                                        valid_rows
-                                    ]
+                                    log_forward_first_position_proposal[valid_rows]
                                 ),
                                 log_forward_second_position_proposal=(
-                                    log_forward_second_position_proposal[
-                                        valid_rows
-                                    ]
+                                    log_forward_second_position_proposal[valid_rows]
                                 ),
                                 log_forward_fraction_proposal=(
                                     -np.log(width[valid_rows])
@@ -6028,9 +5638,7 @@ class IsotopeParticleFilter:
                                     log_reverse_pair_selection[valid_rows]
                                 ),
                                 log_reverse_merged_position_proposal=(
-                                    log_reverse_merged_position_proposal[
-                                        valid_rows
-                                    ]
+                                    log_reverse_merged_position_proposal[valid_rows]
                                 ),
                             )
                         )
@@ -6061,14 +5669,8 @@ class IsotopeParticleFilter:
                     )
                     if valid_rows.size:
                         split_delta_prior[valid_rows] = (
-                            float(
-                                cardinality_prior.log_prob(
-                                    int(cardinality) + 1
-                                )
-                            )
-                            - float(
-                                cardinality_prior.log_prob(int(cardinality))
-                            )
+                            float(cardinality_prior.log_prob(int(cardinality) + 1))
+                            - float(cardinality_prior.log_prob(int(cardinality)))
                             + math.log(float(int(cardinality) + 1))
                             + atlas.log_chart_probabilities[
                                 first_child_chart_ids[valid_rows]
@@ -6082,12 +5684,8 @@ class IsotopeParticleFilter:
                             + self._strength_prior.log_prob(
                                 retained_strength[valid_rows]
                             )
-                            + self._strength_prior.log_prob(
-                                new_strength[valid_rows]
-                            )
-                            - self._strength_prior.log_prob(
-                                total_strength[valid_rows]
-                            )
+                            + self._strength_prior.log_prob(new_strength[valid_rows])
+                            - self._strength_prior.log_prob(total_strength[valid_rows])
                         )
                         split_log_jacobian[valid_rows] = np.log(
                             total_strength[valid_rows]
@@ -6150,9 +5748,7 @@ class IsotopeParticleFilter:
                 )
                 pair_cdf = np.cumsum(pair_probabilities, axis=1)
                 pair_cdf[:, -1] = 1.0
-                pair_draws = self._random_generator.random(
-                    particle_indices.size
-                )
+                pair_draws = self._random_generator.random(particle_indices.size)
                 pair_columns = np.sum(
                     pair_draws[:, None] > pair_cdf,
                     axis=1,
@@ -6167,9 +5763,7 @@ class IsotopeParticleFilter:
                 first_child_chart_ids = chart_ids[rows, receiver_columns]
                 second_child_strengths = strengths[rows, delete_columns]
                 first_child_strengths = strengths[rows, receiver_columns]
-                merged_strength = (
-                    second_child_strengths + first_child_strengths
-                )
+                merged_strength = second_child_strengths + first_child_strengths
                 lower, upper, reverse_feasible = split_fraction_bounds(
                     merged_strength,
                     minimum_strength=self._strength_prior.minimum,
@@ -6189,12 +5783,10 @@ class IsotopeParticleFilter:
                     & (reverse_fraction <= upper)
                 )
                 global_probability = float(
-                    self.config
-                    .structural_rj_split_global_position_probability
+                    self.config.structural_rj_split_global_position_probability
                 )
                 use_first_anchor = (
-                    self._random_generator.random(particle_indices.size)
-                    < 0.5
+                    self._random_generator.random(particle_indices.size) < 0.5
                 )
                 merge_anchor_chart_ids = np.where(
                     use_first_anchor,
@@ -6211,35 +5803,21 @@ class IsotopeParticleFilter:
                     global_component_probability=global_probability,
                     rng=self._random_generator,
                 )
-                log_forward_merged_position_proposal = (
-                    np.logaddexp(
-                        atlas.local_chart_mixture_log_density(
-                            first_child_chart_ids,
-                            merged_chart_ids,
-                            global_component_probability=(
-                                global_probability
-                            ),
-                        ),
-                        atlas.local_chart_mixture_log_density(
-                            second_child_chart_ids,
-                            merged_chart_ids,
-                            global_component_probability=(
-                                global_probability
-                            ),
-                        ),
-                    )
-                    - math.log(2.0)
-                )
+                log_forward_merged_position_proposal = np.logaddexp(
+                    atlas.local_chart_mixture_log_density(
+                        first_child_chart_ids,
+                        merged_chart_ids,
+                        global_component_probability=(global_probability),
+                    ),
+                    atlas.local_chart_mixture_log_density(
+                        second_child_chart_ids,
+                        merged_chart_ids,
+                        global_component_probability=(global_probability),
+                    ),
+                ) - math.log(2.0)
                 keep = (
-                    (
-                        np.arange(int(cardinality))[None, :]
-                        != delete_columns[:, None]
-                    )
-                    & (
-                        np.arange(int(cardinality))[None, :]
-                        != receiver_columns[:, None]
-                    )
-                )
+                    np.arange(int(cardinality))[None, :] != delete_columns[:, None]
+                ) & (np.arange(int(cardinality))[None, :] != receiver_columns[:, None])
                 retained_chart_ids = chart_ids[keep].reshape(
                     particle_indices.size,
                     int(cardinality) - 2,
@@ -6309,15 +5887,13 @@ class IsotopeParticleFilter:
                 )
                 valid_rows = np.flatnonzero(feasible)
                 if valid_rows.size:
-                    proposed_ll[valid_rows] = (
-                        self._continuous_rj_group_log_likelihood(
-                            data,
-                            proposed_positions[valid_rows],
-                            proposed_strengths[valid_rows],
-                            chart_ids=proposed_chart_ids[valid_rows],
-                            particle_indices=particle_indices[valid_rows],
-                            target_beta=target_beta,
-                        )
+                    proposed_ll[valid_rows] = self._continuous_rj_group_log_likelihood(
+                        data,
+                        proposed_positions[valid_rows],
+                        proposed_strengths[valid_rows],
+                        chart_ids=proposed_chart_ids[valid_rows],
+                        particle_indices=particle_indices[valid_rows],
+                        target_beta=target_beta,
                     )
                     width = upper[valid_rows] - lower[valid_rows]
                     log_ratio[valid_rows] = (
@@ -6363,26 +5939,20 @@ class IsotopeParticleFilter:
                                 )
                             ),
                             log_forward_merged_position_proposal=(
-                                log_forward_merged_position_proposal[
-                                    valid_rows
-                                ]
+                                log_forward_merged_position_proposal[valid_rows]
                             ),
                             log_reverse_first_position_proposal=(
                                 atlas.local_chart_mixture_log_density(
                                     merged_chart_ids[valid_rows],
                                     first_child_chart_ids[valid_rows],
-                                    global_component_probability=(
-                                        global_probability
-                                    ),
+                                    global_component_probability=(global_probability),
                                 )
                             ),
                             log_reverse_second_position_proposal=(
                                 atlas.local_chart_mixture_log_density(
                                     merged_chart_ids[valid_rows],
                                     second_child_chart_ids[valid_rows],
-                                    global_component_probability=(
-                                        global_probability
-                                    ),
+                                    global_component_probability=(global_probability),
                                 )
                             ),
                             log_reverse_fraction_proposal=-np.log(width),
@@ -6423,25 +5993,17 @@ class IsotopeParticleFilter:
                 )
                 if valid_rows.size:
                     merge_delta_prior[valid_rows] = (
-                        float(
-                            cardinality_prior.log_prob(int(cardinality) - 1)
-                        )
-                        - float(
-                            cardinality_prior.log_prob(int(cardinality))
-                        )
+                        float(cardinality_prior.log_prob(int(cardinality) - 1))
+                        - float(cardinality_prior.log_prob(int(cardinality)))
                         - math.log(float(int(cardinality)))
-                        + atlas.log_chart_probabilities[
-                            merged_chart_ids[valid_rows]
-                        ]
+                        + atlas.log_chart_probabilities[merged_chart_ids[valid_rows]]
                         - atlas.log_chart_probabilities[
                             first_child_chart_ids[valid_rows]
                         ]
                         - atlas.log_chart_probabilities[
                             second_child_chart_ids[valid_rows]
                         ]
-                        + self._strength_prior.log_prob(
-                            merged_strength[valid_rows]
-                        )
+                        + self._strength_prior.log_prob(merged_strength[valid_rows])
                         - self._strength_prior.log_prob(
                             first_child_strengths[valid_rows]
                         )
@@ -6634,9 +6196,7 @@ class IsotopeParticleFilter:
                     target_beta=target_beta,
                 )
             )
-        multi_component_elapsed = (
-            time.perf_counter() - multi_component_start
-        )
+        multi_component_elapsed = time.perf_counter() - multi_component_start
         block_start = time.perf_counter()
         block_count = 0
         block_cardinality_change_count = 0
@@ -6764,9 +6324,7 @@ class IsotopeParticleFilter:
                 self._structural_rj_move_counts["block_attempted"]
             ),
             "rj_block_accepted": float(block_count),
-            "rj_block_cardinality_changed": float(
-                block_cardinality_change_count
-            ),
+            "rj_block_cardinality_changed": float(block_cardinality_change_count),
             "rj_block_attempted_weight_mass": float(
                 self.last_structural_transition_weight_mass.get(
                     "block_attempted_weight_mass",
@@ -6825,9 +6383,7 @@ class IsotopeParticleFilter:
             "rj_strength_proposal_data_informative": float(
                 strength_proposal.data_informative
             ),
-            "rj_strength_proposal_sigma_cps_1m": float(
-                strength_proposal.data_sigma
-            ),
+            "rj_strength_proposal_sigma_cps_1m": float(strength_proposal.data_sigma),
             "rj_strength_proposal_location_min_cps_1m": float(
                 np.min(strength_proposal.data_locations_by_chart)
             ),
@@ -6880,7 +6436,7 @@ class IsotopeParticleFilter:
             current_target_log_likelihood=current_target_log_likelihood,
         )
 
-    def estimate(self) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    def estimate(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Return the canonical MAP-cardinality PF posterior projection."""
         if not self.continuous_particles:
             return np.zeros((0, 3)), np.zeros(0)
@@ -6921,10 +6477,7 @@ class IsotopeParticleFilter:
             dtype=float,
         ).reshape(-1, 3)
         strengths = np.asarray(
-            [
-                mode.strength_representative_cps_1m
-                for mode in point_estimate.modes
-            ],
+            [mode.strength_representative_cps_1m for mode in point_estimate.modes],
             dtype=float,
         )
         return positions, strengths

@@ -1,28 +1,32 @@
-"""Build the RA-L paper ablation subset from the exhaustive manifest."""
+"""Build the four-run RA-L paper subset from the exhaustive manifest."""
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
 import csv
-from pathlib import Path
 import shlex
 import stat
 import sys
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from sim.runtime import load_runtime_config  # noqa: E402
+from sim.runtime import load_runtime_config
+
+from baselines.ral_ablation.config_factory import MANIFEST_FIELDS
+from pf.atomic_io import atomic_write_text
+from pf.profiles import enforce_pure_runtime_settings
+from pf.replay import load_pf_config
 
 DEFAULT_FULL_MANIFEST = ROOT / "results" / "ral_ablation" / "manifest.csv"
 DEFAULT_SUBSET_MANIFEST = (
     ROOT / "results" / "ral_ablation" / "ral_paper_subset_manifest.csv"
 )
 DEFAULT_RUN_SCRIPT = ROOT / "results" / "ral_ablation" / "run_paper_subset.sh"
-DEFAULT_SEED: str | None = None
 PAPER_CASES = ("mix9_multi_isotope_cardinality",)
 CORE_VARIANTS = (
     "proposed",
@@ -30,196 +34,141 @@ CORE_VARIANTS = (
     "round_robin_shield",
     "eig_only_path",
 )
-MANIFEST_FIELDS = (
-    "case",
-    "variant",
-    "seed",
-    "source_seed",
-    "seed_policy",
-    "config_path",
-    "source_path",
-    "command",
-)
-LEGACY_MANIFEST_FIELDS = (
-    "case",
-    "variant",
-    "seed",
-    "config_path",
-    "source_path",
-    "command",
-)
-_MODE_FLAGS = frozenset(
-    {
-        "--mode",
-        "--gui",
-        "--cui",
-        "--python-gui",
-        "--geant4-isaacsim-gui",
-        "--python-cui",
-        "--geant4-cui",
-        "--standard-geant4-full",
-        "--sim-backend",
-    }
-)
 
 
-def _required_option_value(tokens: Sequence[str], option: str) -> str:
-    """Return one required, uniquely specified CLI option value."""
+def _required_option(tokens: Sequence[str], option: str) -> str:
+    """Return one uniquely declared command-line option value."""
     values: list[str] = []
     for index, token in enumerate(tokens):
         if token == option:
             if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
-                raise ValueError(f"RA-L command {option} requires one value.")
+                raise ValueError(f"RA-L command {option} requires a value.")
             values.append(tokens[index + 1])
         elif token.startswith(f"{option}="):
             values.append(token.split("=", 1)[1])
     if len(values) != 1 or not values[0]:
-        raise ValueError(
-            f"RA-L command requires exactly one {option}; got {len(values)}."
-        )
+        raise ValueError(f"RA-L command requires exactly one {option}.")
     return values[0]
 
 
-def _validated_full_simulation_command(row: Mapping[str, str]) -> str:
-    """Return one shell-safe canonical RA-L Geant4 command or fail closed."""
-    command = str(row["command"])
+def _tokens(command: str, *, name: str) -> list[str]:
+    """Parse one single-line shell command or fail closed."""
     if "\n" in command or "\r" in command:
-        raise ValueError("RA-L command must occupy exactly one line.")
+        raise ValueError(f"{name} must occupy one line.")
     try:
-        tokens = shlex.split(command, posix=True)
+        return shlex.split(command, posix=True)
     except ValueError as exc:
-        raise ValueError(f"RA-L command is not valid shell syntax: {exc}") from exc
-    if tokens[:4] != ["uv", "run", "python", "main.py"]:
-        raise ValueError(
-            "RA-L command must start with 'uv run python main.py'."
-        )
-    if tokens.count("--full-simulation") != 1:
-        raise ValueError(
-            "RA-L paper commands require exactly one --full-simulation flag."
-        )
-    conflicting_flags = sorted(
-        {
-            token.split("=", 1)[0]
-            for token in tokens[4:]
-            if token.split("=", 1)[0] in _MODE_FLAGS
-        }
-    )
-    if conflicting_flags:
-        raise ValueError(
-            "RA-L full-simulation command contains conflicting mode/backend "
-            f"flags: {conflicting_flags}."
-        )
-    expected_values = {
-        "--sim-config": str(row["config_path"]),
-        "--source-config": str(row["source_path"]),
-        "--output-tag": (
-            f"{row['case']}_{row['variant']}_seed_{row['seed']}"
-        ),
+        raise ValueError(f"{name} has invalid shell syntax: {exc}") from exc
+
+
+def _same_path(actual: str, expected: str) -> bool:
+    """Return whether two manifest path spellings identify the same path."""
+    return Path(actual).expanduser().resolve() == Path(expected).expanduser().resolve()
+
+
+def _validated_scenario_command(row: Mapping[str, str]) -> str:
+    """Validate and canonicalize one shared-runtime scenario command."""
+    tokens = _tokens(str(row["scenario_command"]), name="scenario_command")
+    if len(tokens) < 7 or tokens[:2] != ["uv", "run"]:
+        raise ValueError("RA-L scenario command must start with 'uv run'.")
+    if "rotating-shield-sim" not in tokens:
+        raise ValueError("RA-L scenario command must use rotating-shield-sim.")
+    executable_index = tokens.index("rotating-shield-sim")
+    expected_prefix = ["rotating-shield-sim", "generate-ral-scenario"]
+    if tokens[executable_index : executable_index + 2] != expected_prefix:
+        raise ValueError("RA-L scenario command must generate a private scenario.")
+    scenario_index = executable_index + 2
+    if scenario_index >= len(tokens) or not _same_path(
+        tokens[scenario_index], row["scenario_path"]
+    ):
+        raise ValueError("scenario_command path differs from the manifest.")
+    expected_options = {
+        "--measurement-log-output": row["measurement_log_path"],
+        "--runtime-config": row["runtime_config_path"],
+        "--scene-seed": row["seed"],
+        "--source-profile": row["source_profile"],
     }
-    for option, expected in expected_values.items():
-        actual = _required_option_value(tokens, option)
-        if Path(actual).as_posix() != Path(expected).as_posix():
-            raise ValueError(
-                f"RA-L command {option}={actual!r} does not match manifest "
-                f"value {expected!r}."
-            )
+    for option, expected in expected_options.items():
+        actual = _required_option(tokens, option)
+        equal = actual == expected
+        if option in {"--measurement-log-output", "--runtime-config"}:
+            equal = _same_path(actual, expected)
+        if not equal:
+            raise ValueError(f"scenario_command {option} differs from the manifest.")
     return shlex.join(tokens)
 
 
-def _validate_geant4_config(row: Mapping[str, str]) -> None:
-    """Require the selected paper config to resolve to native external Geant4."""
-    config_path = Path(str(row["config_path"])).expanduser()
-    if not config_path.is_absolute():
-        config_path = ROOT / config_path
-    config_path = config_path.resolve()
-    if not config_path.is_file():
-        raise ValueError(f"RA-L config does not exist: {config_path}.")
-    config = load_runtime_config(config_path)
-    if (
-        str(config.get("backend", "")).strip().lower() != "geant4"
-        or str(config.get("engine_mode", "")).strip().lower() != "external"
-    ):
-        raise ValueError(
-            "RA-L paper configs require backend='geant4' and "
-            f"engine_mode='external': {config_path}."
-        )
+def _validated_pf_command(row: Mapping[str, str]) -> str:
+    """Validate and canonicalize one PF-owned live-control command."""
+    tokens = _tokens(str(row["pf_command"]), name="pf_command")
+    if tokens[:2] != ["uv", "run"] or "rotating-shield-pf-live" not in tokens:
+        raise ValueError("RA-L PF command must use uv run and rotating-shield-pf-live.")
+    executable_index = tokens.index("rotating-shield-pf-live")
+    scenario_tokens = _tokens(
+        str(row["scenario_command"]),
+        name="scenario_command",
+    )
+    runtime_root = _required_option(scenario_tokens, "--directory")
+    expected_options = {
+        "--scenario": row["scenario_path"],
+        "--runtime-root": runtime_root,
+        "--config": row["pf_config_path"],
+        "--output-dir": row["pf_output_dir"],
+        "--profile": "pf_strict",
+        "--seed": row["pf_seed"],
+        "--private-scene-profile": row["source_profile"],
+    }
+    for option, expected in expected_options.items():
+        actual = _required_option(tokens, option)
+        equal = actual == expected
+        if option in {"--scenario", "--runtime-root", "--config", "--output-dir"}:
+            equal = _same_path(actual, expected)
+        if not equal:
+            raise ValueError(f"pf_command {option} differs from the manifest.")
+    if executable_index < 2:
+        raise ValueError("RA-L PF command has an invalid executable position.")
+    return shlex.join(tokens)
 
 
 def _parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Generate the compact RA-L paper ablation manifest.",
+        description="Generate the compact RA-L paper ablation manifest."
     )
-    parser.add_argument(
-        "--manifest",
-        type=Path,
-        default=DEFAULT_FULL_MANIFEST,
-        help="Path to the exhaustive RA-L ablation manifest.",
-    )
-    parser.add_argument(
-        "--output-manifest",
-        type=Path,
-        default=DEFAULT_SUBSET_MANIFEST,
-        help="Path for the compact paper-subset manifest.",
-    )
-    parser.add_argument(
-        "--output-script",
-        type=Path,
-        default=DEFAULT_RUN_SCRIPT,
-        help="Path for the compact paper-subset run script.",
-    )
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_FULL_MANIFEST)
+    parser.add_argument("--output-manifest", type=Path, default=DEFAULT_SUBSET_MANIFEST)
+    parser.add_argument("--output-script", type=Path, default=DEFAULT_RUN_SCRIPT)
     parser.add_argument(
         "--seed",
-        default=DEFAULT_SEED,
-        help=(
-            "Single scene seed to use. When omitted, the manifest must contain "
-            "exactly one seed for the paper case."
-        ),
+        default=None,
+        help="Select one recorded scene seed from a multi-batch manifest.",
     )
     return parser.parse_args()
 
 
 def _read_manifest(path: Path) -> list[dict[str, str]]:
-    """Read an ablation manifest CSV."""
+    """Read the current shared-runtime RA-L manifest schema."""
     with Path(path).open("r", encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    normalized: list[dict[str, str]] = []
-    for row in rows:
-        missing = [field for field in LEGACY_MANIFEST_FIELDS if field not in row]
+        reader = csv.DictReader(handle)
+        missing = [field for field in MANIFEST_FIELDS if field not in reader.fieldnames]
         if missing:
-            raise ValueError(f"Manifest row is missing fields: {missing}")
-        normalized.append(
-            {
-                **{field: str(row[field]) for field in LEGACY_MANIFEST_FIELDS},
-                "source_seed": str(row.get("source_seed", "")),
-                "seed_policy": str(row.get("seed_policy", "legacy_explicit")),
-            }
-        )
-    return [
-        {field: row[field] for field in MANIFEST_FIELDS}
-        for row in normalized
-    ]
+            raise ValueError(f"Manifest is missing current fields: {missing}")
+        return [{field: str(row[field]) for field in MANIFEST_FIELDS} for row in reader]
 
 
 def selected_variants_for_case(case: str) -> tuple[str, ...]:
-    """Return the compact RA-L paper variants for one case."""
-    if str(case) not in PAPER_CASES:
-        return ()
-    return CORE_VARIANTS
+    """Return the compact paper variants for one declared case."""
+    return CORE_VARIANTS if str(case) in PAPER_CASES else ()
 
 
 def select_paper_subset(
     rows: Sequence[Mapping[str, str]],
     *,
-    seed: str | None = DEFAULT_SEED,
+    seed: str | None = None,
 ) -> list[dict[str, str]]:
-    """Select the compact paper subset while preserving manifest order."""
+    """Select and validate the four causal sessions for one scene seed."""
     available_seeds = sorted(
-        {
-            str(row["seed"])
-            for row in rows
-            if str(row["case"]) in PAPER_CASES
-        }
+        {str(row["seed"]) for row in rows if str(row["case"]) in PAPER_CASES}
     )
     if seed is None:
         if len(available_seeds) != 1:
@@ -228,78 +177,70 @@ def select_paper_subset(
                 f"--seed is omitted; found {available_seeds}."
             )
         seed = available_seeds[0]
-    seed = str(seed)
-    cases = tuple(
-        case
-        for case in PAPER_CASES
-        if any(row["case"] == case and row["seed"] == seed for row in rows)
-    )
-    if not cases:
-        formatted_cases = ", ".join(PAPER_CASES)
-        raise ValueError(
-            f"Full manifest has no paper cases for seed {seed}: {formatted_cases}"
-        )
-    wanted = {
+    wanted_order = tuple(
         (case, variant)
-        for case in cases
+        for case in PAPER_CASES
         for variant in selected_variants_for_case(case)
-    }
-    selected_unsorted = [
-        {
-            field: str(
-                row.get(
-                    field,
-                    "legacy_explicit" if field == "seed_policy" else "",
-                )
-            )
-            for field in MANIFEST_FIELDS
-        }
-        for row in rows
-        if row["seed"] == seed and (row["case"], row["variant"]) in wanted
-    ]
-    order = {
-        (case, variant): index
-        for case in cases
-        for index, variant in enumerate(selected_variants_for_case(case))
-    }
-    selected = sorted(
-        selected_unsorted,
-        key=lambda row: order[(row["case"], row["variant"])],
     )
+    wanted = set(wanted_order)
+    selected = [
+        {field: str(row[field]) for field in MANIFEST_FIELDS}
+        for row in rows
+        if str(row["seed"]) == str(seed)
+        and (str(row["case"]), str(row["variant"])) in wanted
+    ]
+    order = {pair: index for index, pair in enumerate(wanted_order)}
+    selected.sort(key=lambda row: order[(row["case"], row["variant"])])
     found = {(row["case"], row["variant"]) for row in selected}
     missing = sorted(wanted - found)
-    if missing:
-        formatted = ", ".join(f"{case}:{variant}" for case, variant in missing)
-        raise ValueError(f"Full manifest is missing paper-subset entries: {formatted}")
+    duplicates = len(selected) != len(found)
+    if missing or duplicates:
+        raise ValueError(
+            "Paper subset requires exactly one row per case/variant; "
+            f"missing={missing}, duplicates={duplicates}."
+        )
     for row in selected:
-        row["command"] = _validated_full_simulation_command(row)
+        row["scenario_command"] = _validated_scenario_command(row)
+        row["pf_command"] = _validated_pf_command(row)
     return selected
 
 
+def _validate_configs(row: Mapping[str, str]) -> None:
+    """Require native Geant4 physics and one strict pure-PF configuration."""
+    runtime = load_runtime_config(Path(row["runtime_config_path"]))
+    if runtime.get("backend") != "geant4" or runtime.get("engine_mode") != "external":
+        raise ValueError("RA-L runtime config must use external Geant4.")
+    if runtime.get("primary_sampling_fraction", 1.0) != 1.0:
+        raise ValueError("RA-L runtime config must use all native histories.")
+    if runtime.get("accelerated_weighted_transport_enable", False) is not False:
+        raise ValueError("RA-L runtime config must not weight transport histories.")
+    if runtime.get("target_sampled_primaries") is not None:
+        raise ValueError("RA-L runtime config must not cap transport histories.")
+    pf_config, _ = load_pf_config(Path(row["pf_config_path"]))
+    enforce_pure_runtime_settings(pf_config, profile="pf_strict")
+
+
 def write_manifest(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
-    """Write a deterministic subset manifest CSV."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=MANIFEST_FIELDS,
-            lineterminator="\n",
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({field: row[field] for field in MANIFEST_FIELDS})
+    """Atomically write a deterministic subset manifest."""
+    import io
+
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=MANIFEST_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({field: row[field] for field in MANIFEST_FIELDS})
+    atomic_write_text(path, buffer.getvalue())
 
 
 def write_run_script(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
-    """Write a shell script for the selected paper-subset commands."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Write scenario-authoring and PF-control commands for each trial."""
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
-    lines.extend(_validated_full_simulation_command(row) for row in rows)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    mode = path.stat().st_mode
-    path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    for row in rows:
+        lines.append(_validated_scenario_command(row))
+        lines.append(_validated_pf_command(row))
+    atomic_write_text(path, "\n".join(lines) + "\n")
+    mode = Path(path).stat().st_mode
+    Path(path).chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def build_subset(
@@ -307,13 +248,12 @@ def build_subset(
     subset_manifest_path: Path,
     run_script_path: Path,
     *,
-    seed: str | None = DEFAULT_SEED,
+    seed: str | None = None,
 ) -> list[dict[str, str]]:
     """Build and write the compact RA-L paper subset."""
-    rows = _read_manifest(manifest_path)
-    selected = select_paper_subset(rows, seed=seed)
+    selected = select_paper_subset(_read_manifest(manifest_path), seed=seed)
     for row in selected:
-        _validate_geant4_config(row)
+        _validate_configs(row)
     write_manifest(subset_manifest_path, selected)
     write_run_script(run_script_path, selected)
     return selected

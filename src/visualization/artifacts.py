@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import replace
 import os
-from pathlib import Path
 import shutil
 import tempfile
+from collections.abc import Mapping
+from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
 
-from visualization.realtime_viz import PFFrame
+from visualization.frame import PFFrame
 
 
 def prepare_final_visualization_frame(

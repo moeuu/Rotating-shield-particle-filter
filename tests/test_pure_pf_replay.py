@@ -10,7 +10,7 @@ import pytest
 
 from pf.replay import (
     PFReplayError,
-    _spectrum_record,
+    measurement_record_to_spectrum_input,
     build_replay_estimator,
     replay_measurement_log,
     replay_records,
@@ -148,7 +148,7 @@ def test_spectrum_record_forwards_only_raw_spectrum_and_action_geometry(
         make_measurement_log(tmp_path / "measurement-log", record_count=1)
     )
 
-    replay_row = _spectrum_record(log.records[0])
+    replay_row = measurement_record_to_spectrum_input(log.records[0])
 
     assert len(replay_row) == 4
     spectrum, fe_index, pb_index, live_time_s = replay_row
@@ -168,7 +168,7 @@ def test_spectrum_record_rejects_fractional_event_weights() -> None:
     )
 
     with pytest.raises(PFReplayError, match="raw nonnegative int64"):
-        _spectrum_record(record)
+        measurement_record_to_spectrum_input(record)
 
 
 @pytest.mark.parametrize(
@@ -195,7 +195,7 @@ def test_spectrum_record_rejects_scalar_and_dtype_coercion(
     values[field_name] = invalid
 
     with pytest.raises(PFReplayError):
-        _spectrum_record(SimpleNamespace(**values))
+        measurement_record_to_spectrum_input(SimpleNamespace(**values))
 
 
 def test_replay_groups_records_at_durable_station_boundaries(tmp_path) -> None:

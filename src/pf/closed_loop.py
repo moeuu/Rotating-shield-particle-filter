@@ -7,7 +7,7 @@ import json
 import os
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +18,23 @@ from runtime.adaptive_client import (
     adaptive_step_request,
     candidate_index_for_pose,
     parse_adaptive_record,
+    parse_adaptive_resume_prefix,
     parse_candidate_snapshot,
     parse_run_context,
 )
 from runtime.measurement_log import load_measurement_log
 from runtime.provenance import canonical_json_bytes
 
-from cui_runtime import (
+from baselines.ral_ablation.path_policies import select_baseline_next_pose
+from baselines.ral_ablation.shield_policies import (
+    select_baseline_shield_program,
+)
+from pf.cui_runtime import (
     ensure_cui_view_server,
     resolve_cui_split_view_enabled,
 )
+from pf.atomic_io import atomic_write_bytes
+from pf.live_resume import reconstruct_live_resume_state
 
 from pf.replay import (
     bind_finalized_measurement_log,
@@ -50,6 +57,7 @@ from visualization.realtime_viz import (
     AsyncCUISplitPFVisualizer,
     build_frame_from_pf,
 )
+from visualization.artifacts import publish_final_cui_split_views
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -541,8 +549,46 @@ def _live_posterior_summary(estimator: object) -> dict[str, object]:
     }
 
 
-def _bootstrap_program(estimator: object, planner: DSSPPConfig) -> ShieldProgram:
-    """Choose a PF-owned balanced first-station shield program."""
+def _baseline_shield_program(
+    estimator: object,
+    planner: DSSPPConfig,
+    settings: Mapping[str, Any],
+    *,
+    pose_index: int,
+    current_pair_id: int | None,
+) -> ShieldProgram | None:
+    """Resolve one declared RA-L baseline shield program when configured."""
+    policy = select_baseline_shield_program(
+        settings.get("baseline_shield_policy"),
+        total_pairs=int(len(estimator.normals) ** 2),
+        program_length=int(planner.program_length),
+        pose_index=pose_index,
+        current_pair_id=current_pair_id,
+    )
+    if policy is None:
+        return None
+    return ShieldProgram(
+        name=policy.name,
+        pair_ids=policy.pair_ids,
+        kind="ral_baseline",
+    )
+
+
+def _bootstrap_program(
+    estimator: object,
+    planner: DSSPPConfig,
+    settings: Mapping[str, Any],
+) -> ShieldProgram:
+    """Choose the declared baseline or balanced first-station program."""
+    baseline = _baseline_shield_program(
+        estimator,
+        planner,
+        settings,
+        pose_index=0,
+        current_pair_id=None,
+    )
+    if baseline is not None:
+        return baseline
     programs = build_shield_program_library(
         estimator.normals,
         program_length=int(planner.program_length),
@@ -611,23 +657,79 @@ def _plan(
     height_bounds: tuple[float, float] | None,
     planner: DSSPPConfig,
     rng: np.random.Generator,
+    settings: Mapping[str, Any],
+    station_index: int,
 ) -> DSSPPResult:
-    """Rank only runtime-authored physical actions with PF-specific utility."""
+    """Rank runtime actions under the declared proposed or baseline policy."""
+    candidate_poses = np.asarray(
+        candidates["candidate_poses_xyz"],
+        dtype=np.float64,
+    )
+    visited_array = np.asarray(visited_poses, dtype=np.float64)
+    if visited_array.size == 0:
+        visited_array = visited_array.reshape((0, 3))
+    baseline_program = _baseline_shield_program(
+        estimator,
+        planner,
+        settings,
+        pose_index=station_index,
+        current_pair_id=int(candidates["current_pair_id"]),
+    )
+    baseline_path = select_baseline_next_pose(
+        settings.get("baseline_path_policy"),
+        candidate_poses_xyz=candidate_poses,
+        current_pose_xyz=current_pose,
+        visited_poses_xyz=visited_array,
+        bounds_xyz=room_bounds,
+    )
+    if baseline_path is not None:
+        if baseline_program is None:
+            raise ValueError(
+                "A baseline path policy requires an explicit baseline shield policy."
+            )
+        return DSSPPResult(
+            next_pose=baseline_path.next_pose,
+            next_pose_index=baseline_path.candidate_index,
+            shield_program=baseline_program,
+            score=baseline_path.score,
+            sequence=(),
+            diagnostics={
+                "selection_mode": "ral_baseline_path",
+                "baseline_path_policy": baseline_path.name,
+                "planning_particle_count": 0,
+                "ranked_nodes": [],
+                "component_leaders": {},
+                "planning_eig_shortlist": {},
+            },
+        )
+    active_planner = planner
+    if baseline_program is not None:
+        active_planner = replace(
+            planner,
+            forced_program_pair_ids=baseline_program.pair_ids,
+        )
     return select_dss_pp_next_station(
         estimator,
-        np.asarray(candidates["candidate_poses_xyz"], dtype=np.float64),
+        candidate_poses,
         current_pose,
         current_pair_id=int(candidates["current_pair_id"]),
         visited_poses_xyz=np.asarray(visited_poses, dtype=np.float64),
         map_api=obstacle_grid,
         bounds_xyz=room_bounds,
         continuous_height_bounds_m=height_bounds,
-        config=planner,
+        config=active_planner,
         rng=rng,
         candidate_motion_times_s=np.asarray(
             candidates["travel_costs"],
             dtype=np.float64,
         ),
+    )
+
+
+def _planner_rng(seed: int, station_index: int) -> np.random.Generator:
+    """Return a station-addressed planner stream that supports exact resume."""
+    return np.random.default_rng(
+        np.random.SeedSequence([int(seed), 0xD55A11, int(station_index)])
     )
 
 
@@ -645,9 +747,11 @@ def _refine_and_replan(
     height_bounds: tuple[float, float] | None,
     planner: DSSPPConfig,
     rng: np.random.Generator,
+    settings: Mapping[str, Any],
+    station_index: int,
 ) -> tuple[dict[str, object], DSSPPResult]:
     """Optionally request runtime-owned local poses and rerank them exactly."""
-    if refinement_top_k <= 0:
+    if refinement_top_k <= 0 or settings.get("baseline_path_policy") is not None:
         return dict(candidates), initial
     ranked = initial.diagnostics.get("ranked_nodes", [])
     seed_indices: list[int] = []
@@ -676,6 +780,8 @@ def _refine_and_replan(
         height_bounds=height_bounds,
         planner=planner,
         rng=rng,
+        settings=settings,
+        station_index=station_index,
     )
     return refined, result
 
@@ -717,10 +823,17 @@ def _write_final_outputs(
         ),
         "active_isotopes": list(estimator.joint_isotope_order()),
     }
-    (output_dir / "pf_posterior.json").write_bytes(canonical_json_bytes(posterior))
-    (output_dir / "pf_diagnostics.json").write_bytes(canonical_json_bytes(diagnostics))
-    (output_dir / "closed_loop_result.json").write_bytes(
-        canonical_json_bytes(result.to_dict())
+    atomic_write_bytes(
+        output_dir / "pf_posterior.json",
+        canonical_json_bytes(posterior),
+    )
+    atomic_write_bytes(
+        output_dir / "pf_diagnostics.json",
+        canonical_json_bytes(diagnostics),
+    )
+    atomic_write_bytes(
+        output_dir / "closed_loop_result.json",
+        canonical_json_bytes(result.to_dict()),
     )
 
 
@@ -733,6 +846,8 @@ def run_pf_closed_loop(
     profile: str = "pf_strict",
     seed: int = 0,
     private_scene_profile: str | None = None,
+    resume_stage_path: str | Path | None = None,
+    resume_compatibility_path: str | Path | None = None,
     output_hook: Any = print,
 ) -> PFClosedLoopResult:
     """Run a PF-specific closed loop over the common adaptive runtime API."""
@@ -752,35 +867,54 @@ def run_pf_closed_loop(
         scenario_path,
         runtime_root=runtime_root,
         private_scene_profile=private_scene_profile,
+        resume_stage_path=resume_stage_path,
+        resume_compatibility_path=resume_compatibility_path,
         output_hook=output_hook,
     )
     estimator = None
     cui_split_viz: AsyncCUISplitPFVisualizer | None = None
+    completed_result: PFClosedLoopResult | None = None
+    cui_frame_rendered = False
     try:
         ready = client.read_event()
-        _strict_fields(
-            ready,
-            {"type", "schema_version", "context", "candidates", "bootstrap"},
-            name="ready event",
-        )
-        if ready.get("type") != "ready" or ready.get("schema_version") != 1:
+        schema_version = ready.get("schema_version")
+        if schema_version == 1:
+            _strict_fields(
+                ready,
+                {"type", "schema_version", "context", "candidates", "bootstrap"},
+                name="ready event",
+            )
+        elif schema_version == 2:
+            _strict_fields(
+                ready,
+                {"type", "schema_version", "context", "candidates", "resume"},
+                name="resume ready event",
+            )
+        else:
             raise ValueError("Shared runtime returned an incompatible handshake.")
+        if ready.get("type") != "ready":
+            raise ValueError("Shared runtime did not return a ready handshake.")
         context = parse_run_context(ready["context"])
         candidates = parse_candidate_snapshot(ready["candidates"])
-        bootstrap = ready["bootstrap"]
-        if not isinstance(bootstrap, Mapping):
-            raise TypeError("Runtime bootstrap must be a mapping.")
-        _strict_fields(
-            bootstrap,
-            {"candidate_index", "fe_orientation_index", "pb_orientation_index"},
-            name="bootstrap",
-        )
+        bootstrap = ready.get("bootstrap")
+        if schema_version == 1:
+            if not isinstance(bootstrap, Mapping):
+                raise TypeError("Runtime bootstrap must be a mapping.")
+            _strict_fields(
+                bootstrap,
+                {"candidate_index", "fe_orientation_index", "pb_orientation_index"},
+                name="bootstrap",
+            )
         detected_only_raw = settings.get(
             "pf_detected_isotopes_only",
             settings.get("detected_isotopes_only", False),
         )
         if not isinstance(detected_only_raw, bool):
             raise TypeError("pf_detected_isotopes_only must be a boolean.")
+        if schema_version == 2 and detected_only_raw:
+            raise ValueError(
+                "Adaptive resume currently requires pf_detected_isotopes_only=false."
+            )
         initial_estimator_settings = dict(settings)
         if detected_only_raw:
             initial_estimator_settings["num_particles"] = 1
@@ -831,57 +965,141 @@ def run_pf_closed_loop(
         contract_hash = str(
             context.runtime_config["full_spectrum_contract_hash_sha256"]
         )
-        planner_rng = np.random.default_rng(
-            np.random.SeedSequence([int(seed), 0xD55A11])
-        )
-        current_program = _bootstrap_program(estimator, planner)
-        current_pose = np.asarray(
-            candidates["candidate_poses_xyz"][int(bootstrap["candidate_index"])],
-            dtype=np.float64,
-        )
-        visited: list[np.ndarray] = []
-        record_count = 0
-        cui_elapsed_time_s = 0.0
-        last_cui_record: object | None = None
-        station_id = 0
-        station_history: list[tuple[object, ...]] = []
+        current_program = _bootstrap_program(estimator, planner, settings)
+        visited: list[np.ndarray]
+        station_history: list[tuple[object, ...]]
         gate_diagnostics: dict[str, object] | None = None
         stop_reason = "maximum_station_budget"
-        planner_writer.append(
-            {
-                "schema_version": 1,
-                "station_id": 0,
-                "selection_mode": "pf_prior_balanced_bootstrap",
-                "selected_pose_xyz": current_pose.tolist(),
-                "selected_program": {
-                    "name": current_program.name,
-                    "kind": current_program.kind,
-                    "pair_ids": list(current_program.pair_ids),
-                },
-                "selected_score": None,
-                "selected_information_gain": None,
-                "best_exact_information_gain": None,
-                "total_action_count": 0,
-                "selected_proxy_rank": 0,
-                "exact_action_count": 0,
-                "proxy_action_count": 0,
-                "planning_particle_count": 0,
-                "score_leader": None,
-                "information_gain_leader": None,
-                "top_ranked_actions": [],
-                "shortlist_certificate": {
-                    "available": False,
-                    "winner_exceeds_excluded_bound": False,
-                    "evaluated_objective_lower_bound": None,
-                    "excluded_objective_upper_bound": None,
-                },
-                "exact_eig_seed": None,
-                "mc_seed_rank_stability": {
-                    "status": "not_applicable_before_first_observation"
-                },
-            }
-        )
-        while station_id < budget.max_stations:
+        continue_acquisition = True
+        if schema_version == 1:
+            assert isinstance(bootstrap, Mapping)
+            current_pose = np.asarray(
+                candidates["candidate_poses_xyz"][int(bootstrap["candidate_index"])],
+                dtype=np.float64,
+            )
+            visited = []
+            record_count = 0
+            cui_elapsed_time_s = 0.0
+            last_cui_record: object | None = None
+            station_id = 0
+            station_history = []
+            planner_writer.append(
+                {
+                    "schema_version": 1,
+                    "station_id": 0,
+                    "selection_mode": (
+                        "ral_baseline_bootstrap"
+                        if settings.get("baseline_shield_policy") is not None
+                        else "pf_prior_balanced_bootstrap"
+                    ),
+                    "selected_pose_xyz": current_pose.tolist(),
+                    "selected_program": {
+                        "name": current_program.name,
+                        "kind": current_program.kind,
+                        "pair_ids": list(current_program.pair_ids),
+                    },
+                    "selected_score": None,
+                    "selected_information_gain": None,
+                    "best_exact_information_gain": None,
+                    "total_action_count": 0,
+                    "selected_proxy_rank": 0,
+                    "exact_action_count": 0,
+                    "proxy_action_count": 0,
+                    "planning_particle_count": 0,
+                    "score_leader": None,
+                    "information_gain_leader": None,
+                    "top_ranked_actions": [],
+                    "shortlist_certificate": {
+                        "available": False,
+                        "winner_exceeds_excluded_bound": False,
+                        "evaluated_objective_lower_bound": None,
+                        "excluded_objective_upper_bound": None,
+                    },
+                    "exact_eig_seed": None,
+                    "mc_seed_rank_stability": {
+                        "status": "not_applicable_before_first_observation"
+                    },
+                }
+            )
+        else:
+            prefix = parse_adaptive_resume_prefix(ready["resume"])
+            resume_state = reconstruct_live_resume_state(
+                prefix.records,
+                next_station_id=prefix.next_station_id,
+                expected_views_per_station=budget.views_per_station,
+            )
+            station_history = [tuple(station) for station in resume_state.stations]
+            for prefix_station_id, prefix_station in enumerate(station_history):
+                _assimilate_station(
+                    estimator,
+                    prefix_station,
+                    station_id=prefix_station_id,
+                    contract_hash=contract_hash,
+                )
+            current_pose = resume_state.current_pose.copy()
+            visited = [pose.copy() for pose in resume_state.visited_poses]
+            record_count = resume_state.record_count
+            cui_elapsed_time_s = resume_state.elapsed_time_s
+            last_cui_record = prefix.records[-1]
+            station_id = resume_state.next_station_id
+            if record_count >= budget.max_measurements:
+                stop_reason = "maximum_measurement_budget"
+                continue_acquisition = False
+            elif station_id >= budget.max_stations:
+                stop_reason = "maximum_station_budget"
+                continue_acquisition = False
+            elif (
+                budget.adaptive_stop
+                and station_id >= budget.minimum_stop_stations
+                and estimator.posterior_convergence_diagnostics().get("ready", False)
+            ):
+                stop_reason = "intrinsic_surface_posterior_converged"
+                continue_acquisition = False
+            if continue_acquisition:
+                resume_rng = _planner_rng(seed, station_id)
+                planned = _plan(
+                    estimator,
+                    candidates,
+                    current_pose=current_pose,
+                    visited_poses=visited,
+                    obstacle_grid=obstacle_grid,
+                    room_bounds=room_bounds,
+                    height_bounds=height_bounds,
+                    planner=planner,
+                    rng=resume_rng,
+                    settings=settings,
+                    station_index=station_id,
+                )
+                candidates, planned = _refine_and_replan(
+                    client,
+                    estimator,
+                    candidates,
+                    planned,
+                    refinement_top_k=budget.runtime_refinement_top_k,
+                    current_pose=current_pose,
+                    visited_poses=visited,
+                    obstacle_grid=obstacle_grid,
+                    room_bounds=room_bounds,
+                    height_bounds=height_bounds,
+                    planner=planner,
+                    rng=resume_rng,
+                    settings=settings,
+                    station_index=station_id,
+                )
+                planner_writer.append(
+                    build_planner_audit(
+                        station_id=station_id,
+                        result=planned,
+                        top_k=budget.planner_audit_top_k,
+                    )
+                )
+                current_pose = np.asarray(planned.next_pose, dtype=np.float64)
+                current_program = planned.shield_program
+            output_hook(
+                "Resumed PF from "
+                f"{record_count} truth-free records at station {station_id}."
+            )
+        while continue_acquisition and station_id < budget.max_stations:
             if record_count + len(current_program.pair_ids) > budget.max_measurements:
                 stop_reason = "maximum_measurement_budget"
                 break
@@ -927,6 +1145,7 @@ def run_pf_closed_loop(
                         elapsed_time_s=cui_elapsed_time_s,
                         record_measurement=True,
                     )
+                    cui_frame_rendered = True
                     last_cui_record = record
             if station_records[-1].metadata.get("station_complete") is not True:
                 raise ValueError("Runtime omitted the final station marker.")
@@ -1015,6 +1234,7 @@ def run_pf_closed_loop(
                     elapsed_time_s=cui_elapsed_time_s,
                     record_measurement=False,
                 )
+                cui_frame_rendered = True
                 last_cui_record = station_records[-1]
             _append_jsonl(
                 controller_trace,
@@ -1047,6 +1267,7 @@ def run_pf_closed_loop(
             ):
                 stop_reason = "intrinsic_surface_posterior_converged"
                 break
+            station_planner_rng = _planner_rng(seed, completed_stations)
             planned = _plan(
                 estimator,
                 candidates,
@@ -1056,7 +1277,9 @@ def run_pf_closed_loop(
                 room_bounds=room_bounds,
                 height_bounds=height_bounds,
                 planner=planner,
-                rng=planner_rng,
+                rng=station_planner_rng,
+                settings=settings,
+                station_index=completed_stations,
             )
             candidates, planned = _refine_and_replan(
                 client,
@@ -1070,7 +1293,9 @@ def run_pf_closed_loop(
                 room_bounds=room_bounds,
                 height_bounds=height_bounds,
                 planner=planner,
-                rng=planner_rng,
+                rng=station_planner_rng,
+                settings=settings,
+                station_index=completed_stations,
             )
             station_id += 1
             planner_writer.append(
@@ -1098,6 +1323,7 @@ def run_pf_closed_loop(
                 elapsed_time_s=cui_elapsed_time_s,
                 record_measurement=False,
             )
+            cui_frame_rendered = True
             output_hook(
                 "CUI split visualization truth overlay: post_run "
                 "(private runtime CUI channel; not estimator/planner input)"
@@ -1134,6 +1360,7 @@ def run_pf_closed_loop(
             result=result,
             budget=budget,
         )
+        completed_result = result
         return result
     except BaseException:
         client.abort()
@@ -1141,6 +1368,24 @@ def run_pf_closed_loop(
     finally:
         if cui_split_viz is not None:
             cui_split_viz.close()
+            artifact_paths = (
+                getattr(cui_split_viz, "latest_robot_path", None),
+                getattr(cui_split_viz, "latest_pf_path", None),
+                getattr(cui_split_viz, "latest_pf_labeled_path", None),
+            )
+            if (
+                completed_result is not None
+                and cui_frame_rendered
+                and all(isinstance(path, Path) for path in artifact_paths)
+            ):
+                publish_final_cui_split_views(
+                    source_robot_path=artifact_paths[0],
+                    source_pf_path=artifact_paths[1],
+                    source_pf_labeled_path=artifact_paths[2],
+                    final_robot_path=target / "final_robot_2d.png",
+                    final_pf_path=target / "final_pf_3d.png",
+                    final_pf_labeled_path=target / "final_pf_3d_labeled.png",
+                )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1157,6 +1402,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("ral-mix9", "ral-cs4-co3-eu0"),
         default=None,
     )
+    parser.add_argument(
+        "--resume-stage",
+        type=Path,
+        default=None,
+        help="Shared-runtime MeasurementLog staging directory to resume.",
+    )
+    parser.add_argument(
+        "--resume-compatibility",
+        type=Path,
+        default=None,
+        help="Explicit shared-runtime cross-commit compatibility record.",
+    )
     args = parser.parse_args(None if argv is None else list(argv))
     result = run_pf_closed_loop(
         args.scenario,
@@ -1166,6 +1423,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile=args.profile,
         seed=args.seed,
         private_scene_profile=args.private_scene_profile,
+        resume_stage_path=args.resume_stage,
+        resume_compatibility_path=args.resume_compatibility,
     )
     print(json.dumps(result.to_dict(), sort_keys=True, allow_nan=False))
     return 0

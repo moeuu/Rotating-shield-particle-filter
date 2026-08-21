@@ -1,4 +1,4 @@
-"""Tests for the compact RA-L paper ablation subset."""
+"""Tests for the current shared-runtime RA-L paper subset."""
 
 from __future__ import annotations
 
@@ -20,98 +20,104 @@ TEST_SEED = "246813579"
 
 
 def _manifest_row(case: str, variant: str, seed: str = TEST_SEED) -> dict[str, str]:
-    """Return one minimal manifest row for subset tests."""
+    """Return one current-schema manifest row for subset tests."""
+    root = Path(__file__).resolve().parents[1]
+    runtime_root = root.parent / "Rotating-shield-simulation-runtime"
     tag = f"{case}_{variant}_seed_{seed}"
+    scenario = runtime_root / "private_runs" / "ral_ablation" / f"{tag}.json"
+    log_path = root / "results" / "ral_ablation" / "measurement_logs" / tag
+    pf_config = root / "results" / "ral_ablation" / "configs" / f"{tag}.json"
+    runtime_config = (
+        runtime_root
+        / "private_runs"
+        / "ral_ablation"
+        / "runtime_configs"
+        / f"{tag}.json"
+    )
+    pf_output = root / "results" / "ral_ablation" / "runs" / tag
+    source_profile = "ral-mix9"
     return {
         "case": case,
         "variant": variant,
         "seed": seed,
-        "source_seed": str(int(seed) + 17),
+        "pf_seed": seed,
         "seed_policy": "fresh_per_batch",
-        "config_path": f"results/ral_ablation/configs/{tag}.json",
-        "source_path": f"results/ral_ablation/sources/{case}_seed_{seed}.json",
-        "command": (
-            "uv run python main.py --full-simulation "
-            f"--sim-config results/ral_ablation/configs/{tag}.json "
-            "--source-config "
-            f"results/ral_ablation/sources/{case}_seed_{seed}.json "
-            f"--output-tag {tag}"
+        "source_profile": source_profile,
+        "pf_config_path": pf_config.as_posix(),
+        "runtime_config_path": runtime_config.as_posix(),
+        "scenario_path": scenario.as_posix(),
+        "measurement_log_path": log_path.as_posix(),
+        "pf_output_dir": pf_output.as_posix(),
+        "scenario_command": (
+            f"uv run --directory {runtime_root} rotating-shield-sim "
+            f"generate-ral-scenario {scenario} "
+            f"--measurement-log-output {log_path} --run-id {tag} "
+            f"--runtime-config {runtime_config} --scene-seed {seed} "
+            f"--source-profile {source_profile}"
+        ),
+        "pf_command": (
+            f"uv run --directory {root} rotating-shield-pf-live "
+            f"--scenario {scenario} "
+            f"--runtime-root {runtime_root} --config {pf_config} "
+            f"--output-dir {pf_output} --profile pf_strict --seed {seed} "
+            f"--private-scene-profile {source_profile}"
         ),
     }
 
 
 def test_select_paper_subset_uses_mix9_four_run_plan() -> None:
-    """The RA-L paper subset should keep the four closed-loop MIX-9 runs."""
-    cases = (
-        "mix9_multi_isotope_cardinality",
-        "legacy_case_not_selected",
-    )
-    variants = (
-        "proposed",
-        "baseline_passive_equal_time_no_shield",
-        "round_robin_shield",
-        "eig_only_path",
-        "no_shield",
-    )
+    """The paper subset should retain exactly the four causal MIX-9 runs."""
+    cases = ("mix9_multi_isotope_cardinality", "legacy_case_not_selected")
+    variants = (*MODULE.CORE_VARIANTS, "no_shield")
     rows = [_manifest_row(case, variant) for case in cases for variant in variants]
 
     subset = select_paper_subset(rows)
-    selected_pairs = {(row["case"], row["variant"]) for row in subset}
 
-    assert len(subset) == 4
-    assert (
-        "mix9_multi_isotope_cardinality",
-        "proposed",
-    ) in selected_pairs
-    assert (
-        "mix9_multi_isotope_cardinality",
-        "baseline_passive_equal_time_no_shield",
-    ) in selected_pairs
-    assert (
-        "mix9_multi_isotope_cardinality",
-        "round_robin_shield",
-    ) in selected_pairs
-    assert (
-        "mix9_multi_isotope_cardinality",
-        "eig_only_path",
-    ) in selected_pairs
-    assert all(case == "mix9_multi_isotope_cardinality" for case, _ in selected_pairs)
-    assert all(row["seed"] == TEST_SEED for row in subset)
+    assert [row["variant"] for row in subset] == list(MODULE.CORE_VARIANTS)
+    assert all(row["case"] == "mix9_multi_isotope_cardinality" for row in subset)
+    assert all("generate-ral-scenario" in row["scenario_command"] for row in subset)
+    assert all("rotating-shield-pf-live" in row["pf_command"] for row in subset)
 
 
 def test_select_paper_subset_requires_seed_for_multi_batch_manifest() -> None:
-    """Implicit selection must not silently choose among independent scenes."""
+    """Implicit selection must not choose among independent scenes."""
     rows = [
         _manifest_row("mix9_multi_isotope_cardinality", variant, seed)
         for seed in ("100", "200")
         for variant in MODULE.CORE_VARIANTS
     ]
-
     with pytest.raises(ValueError, match="exactly one scene seed"):
         select_paper_subset(rows)
 
 
 @pytest.mark.parametrize(
-    "replacement",
+    ("field", "replacement", "message"),
     [
-        "--python-cui",
-        "--full-simulation --sim-backend analytic",
-        "--mode python-cui",
-        "",
+        ("scenario_command", "rotating-shield-sim", "scenario command"),
+        ("scenario_command", "--scene-seed 999", "scene-seed"),
+        ("pf_command", "python main.py --full-simulation", "PF command"),
+        ("pf_command", "--profile legacy", "--profile"),
     ],
 )
-def test_select_paper_subset_rejects_non_geant4_commands(
+def test_select_paper_subset_rejects_obsolete_or_mismatched_commands(
+    field: str,
     replacement: str,
+    message: str,
 ) -> None:
-    """A modified manifest cannot relabel an analytic run as a paper trial."""
+    """Manifest commands must match the current runtime-to-PF boundary."""
     rows = [
         _manifest_row("mix9_multi_isotope_cardinality", variant)
         for variant in MODULE.CORE_VARIANTS
     ]
-    rows[0]["command"] = rows[0]["command"].replace(
-        "--full-simulation",
-        replacement,
-    )
-
-    with pytest.raises(ValueError, match="full-simulation|conflicting"):
+    if field == "scenario_command" and replacement == "rotating-shield-sim":
+        rows[0][field] = replacement
+    elif field == "scenario_command":
+        rows[0][field] = rows[0][field].replace(
+            f"--scene-seed {TEST_SEED}", replacement
+        )
+    elif replacement.startswith("python"):
+        rows[0][field] = replacement
+    else:
+        rows[0][field] = rows[0][field].replace("--profile pf_strict", replacement)
+    with pytest.raises(ValueError, match=message):
         select_paper_subset(rows)
