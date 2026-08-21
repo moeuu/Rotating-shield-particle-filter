@@ -73,7 +73,7 @@
   "measurement_pose_clearance_enabled": true,
   "path_planner": "dss_pp",
   "dss_pp": {
-    "augment_candidates": true,
+    "augment_candidates": false,
     "bearing_diversity_weight": 4,
     "coverage_floor_quantile": 0.65,
     "coverage_floor_weight": 2,
@@ -83,7 +83,7 @@
     "coverage_weight": 2,
     "detector_aperture_samples": 121,
     "diagnostic_ranked_node_limit": 10,
-    "distance_weight": 0.04,
+    "distance_weight": 0,
     "elevation_angle_threshold_deg": 15,
     "elevation_condition_weight": 4,
     "elevation_pair_xy_scale_m": 4,

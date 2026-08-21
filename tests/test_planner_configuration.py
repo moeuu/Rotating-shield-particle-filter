@@ -17,6 +17,7 @@ def test_runtime_workspace_disables_estimator_authored_candidate_poses() -> None
                 "max_programs": 48,
                 "planning_method": "resample",
                 "diagnostic_ranked_node_limit": 12,
+                "distance_weight": 0.4,
             },
         },
         runtime_owned_candidates=True,
@@ -27,6 +28,7 @@ def test_runtime_workspace_disables_estimator_authored_candidate_poses() -> None
     assert config.max_modes_per_isotope == 7
     assert config.live_time_s == 45.0
     assert config.diagnostic_ranked_node_limit == 12
+    assert config.lambda_distance == 0.0
 
 
 def test_runtime_planner_defaults_to_pf_hard_cardinality_capacity() -> None:
@@ -50,9 +52,11 @@ def test_replay_planner_can_retain_estimator_candidate_augmentation() -> None:
             "dss_pp": {
                 "augment_candidates": True,
                 "planning_method": "resample",
+                "distance_weight": 0.4,
             }
         },
         runtime_owned_candidates=False,
     )
 
     assert config.augment_candidates is True
+    assert config.lambda_distance == 0.4

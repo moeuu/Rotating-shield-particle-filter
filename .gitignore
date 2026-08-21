@@ -132,10 +132,10 @@ __pypackages__/
 celerybeat-schedule
 celerybeat.pid
 
-# Local visualization server state
-results/cui_view/*.pid
-results/run_logs/
-results/ral_ablation/logs/
+# Generated experiment output. Canonical paper artifacts already tracked by Git
+# remain tracked; adding a new artifact requires an explicit ``git add -f``.
+/results/**
+/logs/
 
 # SageMath parsed files
 *.sage.py
@@ -192,7 +192,7 @@ cython_debug/
 #  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 #  and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 
 # Ruff stuff:
 .ruff_cache/

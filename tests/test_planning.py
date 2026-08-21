@@ -30,7 +30,6 @@ from planning.candidate_generation import (
     generate_candidate_poses,
     resolve_detector_height_actions,
 )
-from planning.traversability import TraversabilityMap
 from pf.particle_filter import IsotopeParticle
 from measurement.shielding import generate_octant_orientations
 from pure_pf_test_support import approved_full_spectrum_model
@@ -44,10 +43,8 @@ def _state_on_filter(
     """Build a continuous-surface state from physical test positions."""
     positions = np.asarray(positions_xyz, dtype=float).reshape(-1, 3)
     strength_values = np.asarray(strengths, dtype=float).reshape(-1)
-    chart_ids, surface_uv = (
-        particle_filter.structural_surface_chart_coordinates(  # type: ignore[attr-defined]
-            positions
-        )
+    chart_ids, surface_uv = particle_filter.structural_surface_chart_coordinates(  # type: ignore[attr-defined]
+        positions
     )
     return IsotopeState(
         num_sources=int(strength_values.size),
@@ -271,20 +268,12 @@ def test_dss_full_spectrum_components_and_eig_share_pf_model(
     source_rate = np.sum(components.total_pnvsl, axis=(-2, -1))
 
     assert components.total_pnvsl.shape[:3] == (1, 2, 1)
-    assert np.all(
-        components.uncollided_pnvsl
-        <= components.total_pnvsl + 1.0e-12
-    )
-    node_rates = (
-        source_rate[..., None] * model._rate_scale_nodes_j
-        + float(model.background_rate_cps)
+    assert np.all(components.uncollided_pnvsl <= components.total_pnvsl + 1.0e-12)
+    node_rates = source_rate[..., None] * model._rate_scale_nodes_j + float(
+        model.background_rate_cps
     )
     expected_totals = np.sum(
-        (
-            3.0
-            * node_rates
-            / (1.0 + node_rates * float(model.dead_time_tau_s))
-        )
+        (3.0 * node_rates / (1.0 + node_rates * float(model.dead_time_tau_s)))
         * model._rate_scale_weights_j,
         axis=-1,
     )
@@ -357,9 +346,7 @@ def test_dss_transport_deduplicates_identical_pose_pair_views(
         estimator,
         detector_aperture_samples=121,
     )
-    evaluate_components = (
-        kernel.line_transport_components_all_pairs_for_detectors
-    )
+    evaluate_components = kernel.line_transport_components_all_pairs_for_detectors
     evaluated_detector_counts: list[int] = []
 
     def _record_components(**kwargs: object) -> object:
@@ -422,9 +409,7 @@ def test_dss_transport_skips_inactive_padded_source_slots(
     padded_positions = np.zeros((particle_count, 2, 3), dtype=np.float64)
     padded_positions[:, :1] = original.positions_nk3_by_isotope[isotope]
     padded_chart_ids = np.zeros((particle_count, 2), dtype=np.int64)
-    padded_chart_ids[:, :1] = (
-        original.surface_chart_ids_nk_by_isotope[isotope]
-    )
+    padded_chart_ids[:, :1] = original.surface_chart_ids_nk_by_isotope[isotope]
     padded_uv = np.zeros((particle_count, 2, 2), dtype=np.float64)
     padded_uv[:, :1] = original.surface_uv_nk2_by_isotope[isotope]
     padded_strengths = np.zeros((particle_count, 2), dtype=np.float64)
@@ -444,16 +429,12 @@ def test_dss_transport_skips_inactive_padded_source_slots(
         estimator,
         detector_aperture_samples=121,
     )
-    evaluate_components = (
-        kernel.line_transport_components_all_pairs_for_detectors
-    )
+    evaluate_components = kernel.line_transport_components_all_pairs_for_detectors
     evaluated_source_counts: list[int] = []
 
     def _record_components(**kwargs: object) -> object:
         """Record evaluated sources while preserving the physical result."""
-        evaluated_source_counts.append(
-            int(np.asarray(kwargs["sources"]).shape[0])
-        )
+        evaluated_source_counts.append(int(np.asarray(kwargs["sources"]).shape[0]))
         return evaluate_components(**kwargs)
 
     monkeypatch.setattr(
@@ -763,12 +744,21 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
 
 def test_candidate_generation_adds_map_cells_when_random_sampling_is_sparse() -> None:
     """Candidate generation should include deterministic free-cell centers."""
-    traversable = TraversabilityMap(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(10, 10),
-        traversable_cells=((8, 8),),
-    )
+
+    class SparseRuntimeMap:
+        """Expose one runtime-authored free cell through the planner contract."""
+
+        origin = (0.0, 0.0)
+        cell_size = 1.0
+        traversable_cells = ((8, 8),)
+
+        def is_free_batch(self, points: np.ndarray) -> np.ndarray:
+            """Accept only points inside the declared runtime free cell."""
+            values = np.asarray(points, dtype=float)
+            cells = np.floor(values[:, :2]).astype(np.int64)
+            return np.all(cells == np.asarray([8, 8]), axis=1)
+
+    traversable = SparseRuntimeMap()
 
     candidates = generate_candidate_poses(
         current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
@@ -1144,9 +1134,7 @@ def test_dss_augmented_geometry_matches_scalar_test_oracle() -> None:
 
     assert actual.shape == expected.shape
     actual_order = np.lexsort((actual[:, 2], actual[:, 1], actual[:, 0]))
-    expected_order = np.lexsort(
-        (expected[:, 2], expected[:, 1], expected[:, 0])
-    )
+    expected_order = np.lexsort((expected[:, 2], expected[:, 1], expected[:, 0]))
     assert np.allclose(actual[actual_order], expected[expected_order])
 
 
@@ -1245,38 +1233,6 @@ def test_batched_bearing_diversity_matches_scalar_test_oracle() -> None:
     assert np.allclose(actual, expected, rtol=0.0, atol=1.0e-12)
 
 
-def test_dss_path_cache_distinguishes_exact_xyz_inside_one_cell() -> None:
-    """Cached grid paths must retain endpoint and height-dependent distance."""
-    traversable = TraversabilityMap(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(1, 1),
-        traversable_cells=((0, 0),),
-    )
-    start = np.array([0.1, 0.1, 0.5], dtype=float)
-    same_height = np.array([0.2, 0.2, 0.5], dtype=float)
-    raised = np.array([0.2, 0.2, 1.5], dtype=float)
-
-    dss_pp._DSS_PP_PATH_LENGTH_CACHE.clear()
-    try:
-        same_height_length = dss_pp._node_path_length(
-            traversable,
-            start,
-            same_height,
-        )
-        raised_length = dss_pp._node_path_length(
-            traversable,
-            start,
-            raised,
-        )
-    finally:
-        dss_pp._DSS_PP_PATH_LENGTH_CACHE.clear()
-
-    assert same_height_length == pytest.approx(np.linalg.norm(same_height - start))
-    assert raised_length == pytest.approx(np.linalg.norm(raised - start))
-    assert raised_length > same_height_length
-
-
 def test_dss_path_filter_prefers_batch_lengths_over_reachability_flags() -> None:
     """Candidate filtering uses finite batch lengths before legacy flags."""
 
@@ -1328,8 +1284,8 @@ def test_dss_path_filter_prefers_batch_lengths_over_reachability_flags() -> None
     np.testing.assert_allclose(filtered, candidates[[0, 2]])
 
 
-def test_dss_batch_path_length_helper_matches_vector_and_scalar_fallbacks() -> None:
-    """DSS batch path lengths preserve native and compatibility semantics."""
+def test_dss_batch_path_length_helper_requires_native_map_motion() -> None:
+    """DSS path lengths use native motion or explicit obstacle-free geometry."""
 
     class NativeBatchMap:
         """Return deterministic native batch lengths for dispatch testing."""
@@ -1366,22 +1322,19 @@ def test_dss_batch_path_length_helper_matches_vector_and_scalar_fallbacks() -> N
         no_map,
         np.linalg.norm(goals - start[None, :], axis=1),
     )
+    with pytest.raises(TypeError, match="must provide motion_path_lengths_batch"):
+        dss_pp._node_path_lengths_batch(object(), start, goals)
 
 
 def test_dss_selection_uses_batch_lengths_for_filter_and_node_build() -> None:
     """End-to-end station selection dispatches both path phases in batches."""
 
     class TrackingBatchMap:
-        """Wrap a traversability map and count native batch path requests."""
+        """Count runtime-native batch path requests."""
 
-        def __init__(self, wrapped: TraversabilityMap) -> None:
-            """Store the wrapped grid and initialize its call counter."""
-            self.wrapped = wrapped
+        def __init__(self) -> None:
+            """Initialize the batch-call counter."""
             self.batch_calls = 0
-
-        def __getattr__(self, name: str) -> object:
-            """Forward non-batch map APIs to the traversability grid."""
-            return getattr(self.wrapped, name)
 
         def motion_path_lengths_batch(
             self,
@@ -1402,13 +1355,7 @@ def test_dss_selection_uses_batch_lengths_for_filter_and_node_build() -> None:
             raise AssertionError("legacy reachability API should not be used")
 
     estimator = _build_simple_estimator()
-    wrapped = TraversabilityMap(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(4, 4),
-        traversable_cells=tuple((ix, iy) for ix in range(4) for iy in range(4)),
-    )
-    planning_map = TrackingBatchMap(wrapped)
+    planning_map = TrackingBatchMap()
     candidates = np.array(
         [[1.5, 1.5, 0.5], [2.5, 1.5, 0.5]],
         dtype=float,
@@ -1440,6 +1387,43 @@ def test_dss_selection_uses_batch_lengths_for_filter_and_node_build() -> None:
     assert any(np.allclose(result.next_pose, pose) for pose in candidates)
 
 
+def test_dss_runtime_motion_times_need_no_local_map_geometry() -> None:
+    """Runtime reachability and time costs must replace local map surrogates."""
+    estimator = _build_simple_estimator()
+    candidates = np.array(
+        [[1.5, 1.5, 0.5], [2.5, 1.5, 0.5]],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(123),
+        candidate_poses_xyz=candidates,
+        candidate_motion_times_s=np.array([4.0, 2.0], dtype=float),
+        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
+        map_api=object(),
+        config=DSSPPConfig(
+            max_programs=4,
+            program_length=1,
+            forced_program_pair_ids=(0,),
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_distance=0.0,
+            lambda_time=1.0,
+            lambda_rotation=0.0,
+            lambda_coverage=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    np.testing.assert_allclose(result.next_pose, candidates[1])
+    assert result.diagnostics["path_filtered_candidates"] == 0
+    assert result.diagnostics["runtime_motion_times_applied"] is True
+    assert result.diagnostics["planning_eig_shortlist"]["path_length_support"] == (
+        "runtime_reachable_candidates_with_time_cost_only"
+    )
+
+
 def test_estimate_lambda_cost_range_scales_motion() -> None:
     """Range-based lambda should match uncertainty and motion-cost ranges."""
     uncertainties = np.array([1.0, 2.0, 4.0], dtype=float)
@@ -1459,11 +1443,7 @@ def test_dss_pp_program_library_balances_every_shield_pair() -> None:
     )
     occurrences = np.bincount(
         np.asarray(
-            [
-                pair_id
-                for program in programs
-                for pair_id in program.pair_ids
-            ],
+            [pair_id for program in programs for pair_id in program.pair_ids],
             dtype=np.int64,
         ),
         minlength=64,
@@ -1471,8 +1451,7 @@ def test_dss_pp_program_library_balances_every_shield_pair() -> None:
 
     assert len(programs) == 48
     assert all(
-        program.kind == "all_pair_balanced_multi_partition"
-        for program in programs
+        program.kind == "all_pair_balanced_multi_partition" for program in programs
     )
     assert all(len(program.pair_ids) == 8 for program in programs)
     assert all(len(set(program.pair_ids)) == 8 for program in programs)
@@ -1482,9 +1461,7 @@ def test_dss_pp_program_library_balances_every_shield_pair() -> None:
     for program in programs:
         for pair_id in program.pair_ids:
             companions[pair_id].update(
-                other
-                for other in program.pair_ids
-                if other != pair_id
+                other for other in program.pair_ids if other != pair_id
             )
     assert min(len(values) for values in companions.values()) >= 28
 
@@ -1551,29 +1528,20 @@ def test_shield_program_batch_schedule_matches_scalar_test_oracle(
         ]
     else:
         ordered = tuple(
-            fe_index * orientation_count
-            + (fe_index + offset) % orientation_count
+            fe_index * orientation_count + (fe_index + offset) % orientation_count
             for offset in range(orientation_count)
             for fe_index in range(orientation_count)
         )
         required = int(
-            np.ceil(
-                orientation_count
-                * orientation_count
-                / float(program_length)
-            )
+            np.ceil(orientation_count * orientation_count / float(program_length))
         )
         for index in range(required):
             start = index * program_length
             selected = list(ordered[start : start + program_length])
             selected.extend(ordered[: program_length - len(selected)])
-            expected.append(
-                (f"all_pair_balanced_{index:02d}", tuple(selected))
-            )
+            expected.append((f"all_pair_balanced_{index:02d}", tuple(selected)))
 
-    assert [
-        (program.name, program.pair_ids) for program in programs
-    ] == expected
+    assert [(program.name, program.pair_ids) for program in programs] == expected
 
 
 def test_dss_pp_program_library_rejects_insufficient_pair_capacity() -> None:
@@ -1698,8 +1666,7 @@ def test_extract_signature_modes_preserves_all_marginal_mode_mass() -> None:
     assert len(modes) == 3
     assert sum(mode.weight for mode in modes) == pytest.approx(1.0)
     assert all(
-        mode.isotope_presence_probability == pytest.approx(1.0)
-        for mode in modes
+        mode.isotope_presence_probability == pytest.approx(1.0) for mode in modes
     )
 
 
@@ -1823,9 +1790,7 @@ def test_extract_signature_modes_packed_joint_matches_state_oracle() -> None:
                 continuous_state_positions=_decode_encoded_surface_state,
             )
         },
-        planning_particles=lambda **_kwargs: {
-            "Cs-137": (states, weights)
-        },
+        planning_particles=lambda **_kwargs: {"Cs-137": (states, weights)},
     )
     packed_positions = np.zeros((3, 2, 3), dtype=float)
     packed_positions[1, 0] = np.array([1.0, 0.0, 0.0])
@@ -1842,12 +1807,8 @@ def test_extract_signature_modes_packed_joint_matches_state_oracle() -> None:
         isotope_order=("Cs-137",),
         weights_n=weights,
         positions_nk3_by_isotope={"Cs-137": packed_positions},
-        surface_chart_ids_nk_by_isotope={
-            "Cs-137": np.zeros((3, 2), dtype=np.int64)
-        },
-        surface_uv_nk2_by_isotope={
-            "Cs-137": np.zeros((3, 2, 2), dtype=float)
-        },
+        surface_chart_ids_nk_by_isotope={"Cs-137": np.zeros((3, 2), dtype=np.int64)},
+        surface_uv_nk2_by_isotope={"Cs-137": np.zeros((3, 2, 2), dtype=float)},
         strengths_nk_by_isotope={"Cs-137": packed_strengths},
         source_mask_nk_by_isotope={"Cs-137": packed_mask},
         original_particle_indices=np.arange(3, dtype=np.int64),
@@ -1869,12 +1830,8 @@ def test_extract_signature_modes_packed_joint_matches_state_oracle() -> None:
 
     assert len(packed) == len(oracle) == 2
     for packed_mode, oracle_mode in zip(packed, oracle):
-        assert packed_mode.position_xyz == pytest.approx(
-            oracle_mode.position_xyz
-        )
-        assert packed_mode.strength_cps_1m == pytest.approx(
-            oracle_mode.strength_cps_1m
-        )
+        assert packed_mode.position_xyz == pytest.approx(oracle_mode.position_xyz)
+        assert packed_mode.strength_cps_1m == pytest.approx(oracle_mode.strength_cps_1m)
         assert packed_mode.weight == pytest.approx(oracle_mode.weight)
         assert packed_mode.isotope_presence_probability == pytest.approx(
             oracle_mode.isotope_presence_probability
@@ -2014,9 +1971,7 @@ def test_finite_sample_eig_bound_is_not_replaced_by_prior_entropy() -> None:
         )[0]
     )
     entropy = float(-np.sum(weights * np.log(weights)))
-    finite_sample_bound = dss_pp._finite_sample_information_gain_upper_bound(
-        weights
-    )
+    finite_sample_bound = dss_pp._finite_sample_information_gain_upper_bound(weights)
 
     assert sampled_gain > entropy
     assert sampled_gain <= finite_sample_bound + 1.0e-12
@@ -2136,10 +2091,7 @@ def test_planner_geometry_modes_match_official_joint_map_projection() -> None:
         np.asarray([2.0, 3.0, 4.0]),
     )
     assert modes["Cs-137"][0].weight == pytest.approx(0.7)
-    assert (
-        modes["Cs-137"][0].isotope_presence_probability
-        == pytest.approx(0.7)
-    )
+    assert modes["Cs-137"][0].isotope_presence_probability == pytest.approx(0.7)
 
 
 def test_planner_rejects_geometry_modes_from_nonofficial_joint_map() -> None:
@@ -2234,19 +2186,17 @@ def test_extract_signature_modes_keeps_distinct_pf_posterior_sources() -> None:
     )["Cs-137"]
 
     assert len(modes) == 2
-    assert {
-        tuple(np.asarray(mode.position_xyz, dtype=float))
-        for mode in modes
-    } == {(1.0, 0.0, 0.0), (5.0, 0.0, 0.0)}
+    assert {tuple(np.asarray(mode.position_xyz, dtype=float)) for mode in modes} == {
+        (1.0, 0.0, 0.0),
+        (5.0, 0.0, 0.0),
+    }
     assert [mode.weight for mode in modes] == pytest.approx([1.0, 1.0])
 
 
 def test_dss_pp_has_no_external_or_tentative_mode_boundary() -> None:
     """DSS-PP should accept only the ordinary PF posterior mode source."""
     extract_parameters = inspect.signature(dss_pp.extract_signature_modes).parameters
-    select_parameters = inspect.signature(
-        dss_pp.select_dss_pp_next_station
-    ).parameters
+    select_parameters = inspect.signature(dss_pp.select_dss_pp_next_station).parameters
 
     assert "tentative_weight_multiplier" not in extract_parameters
     assert "_planner_only_external_mode_token" not in extract_parameters
@@ -2292,10 +2242,7 @@ def test_dss_evaluates_every_action_below_shortlist_threshold(
     ) -> list[np.ndarray]:
         """Record all actions and return one finite value per program."""
         evaluated.append(np.asarray(detector_positions, dtype=float).copy())
-        return [
-            np.zeros(len(programs), dtype=float)
-            for programs in programs_by_pose
-        ]
+        return [np.zeros(len(programs), dtype=float) for programs in programs_by_pose]
 
     monkeypatch.setattr(dss_pp, "_validate_eig_likelihood_contract", fake_validate)
     monkeypatch.setattr(dss_pp, "_program_information_gains_for_poses", fake_eig)
@@ -2382,10 +2329,7 @@ def test_dss_exact_eig_respects_predeclared_action_budget(
         }
         return np.asarray(
             [
-                [
-                    proxy_by_x[float(position[0])]
-                    for _program in programs
-                ]
+                [proxy_by_x[float(position[0])] for _program in programs]
                 for position in np.asarray(
                     detector_positions,
                     dtype=np.float64,
@@ -2453,12 +2397,7 @@ def test_dss_exact_eig_respects_predeclared_action_budget(
         < diagnostics["legacy_all_exact_bin_state_operations"]
     )
     assert diagnostics["shortlist_selected_proxy_rank"] == 2
-    assert (
-        diagnostics[
-            "shortlist_mc_winner_exceeds_universal_excluded_bound"
-        ]
-        is False
-    )
+    assert diagnostics["shortlist_mc_winner_exceeds_universal_excluded_bound"] is False
     assert diagnostics["shortlist_formal_recall_certificate_available"] is False
     assert "joint_full_spectrum" in diagnostics["proxy_contract"]
 
@@ -2524,9 +2463,7 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
                 np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
-            joint_row_identity=filt.continuous_particles[
-                0
-            ].joint_row_identity,
+            joint_row_identity=filt.continuous_particles[0].joint_row_identity,
         ),
         IsotopeParticle(
             state=_state_on_filter(
@@ -2535,9 +2472,7 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
                 np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
-            joint_row_identity=filt.continuous_particles[
-                1
-            ].joint_row_identity,
+            joint_row_identity=filt.continuous_particles[1].joint_row_identity,
         ),
     ]
     candidates = np.array(
@@ -2607,9 +2542,7 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
                 np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
-            joint_row_identity=filt.continuous_particles[
-                0
-            ].joint_row_identity,
+            joint_row_identity=filt.continuous_particles[0].joint_row_identity,
         ),
         IsotopeParticle(
             state=_state_on_filter(
@@ -2618,9 +2551,7 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
                 np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
-            joint_row_identity=filt.continuous_particles[
-                1
-            ].joint_row_identity,
+            joint_row_identity=filt.continuous_particles[1].joint_row_identity,
         ),
     ]
     forced_pairs = (7, 8, 9, 10)
@@ -2682,9 +2613,7 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
                 np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
-            joint_row_identity=filt.continuous_particles[
-                0
-            ].joint_row_identity,
+            joint_row_identity=filt.continuous_particles[0].joint_row_identity,
         ),
         IsotopeParticle(
             state=_state_on_filter(
@@ -2693,9 +2622,7 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
                 np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
-            joint_row_identity=filt.continuous_particles[
-                1
-            ].joint_row_identity,
+            joint_row_identity=filt.continuous_particles[1].joint_row_identity,
         ),
     ]
     result = select_dss_pp_next_station(
@@ -2753,17 +2680,11 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
                 np.array([100.0], dtype=float),
             ),
             log_weight=0.0,
-            joint_row_identity=est.filters[
-                "Cs-137"
-            ].continuous_particles[0].joint_row_identity,
+            joint_row_identity=est.filters["Cs-137"]
+            .continuous_particles[0]
+            .joint_row_identity,
         )
     ]
-    traversable = TraversabilityMap(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(10, 10),
-        traversable_cells=tuple((ix, iy) for ix in range(10) for iy in range(10)),
-    )
     candidates = np.array(
         [[1.5, 1.5, 0.5], [8.5, 8.5, 0.5]],
         dtype=float,
@@ -2775,7 +2696,7 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([1.0, 1.0, 0.5], dtype=float),
         visited_poses_xyz=np.array([[1.0, 1.0, 0.5]], dtype=float),
-        map_api=traversable,
+        map_api=None,
         config=DSSPPConfig(
             max_programs=4,
             program_length=1,
@@ -2817,12 +2738,6 @@ def test_dss_pp_coverage_floor_rejects_low_coverage_candidates(
         "surface_atlas_area_quadrature",
         lambda **_kwargs: quadrature,
     )
-    traversable = TraversabilityMap(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(10, 10),
-        traversable_cells=tuple((ix, iy) for ix in range(10) for iy in range(10)),
-    )
     candidates = np.array(
         [[1.5, 1.5, 0.5], [8.5, 8.5, 0.5]],
         dtype=float,
@@ -2834,7 +2749,7 @@ def test_dss_pp_coverage_floor_rejects_low_coverage_candidates(
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([1.0, 1.0, 0.5], dtype=float),
         visited_poses_xyz=np.array([[1.0, 1.0, 0.5]], dtype=float),
-        map_api=traversable,
+        map_api=None,
         config=DSSPPConfig(
             max_programs=4,
             program_length=1,
@@ -2858,12 +2773,6 @@ def test_dss_pp_coverage_floor_rejects_low_coverage_candidates(
 def test_dss_pp_fails_when_generic_separation_removes_every_candidate() -> None:
     """DSS must not bypass the one generic 3-D station-separation rule."""
     est = _build_simple_estimator()
-    traversable = TraversabilityMap(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(5, 1),
-        traversable_cells=((0, 0), (1, 0), (3, 0), (4, 0)),
-    )
     current = np.array([0.5, 0.5, 0.0], dtype=float)
     candidates = np.array([[1.5, 0.5, 0.0]], dtype=float)
 
@@ -2874,7 +2783,7 @@ def test_dss_pp_fails_when_generic_separation_removes_every_candidate() -> None:
             candidate_poses_xyz=candidates,
             current_pose_xyz=current,
             visited_poses_xyz=np.array([current], dtype=float),
-            map_api=traversable,
+            map_api=None,
             config=DSSPPConfig(
                 max_programs=4,
                 program_length=1,
@@ -2882,8 +2791,7 @@ def test_dss_pp_fails_when_generic_separation_removes_every_candidate() -> None:
                 lambda_distance=0.0,
                 lambda_rotation=0.0,
                 min_station_separation_m=2.0,
-                augment_candidates=True,
-                max_augmented_candidates=8,
+                augment_candidates=False,
             ),
         )
 
@@ -2965,9 +2873,7 @@ def test_dss_coverage_uses_full_surface_atlas_without_pf_modes(
 
     def fake_coverage(**kwargs: object) -> np.ndarray:
         """Record the atlas support passed to the response coverage kernel."""
-        observed.append(
-            np.asarray(kwargs["surface_points_xyz"], dtype=float).copy()
-        )
+        observed.append(np.asarray(kwargs["surface_points_xyz"], dtype=float).copy())
         candidates = np.asarray(kwargs["candidate_poses_xyz"], dtype=float)
         return np.zeros(candidates.shape[0], dtype=float)
 
@@ -3203,14 +3109,12 @@ def test_surface_observability_resolves_horizontal_and_vertical_actions() -> Non
         dtype=np.float64,
     )
 
-    candidate_masks, acquired = (
-        dss_pp._response_equivalent_surface_coverage_masks(
-            kernel=kernel,
-            estimator=estimator,
-            surface_points_xyz=surfaces,
-            candidate_poses_xyz=candidates,
-            reference_radius_m=1.0,
-        )
+    candidate_masks, acquired = dss_pp._response_equivalent_surface_coverage_masks(
+        kernel=kernel,
+        estimator=estimator,
+        surface_points_xyz=surfaces,
+        candidate_poses_xyz=candidates,
+        reference_radius_m=1.0,
     )
 
     np.testing.assert_array_equal(candidate_masks, np.eye(3, dtype=bool))
@@ -3356,9 +3260,9 @@ def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
                 np.array([1000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
-            joint_row_identity=est.filters[
-                "Co-60"
-            ].continuous_particles[0].joint_row_identity,
+            joint_row_identity=est.filters["Co-60"]
+            .continuous_particles[0]
+            .joint_row_identity,
         ),
         IsotopeParticle(
             state=_state_on_filter(
@@ -3367,9 +3271,9 @@ def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
                 np.array([1000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
-            joint_row_identity=est.filters[
-                "Co-60"
-            ].continuous_particles[1].joint_row_identity,
+            joint_row_identity=est.filters["Co-60"]
+            .continuous_particles[1]
+            .joint_row_identity,
         ),
     ]
     candidates = np.array(

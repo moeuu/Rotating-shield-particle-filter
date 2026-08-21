@@ -12,6 +12,8 @@ def test_pf_repository_contains_no_simulation_implementation() -> None:
     """Geant4, observation generation, and raw-log writing stay shared."""
     forbidden = (
         ROOT / "native",
+        ROOT / "obstacle_layouts",
+        ROOT / "source_layouts",
         ROOT / "src" / "sim",
         ROOT / "src" / "measurement",
         ROOT / "src" / "spectrum",
@@ -25,7 +27,10 @@ def test_pf_repository_contains_no_legacy_runtime_entry_points() -> None:
     """Retired simulation orchestration must not return outside the runtime."""
     forbidden = (
         ROOT / "environment.py",
+        ROOT / "scripts" / "monitor_closed_loop_cui.py",
         ROOT / "src" / "realtime_demo.py",
+        ROOT / "src" / "planning" / "measurement_workspace.py",
+        ROOT / "src" / "planning" / "traversability.py",
     )
 
     assert all(not path.exists() for path in forbidden)

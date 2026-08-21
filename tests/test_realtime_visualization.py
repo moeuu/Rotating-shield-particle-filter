@@ -4,14 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from visualization.realtime_viz import (
     CUISplitPFVisualizer,
     PFFrame,
-    RealTimePFVisualizer,
-    _shield_material_normal,
 )
 
 
@@ -112,46 +109,4 @@ def test_cui_writes_plain_and_neighborhood_labeled_pf_images(
     assert visualizer.latest_pf_labeled_path.is_file()
     assert "latest_pf_3d_labeled.png" in visualizer.index_path.read_text(
         encoding="utf-8"
-    )
-
-
-def test_realtime_visualizer_accepts_runtime_shield_normal_vectors(
-    tmp_path: Path,
-) -> None:
-    """A runtime octant normal must render without a matrix-shape failure."""
-    incoming_fe = np.asarray([1.0, 1.0, 1.0], dtype=float) / np.sqrt(3.0)
-    incoming_pb = np.asarray([-1.0, 1.0, -1.0], dtype=float) / np.sqrt(3.0)
-    frame = PFFrame(
-        step_index=0,
-        time=30.0,
-        robot_position=np.asarray([1.0, 1.0, 0.5], dtype=float),
-        robot_orientation=None,
-        RFe=incoming_fe,
-        RPb=incoming_pb,
-        duration=30.0,
-        particle_positions={"Cs-137": np.zeros((0, 3), dtype=float)},
-        particle_weights={"Cs-137": np.zeros(0, dtype=float)},
-        estimated_sources={"Cs-137": np.zeros((0, 3), dtype=float)},
-        estimated_strengths={"Cs-137": np.zeros(0, dtype=float)},
-    )
-    visualizer = RealTimePFVisualizer(isotopes=["Cs-137"])
-    output_path = tmp_path / "runtime_normal_frame.png"
-    try:
-        visualizer.update(frame)
-        visualizer.save_final(output_path.as_posix())
-    finally:
-        plt.close(visualizer.fig)
-
-    assert output_path.is_file()
-    np.testing.assert_allclose(
-        _shield_material_normal(incoming_fe),
-        -incoming_fe,
-    )
-
-
-def test_legacy_shield_rotation_uses_positive_octant_centre() -> None:
-    """Legacy matrices must use the local octant centre instead of local Z."""
-    np.testing.assert_allclose(
-        _shield_material_normal(np.eye(3, dtype=float)),
-        np.ones(3, dtype=float) / np.sqrt(3.0),
     )

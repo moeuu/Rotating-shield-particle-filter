@@ -26,10 +26,13 @@ def dss_config_from_pf_settings(
         augment = False
     planning_method = raw.get("planning_method", "resample")
     if planning_method != "resample":
-        raise ValueError(
-            "Production PF planning_method must be exactly 'resample'."
-        )
+        raise ValueError("Production PF planning_method must be exactly 'resample'.")
     distance_weight = raw.get("distance_weight")
+    if runtime_owned_candidates:
+        # The shared runtime owns obstacle-aware reachability and publishes
+        # time-valued travel costs. The PF must not add a second Euclidean
+        # distance surrogate for those same runtime-authored actions.
+        distance_weight = 0.0
     return DSSPPConfig(
         max_programs=raw.get("max_programs", 40),
         program_length=raw.get("program_length", 2),
