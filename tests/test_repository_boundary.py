@@ -21,6 +21,16 @@ def test_pf_repository_contains_no_simulation_implementation() -> None:
     assert all(not path.exists() for path in forbidden)
 
 
+def test_pf_repository_contains_no_legacy_runtime_entry_points() -> None:
+    """Retired simulation orchestration must not return outside the runtime."""
+    forbidden = (
+        ROOT / "environment.py",
+        ROOT / "src" / "realtime_demo.py",
+    )
+
+    assert all(not path.exists() for path in forbidden)
+
+
 def test_pf_repository_owns_estimator_and_planner_only() -> None:
     """PF and its estimator-specific planner remain local."""
     assert (ROOT / "src" / "pf" / "particle_filter.py").is_file()
