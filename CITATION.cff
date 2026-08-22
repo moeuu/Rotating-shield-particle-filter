@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software in research, please cite this repository using the
+  metadata below and cite the associated paper when its bibliographic record is
+  available.
+title: Rotating-shield particle filter
+type: software
+authors:
+  - family-names: Morita
+    given-names: Eiji
+version: 0.1.0
+repository-code: https://github.com/moeuu/Rotating-shield-particle-filter
+license: MIT

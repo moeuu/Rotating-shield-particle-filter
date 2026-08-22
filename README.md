@@ -77,3 +77,11 @@ truth is not accepted as estimator input.
 To generate a fixed-plan log without an online estimator, run
 `rotating-shield-sim` from the shared runtime repository. See
 [the repository boundary](docs/shared_simulation_runtime.md).
+
+## Citation and license
+
+If this software contributes to research, use the metadata in
+[`CITATION.cff`](CITATION.cff) to cite the exact software repository. Citation is
+a scholarly request, not an additional license condition. Repository-authored
+software and documentation are released under the [MIT License](LICENSE);
+third-party dependencies and externally sourced data retain their own terms.

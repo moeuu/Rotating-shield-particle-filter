@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,16 @@ name = "rotating-shield-particle-filter"
 version = "0.1.0"
 description = "Continuous-surface exact-RJ particle-filter estimator for shared rotating-shield observations"
 readme = "README.md"
+authors = [{ name = "Eiji Morita" }]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = [
     "matplotlib>=3.10.7",
     "numpy>=2.3.5",
