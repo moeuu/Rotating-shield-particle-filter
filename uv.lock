@@ -768,29 +768,38 @@ source = { editable = "." }
 dependencies = [
     { name = "matplotlib" },
     { name = "numpy" },
-    { name = "radiation-estimator-service-contracts" },
     { name = "rotating-shield-simulation-runtime" },
     { name = "scipy" },
     { name = "torch" },
 ]
 
+[package.optional-dependencies]
+service = [
+    { name = "radiation-estimator-service-contracts" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "radiation-estimator-service-contracts" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.7" },
     { name = "numpy", specifier = ">=2.3.5" },
-    { name = "radiation-estimator-service-contracts", git = "https://github.com/moeuu/radiation-estimator-service-contracts.git?rev=e7184a117d5018ddef015182f357eb638b6fa377" },
+    { name = "radiation-estimator-service-contracts", marker = "extra == 'service'", git = "https://github.com/moeuu/radiation-estimator-service-contracts.git?rev=e7184a117d5018ddef015182f357eb638b6fa377" },
     { name = "rotating-shield-simulation-runtime", editable = "../Rotating-shield-simulation-runtime" },
     { name = "scipy", specifier = ">=1.16.3" },
     { name = "torch" },
 ]
+provides-extras = ["service"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.1.1" }]
+dev = [
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "radiation-estimator-service-contracts", git = "https://github.com/moeuu/radiation-estimator-service-contracts.git?rev=e7184a117d5018ddef015182f357eb638b6fa377" },
+]
 
 [[package]]
 name = "rotating-shield-simulation-runtime"

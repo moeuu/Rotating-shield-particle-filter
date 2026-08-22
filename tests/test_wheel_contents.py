@@ -27,9 +27,21 @@ def test_live_cli_runtime_helpers_are_in_wheel(tmp_path: Path) -> None:
             name for name in names if name.endswith(".dist-info/entry_points.txt")
         )
         entry_points = archive.read(entry_points_name).decode("utf-8")
+        metadata_name = next(
+            name for name in names if name.endswith(".dist-info/METADATA")
+        )
+        metadata = archive.read(metadata_name).decode("utf-8")
 
     assert "pf/closed_loop.py" in names
     assert "pf/cui_runtime.py" in names
     assert "pf/service.py" in names
+    assert "pf/service_cli.py" in names
     assert "rotating-shield-pf-live = pf.closed_loop:main" in entry_points
-    assert "rotating-shield-pf-service = pf.service:main" in entry_points
+    assert "rotating-shield-pf-service = pf.service_cli:main" in entry_points
+    contract_requirements = [
+        line
+        for line in metadata.splitlines()
+        if line.startswith("Requires-Dist: radiation-estimator-service-contracts")
+    ]
+    assert len(contract_requirements) == 1
+    assert 'extra == "service"' in contract_requirements[0]
