@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,3 +89,18 @@ def test_service_contract_source_is_pinned_to_reviewed_revision() -> None:
     project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     assert "e7184a117d5018ddef015182f357eb638b6fa377" in project
+
+
+def test_service_contract_is_not_a_core_runtime_dependency() -> None:
+    """Ordinary PF installs must not require the independent-service protocol."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ]
+
+    assert not any(
+        dependency.startswith("radiation-estimator-service-contracts")
+        for dependency in project["dependencies"]
+    )
+    assert project["optional-dependencies"]["service"] == [
+        "radiation-estimator-service-contracts==0.1.0"
+    ]

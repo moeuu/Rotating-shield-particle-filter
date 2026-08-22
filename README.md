@@ -76,8 +76,16 @@ truth is not accepted as estimator input.
 
 ## Independent estimator service
 
-The dedicated PF service exposes exactly the estimator-service contract's two fixed
-verbs:
+The independent-process adapter is optional; normal PF replay and live acquisition do
+not require the estimator-service wire package. Install the `service` extra when this
+process boundary is needed:
+
+```bash
+uv sync --extra service
+```
+
+The dedicated PF service then exposes exactly the estimator-service contract's two
+fixed verbs:
 
 ```bash
 uv run rotating-shield-pf-service capabilities \

@@ -20,16 +20,20 @@ classifiers = [
 dependencies = [
     "matplotlib>=3.10.7",
     "numpy>=2.3.5",
-    "radiation-estimator-service-contracts==0.1.0",
     "rotating-shield-simulation-runtime",
     "scipy>=1.16.3",
     "torch",
 ]
 
+[project.optional-dependencies]
+service = [
+    "radiation-estimator-service-contracts==0.1.0",
+]
+
 [project.scripts]
 rotating-shield-pf = "pf.replay:main"
 rotating-shield-pf-live = "pf.closed_loop:main"
-rotating-shield-pf-service = "pf.service:main"
+rotating-shield-pf-service = "pf.service_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -44,4 +48,5 @@ radiation-estimator-service-contracts = { git = "https://github.com/moeuu/radiat
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "radiation-estimator-service-contracts==0.1.0",
 ]
