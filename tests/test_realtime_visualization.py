@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from measurement.obstacles import ObstacleGrid
 from runtime.cui import CUIRoute, cui_route_from_records
-from runtime.cui_components import pf_reference_panel_specs, write_cui_index
+from runtime.cui_components import write_cui_index
 from runtime.measurement_log import MeasurementLogRecord
 
 from visualization.realtime_viz import (
@@ -19,6 +19,7 @@ from visualization.realtime_viz import (
     CUISplitPFVisualizer,
     PFFrame,
     atomic_copy_file,
+    pf_cui_panel_specs,
 )
 
 
@@ -87,11 +88,26 @@ def test_cui_truth_is_hidden_until_explicit_evaluation_update(
     assert "truth" not in hidden_html.lower()
     reference_index = write_cui_index(
         tmp_path / "reference-shell",
-        pf_reference_panel_specs(),
+        pf_cui_panel_specs(),
         title="Rotating Shield PF CUI View",
         refresh_interval_ms=2000,
     )
     assert hidden_html == reference_index.read_text(encoding="utf-8")
+    panels = pf_cui_panel_specs()
+    assert tuple(panel.panel_id for panel in panels[2:-1]) == (
+        "pf-particle-posterior",
+        "pf-particle-labels",
+    )
+    assert tuple(panel.title for panel in panels[2:-1]) == (
+        "PF particle posterior 3D",
+        "PF particle posterior with source labels",
+    )
+    assert tuple(panel.image_filename for panel in panels[2:-1]) == (
+        "latest_pf_3d.png",
+        "latest_pf_3d_labeled.png",
+    )
+    assert tuple(panel.column_span for panel in panels[2:-1]) == (1, 2)
+    assert "grid" not in " ".join(panel.title.lower() for panel in panels[2:-1])
     source = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float64)
     strength = np.asarray([400_000.0], dtype=np.float64)
 

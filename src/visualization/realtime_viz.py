@@ -20,8 +20,9 @@ from numpy.typing import NDArray
 from runtime.artifacts import atomic_copy_file
 from runtime.cui import CUIRoute
 from runtime.cui_components import (
+    CUIPanelSpec,
     CUIScene,
-    pf_reference_panel_specs,
+    shared_cui_panel_specs,
     write_cui_index,
 )
 
@@ -33,6 +34,25 @@ DEFAULT_ISOTOPE_COLORS = {
     "Eu-154": "tab:green",
     "Eu-155": "tab:green",
 }
+
+PF_RESULT_PANEL_SPECS = (
+    CUIPanelSpec(
+        "pf-particle-posterior",
+        "PF particle posterior 3D",
+        "latest_pf_3d.png",
+    ),
+    CUIPanelSpec(
+        "pf-particle-labels",
+        "PF particle posterior with source labels",
+        "latest_pf_3d_labeled.png",
+        2,
+    ),
+)
+
+
+def pf_cui_panel_specs() -> tuple[CUIPanelSpec, ...]:
+    """Return the shared context shell with PF-owned particle result panels."""
+    return shared_cui_panel_specs(PF_RESULT_PANEL_SPECS)
 
 
 def _normalize_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -457,7 +477,7 @@ class CUISplitPFVisualizer:
         )
 
     def _write_index_html(self) -> None:
-        """Publish the shared PF-reference five-panel browser shell."""
+        """Publish the shared context shell with PF particle result panels."""
         title = "Rotating Shield PF CUI View"
         if self.true_sources:
             title += (
@@ -466,7 +486,7 @@ class CUISplitPFVisualizer:
             )
         self.index_path = write_cui_index(
             self.output_dir,
-            pf_reference_panel_specs(),
+            pf_cui_panel_specs(),
             title=title,
             refresh_interval_ms=2000,
         )
