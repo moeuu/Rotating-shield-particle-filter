@@ -74,6 +74,8 @@ _PF_REPLAY_PHYSICAL_OVERRIDE_KEYS = frozenset(
         "pf_source_extent_samples",
     }
 )
+
+
 def _sha256_bytes(payload: bytes) -> str:
     """Return a hexadecimal SHA-256 digest."""
     return hashlib.sha256(payload).hexdigest()
