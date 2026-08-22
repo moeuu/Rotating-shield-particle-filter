@@ -74,21 +74,6 @@ _PF_REPLAY_PHYSICAL_OVERRIDE_KEYS = frozenset(
         "pf_source_extent_samples",
     }
 )
-PF_SERVICE_CONFIG_KEYS = frozenset(
-    {
-        field.name
-        for field in fields(RotatingShieldPFConfig)
-        if field.name != "position_max"
-    }
-    | set(_PF_CONFIG_ALIASES)
-    | {
-        "cui_truth_display_mode",
-        "estimator_profile",
-        "pure_pf_schema_version",
-    }
-)
-
-
 def _sha256_bytes(payload: bytes) -> str:
     """Return a hexadecimal SHA-256 digest."""
     return hashlib.sha256(payload).hexdigest()

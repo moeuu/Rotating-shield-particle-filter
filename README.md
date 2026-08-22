@@ -74,41 +74,6 @@ The replay fails closed if the log schema, source-rate semantics, model identity
 energy axis, environment geometry, or full-spectrum contract is incompatible. Source
 truth is not accepted as estimator input.
 
-## Independent estimator service
-
-The independent-process adapter is optional; normal PF replay and live acquisition do
-not require the estimator-service wire package. Install the `service` extra when this
-process boundary is needed:
-
-```bash
-uv sync --extra service
-```
-
-The dedicated PF service then exposes exactly the estimator-service contract's two
-fixed verbs:
-
-```bash
-uv run rotating-shield-pf-service capabilities \
-  --response /absolute/path/capabilities.json
-
-uv run rotating-shield-pf-service execute \
-  --request /absolute/path/request.json \
-  --response /absolute/path/response.json
-```
-
-`execute` accepts an authenticated truth-free `MeasurementLogRef`, a self-contained
-`radiation.pf-config` v1 file, a request seed, and a new result-directory target. It
-calls the same public `replay_measurement_log()` path as the replay CLI and returns a
-content-addressed `radiation.pf-result` v1 directory plus named posterior, trace, and
-diagnostics file references. Config inheritance and extra input-artifact roles are not
-accepted at this independent boundary, so no undeclared files or realized source truth
-can enter the PF process.
-
-The service writes an `ExecuteResponse`; it does not manufacture an
-`ExecutionReceipt`. The orchestrator that launches the subprocess owns that receipt
-because only it can attest the executable, request/response evidence, captured stdout
-and stderr, timing, exit status, timeout, and peak memory.
-
 To generate a fixed-plan log without an online estimator, run
 `rotating-shield-sim` from the shared runtime repository. See
 [the repository boundary](docs/shared_simulation_runtime.md).
