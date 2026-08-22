@@ -7,7 +7,7 @@ definition, statistics, and observation path.
 ## Standard Full Simulation Entry Point
 
 - "Full simulation" means a shared-runtime Geant4 adaptive acquisition followed
-  by PF control/replay of its finalized MeasurementLog v2.
+  by PF control/replay of its finalized MeasurementLog.
 - Private physical scenarios are authored by
   `rotating-shield-sim generate-ral-scenario` and executed only by
   `rotating-shield-sim run-adaptive-session`.

@@ -92,7 +92,7 @@ Each row first invokes the sibling runtime's
 session with `rotating-shield-pf-live`. Truth-bearing scenarios and physical
 runtime overrides are kept below the sibling repository's ignored
 `private_runs/ral_ablation/`; they are never written under this repository's
-`results/`. Each session publishes a unique truth-free MeasurementLog v2 below
+`results/`. Each session publishes a unique truth-free MeasurementLog below
 `results/ral_ablation/measurement_logs/<output-tag>` and PF outputs below
 `results/ral_ablation/runs/<output-tag>`. These targets must not already exist
 when the run starts; archive them before an exact replay.

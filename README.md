@@ -8,7 +8,7 @@ generation, or MeasurementLog serialization.
 Physical acquisition is implemented once in the sibling
 `Rotating-shield-simulation-runtime` repository. The online PF controller sends one
 causal action at a time to the common adaptive-session API. The runtime durably stages
-the resulting truth-free raw full-spectrum observation in MeasurementLog v2 before
+the resulting truth-free raw full-spectrum observation in MeasurementLog before
 returning it, and only then does PF update. The same estimator can also consume a
 completed immutable log with an estimator-only PF configuration:
 
@@ -17,7 +17,7 @@ Rotating-shield-simulation-runtime
   Geant4 + environment + detector/shield + raw spectra
                          |
                          v
-                MeasurementLog v2
+                MeasurementLog
                          |
                          v
 Rotating-shield-particle-filter

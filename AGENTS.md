@@ -5,10 +5,10 @@
 - This repository owns PF/SMC/exact-RJ inference, PF-specific planning, diagnostics,
   evaluation, and posterior reporting only.
 - Geant4, environments, detector/shield physics, spectrum generation, observation
-  generation, and MeasurementLog v2 writing belong exclusively to the sibling
+  generation, and MeasurementLog writing belong exclusively to the sibling
   `Rotating-shield-simulation-runtime` repository.
 - Do not copy shared runtime source back into this repository. Consume its package API
-  and truth-free MeasurementLog v2 artifacts.
+  and truth-free MeasurementLog artifacts.
 
 ## Tech stack
 
@@ -167,7 +167,7 @@
   for explicit user direction before modifying the implementation or starting
   another full simulation.
 - "Full simulation" now means acquisition in the sibling shared-runtime repository,
-  followed by PF replay of its finalized MeasurementLog v2. Do not reintroduce
+  followed by PF replay of its finalized MeasurementLog. Do not reintroduce
   simulator modes into this repository's `main.py`.
 - Before changing simulation, Geant4, spectrum-generation, or PF observation
   ingestion code, read `docs/simulation_fidelity_policy.md`.

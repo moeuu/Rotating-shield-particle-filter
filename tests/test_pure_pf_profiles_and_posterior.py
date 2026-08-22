@@ -428,8 +428,8 @@ def _valid_posterior_snapshot() -> PFPosteriorSnapshot:
     )
 
 
-def test_posterior_snapshot_accepts_required_measurement_log_v2() -> None:
-    """The schema-v1 posterior must serialize its required MeasurementLog v2."""
+def test_posterior_snapshot_accepts_required_measurement_log() -> None:
+    """The posterior must serialize its required MeasurementLog identity."""
     snapshot = _valid_posterior_snapshot()
 
     payload = snapshot.to_dict()

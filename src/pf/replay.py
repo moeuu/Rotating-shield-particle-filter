@@ -1,4 +1,4 @@
-"""Sequentially replay a MeasurementLog v2 through the pure particle filter."""
+"""Sequentially replay a MeasurementLog through the pure particle filter."""
 
 from __future__ import annotations
 

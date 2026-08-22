@@ -528,7 +528,7 @@ def _live_posterior_summary(estimator: object) -> dict[str, object]:
     """Return a truth-free, explicitly non-publishable station summary.
 
     A publishable ``PFPosteriorSnapshot`` is intentionally unavailable until
-    the runtime finalizes MeasurementLog v2 and supplies its immutable digest.
+    the runtime finalizes MeasurementLog and supplies its immutable digest.
     The live controller therefore serializes only the current PF point
     estimates; final provenance remains exclusive to ``pf_posterior.json``.
     """
@@ -1335,7 +1335,7 @@ def run_pf_closed_loop(
             name="published event",
         )
         if published.get("type") != "published":
-            raise ValueError("Shared runtime did not publish MeasurementLog v2.")
+            raise ValueError("Shared runtime did not publish MeasurementLog.")
         log = load_measurement_log(published["path"])
         if int(published["record_count"]) != len(log.records):
             raise RuntimeError("Published MeasurementLog record count is inconsistent.")

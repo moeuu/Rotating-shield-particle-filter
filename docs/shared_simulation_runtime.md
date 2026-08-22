@@ -2,7 +2,7 @@
 
 `Rotating-shield-simulation-runtime` is the sole owner of Geant4 transport,
 environment and source realization, detector and Fe/Pb shield physics, action
-execution, raw-spectrum observation generation, and MeasurementLog v2 writing.
+execution, raw-spectrum observation generation, and MeasurementLog writing.
 
 This PF repository imports the shared physical response interfaces required to
 evaluate the logged likelihood, but does not copy their implementation. It owns only
@@ -43,5 +43,5 @@ station count, view count, shield program, or estimator stop rule. The 20-statio
 8-view, 160-observation RA-L limits are PF/experiment-harness settings rather than
 physical-runtime settings.
 
-The private runtime scenario may contain realized source truth. MeasurementLog v2
+The private runtime scenario may contain realized source truth. MeasurementLog
 and every estimator-visible adaptive event must not.
