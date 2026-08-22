@@ -17,6 +17,7 @@ from pf.live_session import (
     PFLiveSessionError,
     bind_published_measurement_log,
     build_live_estimator,
+    load_live_pf_config,
     measurement_record_to_station_input,
 )
 from pf.estimator_types import JointPlanningParticles
@@ -93,6 +94,36 @@ def test_live_builder_uses_run_context_without_synthetic_log(
         "config_hash": None,
         "inference_isotopes": None,
     }
+
+
+def test_live_pf_config_loader_rejects_unknown_fields(tmp_path: Path) -> None:
+    """The public in-process config API must never discard unknown options."""
+    config_path = tmp_path / "pf.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "pure_pf_schema_version": 1,
+                "estimator_profile": "pf_strict",
+                "num_particles": 8,
+                "max_sources": 1,
+                "init_num_sources": [0, 1],
+                "use_gpu": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload, source_sha256 = load_live_pf_config(
+        config_path,
+        profile="pf_strict",
+    )
+
+    assert payload["num_particles"] == 8
+    assert len(source_sha256) == 64
+    payload["num_particels"] = payload.pop("num_particles")
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PFLiveSessionError, match="unknown fields.*num_particels"):
+        load_live_pf_config(config_path, profile="pf_strict")
 
 
 def test_live_record_forwards_only_raw_spectrum_and_action_geometry(
@@ -196,11 +227,48 @@ class _SpyPosterior:
         self.estimator = estimator
 
     def to_dict(self) -> dict[str, object]:
-        """Return the minimal identities checked by the live facade."""
+        """Return a complete package-owned PF posterior contract."""
         return {
             "schema_version": 1,
+            "estimator_family": "particle_filter",
+            "estimator_variant": "pf_strict",
+            "final_estimate_source": "pf_posterior",
+            "uses_all_history_batch_fit": False,
+            "uses_surface_map": False,
+            "uses_batch_model_order": False,
             "measurement_log_sha256": self.estimator.measurement_log_sha256,
             "record_count": len(self.estimator.measurements),
+            "isotopes": {
+                isotope: {
+                    "map_cardinality": 1,
+                    "cardinality_distribution": {"0": 0.0, "1": 1.0},
+                    "modes": [
+                        {
+                            "position_mean_xyz": [0.1, 0.2, 0.3],
+                            "position_covariance_xyz": [
+                                [0.1, 0.0, 0.0],
+                                [0.0, 0.1, 0.0],
+                                [0.0, 0.0, 0.1],
+                            ],
+                            "strength_mean_cps_1m": 2.0,
+                            "posterior_mass": 1.0,
+                        }
+                    ],
+                }
+                for isotope in self.estimator.isotopes
+            },
+            "provenance": {
+                "estimator_repository": "Rotating-shield-particle-filter",
+                "estimator_commit": "a" * 40,
+                "estimator_variant": "pf_strict",
+                "measurement_log_schema_version": 2,
+                "measurement_log_sha256": self.estimator.measurement_log_sha256,
+                "resolved_config_sha256": self.estimator.resolved_config_hash,
+                "config_sha256": "b" * 64,
+                "random_seed": self.estimator.random_seed,
+                "planner_belief_sources": ["pf_posterior"],
+                "batch_feedback_applied": False,
+            },
         }
 
 
@@ -318,6 +386,7 @@ class _SpyEstimator:
             {
                 "measurement_count": len(self.measurements),
                 "station_update_count": len(self.update_calls),
+                "rng_states": {"joint": {"state": 17}},
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -426,6 +495,114 @@ def test_facade_particle_snapshot_is_an_immutable_copy(
     assert estimator.posterior_summary_calls == 1
 
 
+def test_facade_delegates_pose_and_shield_planning_to_pf_package(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The live facade must return the PF planner's complete runtime action."""
+    from pf import live_session
+
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=2,
+            station_complete_markers=True,
+        )
+    )
+    session, estimator = _facade_with_spy(monkeypatch, log)
+    session.receive_persisted_station(log.records)
+    captured: dict[str, object] = {}
+
+    class _Forward:
+        """Expose only runtime-owned planning geometry."""
+
+        bounds_xyz = (
+            np.asarray([0.0, 0.0, 0.0]),
+            np.asarray([2.0, 2.0, 2.0]),
+        )
+        obstacle_grid = object()
+
+    class _Resolver:
+        """Return the authenticated planning geometry sentinel."""
+
+        @classmethod
+        def from_run_context(cls, context: object, *, run_root: Path) -> _Forward:
+            """Validate the facade's context and runtime root."""
+            del cls
+            assert context.to_payload() == log.context.to_payload()
+            assert run_root == log.path
+            return _Forward()
+
+    def select(
+        estimator_arg: object,
+        candidates: object,
+        current: object,
+        **kwargs: object,
+    ) -> object:
+        """Capture PF-owned planner inputs and return a complete action."""
+        assert estimator_arg is estimator
+        captured["candidates"] = candidates
+        captured["current"] = current
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(
+            # DSS-PP may index its filtered candidates, so the public facade
+            # must remap the selected pose to the original runtime snapshot.
+            next_pose_index=0,
+            next_pose=np.asarray([1.0, 1.5, 0.5]),
+            shield_program=SimpleNamespace(
+                pair_ids=(7, 23),
+                name="dynamic",
+                kind="dss_pp",
+            ),
+            score=3.5,
+            diagnostics={"selected_information_gain": 2.25},
+        )
+
+    monkeypatch.setattr(live_session, "ResolvedForwardContext", _Resolver)
+    monkeypatch.setattr(live_session, "select_dss_pp_next_station", select)
+    action = session.plan_next_action(
+        [[0.5, 0.5, 0.5], [1.0, 1.5, 0.5]],
+        candidate_motion_times_s=[0.0, 2.0],
+        config={"augment_candidates": False, "program_length": 2},
+    )
+
+    assert action.candidate_index == 1
+    assert action.detector_pose_xyz == (1.0, 1.5, 0.5)
+    assert action.shield_pair_ids == (7, 23)
+    assert action.diagnostics()["selected_information_gain"] == 2.25
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["current_pair_id"] == (
+        log.records[-1].fe_orientation_index * 8
+        + log.records[-1].pb_orientation_index
+    )
+    assert kwargs["map_api"] is _Forward.obstacle_grid
+    assert kwargs["config"].augment_candidates is False
+
+
+def test_facade_rejects_unknown_pf_planning_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unknown planning settings must fail instead of being silently dropped."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=2,
+            station_complete_markers=True,
+        )
+    )
+    session, _ = _facade_with_spy(monkeypatch, log)
+    session.receive_persisted_station(log.records)
+
+    with pytest.raises(PFLiveSessionError, match="configuration is incompatible"):
+        session.plan_next_action(
+            [[0.5, 0.5, 0.5]],
+            candidate_motion_times_s=[0.0],
+            config={"augment_candidates": False, "unknown_option": 1},
+        )
+
+
 def test_bind_and_publication_never_advance_completed_pf(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -458,6 +635,41 @@ def test_bind_and_publication_never_advance_completed_pf(
     assert bound.checkpoint_state == completed.checkpoint_state
     assert json.loads(bound.posterior_json)["measurement_log_sha256"] == log.log_sha256
     assert session.phase == "bound"
+
+
+def test_bound_facade_publishes_package_owned_result_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PF publication writes posterior, trace, checkpoint, and particles once."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=2,
+            station_complete_markers=True,
+        )
+    )
+    session, estimator = _facade_with_spy(monkeypatch, log)
+    session.receive_persisted_station(log.records)
+    session.complete_live_state()
+    session.bind_published_log(log)
+    update_count = len(estimator.update_calls)
+
+    published = session.publish_bound_result(tmp_path / "pf-result")
+
+    assert published.root == (tmp_path / "pf-result").resolve()
+    assert published.posterior_path.is_file()
+    assert published.checkpoint_path.is_file()
+    assert published.checkpoint_state_path.is_file()
+    assert published.particle_snapshot_path.is_file()
+    assert len(published.result_sha256) == 64
+    assert len(estimator.update_calls) == update_count
+    checkpoint = json.loads(published.checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["prefix_measurement_log_sha256"] == log.log_sha256
+    assert checkpoint["covered_step_ids"] == [0, 1]
+    with np.load(published.particle_snapshot_path, allow_pickle=False) as arrays:
+        assert arrays["weights_n"].tolist() == [0.75, 0.25]
+        assert arrays["isotope_names"].tolist() == list(log.context.isotopes)
 
 
 def test_facade_rejects_out_of_order_and_mismatched_final_logs(
