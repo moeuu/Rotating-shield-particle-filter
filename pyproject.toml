@@ -26,7 +26,6 @@ dependencies = [
 ]
 
 [project.scripts]
-rotating-shield-pf = "pf.replay:main"
 rotating-shield-pf-live = "pf.closed_loop:main"
 
 [tool.setuptools]

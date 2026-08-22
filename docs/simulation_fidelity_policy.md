@@ -6,13 +6,14 @@ definition, statistics, and observation path.
 
 ## Standard Full Simulation Entry Point
 
-- "Full simulation" means a shared-runtime Geant4 adaptive acquisition followed
-  by PF control/replay of its finalized MeasurementLog.
+- "Full simulation" means a PF-controlled shared-runtime Geant4 adaptive
+  acquisition. Every completed station is durably recorded before its event is
+  assimilated and used to choose the next station and shield program.
 - Private physical scenarios are authored by
   `rotating-shield-sim generate-ral-scenario` and executed only by
   `rotating-shield-sim run-adaptive-session`.
-- PF controls that session through `rotating-shield-pf-live`; this repository's
-  `main.py` remains a replay-only compatibility shim.
+- PF controls that session through `rotating-shield-pf-live`; this repository has
+  no finalized-log batch inference command or compatibility shim.
 - Simulator backend and CUI/GUI mode selection belong exclusively to the shared
   runtime repository.
 

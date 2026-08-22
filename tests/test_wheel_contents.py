@@ -29,5 +29,9 @@ def test_live_cli_runtime_helpers_are_in_wheel(tmp_path: Path) -> None:
         entry_points = archive.read(entry_points_name).decode("utf-8")
 
     assert "pf/closed_loop.py" in names
+    assert "pf/configuration.py" in names
     assert "pf/cui_runtime.py" in names
+    assert "pf/live_session.py" in names
+    assert "pf/replay.py" not in names
     assert "rotating-shield-pf-live = pf.closed_loop:main" in entry_points
+    assert "rotating-shield-pf =" not in entry_points

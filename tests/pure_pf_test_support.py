@@ -401,19 +401,3 @@ def make_measurement_log(
         ),
     )
     return root
-
-
-def replay_config() -> dict[str, object]:
-    """Return a small deterministic strict-PF replay configuration."""
-    return {
-        "pure_pf_schema_version": 1,
-        "estimator_profile": "pf_strict",
-        "num_particles": 12,
-        "max_sources": 2,
-        "init_num_sources": [1, 1],
-        "variable_cardinality": False,
-        "strength_prior_min_cps_1m": 1.0,
-        "strength_prior_max_cps_1m": 2_000_000.0,
-        "use_gpu": False,
-        "gpu_dtype": "float64",
-    }

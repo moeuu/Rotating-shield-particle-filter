@@ -12,7 +12,7 @@
 
 ## Tech stack
 
-- Use Python 3.x
+- Use Python 3.12.
 - This project uses `uv` for environment management.
 - To run tests, use `uv run pytest`.
 - To add dependencies, use `uv add <package>` instead of `pip install`.
@@ -46,8 +46,8 @@
 - Do not adopt case-specific, run-specific, seed-specific, source-index-specific,
   or shield-pair-specific empirical fixes unless the parameter is physically
   defined before evaluation and is fitted only from a designated training set.
-- A failed holdout or replay may be used for diagnosis, but not as the final
-  evidence for adopting a tuned correction. After any accuracy-motivated
+- A failed holdout or diagnostic run may be used for diagnosis, but not as the
+  final evidence for adopting a tuned correction. After any accuracy-motivated
   calibration or model change, final acceptance must be measured on a new
   random Geant4 environment that was not used to design, fit, or select the
   change.
@@ -56,7 +56,7 @@
   requests a smaller diagnostic run.
 - Prefer physically motivated features with regularization and documented count
   semantics over extra degrees of freedom. If a proposed change mainly improves
-  known replays while weakening independent-environment metrics, reject it.
+  known runs while weakening independent-environment metrics, reject it.
 
 
 ## RA-L paper ablation plan
@@ -83,8 +83,8 @@
 - Generate a fresh environment/truth seed for every new RA-L comparison batch
   by omitting `--seeds` from the ablation-plan CLI. Store the generated seed in
   the manifest and reuse it only across variants within that same batch.
-  Explicit `--seeds` is reserved for exact replay and must not be used as a new
-  independent acceptance environment.
+  Explicit `--seeds` is reserved for repeating a recorded live acquisition batch
+  and must not be used as a new independent acceptance environment.
 - Use `uv run python scripts/build_ral_paper_subset.py` to regenerate
   `results/ral_ablation/ral_paper_subset_manifest.csv` and
   `results/ral_ablation/run_paper_subset.sh` from the exhaustive manifest.
@@ -145,8 +145,8 @@
   session such as `tmux` when the user is connected over SSH or asks for log
   monitoring. Do not run multi-hour RA-L/Geant4 simulations only as a foreground
   command attached to the current Codex/SSH terminal, because SSH disconnects or
-  tool-session interruptions can terminate `main.py` while leaving Geant4
-  sidecars or CUI servers orphaned.
+  tool-session interruptions can terminate the live controller process while
+  leaving Geant4 sidecars or CUI servers orphaned.
 - For persistent runs, write stdout/stderr to a timestamped log file, save the
   PID/session name, and monitor that log from a separate command. If a CUI URL is
   exposed, relay it immediately and keep the server process tied to the
@@ -166,9 +166,11 @@
   and the exact artifact paths. End that run cycle after the analysis and wait
   for explicit user direction before modifying the implementation or starting
   another full simulation.
-- "Full simulation" now means acquisition in the sibling shared-runtime repository,
-  followed by PF replay of its finalized MeasurementLog. Do not reintroduce
-  simulator modes into this repository's `main.py`.
+- "Full simulation" means one PF-controlled adaptive acquisition through the
+  sibling shared-runtime API. The PF consumes durable station events causally,
+  proposes the next station and shield program, and binds its posterior to the
+  runtime's finalized MeasurementLog. Do not add batch inference over a completed
+  log or simulator modes to this repository.
 - Before changing simulation, Geant4, spectrum-generation, or PF observation
   ingestion code, read `docs/simulation_fidelity_policy.md`.
 - Do not introduce runtime shortcuts that lower physical fidelity for speed:
@@ -196,7 +198,7 @@
 - If an approximate method is needed for a benchmark, planning heuristic, or
   legacy comparison, keep it out of runtime simulation defaults, name it
   explicitly as approximate, and add tests that prevent it from being selected
-  by `main.py` runtime modes.
+  by the production live command.
 - When starting a simulation that exposes a CUI/split-view progress URL, relay
   that URL in the chat immediately. Do not require the user to inspect terminal
   logs to find the progress view.

@@ -64,7 +64,7 @@ def _safe_suffix(value: str) -> str:
 
 
 def resolve_ablation_seeds(seeds: Sequence[int] | None) -> tuple[int, ...]:
-    """Resolve replay seeds or create one fresh comparison-scene seed."""
+    """Resolve recorded live seeds or create one fresh comparison seed."""
     if seeds is None:
         return (generate_fresh_ablation_seed(),)
     resolved = tuple(_json_integer(seed, name="seed") for seed in seeds)
@@ -353,7 +353,7 @@ def build_ablation_plan(
             f"Shared runtime config does not exist: {runtime_config_path}"
         )
     pf_base = _load_json(pf_config_path)
-    seed_policy = "fresh_per_batch" if seeds is None else "explicit_replay"
+    seed_policy = "fresh_per_batch" if seeds is None else "explicit_live_repeat"
     suffix = _safe_suffix(output_tag_suffix)
     entries: list[AblationPlanEntry] = []
     resolved_seeds = resolve_ablation_seeds(seeds)

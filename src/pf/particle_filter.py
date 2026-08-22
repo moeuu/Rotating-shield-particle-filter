@@ -614,7 +614,7 @@ class JointRowIdentity:
         )
 
     def to_dict(self) -> dict[str, object]:
-        """Return the canonical checkpoint/replay representation."""
+        """Return the canonical checkpoint-and-restore representation."""
         self.validate()
         return {
             "schema_version": 1,

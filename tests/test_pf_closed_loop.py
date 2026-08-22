@@ -304,10 +304,7 @@ def test_pf_budget_requires_one_complete_estimator_station() -> None:
             "planning_method": "resample",
         },
     }
-    planner = dss_config_from_pf_settings(
-        settings,
-        runtime_owned_candidates=True,
-    )
+    planner = dss_config_from_pf_settings(settings)
 
     with pytest.raises(ValueError, match="complete station"):
         PFControlBudget.from_settings(settings, planner)
@@ -325,7 +322,7 @@ def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
         "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
         "dss_pp": {"program_length": 2},
     }
-    planner = dss_config_from_pf_settings(settings, runtime_owned_candidates=True)
+    planner = dss_config_from_pf_settings(settings)
     candidates = AdaptiveCandidateSnapshot(
         candidate_poses_xyz=((0.0, 0.0, 0.5), (2.0, 2.0, 0.5)),
         travel_costs=(1.0, 1.0),
@@ -382,6 +379,19 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
     )
     estimator = _FakeEstimator()
     fake_log = _FakeLog()
+    bound_live_records: list[tuple[object, ...]] = []
+
+    def capture_binding(
+        actual_estimator: object,
+        actual_log: object,
+        *,
+        live_records: tuple[object, ...],
+    ) -> None:
+        """Capture the exact runtime records used for final provenance binding."""
+        assert actual_estimator is estimator
+        assert actual_log is fake_log
+        bound_live_records.append(live_records)
+
     monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
     monkeypatch.setattr(
         closed_loop,
@@ -391,8 +401,8 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
     monkeypatch.setattr(closed_loop, "load_measurement_log", lambda path: fake_log)
     monkeypatch.setattr(
         closed_loop,
-        "bind_finalized_measurement_log",
-        lambda estimator, log: None,
+        "bind_published_measurement_log",
+        capture_binding,
     )
     monkeypatch.setattr(
         closed_loop,
@@ -412,6 +422,9 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
     assert client is not None
     assert client.closed is True
     assert len(client.requests) == 1
+    assert len(bound_live_records) == 1
+    assert len(bound_live_records[0]) == 1
+    assert int(bound_live_records[0][0].step_id) == 0
     assert "actions" not in client.requests[0]
     assert client.requests[0]["station_complete"] is True
     assert (
@@ -445,7 +458,7 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
     assert station_trace["posterior_snapshot"]["publishable"] is False
 
 
-def test_pf_closed_loop_replays_runtime_resume_prefix(
+def test_pf_closed_loop_restores_runtime_resume_prefix(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -507,8 +520,8 @@ def test_pf_closed_loop_replays_runtime_resume_prefix(
     monkeypatch.setattr(closed_loop, "load_measurement_log", lambda path: fake_log)
     monkeypatch.setattr(
         closed_loop,
-        "bind_finalized_measurement_log",
-        lambda estimator, log: None,
+        "bind_published_measurement_log",
+        lambda estimator, log, **kwargs: None,
     )
     monkeypatch.setattr(
         closed_loop,
@@ -597,8 +610,8 @@ def test_detected_isotope_gate_builds_only_active_pf(
     monkeypatch.setattr(closed_loop, "load_measurement_log", lambda path: fake_log)
     monkeypatch.setattr(
         closed_loop,
-        "bind_finalized_measurement_log",
-        lambda estimator, log: None,
+        "bind_published_measurement_log",
+        lambda estimator, log, **kwargs: None,
     )
     monkeypatch.setattr(
         closed_loop,
@@ -714,8 +727,8 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
     monkeypatch.setattr(closed_loop, "load_measurement_log", lambda path: fake_log)
     monkeypatch.setattr(
         closed_loop,
-        "bind_finalized_measurement_log",
-        lambda estimator, log: None,
+        "bind_published_measurement_log",
+        lambda estimator, log, **kwargs: None,
     )
     monkeypatch.setattr(
         closed_loop,

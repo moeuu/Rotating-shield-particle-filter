@@ -272,7 +272,7 @@ def validate_observed_spectrum(
 
     The production likelihood models unit-weight detected events.  Fractional,
     efficiency-corrected, or variance-reduced spectra have different sampling
-    laws and must remain in explicitly diagnostic replay paths.
+    laws and must remain in explicitly diagnostic analysis paths.
     """
     if isinstance(expected_bin_count, (bool, np.bool_)) or not isinstance(
         expected_bin_count,

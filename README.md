@@ -9,15 +9,15 @@ Physical acquisition is implemented once in the sibling
 `Rotating-shield-simulation-runtime` repository. The online PF controller sends one
 causal action at a time to the common adaptive-session API. The runtime durably stages
 the resulting truth-free raw full-spectrum observation in MeasurementLog before
-returning it, and only then does PF update. The same estimator can also consume a
-completed immutable log with an estimator-only PF configuration:
+returning it, and only then does PF update. The finalized MeasurementLog is retained
+as immutable provenance for that live session; it is not a batch inference input:
 
 ```text
 Rotating-shield-simulation-runtime
   Geant4 + environment + detector/shield + raw spectra
                          |
                          v
-                MeasurementLog
+        typed adaptive event + durable record
                          |
                          v
 Rotating-shield-particle-filter
@@ -60,22 +60,9 @@ selected and best exact EIG, score/EIG leaders, top-ranked actions, shortlist
 certificate, and MC seed. Independent-seed rank stability remains an explicit
 offline diagnostic so it cannot silently double closed-loop planning time.
 
-## Replay
-
-```bash
-uv run rotating-shield-pf \
-  --measurement-log /path/to/measurement_log \
-  --config configs/pf/pf_strict_3d.json \
-  --profile pf_strict \
-  --output-dir results/pf-replay
-```
-
-The replay fails closed if the log schema, source-rate semantics, model identity,
-energy axis, environment geometry, or full-spectrum contract is incompatible. Source
-truth is not accepted as estimator input.
-
-To generate a fixed-plan log without an online estimator, run
-`rotating-shield-sim` from the shared runtime repository. See
+The live command fails closed if the runtime context, source-rate semantics, model
+identity, energy axis, environment geometry, or full-spectrum contract is
+incompatible. Source truth is never accepted as estimator input. See
 [the repository boundary](docs/shared_simulation_runtime.md).
 
 ## Citation and license

@@ -39,14 +39,14 @@ from pf.cui_runtime import (
     ensure_cui_view_server,
     resolve_cui_split_view_enabled,
 )
+from pf.configuration import load_pf_config
 from pf.isotope_gate import FullSpectrumIsotopeGate
-from pf.live_resume import reconstruct_live_resume_state
-from pf.replay import (
-    bind_finalized_measurement_log,
+from pf.live_session import (
+    bind_published_measurement_log,
     build_live_estimator,
-    load_pf_config,
-    measurement_record_to_spectrum_input,
+    measurement_record_to_station_input,
 )
+from pf.live_resume import reconstruct_live_resume_state
 from pf.runtime_defaults import (
     DEFAULT_CUI_SPLIT_VIEW_DIR,
     DEFAULT_CUI_SPLIT_VIEW_HOST,
@@ -449,7 +449,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         "interpretation": (
             "A warning means particle diversity may be insufficient, but "
             "particle count alone is not identified without independent-seed "
-            "2k/4k/8k replay stability."
+            "2k/4k/8k live-session stability."
         ),
     }
     return {"assessment": evidence, "isotopes": isotopes}
@@ -571,7 +571,7 @@ def _assimilate_station(
         station_id=station_id,
     )
     estimator.update_spectrum_station(
-        tuple(measurement_record_to_spectrum_input(record) for record in records),
+        tuple(measurement_record_to_station_input(record) for record in records),
         pose_idx=pose_index,
         generative_contract_hash_sha256=contract_hash,
     )
@@ -782,10 +782,7 @@ def run_pf_closed_loop(
 ) -> PFClosedLoopResult:
     """Run a PF-specific closed loop over the common adaptive runtime API."""
     settings, config_hash = load_pf_config(pf_config_path)
-    planner = dss_config_from_pf_settings(
-        settings,
-        runtime_owned_candidates=True,
-    )
+    planner = dss_config_from_pf_settings(settings)
     budget = PFControlBudget.from_settings(settings, planner)
     target = Path(output_dir).expanduser().resolve()
     if target.exists():
@@ -873,7 +870,7 @@ def run_pf_closed_loop(
         )
         current_program = _bootstrap_program(estimator, planner, settings)
         visited: list[np.ndarray]
-        station_history: list[tuple[object, ...]]
+        station_history: list[tuple[MeasurementLogRecord, ...]]
         gate_diagnostics: dict[str, object] | None = None
         stop_reason = "maximum_station_budget"
         continue_acquisition = True
@@ -1081,7 +1078,7 @@ def run_pf_closed_loop(
                 score_grids = (
                     detection_estimator.full_spectrum_isotope_detection_score_grids(
                         tuple(
-                            measurement_record_to_spectrum_input(record)
+                            measurement_record_to_station_input(record)
                             for record in station_records
                         ),
                         pose_idx=detection_pose_index,
@@ -1105,11 +1102,11 @@ def run_pf_closed_loop(
                         config_hash=config_hash,
                         inference_isotopes=active_isotopes,
                     )
-                    for replay_station_id, replay_station in enumerate(station_history):
+                    for prior_station_id, prior_station in enumerate(station_history):
                         _assimilate_station(
                             estimator,
-                            replay_station,
-                            station_id=replay_station_id,
+                            prior_station,
+                            station_id=prior_station_id,
                             contract_hash=contract_hash,
                         )
                     estimator.detected_isotope_gate_diagnostics = gate_diagnostics
@@ -1228,7 +1225,14 @@ def run_pf_closed_loop(
                 "No candidate isotope crossed the truth-free full-spectrum "
                 "activation threshold before the acquisition budget ended."
             )
-        bind_finalized_measurement_log(estimator, log)
+        live_records = tuple(
+            record for station_records in station_history for record in station_records
+        )
+        bind_published_measurement_log(
+            estimator,
+            log,
+            live_records=live_records,
+        )
         result = PFClosedLoopResult(
             measurement_log_path=log.path.resolve(),
             pf_output_dir=target,

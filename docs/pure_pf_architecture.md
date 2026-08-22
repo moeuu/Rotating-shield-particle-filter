@@ -19,7 +19,7 @@ unit-weight Geant4 detector events
 The MeasurementLog append precedes the update. Ground truth is stored outside
 the inference log and is used only for evaluation. Source cardinality,
 continuous surface position, and strength remain particle state throughout
-runtime, replay, planning, and reporting.
+live ingestion, planning, and reporting.
 
 There are no position MLE, batch fit, strength refit, surface-map rescue,
 count-extraction rescue, or report-time optimization paths. Unknown, retired,
@@ -42,9 +42,9 @@ source-resolved generative model owns:
 The model contract is identified by a SHA-256 digest covering its physics,
 parameters, energy axis, line order, and validation provenance. Runtime use is
 allowed only after predeclared independent Geant4 holdouts pass production
-gates. PF, exact RJ moves, replay, and DSS call this same model. No additional
-isotope-count, contrast, view-ratio, Poisson, or covariance likelihood is
-added.
+gates. PF, exact RJ moves, live ingestion, and DSS call this same model. No
+additional isotope-count, contrast, view-ratio, Poisson, or covariance
+likelihood is added.
 
 Production observations are nonnegative integer histograms produced from
 unit-weight detector events. Fractional, weighted, truncated, energy-axis
@@ -88,8 +88,8 @@ The strict profile uses a shifted-Gamma source-strength prior.  Its support is
 `[300 kcps, infinity)`, so a physically supported multi-merge cannot be rejected
 only because the combined source exceeds the former 2 Mcps ceiling.  The Gamma
 shape and scale are predeclared physical-prior parameters, not fitted to a
-replay.  Finite strength grids are proposal design points only and never truncate
-the PF state space.
+diagnostic run. Finite strength grids are proposal design points only and never
+truncate the PF state space.
 
 Same-isotope pair and multi-component split/merge kernels remain reversible.
 Multi-merge anchor selection mixes frozen data-informed evidence with a positive
@@ -105,7 +105,7 @@ The standard cardinality policy is
 each isotope, a Poisson source-count prior with predeclared mean 2.0 is
 normalized on the exact configured support `K = 0, ..., 5`. This encodes the
 design assumption of sparse surface contamination; it is fixed before any
-observation and was not selected from a failed replay. Every result manifest
+observation and was not selected from a failed diagnostic run. Every result manifest
 records the policy name, mean, support, and complete normalized probability
 vector. Ground-truth isotope counts and strengths are checked against PF
 support before any external Geant4 process starts. The policy remains subject
@@ -200,22 +200,22 @@ constructs one canonical generator per action so memory chunking and action
 ordering cannot change its random stream; it does not iterate over particles,
 source slots, views, or spectrum bins.
 
-## MeasurementLog replay
+## Live MeasurementLog ingestion
 
-A publishable MeasurementLog bundle binds the resolved runtime configuration,
+A published MeasurementLog bundle binds the resolved runtime configuration,
 environment, forward-model manifest, repository commit, ordered station
 records, and joint-spectrum contract hash. Each record stores the exact raw
 integer analysis spectrum, energy-axis identity, detector pose, Fe/Pb indices,
 live time, station completion marker, and native statistical provenance.
 Isotope-fitted counts and truth are not part of the inference record.
 
-Replay consumes records once and in order, rejects future-row access and
-contract mismatch, and executes the same joint SMC/RJ path as live runtime.
-Legacy logs with a different energy axis or fitted-count contract may be used
-only by an explicitly labelled read-only diagnostic; they cannot produce an
-accepted production posterior.
+During a live session, the runtime durably appends a completed station before
+returning its typed event. PF validates and assimilates that station before it
+proposes the next reachable pose and shield program. A resumed session may
+restore the runtime-provided active prefix before continuing, but no API or
+command runs inference from the beginning of an already finalized log.
 
-`scripts/run_pf_causal_replay_matrix.py` runs predeclared prior/proposal cases
-against immutable raw logs in fresh sequential processes. It is a diagnosis
-tool only: it does not fit parameters, modify observations, or constitute
-independent acceptance evidence.
+At termination PF asks the runtime to publish the immutable MeasurementLog,
+validates its exact ordered-record digest against the stations assimilated in
+that live session, and binds the posterior provenance to the published bundle
+digest. Contract mismatches fail before publication.

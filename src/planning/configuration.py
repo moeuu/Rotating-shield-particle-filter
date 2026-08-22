@@ -10,10 +10,8 @@ from planning.dss_pp import DSSPPConfig
 
 def dss_config_from_pf_settings(
     settings: Mapping[str, Any],
-    *,
-    runtime_owned_candidates: bool,
 ) -> DSSPPConfig:
-    """Build DSS-PP settings without importing the legacy simulator controller."""
+    """Build live DSS-PP settings for runtime-owned candidate poses."""
     raw = settings.get("dss_pp", {})
     if not isinstance(raw, Mapping):
         raise TypeError("dss_pp must be a mapping.")
@@ -21,18 +19,12 @@ def dss_config_from_pf_settings(
         "pf_hard_max_sources",
         settings.get("pf_max_sources", 5),
     )
-    augment = raw.get("augment_candidates", True)
-    if runtime_owned_candidates:
-        augment = False
     planning_method = raw.get("planning_method", "resample")
     if planning_method != "resample":
         raise ValueError("Production PF planning_method must be exactly 'resample'.")
-    distance_weight = raw.get("distance_weight")
-    if runtime_owned_candidates:
-        # The shared runtime owns obstacle-aware reachability and publishes
-        # time-valued travel costs. The PF must not add a second Euclidean
-        # distance surrogate for those same runtime-authored actions.
-        distance_weight = 0.0
+    # The shared runtime owns obstacle-aware reachability and publishes
+    # time-valued travel costs. The PF must not add a second Euclidean
+    # distance surrogate for those same runtime-authored actions.
     return DSSPPConfig(
         max_programs=raw.get("max_programs", 40),
         program_length=raw.get("program_length", 2),
@@ -45,7 +37,7 @@ def dss_config_from_pf_settings(
         planning_method=planning_method,
         live_time_s=settings.get("measurement_live_time_s", 30.0),
         lambda_eig=raw.get("eig_weight", 1.0),
-        lambda_distance=distance_weight,
+        lambda_distance=0.0,
         lambda_time=raw.get("time_weight", 0.0),
         lambda_rotation=raw.get("rotation_weight", 0.15),
         lambda_coverage=raw.get("coverage_weight", 0.0),
@@ -73,7 +65,7 @@ def dss_config_from_pf_settings(
         detector_aperture_samples=raw.get("detector_aperture_samples", 121),
         robot_speed_m_s=raw.get("robot_speed_m_s", 0.5),
         rotation_overhead_s=raw.get("rotation_overhead_s", 0.0),
-        augment_candidates=augment,
+        augment_candidates=False,
         max_augmented_candidates=raw.get("max_augmented_candidates", 256),
         local_orbit_sigma_m=raw.get("local_orbit_sigma_m", 0.75),
         elevation_pair_z_scale_m=raw.get("elevation_pair_z_scale_m", 2.0),

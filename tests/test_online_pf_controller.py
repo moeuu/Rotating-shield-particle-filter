@@ -80,7 +80,15 @@ def test_closed_loop_binds_final_log_after_live_assimilation() -> None:
 
     update_offset = source.index("_assimilate_station(")
     finalize_offset = source.index("published = client.finalize_log()")
-    bind_offset = source.index("bind_finalized_measurement_log(estimator, log)")
+    records_offset = source.index("live_records = tuple(")
+    bind_offset = source.index("bind_published_measurement_log(")
     write_offset = source.index("_write_final_outputs(")
 
-    assert update_offset < finalize_offset < bind_offset < write_offset
+    assert "for station_records in station_history" in source
+    assert (
+        update_offset
+        < finalize_offset
+        < records_offset
+        < bind_offset
+        < write_offset
+    )

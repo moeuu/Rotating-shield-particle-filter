@@ -55,8 +55,8 @@ def main() -> None:
         nargs="+",
         default=None,
         help=(
-            "Explicit environment seed list for exact replay. When omitted, "
-            "one fresh scene seed is generated for this comparison batch."
+            "Recorded environment seeds for repeating a live acquisition batch. "
+            "When omitted, one fresh scene seed is generated."
         ),
     )
     parser.add_argument(

@@ -20,7 +20,6 @@ def test_runtime_workspace_disables_estimator_authored_candidate_poses() -> None
                 "distance_weight": 0.4,
             },
         },
-        runtime_owned_candidates=True,
     )
 
     assert config.augment_candidates is False
@@ -39,24 +38,6 @@ def test_runtime_planner_defaults_to_pf_hard_cardinality_capacity() -> None:
             "pf_hard_max_sources": 8,
             "dss_pp": {"planning_method": "resample"},
         },
-        runtime_owned_candidates=True,
     )
 
     assert config.max_modes_per_isotope == 8
-
-
-def test_replay_planner_can_retain_estimator_candidate_augmentation() -> None:
-    """Offline planner studies may retain PF-authored candidate augmentation."""
-    config = dss_config_from_pf_settings(
-        {
-            "dss_pp": {
-                "augment_candidates": True,
-                "planning_method": "resample",
-                "distance_weight": 0.4,
-            }
-        },
-        runtime_owned_candidates=False,
-    )
-
-    assert config.augment_candidates is True
-    assert config.lambda_distance == 0.4

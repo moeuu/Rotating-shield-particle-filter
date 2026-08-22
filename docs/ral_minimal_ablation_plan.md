@@ -10,7 +10,7 @@ in the generated PF config, private runtime scenario, and manifest so the batch
 remains exactly reproducible after generation.
 
 - Omit `--seeds` for a new independent batch.
-- Use an explicit `--seeds <recorded-seed>` only for exact replay.
+- Use an explicit `--seeds <recorded-seed>` only to repeat a recorded live batch.
 - All four methods in one comparison batch use the same generated environment
   and truth layout. A later batch must use a new seed.
 
@@ -95,7 +95,7 @@ runtime overrides are kept below the sibling repository's ignored
 `results/`. Each session publishes a unique truth-free MeasurementLog below
 `results/ral_ablation/measurement_logs/<output-tag>` and PF outputs below
 `results/ral_ablation/runs/<output-tag>`. These targets must not already exist
-when the run starts; archive them before an exact replay.
+when the run starts; archive them before repeating a recorded live batch.
 
 Run the selected full simulations with:
 

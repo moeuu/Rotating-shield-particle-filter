@@ -109,7 +109,7 @@ def preflight_compute_backend(
     gpu_device: str,
     gpu_dtype: str,
 ) -> str:
-    """Validate the selected PF compute backend before replay starts."""
+    """Validate the selected PF compute backend before live inference starts."""
     dtype_name = str(gpu_dtype).strip().lower()
     if dtype_name != "float64":
         raise ValueError(

@@ -73,7 +73,7 @@ def test_fresh_ablation_seed_is_generated_when_omitted(
 
 
 def test_explicit_ablation_seeds_reject_duplicates() -> None:
-    """Explicit seeds should retain deterministic replay semantics."""
+    """Recorded live seeds may be repeated but must remain unique per batch."""
     assert resolve_ablation_seeds((1234, 5678)) == (1234, 5678)
     with pytest.raises(ValueError, match="duplicate"):
         resolve_ablation_seeds((1234, 1234))
@@ -131,6 +131,7 @@ def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) ->
     assert all(entry.scenario_path.is_relative_to(private_root) for entry in entries)
     assert len({entry.measurement_log_path for entry in entries}) == 4
     assert len({entry.pf_output_dir for entry in entries}) == 4
+    assert {entry.seed_policy for entry in entries} == {"explicit_live_repeat"}
 
     by_variant = {entry.variant: entry for entry in entries}
     for entry in entries:

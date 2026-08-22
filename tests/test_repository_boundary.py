@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import tomllib
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,7 +44,7 @@ def test_pf_repository_owns_estimator_and_planner_only() -> None:
 
 
 def test_pf_repository_has_no_out_of_process_service_surface() -> None:
-    """PF must expose only its in-process estimator and replay entry points."""
+    """PF must expose only its in-process estimator and live entry point."""
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
         "project"
     ]
@@ -54,3 +53,37 @@ def test_pf_repository_has_no_out_of_process_service_surface() -> None:
     assert not (ROOT / "src" / "pf" / "service_cli.py").exists()
     assert "service" not in project.get("optional-dependencies", {})
     assert all(not name.endswith("-service") for name in project.get("scripts", {}))
+
+
+def test_pf_repository_has_no_finalized_log_replay_surface() -> None:
+    """Finalized logs must not have a batch inference API or command."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ]
+    forbidden = (
+        ROOT / "main.py",
+        ROOT / "src" / "pf" / "replay.py",
+        ROOT / "scripts" / "evaluate_pure_pf_replay.py",
+        ROOT / "scripts" / "run_pf_causal_replay_matrix.py",
+        ROOT
+        / "results"
+        / "ral_ablation"
+        / "diagnostic_runners"
+        / "evaluate_exact_rj_shared_likelihood.py",
+        ROOT / "configs" / "pf" / "diagnostics" / "causal_replay_matrix.example.json",
+    )
+    pf_sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "src" / "pf").glob("*.py"))
+    )
+    forbidden_symbols = (
+        "build_replay_estimator",
+        "replay_measurement_log",
+        "replay_records",
+    )
+
+    assert all(not path.exists() for path in forbidden)
+    assert all(symbol not in pf_sources for symbol in forbidden_symbols)
+    assert project.get("scripts", {}) == {
+        "rotating-shield-pf-live": "pf.closed_loop:main"
+    }

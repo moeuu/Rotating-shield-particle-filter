@@ -21,8 +21,8 @@ from sim.runtime import load_runtime_config
 
 from baselines.ral_ablation.config_factory import MANIFEST_FIELDS
 from pf.atomic_io import atomic_write_text
+from pf.configuration import load_pf_config
 from pf.profiles import enforce_pure_runtime_settings
-from pf.replay import load_pf_config
 
 DEFAULT_FULL_MANIFEST = ROOT / "results" / "ral_ablation" / "manifest.csv"
 DEFAULT_SUBSET_MANIFEST = (

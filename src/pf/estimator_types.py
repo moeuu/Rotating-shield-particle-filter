@@ -1,4 +1,4 @@
-"""Array contracts shared by PF estimation, replay, and planning."""
+"""Array contracts shared by PF estimation, live ingestion, and planning."""
 
 from __future__ import annotations
 

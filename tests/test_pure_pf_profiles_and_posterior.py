@@ -638,7 +638,7 @@ def test_joint_row_identity_rejects_uniform_weight_isotope_permutation() -> None
 def test_joint_row_identity_initialization_is_shared_unique_and_immutable() -> None:
     """Initial joint rows must share one authenticated positional identity."""
     first = _joint_row_identity_estimator(random_seed=81)
-    replay = _joint_row_identity_estimator(random_seed=81)
+    repeated = _joint_row_identity_estimator(random_seed=81)
     identity_vectors: list[tuple[JointRowIdentity, ...]] = []
     for isotope in first.joint_isotope_order():
         identities = tuple(
@@ -651,11 +651,11 @@ def test_joint_row_identity_initialization_is_shared_unique_and_immutable() -> N
     assert len({identity.row_sha256 for identity in identity_vectors[0]}) == 4
     assert [identity.ordinal for identity in identity_vectors[0]] == list(range(4))
     assert {identity.generation for identity in identity_vectors[0]} == {0}
-    replay_identities = tuple(
+    repeated_identities = tuple(
         particle.joint_row_identity
-        for particle in replay.filters["Co-60"].continuous_particles
+        for particle in repeated.filters["Co-60"].continuous_particles
     )
-    assert replay_identities == identity_vectors[0]
+    assert repeated_identities == identity_vectors[0]
     particle = first.filters["Co-60"].continuous_particles[0]
     with pytest.raises(AttributeError, match="immutable"):
         particle.joint_row_identity = identity_vectors[1][0]
