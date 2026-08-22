@@ -285,6 +285,43 @@ class _JointProgramSpectrumComponents:
 
 
 @dataclass(frozen=True)
+class _DeviceJointProgramSpectrumComponents:
+    """Store source-resolved full-spectrum inputs on one Torch device."""
+
+    total_pnvsl: object
+    uncollided_pnvsl: object
+    features_pnvslf: object
+    live_times_v: object
+    contract_hash_sha256: str
+
+    def __post_init__(self) -> None:
+        """Require aligned float64 Torch tensors on exactly one device."""
+        import torch
+
+        values = (
+            self.total_pnvsl,
+            self.uncollided_pnvsl,
+            self.features_pnvslf,
+            self.live_times_v,
+        )
+        if any(not torch.is_tensor(value) for value in values):
+            raise TypeError(
+                "Device-resident spectrum components must be Torch tensors."
+            )
+        reference = values[0]
+        if any(value.dtype != torch.float64 for value in values):
+            raise TypeError(
+                "Device-resident spectrum components must use torch.float64."
+            )
+        if any(value.device != reference.device for value in values[1:]):
+            raise ValueError(
+                "Device-resident spectrum components must share one device."
+            )
+        if not str(self.contract_hash_sha256):
+            raise ValueError("Device-resident spectrum components need a model hash.")
+
+
+@dataclass(frozen=True)
 class DSSPPNode:
     """Store one candidate station and shield program evaluation."""
 

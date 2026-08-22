@@ -193,9 +193,16 @@ NumPy or multithreaded Torch-CPU kernels; there is no separate Python-worker
 count. Geant4 uses native worker threads. Scalar implementations are limited
 to tiny deterministic test or debug oracles.
 
+GPU DSS keeps selected-pair transport, source/line packing, exact predictive
+spectra, cross likelihoods, and EIG aggregation on one Torch device. Only the
+final action-score vector returns to the host. A bounded control-plane loop
+constructs one canonical generator per action so memory chunking and action
+ordering cannot change its random stream; it does not iterate over particles,
+source slots, views, or spectrum bins.
+
 ## MeasurementLog replay
 
-A publishable MeasurementLog schema-v2 bundle binds the resolved runtime configuration,
+A publishable MeasurementLog bundle binds the resolved runtime configuration,
 environment, forward-model manifest, repository commit, ordered station
 records, and joint-spectrum contract hash. Each record stores the exact raw
 integer analysis spectrum, energy-axis identity, detector pose, Fe/Pb indices,

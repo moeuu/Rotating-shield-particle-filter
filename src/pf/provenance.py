@@ -36,7 +36,7 @@ def json_safe(value: Any) -> Any:
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    """Serialize canonical schema-v1 JSON with stable indentation and newline."""
+    """Serialize canonical provenance JSON with stable indentation and newline."""
     text = json.dumps(
         json_safe(value),
         sort_keys=True,

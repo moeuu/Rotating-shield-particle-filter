@@ -3,11 +3,13 @@
 import inspect
 import math
 from types import SimpleNamespace
+import weakref
 
 import numpy as np
 import pytest
 
 import planning.candidate_generation as candidate_generation
+import planning.dss_eig as dss_eig
 import planning.dss_pp as dss_pp
 from measurement.kernels import ShieldParams
 from measurement.surface_charts import SurfaceChartGeometry
@@ -33,25 +35,10 @@ from planning.candidate_generation import (
 from pf.particle_filter import IsotopeParticle
 from measurement.shielding import generate_octant_orientations
 from pure_pf_test_support import approved_full_spectrum_model
-
-
-def _state_on_filter(
-    particle_filter: object,
-    positions_xyz: np.ndarray,
-    strengths: np.ndarray,
-) -> IsotopeState:
-    """Build a continuous-surface state from physical test positions."""
-    positions = np.asarray(positions_xyz, dtype=float).reshape(-1, 3)
-    strength_values = np.asarray(strengths, dtype=float).reshape(-1)
-    chart_ids, surface_uv = particle_filter.structural_surface_chart_coordinates(  # type: ignore[attr-defined]
-        positions
-    )
-    return IsotopeState(
-        num_sources=int(strength_values.size),
-        strengths=strength_values,
-        surface_chart_ids=chart_ids,
-        surface_uv=surface_uv,
-    )
+from planning_test_support import (
+    build_full_spectrum_planning_estimator as _build_full_spectrum_planning_estimator,
+    state_on_filter as _state_on_filter,
+)
 
 
 def test_runtime_candidate_values_remain_aligned_after_filtering() -> None:
@@ -159,62 +146,6 @@ def _build_simple_estimator(
             ),
         ),
     ]
-    return estimator
-
-
-def _build_full_spectrum_planning_estimator(
-    *,
-    shield_normals: np.ndarray | None = None,
-) -> RotatingShieldPFEstimator:
-    """Build a production-approved tiny estimator for DSS spectrum tests."""
-    isotope = "Cs-137"
-    model = approved_full_spectrum_model()
-    line_mu = tuple(
-        {
-            "energy_keV": float(line["energy_keV"]),
-            "weight": float(line["branching_weight"]),
-            "fe": float(line["mu_fe_cm_inv"]),
-            "pb": float(line["mu_pb_cm_inv"]),
-        }
-        for line in model.line_identity
-        if str(line["isotope"]) == isotope
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=(isotope,),
-        surface_diagnostic_points=np.array(
-            [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            dtype=float,
-        ),
-        shield_normals=(
-            np.asarray([[0.0, 0.0, 1.0]], dtype=float)
-            if shield_normals is None
-            else np.asarray(shield_normals, dtype=float)
-        ),
-        mu_by_isotope={isotope: {"fe": 0.0, "pb": 0.0}},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=2,
-            max_sources=1,
-            variable_cardinality=False,
-            init_num_sources=(1, 1),
-            use_gpu=False,
-            planning_eig_samples=4,
-        ),
-        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
-        line_mu_by_isotope={isotope: line_mu},
-        full_spectrum_generative_model=model,
-        random_seed=9,
-    )
-    estimator.add_measurement_pose(np.array([1.0, 0.0, 0.0], dtype=float))
-    estimator._ensure_kernel_cache()
-    particles = estimator.filters[isotope].continuous_particles
-    particle_filter = estimator.filters[isotope]
-    for index, particle in enumerate(particles):
-        particle.state = _state_on_filter(
-            particle_filter,
-            np.array([[0.0, 0.0, 0.0]]),
-            np.array([float(10 + 10 * index)]),
-        )
-        particle.log_weight = float(np.log(0.5))
     return estimator
 
 
@@ -343,6 +274,402 @@ def test_dss_full_spectrum_components_and_eig_share_pf_model(
     )
 
 
+@pytest.mark.parametrize("device_name", ("cpu", "cuda"))
+def test_dss_full_spectrum_components_remain_device_resident(
+    device_name: str,
+) -> None:
+    """Torch transport assembly must retain bulk data on its selected device."""
+    torch = pytest.importorskip("torch")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    estimator = _build_full_spectrum_planning_estimator(
+        use_gpu=True,
+        gpu_device=device_name,
+    )
+    joint = estimator.planning_joint_particles()
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    detectors = np.asarray(
+        [[1.0, 0.0, 0.0], [1.25, 0.25, 0.0]],
+        dtype=np.float64,
+    )
+    programs = [program, program]
+    host = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        detectors,
+        programs,
+        joint,
+        live_time_s=3.0,
+        detector_aperture_samples=1,
+    )
+    device = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        detectors,
+        programs,
+        joint,
+        live_time_s=3.0,
+        detector_aperture_samples=1,
+        device_resident=True,
+    )
+
+    assert isinstance(device, dss_pp._DeviceJointProgramSpectrumComponents)
+    for field_name in (
+        "total_pnvsl",
+        "uncollided_pnvsl",
+        "features_pnvslf",
+        "live_times_v",
+    ):
+        value = getattr(device, field_name)
+        assert torch.is_tensor(value)
+        assert value.device.type == device_name
+        assert value.dtype == torch.float64
+        np.testing.assert_allclose(
+            value.detach().cpu().numpy(),
+            getattr(host, field_name),
+            rtol=1.0e-12,
+            atol=1.0e-15,
+        )
+
+
+@pytest.mark.parametrize("device_name", ("cpu", "cuda"))
+def test_dss_predictive_eig_stays_on_torch_device_until_final_scores(
+    monkeypatch: pytest.MonkeyPatch,
+    device_name: str,
+) -> None:
+    """DSS must sample, score, and aggregate spectra without bulk host copies."""
+    torch = pytest.importorskip("torch")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    estimator = _build_full_spectrum_planning_estimator(
+        use_gpu=True,
+        gpu_device=device_name,
+    )
+    joint = estimator.planning_joint_particles()
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    components = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        np.asarray(
+            [[1.0, 0.0, 0.0], [1.25, 0.25, 0.0]],
+            dtype=np.float64,
+        ),
+        [program, program],
+        joint,
+        live_time_s=1.0,
+        detector_aperture_samples=1,
+        device_resident=True,
+    )
+    model = estimator.full_spectrum_generative_model
+    exact_predictive = model.sample_predictive_torch
+    exact_cross_likelihood = model.cross_log_likelihood_torch
+    predictive_calls = 0
+    likelihood_calls = 0
+    device_to_host_shapes: list[tuple[int, ...]] = []
+
+    def _reject_numpy_predictive(*_args: object, **_kwargs: object) -> object:
+        """Reject an accidental round trip through the host sampler."""
+        raise AssertionError("device DSS selected the NumPy predictive sampler")
+
+    def _record_predictive(*args: object, **kwargs: object) -> object:
+        """Verify predictive inputs and outputs remain Torch tensors."""
+        nonlocal predictive_calls
+        predictive_calls += 1
+        assert all(
+            torch.is_tensor(value) and value.device.type == device_name
+            for value in args
+        )
+        result = exact_predictive(*args, **kwargs)
+        assert torch.is_tensor(result) and result.device.type == device_name
+        assert result.dtype == torch.int64
+        return result
+
+    def _record_cross_likelihood(*args: object, **kwargs: object) -> object:
+        """Verify cross-likelihood inputs and outputs remain on one device."""
+        nonlocal likelihood_calls
+        likelihood_calls += 1
+        assert all(
+            torch.is_tensor(value) and value.device.type == device_name
+            for value in args
+        )
+        result = exact_cross_likelihood(*args, **kwargs)
+        assert torch.is_tensor(result) and result.device.type == device_name
+        return result
+
+    monkeypatch.setattr(model, "sample_predictive_numpy", _reject_numpy_predictive)
+    monkeypatch.setattr(model, "sample_predictive_torch", _record_predictive)
+    monkeypatch.setattr(
+        model,
+        "cross_log_likelihood_torch",
+        _record_cross_likelihood,
+    )
+    if device_name == "cuda":
+        exact_cpu_transfer = torch.Tensor.cpu
+
+        def _record_cpu_transfer(tensor: object, *args: object, **kwargs: object) -> object:
+            """Record every explicit CUDA-to-host tensor transfer."""
+            device_to_host_shapes.append(tuple(tensor.shape))
+            return exact_cpu_transfer(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "cpu", _record_cpu_transfer)
+    call_kwargs = {
+        "sample_count": 4,
+        "use_gpu": True,
+        "gpu_device": device_name,
+        "latent_particle_indices": np.asarray([0, 1, 0, 1], dtype=np.int64),
+        "action_seeds_a": np.asarray([1234, 5678], dtype=np.int64),
+    }
+    first = dss_pp._full_spectrum_information_gain(
+        estimator,
+        components,
+        joint.weights_n,
+        rng=np.random.default_rng(1),
+        **call_kwargs,
+    )
+    second = dss_pp._full_spectrum_information_gain(
+        estimator,
+        components,
+        joint.weights_n,
+        rng=np.random.default_rng(999),
+        **call_kwargs,
+    )
+
+    assert first.shape == (2,)
+    assert np.all(np.isfinite(first))
+    assert np.all(first >= 0.0)
+    np.testing.assert_array_equal(second, first)
+    assert predictive_calls == 2
+    assert likelihood_calls == 2
+    if device_name == "cuda":
+        assert device_to_host_shapes == [(2,), (2,)]
+
+
+def test_dss_torch_information_gain_matches_numpy_on_cuda() -> None:
+    """Device EIG aggregation must preserve the NumPy reference exactly."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    log_likelihood = np.random.default_rng(71).normal(size=(3, 5, 4))
+    weights = np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float64)
+
+    expected = dss_pp._information_gain_from_log_likelihood(
+        log_likelihood,
+        weights,
+    )
+    actual = (
+        dss_eig._information_gain_from_log_likelihood_torch(
+            torch.as_tensor(
+                log_likelihood,
+                device="cuda",
+                dtype=torch.float64,
+            ),
+            weights,
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-15)
+
+
+@pytest.mark.parametrize(
+    ("invalid_kind", "expected_error"),
+    (
+        ("numpy", TypeError),
+        ("floating", TypeError),
+        ("wrong_device", TypeError),
+        ("negative", ValueError),
+    ),
+)
+def test_dss_device_predictive_sampler_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_kind: str,
+    expected_error: type[Exception],
+) -> None:
+    """Invalid sampler storage, dtype, or counts must never reach scoring."""
+    torch = pytest.importorskip("torch")
+    if invalid_kind == "wrong_device" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    estimator = _build_full_spectrum_planning_estimator(
+        use_gpu=True,
+        gpu_device="cpu",
+    )
+    joint = estimator.planning_joint_particles()
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    components = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
+        [program],
+        joint,
+        live_time_s=1.0,
+        detector_aperture_samples=1,
+        device_resident=True,
+    )
+    model = estimator.full_spectrum_generative_model
+
+    def _invalid_predictive(
+        total: object,
+        _uncollided: object,
+        _features: object,
+        _live_times: object,
+        *,
+        sample_count: int,
+        **_kwargs: object,
+    ) -> object:
+        """Return one deliberately invalid predictive representation."""
+        tensor = torch.as_tensor(total)
+        shape = (
+            int(tensor.shape[0]),
+            int(tensor.shape[1]),
+            int(sample_count),
+            int(tensor.shape[2]),
+            int(np.asarray(model.energy_axis_keV).size),
+        )
+        if invalid_kind == "numpy":
+            return np.zeros(shape, dtype=np.int64)
+        if invalid_kind == "floating":
+            return torch.zeros(shape, dtype=torch.float64)
+        if invalid_kind == "wrong_device":
+            return torch.zeros(shape, device="cuda", dtype=torch.int64)
+        return torch.full(shape, -1, dtype=torch.int64)
+
+    monkeypatch.setattr(model, "sample_predictive_torch", _invalid_predictive)
+    with pytest.raises(expected_error):
+        dss_pp._full_spectrum_information_gain(
+            estimator,
+            components,
+            joint.weights_n,
+            sample_count=2,
+            rng=np.random.default_rng(5),
+            use_gpu=True,
+            gpu_device="cpu",
+            latent_particle_indices=np.asarray([0, 1], dtype=np.int64),
+            action_seeds_a=np.asarray([101], dtype=np.int64),
+        )
+
+
+@pytest.mark.parametrize(
+    ("invalid_kind", "expected_error"),
+    (("numpy", TypeError), ("float32", TypeError)),
+)
+def test_dss_device_cross_likelihood_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_kind: str,
+    expected_error: type[Exception],
+) -> None:
+    """Cross likelihoods must return same-device float64 Torch tensors."""
+    torch = pytest.importorskip("torch")
+    estimator = _build_full_spectrum_planning_estimator(
+        use_gpu=True,
+        gpu_device="cpu",
+    )
+    joint = estimator.planning_joint_particles()
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    components = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
+        [program],
+        joint,
+        live_time_s=1.0,
+        detector_aperture_samples=1,
+        device_resident=True,
+    )
+    model = estimator.full_spectrum_generative_model
+
+    def _invalid_cross_likelihood(
+        observations: object,
+        total: object,
+        *_args: object,
+        **_kwargs: object,
+    ) -> object:
+        """Return one deliberately invalid likelihood representation."""
+        observed = torch.as_tensor(observations)
+        states = torch.as_tensor(total)
+        shape = (
+            int(states.shape[0]),
+            int(observed.shape[1]),
+            int(states.shape[1]),
+        )
+        if invalid_kind == "numpy":
+            return np.zeros(shape, dtype=np.float64)
+        return torch.zeros(shape, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        model,
+        "cross_log_likelihood_torch",
+        _invalid_cross_likelihood,
+    )
+    with pytest.raises(expected_error):
+        dss_pp._full_spectrum_information_gain(
+            estimator,
+            components,
+            joint.weights_n,
+            sample_count=2,
+            rng=np.random.default_rng(5),
+            use_gpu=True,
+            gpu_device="cpu",
+            latent_particle_indices=np.asarray([0, 1], dtype=np.int64),
+            action_seeds_a=np.asarray([101], dtype=np.int64),
+        )
+
+
+def test_dss_torch_sampler_capability_is_checked_before_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing device sampler must fail before allocating transport tensors."""
+    estimator = _build_full_spectrum_planning_estimator(
+        use_gpu=True,
+        gpu_device="cpu",
+    )
+    joint = estimator.planning_joint_particles()
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    model = estimator.full_spectrum_generative_model
+
+    def _reject_transport(*_args: object, **_kwargs: object) -> object:
+        """Reject transport work before the capability preflight."""
+        raise AssertionError("transport was built before sampler preflight")
+
+    monkeypatch.setattr(model, "sample_predictive_torch", None)
+    monkeypatch.setattr(
+        dss_pp,
+        "_full_spectrum_joint_program_components",
+        _reject_transport,
+    )
+    with pytest.raises(RuntimeError, match="predictive sampler"):
+        dss_pp._program_information_gains_for_poses(
+            estimator,
+            np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
+            [[program]],
+            config=DSSPPConfig(
+                max_programs=1,
+                program_length=1,
+                forced_program_pair_ids=(0,),
+                exact_eig_coverage_reserve=0,
+                exact_eig_program_diversity_reserve=0,
+            ),
+            rng=np.random.default_rng(17),
+            joint_particles=joint,
+        )
+
+
 def test_dss_transport_deduplicates_identical_pose_pair_views(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -424,7 +751,7 @@ def test_dss_transport_deduplicates_identical_pose_pair_views(
     )
 
 
-def test_dss_selected_transport_retains_dense_all_pair_gpu_kernel() -> None:
+def test_dss_selected_transport_retains_dense_all_pair_host_kernel() -> None:
     """A genuinely complete pair union must select the optimized dense path."""
 
     class DenseKernel:
@@ -727,13 +1054,23 @@ def test_dss_full_spectrum_proxy_matches_direct_reduced_eig() -> None:
         atol=0.0,
     )
     assert proxy_diagnostics["backend"] == "numpy"
+    assert proxy_diagnostics["bulk_device_resident"] is False
 
 
+@pytest.mark.parametrize("torch_device", (None, "cpu", "cuda"))
 def test_dss_exact_eig_is_action_batch_invariant(
     monkeypatch: pytest.MonkeyPatch,
+    torch_device: str | None,
 ) -> None:
     """Canonical action RNG streams must remove batching-order dependence."""
-    estimator = _build_full_spectrum_planning_estimator()
+    if torch_device == "cuda":
+        torch = pytest.importorskip("torch")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is unavailable")
+    estimator = _build_full_spectrum_planning_estimator(
+        use_gpu=torch_device is not None,
+        gpu_device="cuda" if torch_device is None else torch_device,
+    )
     joint = estimator.planning_joint_particles()
     detectors = np.asarray(
         [[1.0, 0.0, 0.0], [1.25, 0.0, 0.0], [1.5, 0.0, 0.0]],
@@ -784,8 +1121,8 @@ def test_dss_exact_eig_is_action_batch_invariant(
     np.testing.assert_allclose(
         np.concatenate(one_batch),
         np.concatenate(scalar_batches),
-        rtol=0.0,
-        atol=0.0,
+        rtol=1.0e-10 if torch_device == "cuda" else 0.0,
+        atol=1.0e-10 if torch_device == "cuda" else 0.0,
     )
 
 
@@ -888,20 +1225,30 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
     exact_information_gain = dss_pp._full_spectrum_information_gain
     attempted_action_counts: list[int] = []
     raised = False
+    failed_components: weakref.ReferenceType[object] | None = None
+    release_calls = 0
 
     def fail_first_multi_action_batch(
         *args: object,
         **kwargs: object,
     ) -> np.ndarray:
         """Raise once for a multi-action batch, then run the exact evaluator."""
-        nonlocal raised
+        nonlocal failed_components, raised
         components = args[1]
         action_count = int(np.asarray(components.total_pnvsl).shape[0])
         attempted_action_counts.append(action_count)
         if action_count > 1 and not raised:
             raised = True
+            failed_components = weakref.ref(components)
             raise MemoryError("synthetic DSS action-batch OOM")
         return exact_information_gain(*args, **kwargs)
+
+    def assert_failed_batch_released() -> None:
+        """Require failed bulk components to die before allocator cleanup."""
+        nonlocal release_calls
+        release_calls += 1
+        assert failed_components is not None
+        assert failed_components() is None
 
     def three_action_batch(*args: object, **kwargs: object) -> int:
         """Populate the real memory contract, then force one retry fixture."""
@@ -918,6 +1265,11 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
         "_full_spectrum_information_gain",
         fail_first_multi_action_batch,
     )
+    monkeypatch.setattr(
+        dss_pp,
+        "_release_dss_gpu_cache",
+        assert_failed_batch_released,
+    )
     diagnostics: dict[str, object] = {}
     actual = dss_pp._program_information_gains_for_poses(
         estimator,
@@ -932,6 +1284,7 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
     assert attempted_action_counts[0] == 3
     assert all(count == 1 for count in attempted_action_counts[1:])
     assert diagnostics["oom_retry_count"] == 1
+    assert release_calls == 1
     assert diagnostics["cpu_fallback_used"] is False
     assert diagnostics["attempted_action_batch_sizes"] == [3, 1, 1, 1]
     assert diagnostics["successful_action_batch_sizes"] == [1, 1, 1]

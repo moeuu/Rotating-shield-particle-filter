@@ -10,9 +10,15 @@ from scipy.special import logsumexp
 
 from measurement.continuous_kernels import ContinuousKernel
 from pf.estimator import RotatingShieldPFEstimator
-from pf.full_spectrum import validate_full_spectrum_model
+from pf.full_spectrum import (
+    TorchPredictiveFullSpectrumModel,
+    validate_full_spectrum_model,
+)
 from planning.dss_modes import _normalise_weights
-from planning.dss_types import _JointProgramSpectrumComponents
+from planning.dss_types import (
+    _DeviceJointProgramSpectrumComponents,
+    _JointProgramSpectrumComponents,
+)
 from planning.shield_programs import ShieldProgram
 
 
@@ -152,6 +158,55 @@ def _information_gain_from_log_likelihood(
     return np.maximum(information_gain, 0.0)
 
 
+def _information_gain_from_log_likelihood_torch(
+    log_likelihood_psn: object,
+    weights_n: NDArray[np.float64],
+) -> object:
+    """Return program mutual information without leaving the Torch device."""
+    import torch
+
+    log_likelihood = torch.as_tensor(log_likelihood_psn)
+    weights = torch.as_tensor(
+        _normalise_weights(np.asarray(weights_n, dtype=np.float64)),
+        device=log_likelihood.device,
+        dtype=log_likelihood.dtype,
+    )
+    if log_likelihood.ndim != 3:
+        raise ValueError(
+            "log_likelihood_psn must be shaped (program, sample, particle)."
+        )
+    if tuple(weights.shape) != (int(log_likelihood.shape[2]),):
+        raise ValueError("weights_n must match the particle dimension.")
+    positive_prior = weights > 0.0
+    active_likelihood = log_likelihood[:, :, positive_prior]
+    active_weights = weights[positive_prior]
+    log_prior = torch.log(active_weights).reshape(1, 1, -1)
+    log_joint = active_likelihood + log_prior
+    log_evidence = torch.logsumexp(log_joint, dim=2, keepdim=True)
+    posterior = torch.exp(log_joint - log_evidence)
+    kl_terms = torch.where(
+        posterior > 0.0,
+        posterior * (active_likelihood - log_evidence),
+        torch.zeros_like(posterior),
+    )
+    information_gain = torch.mean(torch.sum(kl_terms, dim=2), dim=1)
+    numerical_tolerance = 1.0e-10
+    invalid = torch.stack(
+        (
+            torch.any(torch.isnan(log_likelihood)),
+            torch.any(torch.isposinf(log_likelihood)),
+            torch.any(~torch.isfinite(log_evidence)),
+            torch.any(~torch.isfinite(information_gain)),
+            torch.any(information_gain < -numerical_tolerance),
+        )
+    ).any()
+    if bool(invalid.item()):
+        raise RuntimeError(
+            "Torch program mutual information inputs or outputs are invalid."
+        )
+    return torch.clamp(information_gain, min=0.0)
+
+
 def _finite_sample_information_gain_upper_bound(
     weights_n: NDArray[np.float64],
 ) -> float:
@@ -209,7 +264,8 @@ def _selected_program_transport_components(
     pair_ids_av: NDArray[np.int64],
     sources: NDArray[np.float64],
     positive_line_indices: NDArray[np.int64],
-) -> dict[str, NDArray[np.float64]]:
+    device_resident: bool = False,
+) -> dict[str, object]:
     """Evaluate each distinct detector/pair response exactly once in batches.
 
     The number of distinct union sizes is bounded by the physical shield-pair
@@ -218,9 +274,10 @@ def _selected_program_transport_components(
     avoiding scalar candidate loops and unnecessary full-pair response
     tensors. CPU execution uses the runtime's batched selected-pair kernel; GPU
     execution reuses detector/source geometry across each requested program.
-    A detector that genuinely requests every pair retains the optimized dense
-    all-pair kernel, so batching never replaces a complete union with a slower
-    selected-pair emulation.
+    A host result that genuinely requests every pair retains the optimized
+    dense all-pair kernel. Device-resident results use the runtime's selected
+    pair-program API for every union because that API preserves its Torch
+    tensors instead of copying the complete response back through NumPy.
     """
     detectors = np.asarray(detector_positions, dtype=np.float64)
     pair_ids = np.asarray(pair_ids_av)
@@ -255,6 +312,8 @@ def _selected_program_transport_components(
         or np.any(line_indices < 0)
     ):
         raise ValueError("positive_line_indices must be nonnegative integers.")
+    if not isinstance(device_resident, bool):
+        raise TypeError("device_resident must be a boolean.")
 
     _, sorted_first_indices, sorted_inverse = np.unique(
         detectors,
@@ -291,10 +350,12 @@ def _selected_program_transport_components(
         "tau_obstacle",
         "distance_m",
     )
-    outputs = {
-        field_name: np.empty(output_shape, dtype=np.float64)
-        for field_name in field_names
-    }
+    outputs: dict[str, object] = {}
+    if not device_resident:
+        outputs = {
+            field_name: np.empty(output_shape, dtype=np.float64)
+            for field_name in field_names
+        }
     pair_column_lookup = np.full(
         detector_pair_mask.shape,
         -1,
@@ -321,7 +382,7 @@ def _selected_program_transport_components(
             detector_ids.size,
             dtype=np.int64,
         )
-        if union_size == pair_count:
+        if union_size == pair_count and not device_resident:
             components = kernel.line_transport_components_all_pairs_for_detectors(
                 isotope=isotope,
                 detector_positions=unique_detectors[detector_ids],
@@ -329,14 +390,19 @@ def _selected_program_transport_components(
                 positive_line_indices=line_indices,
             )
         else:
+            pair_program_kwargs: dict[str, object] = {
+                "isotope": isotope,
+                "detector_positions": unique_detectors[detector_ids],
+                "sources": source_positions,
+                "fe_indices": group_pair_ids // orientation_count,
+                "pb_indices": group_pair_ids % orientation_count,
+                "positive_line_indices": line_indices,
+            }
+            if device_resident:
+                pair_program_kwargs["device_resident"] = True
             components = (
                 kernel.line_transport_components_pair_program_for_detectors(
-                    isotope=isotope,
-                    detector_positions=unique_detectors[detector_ids],
-                    sources=source_positions,
-                    fe_indices=group_pair_ids // orientation_count,
-                    pb_indices=group_pair_ids % orientation_count,
-                    positive_line_indices=line_indices,
+                    **pair_program_kwargs,
                 )
             )
         selected_actions = np.flatnonzero(
@@ -351,10 +417,57 @@ def _selected_program_transport_components(
         ]
         if np.any(local_pair_columns < 0):
             raise RuntimeError("DSS pair-program lookup is incomplete.")
+        if device_resident:
+            import torch
+
+            reference = getattr(components, "total_kernel")
+            if not torch.is_tensor(reference):
+                raise RuntimeError(
+                    "Device-resident pair transport returned a host array."
+                )
+            if reference.dtype != torch.float64:
+                raise TypeError(
+                    "Device-resident pair transport must use torch.float64."
+                )
+            if not outputs:
+                outputs = {
+                    field_name: torch.empty(
+                        output_shape,
+                        device=reference.device,
+                        dtype=reference.dtype,
+                    )
+                    for field_name in field_names
+                }
+            selected_index = torch.as_tensor(
+                selected_actions,
+                device=reference.device,
+                dtype=torch.long,
+            )
+            detector_index = torch.as_tensor(
+                local_detector_rows,
+                device=reference.device,
+                dtype=torch.long,
+            )
+            pair_index = torch.as_tensor(
+                local_pair_columns,
+                device=reference.device,
+                dtype=torch.long,
+            )
         for field_name in field_names:
-            values = np.asarray(
-                getattr(components, field_name),
-                dtype=np.float64,
+            raw_values = getattr(components, field_name)
+            if device_resident and (
+                not torch.is_tensor(raw_values)
+                or raw_values.device != reference.device
+                or raw_values.dtype != torch.float64
+            ):
+                raise TypeError(
+                    "Device-resident pair transport fields must be aligned "
+                    "float64 Torch tensors."
+                )
+            values = (
+                raw_values
+                if device_resident
+                else np.asarray(raw_values, dtype=np.float64)
             )
             expected_shape = (
                 detector_ids.size,
@@ -362,16 +475,36 @@ def _selected_program_transport_components(
                 source_positions.shape[0],
                 line_indices.size,
             )
-            if values.shape != expected_shape:
+            if tuple(values.shape) != expected_shape:
                 raise RuntimeError(
                     "Pair-program transport returned an invalid component shape."
                 )
-            outputs[field_name][selected_actions] = values[
-                local_detector_rows[:, None],
-                local_pair_columns,
-            ]
-    if any(np.any(~np.isfinite(values)) for values in outputs.values()) or any(
-        np.any(values < 0.0) for values in outputs.values()
+            if device_resident:
+                outputs[field_name][selected_index] = values[
+                    detector_index[:, None],
+                    pair_index,
+                ]
+            else:
+                outputs[field_name][selected_actions] = values[
+                    local_detector_rows[:, None],
+                    local_pair_columns,
+                ]
+    if device_resident:
+        import torch
+
+        invalid = torch.stack(
+            tuple(
+                torch.any(~torch.isfinite(value)) | torch.any(value < 0.0)
+                for value in outputs.values()
+            )
+        ).any()
+        if bool(invalid.item()):
+            raise RuntimeError(
+                "Pair-program transport components must be nonnegative."
+            )
+    elif any(
+        np.any(~np.isfinite(value)) or np.any(value < 0.0)
+        for value in outputs.values()
     ):
         raise RuntimeError("Pair-program transport components must be nonnegative.")
     return outputs
@@ -379,7 +512,10 @@ def _selected_program_transport_components(
 
 def _full_spectrum_information_gain(
     estimator: RotatingShieldPFEstimator,
-    components: _JointProgramSpectrumComponents,
+    components: (
+        _JointProgramSpectrumComponents
+        | _DeviceJointProgramSpectrumComponents
+    ),
     particle_weights: NDArray[np.float64],
     *,
     sample_count: int,
@@ -401,18 +537,45 @@ def _full_spectrum_information_gain(
     model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
     if str(model.contract_hash_sha256) != str(components.contract_hash_sha256):
         raise RuntimeError("DSS spectrum components use a different model hash.")
-    total = np.asarray(components.total_pnvsl, dtype=np.float64)
-    uncollided = np.asarray(components.uncollided_pnvsl, dtype=np.float64)
-    features = np.asarray(components.features_pnvslf, dtype=np.float64)
-    live_times = np.asarray(components.live_times_v, dtype=np.float64)
+    device_components = isinstance(
+        components,
+        _DeviceJointProgramSpectrumComponents,
+    )
+    if device_components:
+        import torch
+
+        total = components.total_pnvsl
+        uncollided = components.uncollided_pnvsl
+        features = components.features_pnvslf
+        live_times = components.live_times_v
+        if not bool(use_gpu):
+            raise ValueError(
+                "Device-resident DSS components require the Torch backend."
+            )
+        configured_device = torch.device(str(gpu_device))
+        if total.device.type != configured_device.type or (
+            configured_device.index is not None
+            and total.device.index != configured_device.index
+        ):
+            raise ValueError(
+                "Device-resident DSS components are on the wrong Torch device."
+            )
+    else:
+        total = np.asarray(components.total_pnvsl, dtype=np.float64)
+        uncollided = np.asarray(components.uncollided_pnvsl, dtype=np.float64)
+        features = np.asarray(components.features_pnvslf, dtype=np.float64)
+        live_times = np.asarray(components.live_times_v, dtype=np.float64)
     if (
         total.ndim != 5
-        or uncollided.shape != total.shape
-        or features.shape != total.shape + (4,)
-        or live_times.shape != (total.shape[2],)
+        or tuple(uncollided.shape) != tuple(total.shape)
+        or tuple(features.shape) != tuple(total.shape) + (4,)
+        or tuple(live_times.shape) != (int(total.shape[2]),)
     ):
         raise ValueError("DSS full-spectrum component shapes are inconsistent.")
-    action_count, particle_count = total.shape[:2]
+    action_count, particle_count = (
+        int(total.shape[0]),
+        int(total.shape[1]),
+    )
     action_seeds = None
     if action_seeds_a is not None:
         action_seeds = np.asarray(action_seeds_a)
@@ -424,6 +587,14 @@ def _full_spectrum_information_gain(
             raise ValueError(
                 "action_seeds_a must contain one integer seed per DSS action."
             )
+    elif device_components:
+        action_seeds = rng.integers(
+            0,
+            np.iinfo(np.int64).max,
+            size=action_count,
+            endpoint=False,
+            dtype=np.int64,
+        )
     weights = _normalise_weights(np.asarray(particle_weights, dtype=np.float64))
     if weights.shape != (particle_count,):
         raise ValueError("DSS particle weights do not match spectrum states.")
@@ -455,21 +626,52 @@ def _full_spectrum_information_gain(
                 "DSS latent_particle_indices must contain one valid common "
                 "posterior-particle index per predictive sample."
             )
-    truth_total = total[:, latent_indices]
-    truth_uncollided = uncollided[:, latent_indices]
-    truth_features = features[:, latent_indices]
-    predictive = np.asarray(
-        model.sample_predictive_numpy(
+    if device_components:
+        import torch
+
+        latent_index = torch.as_tensor(
+            latent_indices,
+            device=total.device,
+            dtype=torch.long,
+        )
+        truth_total = total[:, latent_index]
+        truth_uncollided = uncollided[:, latent_index]
+        truth_features = features[:, latent_index]
+        if not isinstance(model, TorchPredictiveFullSpectrumModel) or not callable(
+            getattr(model, "sample_predictive_torch", None)
+        ):
+            raise RuntimeError(
+                "Device-resident DSS requires the shared Torch predictive "
+                "sampler."
+            )
+        predictive = model.sample_predictive_torch(
             truth_total,
             truth_uncollided,
             truth_features,
             live_times,
             sample_count=1,
-            rng=rng,
             action_seeds_a=action_seeds,
-        ),
-        dtype=np.float64,
-    )
+        )
+        if not torch.is_tensor(predictive):
+            raise TypeError(
+                "Torch predictive sampling must return a device tensor."
+            )
+    else:
+        truth_total = total[:, latent_indices]
+        truth_uncollided = uncollided[:, latent_indices]
+        truth_features = features[:, latent_indices]
+        predictive = np.asarray(
+            model.sample_predictive_numpy(
+                truth_total,
+                truth_uncollided,
+                truth_features,
+                live_times,
+                sample_count=1,
+                rng=rng,
+                action_seeds_a=action_seeds,
+            ),
+            dtype=np.float64,
+        )
     expected_predictive_shape = (
         action_count,
         resolved_sample_count,
@@ -477,11 +679,22 @@ def _full_spectrum_information_gain(
         int(total.shape[2]),
         int(np.asarray(model.energy_axis_keV).size),
     )
-    if predictive.shape != expected_predictive_shape:
+    if tuple(predictive.shape) != expected_predictive_shape:
         raise RuntimeError(
             "Full-spectrum predictive sampler returned an invalid DSS shape."
         )
-    observations = np.ascontiguousarray(predictive[:, :, 0])
+    if device_components:
+        if predictive.device != total.device or predictive.dtype != torch.int64:
+            raise TypeError(
+                "Torch predictive spectra must be same-device int64 tensors."
+            )
+        if bool(torch.any(predictive < 0).item()):
+            raise ValueError("Torch predictive spectra must be nonnegative.")
+    observations = (
+        predictive[:, :, 0].contiguous()
+        if device_components
+        else np.ascontiguousarray(predictive[:, :, 0])
+    )
     if bool(use_gpu):
         import torch
 
@@ -490,33 +703,42 @@ def _full_spectrum_information_gain(
             raise RuntimeError(
                 "GPU DSS requires vectorized full-spectrum Torch cross likelihood."
             )
-        device = torch.device(str(gpu_device))
-        log_likelihood = np.asarray(
-            cross_likelihood(
-                torch.as_tensor(
-                    observations,
-                    dtype=torch.float64,
-                    device=device,
-                ),
-                torch.as_tensor(total, dtype=torch.float64, device=device),
-                torch.as_tensor(uncollided, dtype=torch.float64, device=device),
-                torch.as_tensor(features, dtype=torch.float64, device=device),
-                torch.as_tensor(live_times, dtype=torch.float64, device=device),
-                action_chunk_size=action_chunk_size,
-                state_chunk_size=state_chunk_size,
-            )
-            .detach()
-            .cpu()
-            .numpy(),
-            dtype=np.float64,
+        device = (
+            total.device
+            if device_components
+            else torch.device(str(gpu_device))
         )
+        log_likelihood_torch = cross_likelihood(
+            torch.as_tensor(
+                observations,
+                dtype=torch.float64,
+                device=device,
+            ),
+            torch.as_tensor(total, dtype=torch.float64, device=device),
+            torch.as_tensor(uncollided, dtype=torch.float64, device=device),
+            torch.as_tensor(features, dtype=torch.float64, device=device),
+            torch.as_tensor(live_times, dtype=torch.float64, device=device),
+            action_chunk_size=action_chunk_size,
+            state_chunk_size=state_chunk_size,
+        )
+        if not torch.is_tensor(log_likelihood_torch):
+            raise TypeError(
+                "Torch cross likelihood must return a device tensor."
+            )
+        if (
+            log_likelihood_torch.device != device
+            or log_likelihood_torch.dtype != torch.float64
+        ):
+            raise TypeError(
+                "Torch cross likelihood must return same-device float64 values."
+            )
     else:
         cross_likelihood = getattr(model, "cross_log_likelihood_numpy", None)
         if not callable(cross_likelihood):
             raise RuntimeError(
                 "DSS requires vectorized full-spectrum cross likelihoods."
             )
-        log_likelihood = np.asarray(
+        log_likelihood_numpy = np.asarray(
             cross_likelihood(
                 observations,
                 total,
@@ -533,11 +755,35 @@ def _full_spectrum_information_gain(
         resolved_sample_count,
         particle_count,
     )
-    if log_likelihood.shape != expected_log_shape:
+    log_likelihood_shape = (
+        tuple(log_likelihood_torch.shape)
+        if bool(use_gpu)
+        else tuple(log_likelihood_numpy.shape)
+    )
+    if log_likelihood_shape != expected_log_shape:
         raise RuntimeError(
             "Full-spectrum cross likelihood returned an invalid DSS shape."
         )
-    return _information_gain_from_log_likelihood(log_likelihood, weights)
+    if bool(use_gpu) and device_components:
+        return np.asarray(
+            _information_gain_from_log_likelihood_torch(
+                log_likelihood_torch,
+                weights,
+            )
+            .detach()
+            .cpu()
+            .numpy(),
+            dtype=np.float64,
+        )
+    if bool(use_gpu):
+        log_likelihood_numpy = np.asarray(
+            log_likelihood_torch.detach().cpu().numpy(),
+            dtype=np.float64,
+        )
+    return _information_gain_from_log_likelihood(
+        log_likelihood_numpy,
+        weights,
+    )
 
 
 def _dss_eig_state_chunk_size(

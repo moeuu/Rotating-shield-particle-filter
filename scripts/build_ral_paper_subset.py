@@ -1,5 +1,7 @@
 """Build the four-run RA-L paper subset from the exhaustive manifest."""
 
+# ruff: noqa: E402  # Repository-local imports require the src path bootstrap.
+
 from __future__ import annotations
 
 import argparse

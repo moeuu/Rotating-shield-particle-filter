@@ -891,7 +891,7 @@ class PurePFEstimator(_PFEstimatorCore):
         return self._store_posterior_point_estimate(result)
 
     def posterior_snapshot(self) -> PFPosteriorSnapshot:
-        """Return a schema-v1 PF posterior result with reproducibility metadata."""
+        """Return a PF posterior result with reproducibility metadata."""
         log_digest = str(self.measurement_log_sha256).strip().lower()
         if len(log_digest) != 64 or any(
             character not in "0123456789abcdef" for character in log_digest

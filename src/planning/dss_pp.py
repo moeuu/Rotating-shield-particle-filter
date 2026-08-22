@@ -16,7 +16,10 @@ from scipy.spatial import cKDTree
 
 from measurement.continuous_kernels import ContinuousKernel
 from pf.estimator import JointPlanningParticles, RotatingShieldPFEstimator
-from pf.full_spectrum import validate_full_spectrum_model
+from pf.full_spectrum import (
+    TorchPredictiveFullSpectrumModel,
+    validate_full_spectrum_model,
+)
 from pf.randomness import named_random_generator, named_stream_seed
 # Private imports preserve direct legacy paths without joining wildcard exports.
 from planning.dss_candidates import (  # noqa: F401
@@ -83,6 +86,7 @@ from planning.dss_types import (
     DSSPPNode,
     DSSPPResult,
     SignatureMode,
+    _DeviceJointProgramSpectrumComponents,
     _JointProgramSpectrumComponents,
     _PendingDSSPPNode,
     estimate_lambda_cost,
@@ -165,7 +169,8 @@ def _full_spectrum_joint_program_components(
     *,
     live_time_s: float,
     detector_aperture_samples: int,
-) -> _JointProgramSpectrumComponents:
+    device_resident: bool = False,
+) -> _JointProgramSpectrumComponents | _DeviceJointProgramSpectrumComponents:
     """Build batched source-resolved inputs for the shared spectrum model."""
     detectors = np.asarray(detector_positions, dtype=np.float64)
     if (
@@ -189,6 +194,8 @@ def _full_spectrum_joint_program_components(
     resolved_live_time = float(live_time_s)
     if not np.isfinite(resolved_live_time) or resolved_live_time <= 0.0:
         raise ValueError("DSS live_time_s must be finite and positive.")
+    if not isinstance(device_resident, bool):
+        raise TypeError("device_resident must be a boolean.")
     model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
     isotope_order = tuple(str(value) for value in joint_particles.isotope_order)
     if isotope_order != tuple(sorted(str(value) for value in estimator.isotopes)):
@@ -214,20 +221,38 @@ def _full_spectrum_joint_program_components(
     source_slot_count = int(sum(slot_counts.values()))
     action_count = int(detectors.shape[0])
     flattened_view_count = action_count * view_count
-    total_flat = np.zeros(
-        (
-            flattened_view_count,
-            particle_count,
-            source_slot_count,
-            line_count,
-        ),
-        dtype=np.float64,
+    flat_shape = (
+        flattened_view_count,
+        particle_count,
+        source_slot_count,
+        line_count,
     )
-    uncollided_flat = np.zeros_like(total_flat)
-    features_flat = np.zeros(
-        total_flat.shape + (len(feature_order),),
-        dtype=np.float64,
-    )
+    if device_resident:
+        import torch
+
+        if not bool(estimator.pf_config.use_gpu):
+            raise ValueError(
+                "Device-resident DSS components require the configured GPU path."
+            )
+        component_device = torch.device(str(estimator.pf_config.gpu_device))
+        total_flat = torch.zeros(
+            flat_shape,
+            device=component_device,
+            dtype=torch.float64,
+        )
+        uncollided_flat = torch.zeros_like(total_flat)
+        features_flat = torch.zeros(
+            flat_shape + (len(feature_order),),
+            device=component_device,
+            dtype=torch.float64,
+        )
+    else:
+        total_flat = np.zeros(flat_shape, dtype=np.float64)
+        uncollided_flat = np.zeros_like(total_flat)
+        features_flat = np.zeros(
+            flat_shape + (len(feature_order),),
+            dtype=np.float64,
+        )
     pair_ids = _program_pair_id_matrix(programs)
     orientation_count = int(estimator.num_orientations)
     if (
@@ -350,6 +375,7 @@ def _full_spectrum_joint_program_components(
             pair_ids_av=pair_ids,
             sources=active_transport_positions,
             positive_line_indices=local_line_indices,
+            device_resident=device_resident,
         )
         expected_program_shape = (
             action_count,
@@ -358,16 +384,25 @@ def _full_spectrum_joint_program_components(
             int(global_line_indices.size),
         )
 
-        def _local_component(field_name: str) -> NDArray[np.float64]:
+        def _local_component(field_name: str) -> object:
             """Return one validated reshaped physical component."""
-            values = np.asarray(
-                component_arrays[field_name],
-                dtype=np.float64,
-            ).reshape(expected_program_shape)
-            if np.any(~np.isfinite(values)) or np.any(values < 0.0):
-                raise RuntimeError(
-                    f"Full-spectrum component {field_name!r} is invalid."
-                )
+            if device_resident:
+                import torch
+
+                values = torch.as_tensor(
+                    component_arrays[field_name],
+                    device=total_flat.device,
+                    dtype=total_flat.dtype,
+                ).reshape(expected_program_shape)
+            else:
+                values = np.asarray(
+                    component_arrays[field_name],
+                    dtype=np.float64,
+                ).reshape(expected_program_shape)
+                if np.any(~np.isfinite(values)) or np.any(values < 0.0):
+                    raise RuntimeError(
+                        f"Full-spectrum component {field_name!r} is invalid."
+                    )
             return values.reshape(
                 flattened_view_count,
                 int(active_particle_indices.size),
@@ -380,35 +415,76 @@ def _full_spectrum_joint_program_components(
         tau_pb = _local_component("tau_pb")
         tau_obstacle = _local_component("tau_obstacle")
         distance_m = _local_component("distance_m")
-        source_scale = (
-            strengths[source_mask][None, :, None] * branching_weights[None, None, :]
-        )
+        if device_resident:
+            import torch
+
+            source_scale = (
+                torch.as_tensor(
+                    strengths[source_mask],
+                    device=total_flat.device,
+                    dtype=total_flat.dtype,
+                )
+                .reshape(1, -1, 1)
+                * torch.as_tensor(
+                    branching_weights,
+                    device=total_flat.device,
+                    dtype=total_flat.dtype,
+                ).reshape(1, 1, -1)
+            )
+        else:
+            source_scale = (
+                strengths[source_mask][None, :, None]
+                * branching_weights[None, None, :]
+            )
         total_local *= source_scale
         uncollided_local *= source_scale
-        local_features = np.stack(
-            (tau_fe, tau_pb, tau_obstacle, distance_m),
-            axis=-1,
+        local_features = (
+            torch.stack(
+                (tau_fe, tau_pb, tau_obstacle, distance_m),
+                dim=-1,
+            )
+            if device_resident
+            else np.stack(
+                (tau_fe, tau_pb, tau_obstacle, distance_m),
+                axis=-1,
+            )
         )
         active_global_slots = int(slot_offset) + active_slot_indices
+        if device_resident:
+            flat_view_target = torch.as_tensor(
+                flat_view_axis,
+                device=total_flat.device,
+                dtype=torch.long,
+            )
+            particle_target = torch.as_tensor(
+                active_particle_indices,
+                device=total_flat.device,
+                dtype=torch.long,
+            )
+            slot_target = torch.as_tensor(
+                active_global_slots,
+                device=total_flat.device,
+                dtype=torch.long,
+            )
+            line_target = torch.as_tensor(
+                global_line_indices,
+                device=total_flat.device,
+                dtype=torch.long,
+            )
+        else:
+            flat_view_target = flat_view_axis
+            particle_target = active_particle_indices
+            slot_target = active_global_slots
+            line_target = global_line_indices
         target = (
-            flat_view_axis[:, None, None],
-            active_particle_indices[None, :, None],
-            active_global_slots[None, :, None],
-            global_line_indices[None, None, :],
+            flat_view_target[:, None, None],
+            particle_target[None, :, None],
+            slot_target[None, :, None],
+            line_target[None, None, :],
         )
         total_flat[target] = total_local
         uncollided_flat[target] = uncollided_local
-        feature_target = (
-            flat_view_axis[:, None, None, None],
-            active_particle_indices[None, :, None, None],
-            active_global_slots[None, :, None, None],
-            global_line_indices[None, None, :, None],
-            np.arange(
-                len(feature_order),
-                dtype=np.int64,
-            )[None, None, None, :],
-        )
-        features_flat[feature_target] = local_features
+        features_flat[target] = local_features
         slot_offset += slot_count
     output_shape = (
         action_count,
@@ -417,6 +493,49 @@ def _full_spectrum_joint_program_components(
         source_slot_count,
         line_count,
     )
+    if device_resident:
+        total = (
+            total_flat.reshape(output_shape)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+        uncollided = (
+            uncollided_flat.reshape(output_shape)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+        features = (
+            features_flat.reshape(output_shape + (len(feature_order),))
+            .permute(0, 2, 1, 3, 4, 5)
+            .contiguous()
+        )
+        invalid = torch.stack(
+            (
+                torch.any(~torch.isfinite(total)),
+                torch.any(~torch.isfinite(uncollided)),
+                torch.any(~torch.isfinite(features)),
+                torch.any(total < 0.0),
+                torch.any(uncollided < 0.0),
+                torch.any(features < 0.0),
+                torch.any(uncollided > total + 1.0e-10),
+            )
+        ).any()
+        if bool(invalid.item()):
+            raise RuntimeError(
+                "Full-spectrum DSS device transport components are invalid."
+            )
+        return _DeviceJointProgramSpectrumComponents(
+            total_pnvsl=total,
+            uncollided_pnvsl=uncollided,
+            features_pnvslf=features,
+            live_times_v=torch.full(
+                (view_count,),
+                resolved_live_time,
+                device=total.device,
+                dtype=total.dtype,
+            ),
+            contract_hash_sha256=str(model.contract_hash_sha256),
+        )
     total = total_flat.reshape(output_shape).transpose(0, 2, 1, 3, 4)
     uncollided = uncollided_flat.reshape(output_shape).transpose(
         0,
@@ -564,6 +683,17 @@ def _program_information_gains_for_poses(
     snapshot_index = len(estimator.measurements)
     use_gpu = bool(pf_config.use_gpu)
     gpu_device = str(pf_config.gpu_device)
+    if use_gpu and (
+        not isinstance(model, TorchPredictiveFullSpectrumModel)
+        or not callable(getattr(model, "sample_predictive_torch", None))
+    ):
+        raise RuntimeError(
+            "Torch DSS requires the shared device-resident predictive sampler."
+        )
+    if use_gpu and not callable(
+        getattr(model, "cross_log_likelihood_torch", None)
+    ):
+        raise RuntimeError("Torch DSS requires the shared Torch cross likelihood.")
     accelerator_memory_before = _dss_accelerator_memory_snapshot(
         use_gpu=use_gpu,
         gpu_device=gpu_device,
@@ -700,6 +830,8 @@ def _program_information_gains_for_poses(
                 int(snapshot_index),
                 "action_seeded_sampler_fallback",
             )
+            components = None
+            retry_after_memory_error = False
             try:
                 components = _full_spectrum_joint_program_components(
                     estimator,
@@ -708,8 +840,9 @@ def _program_information_gains_for_poses(
                     joint_particles,
                     live_time_s=float(config.live_time_s),
                     detector_aperture_samples=int(config.detector_aperture_samples),
+                    device_resident=use_gpu,
                 )
-                flattened_gains[action_indices] = _full_spectrum_information_gain(
+                batch_gains = _full_spectrum_information_gain(
                     estimator,
                     components,
                     np.asarray(
@@ -725,7 +858,10 @@ def _program_information_gains_for_poses(
                     action_chunk_size=likelihood_action_chunk_size,
                     state_chunk_size=state_chunk_size,
                 )
+                components = None
+                flattened_gains[action_indices] = batch_gains
             except Exception as error:
+                components = None
                 if not _is_dss_eig_memory_error(error):
                     raise
                 failed_action_batch_size = action_stop - action_start
@@ -734,6 +870,8 @@ def _program_information_gains_for_poses(
                         "DSS exact EIG exhausted memory for one action even "
                         "after action and state-chunk reduction."
                     ) from error
+                retry_after_memory_error = True
+            if retry_after_memory_error:
                 _release_dss_gpu_cache()
                 reduced_action_batch_size = int(action_batch_size)
                 reduced_state_chunk_size = int(state_chunk_size)
@@ -776,6 +914,7 @@ def _program_information_gains_for_poses(
             {
                 "backend": "torch" if use_gpu else "numpy",
                 "gpu_device": str(gpu_device) if use_gpu else "cpu",
+                "bulk_device_resident": bool(use_gpu),
                 "memory_budget_bytes": int(memory_budget_bytes),
                 "accelerator_memory_before": accelerator_memory_before,
                 "accelerator_memory_after": _dss_accelerator_memory_snapshot(

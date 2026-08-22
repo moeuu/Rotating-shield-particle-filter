@@ -185,7 +185,7 @@ def evaluate_forward_response_fixture(
         raise ForwardResponseFixtureError("schema_version must be 1.")
     if tuple(payload.get("required_case_order", ())) != _REQUIRED_CASE_ORDER:
         raise ForwardResponseFixtureError(
-            "required_case_order does not match the conformance-v1 contract."
+            "required_case_order does not match the conformance contract."
         )
     units = payload.get("units")
     if units != {

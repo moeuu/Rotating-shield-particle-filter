@@ -279,10 +279,10 @@ def _runtime_config_template() -> dict[str, object]:
         "source_rate_model": "detector_cps_1m",
         "candidate_isotopes": list(TEST_ISOTOPES),
         "line_resolved_shield_attenuation": True,
-        "detector_model_id": "test-detector.v2",
-        "shield_model_id": "test-shield.v2",
-        "transport_model_id": "test-transport.v2",
-        "spectrum_model_id": "test-full-spectrum.v2",
+        "detector_model_id": "test-detector",
+        "shield_model_id": "test-shield",
+        "transport_model_id": "test-transport",
+        "spectrum_model_id": "test-full-spectrum",
         "detector_count_radius_m": 0.025,
         "detector_aperture_radius_m": 0.0,
         "detector_aperture_samples": 1,
@@ -309,8 +309,8 @@ def runtime_config() -> dict[str, object]:
 def environment() -> dict[str, object]:
     """Return a small physical room without embedded source truth."""
     return {
-        "environment_model_id": "test-room.v2",
-        "obstacle_model_id": "test-obstacle-empty.v2",
+        "environment_model_id": "test-room",
+        "obstacle_model_id": "test-obstacle-empty",
         "size_x": 2.0,
         "size_y": 2.0,
         "size_z": 1.5,
@@ -373,7 +373,7 @@ def make_measurement_log(
     runtime_overrides: dict[str, object] | None = None,
     station_complete_markers: bool = False,
 ) -> Path:
-    """Write one complete local schema-v2 MeasurementLog."""
+    """Write one complete local MeasurementLog."""
     config = runtime_config()
     if runtime_overrides:
         config.update(runtime_overrides)
@@ -389,7 +389,7 @@ def make_measurement_log(
     )
     write_measurement_log(
         root,
-        run_id="pure-pf-schema-v2-local-fixture",
+        run_id="pure-pf-local-fixture",
         repository_commit=TEST_COMMIT,
         runtime_config=config,
         environment=env,

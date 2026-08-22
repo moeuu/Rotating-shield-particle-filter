@@ -149,6 +149,7 @@ class FullSpectrumGenerativeModel(Protocol):
         *,
         sample_count: int,
         rng: np.random.Generator,
+        action_seeds_a: NDArray[np.int64] | None = None,
     ) -> NDArray[np.int64]:
         """Draw exact future spectra shaped state x sample x view x bin."""
 
@@ -191,6 +192,24 @@ class FullSpectrumGenerativeModel(Protocol):
 
     def manifest_payload(self) -> Mapping[str, object]:
         """Return immutable model and validation provenance."""
+
+
+@runtime_checkable
+class TorchPredictiveFullSpectrumModel(Protocol):
+    """Define the optional device-resident predictive sampling capability."""
+
+    def sample_predictive_torch(
+        self,
+        total_line_contributions_xvsl: object,
+        uncollided_line_contributions_xvsl: object,
+        transport_features_xvslf: object,
+        live_times_s_v: object,
+        *,
+        sample_count: int,
+        generator: object | None = None,
+        action_seeds_a: object | None = None,
+    ) -> object:
+        """Draw exact integer spectra without leaving the Torch device."""
 
 
 def validate_full_spectrum_model(

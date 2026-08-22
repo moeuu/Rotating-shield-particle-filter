@@ -1,4 +1,4 @@
-"""Causal replay tests for the schema-v2 full-spectrum PF boundary."""
+"""Causal replay tests for the full-spectrum PF boundary."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class _Posterior:
     """Provide the minimal immutable posterior interface used by traces."""
 
     def to_dict(self) -> dict[str, object]:
-        """Return a deterministic schema-v2 test posterior."""
+        """Return a deterministic test posterior."""
         return {"schema_version": 2, "cardinality": {"Cs-137": {"0": 1.0}}}
 
 

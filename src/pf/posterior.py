@@ -469,9 +469,8 @@ class PFPosteriorSnapshot:
             or "strength_prior" not in structural_model
         ):
             raise ValueError(
-                "Pure-PF posterior snapshots require a schema-v1 structural "
-                "model over the environment surface with a declared strength "
-                "prior."
+                "Pure-PF posterior snapshots require a structural model over "
+                "the environment surface with a declared strength prior."
             )
         if not isinstance(structural_model["strength_prior"], Mapping):
             raise ValueError(
