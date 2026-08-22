@@ -1571,7 +1571,7 @@ def test_strict_profile_keeps_pf_budget_and_retires_runtime_placeholders() -> No
     assert resolved["adaptive_mission_stop"] is False
     assert resolved["measurement_budget_max_steps"] == 160
     assert resolved["mission_stop_max_poses"] == 20
-    assert resolved["cui_truth_display_mode"] == "evaluation_live"
+    assert resolved["cui_truth_display_mode"] == "hidden"
     assert "detector_height_sampling_mode" not in resolved
     assert "measurement_pose_clearance_enabled" not in resolved
     assert "path_planner" not in resolved

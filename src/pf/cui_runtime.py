@@ -1,25 +1,28 @@
-"""CUI split-view runtime helpers for long-running PF sessions."""
+"""Compatibility wrappers for the shared runtime CUI server API."""
 
 from __future__ import annotations
 
-import os
-import socket
-import subprocess
-import sys
-import threading
-import time
 from collections.abc import Mapping
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from pf.runtime_defaults import DEFAULT_CUI_SPLIT_VIEW_DIR
+from runtime.cui import (
+    CUIDashboardConfig,
+    CUIServerHandle,
+    resolve_cui_public_host,
+    start_cui_server,
+)
+
+from pf.runtime_defaults import (
+    DEFAULT_CUI_SPLIT_VIEW_DIR,
+    DEFAULT_CUI_SPLIT_VIEW_HOST,
+    DEFAULT_CUI_SPLIT_VIEW_PORT,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CUI_VIEW_DIR = ROOT / DEFAULT_CUI_SPLIT_VIEW_DIR
 
-_CUI_HTTP_SERVER: ThreadingHTTPServer | None = None
-_CUI_HTTP_THREAD: threading.Thread | None = None
+_CUIServerKey = tuple[Path, Path, str, int, str]
+_CUI_SERVER_HANDLES: dict[_CUIServerKey, CUIServerHandle] = {}
 
 
 def resolve_cui_split_view_enabled(
@@ -33,130 +36,83 @@ def resolve_cui_split_view_enabled(
     return bool(save_outputs)
 
 
-def _cui_view_relative_url(output_dir: Path, static_root: Path) -> str:
-    """Return the CUI split-view URL path relative to the static root."""
-    try:
-        relative = output_dir.resolve().relative_to(static_root.resolve())
-    except ValueError:
-        return "index.html"
-    if str(relative) == ".":
-        return "index.html"
-    return f"{relative.as_posix()}/index.html"
-
-
-def _tcp_port_is_open(host: str, port: int) -> bool:
-    """Return whether a TCP port already accepts local connections."""
-    connect_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
-    try:
-        with socket.create_connection((connect_host, int(port)), timeout=0.2):
-            return True
-    except OSError:
-        return False
-
-
-def _default_cui_public_host() -> str:
-    """Return a likely browser-reachable host for local CUI visualization."""
-    env_host = os.environ.get("CUI_SPLIT_VIEW_PUBLIC_HOST")
-    if env_host:
-        return env_host
-    try:
-        raw_hosts = subprocess.check_output(
-            ["hostname", "-I"],
-            text=True,
-            timeout=0.2,
+def _nonzero_cui_port(value: object) -> int:
+    """Return a valid legacy PF CUI port without accepting coercion or zero."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("CUI split visualization port must be an integer.")
+    if value < 1 or value > 65535:
+        raise ValueError(
+            "CUI split visualization port must be between 1 and 65535."
         )
-        hosts = [host.strip() for host in raw_hosts.split() if host.strip()]
-        for candidate in hosts:
-            if candidate.startswith("100."):
-                return candidate
-        for candidate in hosts:
-            if candidate and not candidate.startswith(("127.", "172.")):
-                return candidate
-    except (OSError, subprocess.SubprocessError):
-        pass
+    return int(value)
+
+
+def _server_root_and_index(
+    output_dir: Path,
+    static_root: Path,
+) -> tuple[Path, Path]:
+    """Return a serving root and relative index that contain the PF output."""
+    output_path = Path(output_dir).expanduser().resolve()
+    static_path = Path(static_root).expanduser().resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            candidate = str(info[4][0])
-            if candidate.startswith("100."):
-                return candidate
-    except OSError:
-        pass
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(0.2)
-            sock.connect(("8.8.8.8", 80))
-            host = str(sock.getsockname()[0])
-            if host and not host.startswith("127."):
-                return host
-    except OSError:
-        pass
-    return "127.0.0.1"
+        relative_output = output_path.relative_to(static_path)
+    except ValueError:
+        return output_path, Path("index.html")
+    static_path.mkdir(parents=True, exist_ok=True)
+    if relative_output == Path("."):
+        return static_path, Path("index.html")
+    return static_path, relative_output / "index.html"
+
+
+def _close_cui_server_handles() -> None:
+    """Close every shared server retained by this compatibility module."""
+    unique_handles = {id(handle): handle for handle in _CUI_SERVER_HANDLES.values()}
+    _CUI_SERVER_HANDLES.clear()
+    for handle in unique_handles.values():
+        handle.close()
 
 
 def ensure_cui_view_server(
     output_dir: Path,
     *,
-    host: str = "0.0.0.0",
-    port: int = 8877,
+    host: str = DEFAULT_CUI_SPLIT_VIEW_HOST,
+    port: int = DEFAULT_CUI_SPLIT_VIEW_PORT,
     public_host: str | None = None,
     static_root: Path = DEFAULT_CUI_VIEW_DIR,
 ) -> str:
-    """Start or reuse an HTTP server for CUI split visualization."""
-    global _CUI_HTTP_SERVER, _CUI_HTTP_THREAD
-    static_root.mkdir(parents=True, exist_ok=True)
-    port = int(port)
-    relative_url = _cui_view_relative_url(output_dir, static_root)
-    display_host = (
-        _default_cui_public_host()
-        if public_host is None and host in {"0.0.0.0", "::"}
-        else str(public_host or host)
+    """Start or reuse the shared server while preserving the PF string API."""
+    root, index_path = _server_root_and_index(output_dir, static_root)
+    resolved_public_host = resolve_cui_public_host(host, public_host)
+    config = CUIDashboardConfig(
+        serve=True,
+        host=host,
+        port=_nonzero_cui_port(port),
+        public_host=resolved_public_host,
     )
-    url = f"http://{display_host}:{port}/{relative_url}"
-    if _CUI_HTTP_SERVER is not None:
-        return url
-    if _tcp_port_is_open(host, port):
-        return url
-    log_path = static_root / f"http_server_{port}.log"
-    pid_path = static_root / f"http_server_{port}.pid"
-    try:
-        log_handle = log_path.open("ab")
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "http.server",
-                str(port),
-                "--bind",
-                host,
-                "--directory",
-                static_root.as_posix(),
-            ],
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        log_handle.close()
-        pid_path.write_text(f"{int(process.pid)}\n", encoding="utf-8")
-        for _ in range(20):
-            if _tcp_port_is_open(host, port):
-                return url
-            if process.poll() is not None:
-                break
-            time.sleep(0.05)
-    except OSError as exc:
-        print(f"Persistent CUI split visualization server failed: {exc}")
-    handler = partial(SimpleHTTPRequestHandler, directory=static_root.as_posix())
-    try:
-        server = ThreadingHTTPServer((host, port), handler)
-    except OSError as exc:
-        print(f"CUI split visualization URL unavailable on {host}:{port}: {exc}")
-        return output_dir.as_posix()
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="cui-view-http-server",
-        daemon=True,
+    resolved_index = (root / index_path).resolve()
+    server_key = (
+        root,
+        resolved_index,
+        config.host,
+        config.port,
+        str(config.public_host),
     )
-    thread.start()
-    _CUI_HTTP_SERVER = server
-    _CUI_HTTP_THREAD = thread
-    return url
+    existing = _CUI_SERVER_HANDLES.get(server_key)
+    if existing is not None and not getattr(existing, "_closed", False):
+        if existing.url is None:
+            raise RuntimeError("Retained CUI server has no dashboard URL.")
+        return existing.url
+    _CUI_SERVER_HANDLES.pop(server_key, None)
+    handle = start_cui_server(
+        root,
+        index_path=index_path,
+        config=config,
+    )
+    _CUI_SERVER_HANDLES[server_key] = handle
+    if handle.url is None:
+        raise RuntimeError("Shared runtime did not provide a CUI dashboard URL.")
+    return handle.url
+
+
+__all__ = ["ensure_cui_view_server", "resolve_cui_split_view_enabled"]

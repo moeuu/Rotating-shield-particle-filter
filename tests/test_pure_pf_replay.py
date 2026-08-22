@@ -10,13 +10,21 @@ import pytest
 
 from pf.replay import (
     PFReplayError,
+    build_live_estimator,
     measurement_record_to_spectrum_input,
     build_replay_estimator,
     replay_measurement_log,
     replay_records,
     validate_local_full_spectrum_contract,
 )
-from runtime.measurement_log import MeasurementLog, load_measurement_log
+from runtime.measurement_log import (
+    MeasurementLog,
+    MeasurementLogArrayView,
+    MeasurementLogStationView,
+    build_forward_model_manifest,
+    load_measurement_log,
+)
+from runtime.provenance import sha256_json as runtime_sha256_json
 from tests.pure_pf_test_support import make_measurement_log
 
 
@@ -78,6 +86,186 @@ class _RecordingEstimator:
         return _Posterior()
 
 
+def test_live_builder_uses_run_context_without_synthetic_log(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Live construction must resolve its forward model directly from context."""
+    from pf import replay as replay_module
+
+    context = SimpleNamespace(
+        schema_version=2,
+        runtime_config_sha256="a" * 64,
+    )
+    forward = object()
+    estimator = object()
+    calls: dict[str, object] = {}
+
+    class _Resolver:
+        """Capture direct shared-runtime context resolution."""
+
+        @classmethod
+        def from_run_context(
+            cls,
+            actual_context: object,
+            *,
+            run_root: object,
+        ) -> object:
+            """Return the sentinel authenticated forward context."""
+            del cls
+            calls["context"] = actual_context
+            calls["run_root"] = run_root
+            return forward
+
+    def build_from_forward(
+        actual_forward: object,
+        config: object,
+        **kwargs: object,
+    ) -> object:
+        """Capture the thin PF-specific construction adapter."""
+        calls["forward"] = actual_forward
+        calls["config"] = config
+        calls["kwargs"] = kwargs
+        return estimator
+
+    monkeypatch.setattr(replay_module, "ResolvedForwardContext", _Resolver)
+    monkeypatch.setattr(
+        replay_module,
+        "_build_estimator_from_forward_context",
+        build_from_forward,
+    )
+
+    actual = build_live_estimator(
+        context,  # type: ignore[arg-type]
+        {"pure_pf_schema_version": 1},
+        profile="pf_strict",
+        seed=9,
+        runtime_root=tmp_path,
+    )
+
+    assert actual is estimator
+    assert calls["context"] is context
+    assert calls["run_root"] == tmp_path.resolve()
+    assert calls["forward"] is forward
+    assert calls["kwargs"] == {
+        "profile": "pf_strict",
+        "seed": 9,
+        "measurement_log_schema_version": 2,
+        "measurement_runtime_config_sha256": "a" * 64,
+        "measurement_log_digest": "unavailable",
+        "config_hash": None,
+        "inference_isotopes": None,
+    }
+
+
+def test_replay_output_uses_shared_atomic_bundle_without_changing_bytes(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Shared bundle publication must preserve the established result bytes."""
+    from pf import replay as replay_module
+
+    writes: dict[str, bytes] = {}
+    publication: dict[str, object] = {}
+
+    class _Publisher:
+        """Capture shared atomic bundle operations without touching disk."""
+
+        def __init__(self, target: object, *, policy: str) -> None:
+            """Record the target and publication policy."""
+            publication["target"] = target
+            publication["policy"] = policy
+
+        def __enter__(self) -> "_Publisher":
+            """Enter the fake publisher lifetime."""
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: object,
+        ) -> None:
+            """Leave the fake publisher lifetime."""
+            del exc_type, exc, traceback
+
+        def write_bytes(self, name: str, payload: bytes) -> None:
+            """Capture one exact bundle member."""
+            writes[name] = payload
+
+        def publish(self) -> None:
+            """Record successful atomic publication."""
+            publication["published"] = True
+
+    class _OutputEstimator:
+        """Provide the result metadata required by replay publication."""
+
+        estimator_variant = "test"
+        config_hash = "b" * 64
+        resolved_config_hash = "c" * 64
+        candidate_isotopes = ("Cs-137",)
+        isotopes = ("Cs-137",)
+
+        def posterior_snapshot(self) -> SimpleNamespace:
+            """Return one deterministic posterior payload."""
+            return SimpleNamespace(
+                to_dict=lambda: {"structural_model_manifest": {"kind": "test"}}
+            )
+
+        def serialized_state(self) -> bytes:
+            """Return stable final-state bytes."""
+            return b"pf-state"
+
+        def structural_transition_diagnostics(self) -> dict[str, object]:
+            """Return the structural diagnostics required by publication."""
+            return {
+                "posterior_semantics": "test",
+                "structural_kernel_family": "test",
+                "structural_kernel_target_preserving": True,
+                "structural_kernel_exact_rj": True,
+                "reversible_jump_mcmc_used": True,
+            }
+
+        def posterior_predictive_check(self) -> dict[str, object]:
+            """Return one deterministic predictive diagnostic."""
+            return {"status": "test"}
+
+        def joint_isotope_order(self) -> tuple[str, ...]:
+            """Return the active isotope ordering."""
+            return ("Cs-137",)
+
+    log = SimpleNamespace(
+        schema_version=2,
+        log_sha256="d" * 64,
+        resolved_config_sha256="e" * 64,
+        run_manifest={"full_spectrum_contract_hash_sha256": "f" * 64},
+    )
+    monkeypatch.setattr(replay_module, "AtomicBundlePublisher", _Publisher)
+
+    result = replay_module._write_replay_outputs(
+        tmp_path / "result",
+        estimator=_OutputEstimator(),  # type: ignore[arg-type]
+        trace=({"b": 2, "a": 1},),
+        log=log,  # type: ignore[arg-type]
+    )
+
+    assert result == tmp_path / "result"
+    assert publication == {
+        "target": tmp_path / "result",
+        "policy": "create",
+        "published": True,
+    }
+    assert writes["pf_trace.jsonl"] == b'{"a":1,"b":2}\n'
+    assert writes["pf_posterior.json"] == replay_module.canonical_json_bytes(
+        {"structural_model_manifest": {"kind": "test"}}
+    )
+    assert set(writes) == {
+        "pf_posterior.json",
+        "pf_trace.jsonl",
+        "pf_diagnostics.json",
+    }
+
+
 def _with_records(
     log: MeasurementLog,
     records: tuple[object, ...],
@@ -114,6 +302,41 @@ def _as_single_completed_station(log: MeasurementLog) -> MeasurementLog:
     return _with_records(log, tuple(station_records))
 
 
+def _with_authenticated_candidate_isotopes(
+    log: MeasurementLog,
+    isotopes: tuple[str, ...],
+    *,
+    rebuild_forward_manifest: bool,
+) -> MeasurementLog:
+    """Return a synthetic log whose changed isotope selection remains hash-bound."""
+    runtime_config = dict(log.runtime_config)
+    runtime_config["candidate_isotopes"] = list(isotopes)
+    resolved_hash = runtime_sha256_json(runtime_config)
+    run_manifest = dict(log.run_manifest)
+    run_manifest["isotopes"] = list(isotopes)
+    run_manifest["resolved_config_sha256"] = resolved_hash
+    forward_manifest = dict(log.forward_model_manifest)
+    if rebuild_forward_manifest:
+        assert log.path is not None
+        forward_manifest = build_forward_model_manifest(
+            runtime_config=runtime_config,
+            environment=log.environment,
+            obstacle_layout_path=run_manifest.get("obstacle_layout_path"),
+            isotopes=isotopes,
+            repository_commit=run_manifest["repository_commit"],
+            resolved_config_sha256=resolved_hash,
+            run_root=log.path,
+        )
+    return MeasurementLog(
+        run_manifest=run_manifest,
+        runtime_config=runtime_config,
+        environment=log.environment,
+        forward_model_manifest=forward_manifest,
+        records=log.records,
+        path=log.path,
+    )
+
+
 def test_full_spectrum_model_may_cover_a_candidate_isotope_superset(
     tmp_path,
 ) -> None:
@@ -121,17 +344,10 @@ def test_full_spectrum_model_may_cover_a_candidate_isotope_superset(
     log = load_measurement_log(
         make_measurement_log(tmp_path / "measurement-log", record_count=1)
     )
-    run_manifest = dict(log.run_manifest)
-    run_manifest["isotopes"] = ["Co-60", "Cs-137"]
-    runtime_config = dict(log.runtime_config)
-    runtime_config["candidate_isotopes"] = ["Co-60", "Cs-137"]
-    subset_log = MeasurementLog(
-        run_manifest=run_manifest,
-        runtime_config=runtime_config,
-        environment=log.environment,
-        forward_model_manifest=log.forward_model_manifest,
-        records=log.records,
-        path=log.path,
+    subset_log = _with_authenticated_candidate_isotopes(
+        log,
+        ("Co-60", "Cs-137"),
+        rebuild_forward_manifest=True,
     )
 
     model = validate_local_full_spectrum_contract(subset_log)
@@ -141,27 +357,20 @@ def test_full_spectrum_model_may_cover_a_candidate_isotope_superset(
     }
 
 
-def test_full_spectrum_model_must_cover_every_candidate_isotope(
+def test_full_spectrum_context_rejects_unauthenticated_candidate_changes(
     tmp_path,
 ) -> None:
-    """A candidate missing from the authenticated line basis must fail."""
+    """A candidate change without a matching runtime manifest must fail closed."""
     log = load_measurement_log(
         make_measurement_log(tmp_path / "measurement-log", record_count=1)
     )
-    run_manifest = dict(log.run_manifest)
-    run_manifest["isotopes"] = ["Co-60", "Cs-137", "Eu-154", "Xe-133"]
-    runtime_config = dict(log.runtime_config)
-    runtime_config["candidate_isotopes"] = list(run_manifest["isotopes"])
-    invalid_log = MeasurementLog(
-        run_manifest=run_manifest,
-        runtime_config=runtime_config,
-        environment=log.environment,
-        forward_model_manifest=log.forward_model_manifest,
-        records=log.records,
-        path=log.path,
+    invalid_log = _with_authenticated_candidate_isotopes(
+        log,
+        ("Co-60", "Cs-137", "Eu-154", "Xe-133"),
+        rebuild_forward_manifest=False,
     )
 
-    with pytest.raises(PFReplayError, match="do not cover"):
+    with pytest.raises(PFReplayError, match="forward context"):
         validate_local_full_spectrum_contract(invalid_log)
 
 
@@ -245,6 +454,47 @@ def test_replay_groups_records_at_durable_station_boundaries(tmp_path) -> None:
         == log.run_manifest["full_spectrum_contract_hash_sha256"]
         for update in estimator.updates
     )
+
+
+def test_replay_delegates_prefix_grouping_and_alignment_to_runtime_views(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Replay must consume the shared prefix, station, and array view APIs."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=4,
+            station_complete_markers=True,
+        )
+    )
+    calls: list[str] = []
+    original_prefix = MeasurementLog.prefix
+    original_station_view = MeasurementLog.station_view
+    original_array_view = MeasurementLogStationView.array_view
+
+    def prefix(self: MeasurementLog, record_count: int) -> MeasurementLog:
+        """Record shared prefix selection before delegating."""
+        calls.append("prefix")
+        return original_prefix(self, record_count)
+
+    def station_view(self: MeasurementLog) -> MeasurementLogStationView:
+        """Record shared station grouping before delegating."""
+        calls.append("station_view")
+        return original_station_view(self)
+
+    def array_view(self: MeasurementLogStationView) -> MeasurementLogArrayView:
+        """Record shared array alignment before delegating."""
+        calls.append("array_view")
+        return original_array_view(self)
+
+    monkeypatch.setattr(MeasurementLog, "prefix", prefix)
+    monkeypatch.setattr(MeasurementLog, "station_view", station_view)
+    monkeypatch.setattr(MeasurementLogStationView, "array_view", array_view)
+
+    replay_records(log, _RecordingEstimator())
+
+    assert calls == ["prefix", "station_view", "array_view"]
 
 
 def test_replay_reuses_trace_payload_while_estimator_state_is_unchanged(
@@ -390,7 +640,7 @@ def test_replay_rejects_quaternion_drift_within_station(tmp_path) -> None:
         ),
     )
 
-    with pytest.raises(PFReplayError, match="quaternions"):
+    with pytest.raises(PFReplayError, match="pose and quaternion"):
         replay_records(malformed, _RecordingEstimator())
 
 
@@ -411,12 +661,12 @@ def test_replay_rejects_noncanonical_record_ids(tmp_path) -> None:
         ),
     )
 
-    with pytest.raises(PFReplayError, match="record order"):
+    with pytest.raises(PFReplayError, match="measurement-action order"):
         replay_records(malformed, _RecordingEstimator())
 
 
 def test_replay_rejects_detector_pose_outside_logged_environment(tmp_path) -> None:
-    """A finite pose cannot escape the environment bound to the PF support."""
+    """Logged runtime bounds override any conflicting PF solver support."""
     log = load_measurement_log(
         make_measurement_log(
             tmp_path / "measurement-log",
@@ -434,8 +684,11 @@ def test_replay_rejects_detector_pose_outside_logged_environment(tmp_path) -> No
         ),
     )
 
+    estimator = _RecordingEstimator()
+    estimator.pf_config = SimpleNamespace(position_max=(100.0, 100.0, 100.0))
+
     with pytest.raises(PFReplayError, match="outside"):
-        replay_records(malformed, _RecordingEstimator())
+        replay_records(malformed, estimator)
 
 
 def test_replay_rejects_non_string_contract_hash(tmp_path) -> None:

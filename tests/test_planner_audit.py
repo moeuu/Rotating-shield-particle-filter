@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from planning.audit import PlannerAuditWriter, build_planner_audit
 from planning.dss_pp import DSSPPNode, DSSPPResult, ShieldProgram
@@ -90,9 +91,12 @@ def test_planner_audit_captures_domain_shortlist_and_leaders() -> None:
 def test_planner_audit_writer_is_append_only_and_durable(tmp_path: Path) -> None:
     """Each station must produce one independent JSONL audit row."""
     path = tmp_path / "planner.jsonl"
-    writer = PlannerAuditWriter(path)
-    writer.append(build_planner_audit(station_id=0, result=_result()))
-    writer.append(build_planner_audit(station_id=1, result=_result()))
+    with PlannerAuditWriter(path) as writer:
+        writer.append(build_planner_audit(station_id=0, result=_result()))
+        writer.append(build_planner_audit(station_id=1, result=_result()))
+
+    with pytest.raises(ValueError, match="closed"):
+        writer.append(build_planner_audit(station_id=2, result=_result()))
 
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     assert [row["station_id"] for row in rows] == [0, 1]

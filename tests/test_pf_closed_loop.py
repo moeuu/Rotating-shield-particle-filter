@@ -10,8 +10,22 @@ from typing import Any
 import numpy as np
 import pytest
 from measurement.shielding import generate_octant_orientations
+from runtime.adaptive_client import (
+    AdaptiveCandidateSnapshot,
+    AdaptiveCandidatesEvent,
+    AdaptivePublishedEvent,
+    AdaptiveReadyEvent,
+    AdaptiveRecordEvent,
+    AdaptiveRefineRequest,
+    AdaptiveStepRequest,
+)
 
-from pf.closed_loop import PFClosedLoopResult, PFControlBudget, run_pf_closed_loop
+from pf.closed_loop import (
+    PFClosedLoopResult,
+    PFControlBudget,
+    _cui_truth_display_mode,
+    run_pf_closed_loop,
+)
 from planning.configuration import dss_config_from_pf_settings
 
 
@@ -42,6 +56,15 @@ def _context_payload() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("mode", ("evaluation_live", "post_run"))
+def test_estimator_owned_cui_rejects_truth_modes(mode: str) -> None:
+    """Realized truth must be rendered only by a separate evaluator."""
+    with pytest.raises(ValueError, match="separate post-estimation evaluator"):
+        _cui_truth_display_mode({"cui_truth_display_mode": mode})
+
+    assert _cui_truth_display_mode({}) == "hidden"
+
+
 class _FakeRuntimeClient:
     """Return one station while capturing every PF-selected action."""
 
@@ -51,7 +74,9 @@ class _FakeRuntimeClient:
         """Initialize a deterministic one-pose runtime session."""
         del args, kwargs
         type(self).instance = self
+        self.closed = False
         self.requests: list[dict[str, object]] = []
+        self.refinement_requests: list[dict[str, object]] = []
         self.overlay_requests: list[bool] = []
         self.candidates = {
             "candidate_poses_xyz": [[0.5, 0.5, 0.5]],
@@ -73,6 +98,14 @@ class _FakeRuntimeClient:
                 "pb_orientation_index": 7,
             },
         }
+
+    def read_ready_event(self) -> AdaptiveReadyEvent:
+        """Return the typed form of the fake runtime handshake."""
+        return AdaptiveReadyEvent.from_payload(self.read_event())
+
+    def handshake(self) -> AdaptiveReadyEvent:
+        """Return the handshake through the concise runtime API."""
+        return self.read_ready_event()
 
     def request(self, payload: dict[str, object]) -> dict[str, object]:
         """Return an exact integer raw spectrum for the chosen PF action."""
@@ -108,19 +141,35 @@ class _FakeRuntimeClient:
             "candidates": self.candidates,
         }
 
+    def request_step(self, request: AdaptiveStepRequest) -> AdaptiveRecordEvent:
+        """Return the typed form of one fake runtime record response."""
+        return AdaptiveRecordEvent.from_payload(self.request(request.to_payload()))
+
+    def acquire(self, request: AdaptiveStepRequest) -> AdaptiveRecordEvent:
+        """Acquire one record through the concise runtime API."""
+        return self.request_step(request)
+
+    def request_refinement(
+        self,
+        request: AdaptiveRefineRequest,
+    ) -> AdaptiveCandidatesEvent:
+        """Return unchanged typed candidates for a fake refinement request."""
+        self.refinement_requests.append(request.to_payload())
+        return AdaptiveCandidatesEvent.from_payload(
+            {"type": "candidates", "candidates": self.candidates}
+        )
+
+    def refine_candidates(
+        self,
+        request: AdaptiveRefineRequest,
+    ) -> AdaptiveCandidatesEvent:
+        """Refine candidates through the concise runtime API."""
+        return self.request_refinement(request)
+
     def request_cui_overlay(self, *, include_truth: bool) -> dict[str, object]:
-        """Return private truth for the CUI without capturing a PF action."""
+        """Fail if an estimator-owned controller requests realized truth."""
         self.overlay_requests.append(bool(include_truth))
-        return {
-            "type": "cui_overlay",
-            "schema_version": 1,
-            "truth": {
-                "schema_version": 1,
-                "semantics": "evaluation_cui_overlay_only_not_estimator_input",
-                "true_sources": {"Cs-137": [[1.0, 1.0, 1.0]]},
-                "true_strengths": {"Cs-137": [300000.0]},
-            },
-        }
+        raise AssertionError("PF closed loop must not request a truth overlay.")
 
     def finalize(self) -> dict[str, object]:
         """Return the fake immutable log path."""
@@ -129,6 +178,18 @@ class _FakeRuntimeClient:
             "path": "/tmp/pf-live-log",
             "record_count": len(self.requests),
         }
+
+    def finalize_event(self) -> AdaptivePublishedEvent:
+        """Return the typed form of the fake publication response."""
+        return AdaptivePublishedEvent.from_payload(self.finalize())
+
+    def finalize_log(self) -> AdaptivePublishedEvent:
+        """Finalize the log through the concise runtime API."""
+        return self.finalize_event()
+
+    def close(self) -> None:
+        """Record deterministic client cleanup."""
+        self.closed = True
 
     def abort(self) -> None:
         """Expose the runtime cleanup method."""
@@ -221,6 +282,18 @@ class _FakeEstimator:
         }
 
 
+class _FakeLog:
+    """Expose finalized-log fields and the shared station-view surface."""
+
+    path = Path("/tmp/pf-live-log")
+    run_id = "pf-live-test"
+    records = (SimpleNamespace(station_id=0),)
+
+    def station_view(self) -> SimpleNamespace:
+        """Return the station count used by closed-loop result publication."""
+        return SimpleNamespace(station_count=1)
+
+
 def test_pf_budget_requires_one_complete_estimator_station() -> None:
     """The runtime must never receive a truncated PF likelihood block."""
     settings = {
@@ -253,13 +326,12 @@ def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
         "dss_pp": {"program_length": 2},
     }
     planner = dss_config_from_pf_settings(settings, runtime_owned_candidates=True)
-    candidates = {
-        "candidate_poses_xyz": np.asarray(
-            [[0.0, 0.0, 0.5], [2.0, 2.0, 0.5]], dtype=float
-        ),
-        "travel_costs": np.asarray([1.0, 1.0]),
-        "current_pair_id": 63,
-    }
+    candidates = AdaptiveCandidateSnapshot(
+        candidate_poses_xyz=((0.0, 0.0, 0.5), (2.0, 2.0, 0.5)),
+        travel_costs=(1.0, 1.0),
+        allowed_pair_ids=tuple(range(64)),
+        current_pair_id=63,
+    )
 
     result = closed_loop._plan(
         estimator,
@@ -309,11 +381,7 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
         encoding="utf-8",
     )
     estimator = _FakeEstimator()
-    fake_log = SimpleNamespace(
-        path=Path("/tmp/pf-live-log"),
-        run_id="pf-live-test",
-        records=(SimpleNamespace(station_id=0),),
-    )
+    fake_log = _FakeLog()
     monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
     monkeypatch.setattr(
         closed_loop,
@@ -342,6 +410,7 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
     client = _FakeRuntimeClient.instance
     assert isinstance(result, PFClosedLoopResult)
     assert client is not None
+    assert client.closed is True
     assert len(client.requests) == 1
     assert "actions" not in client.requests[0]
     assert client.requests[0]["station_complete"] is True
@@ -400,11 +469,31 @@ def test_pf_closed_loop_replays_runtime_resume_prefix(
         encoding="utf-8",
     )
     estimator = _FakeEstimator()
-    fake_log = SimpleNamespace(
-        path=Path("/tmp/pf-live-log"),
-        run_id="pf-live-test",
-        records=(SimpleNamespace(station_id=0),),
-    )
+    fake_log = _FakeLog()
+    redraws: list[tuple[int, bool, int]] = []
+
+    class _ResumeCUI:
+        """Provide the minimal lifecycle for a resume-only redraw."""
+
+        def close(self) -> None:
+            """Close the fake renderer."""
+
+    resume_cui = _ResumeCUI()
+
+    def capture_resume_frame(
+        visualizer: object,
+        estimator: object,
+        record: object,
+        route_records: list[object],
+        *,
+        elapsed_time_s: float,
+        record_measurement: bool,
+    ) -> None:
+        """Record the posterior-only redraw of the resumed prefix."""
+        del estimator, elapsed_time_s
+        assert visualizer is resume_cui
+        redraws.append((int(record.step_id), record_measurement, len(route_records)))
+
     monkeypatch.setattr(
         closed_loop,
         "AdaptiveRuntimeClient",
@@ -426,6 +515,12 @@ def test_pf_closed_loop_replays_runtime_resume_prefix(
         "_write_final_outputs",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        closed_loop,
+        "_start_cui_split_view",
+        lambda *args, **kwargs: resume_cui,
+    )
+    monkeypatch.setattr(closed_loop, "_publish_cui_frame", capture_resume_frame)
 
     result = run_pf_closed_loop(
         tmp_path / "private-scenario.json",
@@ -442,6 +537,7 @@ def test_pf_closed_loop_replays_runtime_resume_prefix(
     assert result.record_count == 1
     assert result.station_count == 1
     assert result.stop_reason == "maximum_measurement_budget"
+    assert redraws == [(0, False, 1)]
 
 
 def test_detected_isotope_gate_builds_only_active_pf(
@@ -495,11 +591,7 @@ def test_detected_isotope_gate_builds_only_active_pf(
         build_calls.append({"args": args, "kwargs": dict(kwargs)})
         return detector if len(build_calls) == 1 else active_estimator
 
-    fake_log = SimpleNamespace(
-        path=Path("/tmp/pf-live-log"),
-        run_id="pf-live-test",
-        records=(SimpleNamespace(station_id=0),),
-    )
+    fake_log = _FakeLog()
     monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
     monkeypatch.setattr(closed_loop, "build_live_estimator", _build)
     monkeypatch.setattr(closed_loop, "load_measurement_log", lambda path: fake_log)
@@ -556,7 +648,7 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
                 "measurement_live_time_s": 30.0,
                 "cui_split_view": True,
                 "cui_split_view_dir": (tmp_path / "cui").as_posix(),
-                "cui_truth_display_mode": "evaluation_live",
+                "cui_truth_display_mode": "hidden",
                 "dss_pp": {
                     "program_length": 1,
                     "max_programs": 64,
@@ -567,13 +659,10 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
         encoding="utf-8",
     )
     estimator = _FakeEstimator()
-    fake_log = SimpleNamespace(
-        path=Path("/tmp/pf-live-log"),
-        run_id="pf-live-test",
-        records=(SimpleNamespace(station_id=0),),
-    )
+    fake_log = _FakeLog()
     frames: list[object] = []
     truth_updates: list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = []
+    output_messages: list[str] = []
 
     class _FakeCUI:
         """Capture CUI frames without spawning a renderer process."""
@@ -583,6 +672,23 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
         def __init__(self, **kwargs: object) -> None:
             """Record construction arguments for the CUI sidecar."""
             self.kwargs = kwargs
+            output_dir = Path(str(kwargs["output_dir"]))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self.latest_overview_path = (
+                output_dir / "latest_experiment_overview.png"
+            )
+            self.latest_robot_path = output_dir / "latest_robot_2d.png"
+            self.latest_pf_path = output_dir / "latest_pf_3d.png"
+            self.latest_pf_labeled_path = output_dir / "latest_pf_3d_labeled.png"
+            self.latest_spectrum_path = output_dir / "latest_spectrum.png"
+            for path in (
+                self.latest_overview_path,
+                self.latest_robot_path,
+                self.latest_pf_path,
+                self.latest_pf_labeled_path,
+                self.latest_spectrum_path,
+            ):
+                path.write_bytes(path.name.encode())
 
         def update(self, frame: object) -> None:
             """Record one CUI frame."""
@@ -633,14 +739,44 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
         runtime_root=tmp_path,
         pf_config_path=config,
         output_dir=tmp_path / "output",
+        output_hook=output_messages.append,
     )
 
     assert len(frames) == 2
     assert frames[0].record_measurement is True
     assert frames[1].record_measurement is False
     assert np.asarray(frames[0].path_waypoints_xyz).shape == (2, 3)
-    assert len(truth_updates) == 1
-    assert truth_updates[0][0]["Cs-137"].shape == (1, 3)
+    np.testing.assert_array_equal(
+        frames[0].cui_route.measurement_visit_counts,
+        np.asarray([1], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        frames[1].cui_route.measurement_visit_counts,
+        np.asarray([1], dtype=np.int64),
+    )
+    assert truth_updates == []
     client = _FakeRuntimeClient.instance
     assert client is not None
-    assert client.overlay_requests == [True]
+    assert client.overlay_requests == []
+    assert (
+        "CUI split visualization URL: "
+        "http://example.test:8877/index.html"
+    ) in output_messages
+    enabled_message = next(
+        message
+        for message in output_messages
+        if message.startswith("CUI split visualization enabled:")
+    )
+    for filename in (
+        "latest_experiment_overview.png",
+        "latest_robot_2d.png",
+        "latest_pf_3d.png",
+        "latest_pf_3d_labeled.png",
+        "latest_spectrum.png",
+    ):
+        assert filename in enabled_message
+    assert (tmp_path / "output" / "final_experiment_overview.png").is_file()
+    assert (tmp_path / "output" / "final_robot_2d.png").is_file()
+    assert (tmp_path / "output" / "final_pf_3d.png").is_file()
+    assert (tmp_path / "output" / "final_pf_3d_labeled.png").is_file()
+    assert (tmp_path / "output" / "final_spectrum.png").is_file()

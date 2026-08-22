@@ -8,22 +8,18 @@ from dataclasses import fields
 import hashlib
 import json
 from numbers import Real
-import os
 from pathlib import Path
-import shutil
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig
-from measurement.observation_model import build_runtime_observation_model
 from measurement.obstacles import ObstacleGrid
 from measurement.shielding import generate_octant_orientations
 from measurement.surface_charts import (
     build_surface_chart_geometry,
 )
-from pf.full_spectrum import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
 from pf.gpu_utils import preflight_compute_backend
 from pf.isotope_gate import FullSpectrumIsotopeGate
 from pf.profiles import apply_profile_to_config, enforce_pure_runtime_settings
@@ -31,17 +27,17 @@ from pf.provenance import canonical_json_bytes, sha256_json
 from pf.pure_estimator import PurePFEstimator, RotatingShieldPFConfig
 from measurement.surface_atlas import ContinuousSurfaceAtlas
 from runtime.measurement_log import (
-    MEASUREMENT_LOG_SCHEMA_VERSION,
     MeasurementLog,
+    MeasurementLogArrayView,
     MeasurementLogRecord,
-    build_forward_model_manifest,
+    MeasurementLogStationView,
+    MeasurementLogValidationError,
     load_measurement_log,
 )
+from runtime.forward_context import ResolvedForwardContext
+from runtime.artifacts import AtomicBundlePublisher
 from runtime.records import RunContext
-from spectrum.transport_spectral import (
-    GeometryConditionedSpectralModel,
-    geometry_conditioned_model_from_runtime_config,
-)
+from spectrum.transport_spectral import GeometryConditionedSpectralModel
 
 
 class PFReplayError(RuntimeError):
@@ -76,6 +72,19 @@ _PF_REPLAY_PHYSICAL_OVERRIDE_KEYS = frozenset(
         "pf_obstacle_source_extent_samples",
         "pf_source_extent_radius_m",
         "pf_source_extent_samples",
+    }
+)
+PF_SERVICE_CONFIG_KEYS = frozenset(
+    {
+        field.name
+        for field in fields(RotatingShieldPFConfig)
+        if field.name != "position_max"
+    }
+    | set(_PF_CONFIG_ALIASES)
+    | {
+        "cui_truth_display_mode",
+        "estimator_profile",
+        "pure_pf_schema_version",
     }
 )
 
@@ -215,206 +224,31 @@ def load_pf_config(path: str | Path) -> tuple[dict[str, Any], str]:
     )
 
 
-def validate_local_forward_model(log: MeasurementLog) -> None:
-    """Fail closed unless the log identifies the current physical model."""
-    obstacle_layout_path = log.run_manifest.get("obstacle_layout_path")
-    if obstacle_layout_path is not None and not isinstance(
-        obstacle_layout_path,
-        str,
-    ):
-        raise PFReplayError(
-            "run_manifest.obstacle_layout_path must be a string or null."
-        )
+def _resolved_forward_context(log: MeasurementLog) -> ResolvedForwardContext:
+    """Resolve one runtime-authenticated physical context for PF consumption."""
     try:
-        expected = build_forward_model_manifest(
-            runtime_config=log.runtime_config,
-            environment=log.environment,
-            obstacle_layout_path=obstacle_layout_path,
-            isotopes=tuple(log.run_manifest.get("isotopes", ())),
-            repository_commit=log.run_manifest["repository_commit"],
-            resolved_config_sha256=log.run_manifest["resolved_config_sha256"],
-            run_root=log.path,
-        )
+        return ResolvedForwardContext.from_log(log)
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise PFReplayError(
-            "Cannot reconstruct the local forward-model identity."
+            "Cannot resolve the runtime-authenticated forward context: "
+            f"{exc}"
         ) from exc
-    if dict(log.forward_model_manifest) != expected:
-        raise PFReplayError(
-            "Forward-model compatibility check failed; replay refuses a "
-            "missing, unknown, or mismatched model field."
-        )
+
+
+def validate_local_forward_model(log: MeasurementLog) -> None:
+    """Fail closed unless runtime authenticates the complete physical context."""
+    _resolved_forward_context(log)
 
 
 def validate_local_full_spectrum_contract(
     log: MeasurementLog,
 ) -> GeometryConditionedSpectralModel:
-    """Reconstruct and authenticate the sole approved observation law."""
-    raw_schema_version = log.run_manifest.get("schema_version")
-    if (
-        isinstance(raw_schema_version, bool)
-        or not isinstance(raw_schema_version, int)
-        or raw_schema_version != MEASUREMENT_LOG_SCHEMA_VERSION
-    ):
-        raise PFReplayError(
-            "Production replay supports only MeasurementLog schema version "
-            f"{MEASUREMENT_LOG_SCHEMA_VERSION}."
-        )
-    raw_isotopes = log.run_manifest.get("isotopes")
-    if (
-        not isinstance(raw_isotopes, list)
-        or not raw_isotopes
-        or any(not isinstance(value, str) or not value for value in raw_isotopes)
-    ):
-        raise PFReplayError("Replay isotopes must be nonempty exact JSON strings.")
-    isotopes = tuple(raw_isotopes)
-    if len(set(isotopes)) != len(isotopes) or isotopes != tuple(sorted(isotopes)):
-        raise PFReplayError(
-            "Replay isotopes must be nonempty, unique, and canonically sorted."
-        )
-    try:
-        model = geometry_conditioned_model_from_runtime_config(
-            log.runtime_config,
-            run_root=log.path,
-        )
-        model.require_environment_applicable(log.environment)
-    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
-        raise PFReplayError(
-            "Cannot authenticate the logged full-spectrum generative model."
-        ) from exc
-    raw_model_isotopes = [row.get("isotope") for row in model.line_identity]
-    if any(not isinstance(value, str) or not value for value in raw_model_isotopes):
-        raise PFReplayError(
-            "Full-spectrum line isotopes must be nonempty exact strings."
-        )
-    model_isotopes = tuple(sorted(set(raw_model_isotopes)))
-    if not set(isotopes).issubset(model_isotopes):
-        raise PFReplayError(
-            "Full-spectrum line isotopes do not cover the run manifest."
-        )
-    manifest_hash = _sha256_string(
-        log.run_manifest.get("full_spectrum_contract_hash_sha256"),
-        location="run_manifest.full_spectrum_contract_hash_sha256",
-    )
-    if manifest_hash != model.contract_hash_sha256:
-        raise PFReplayError("Run and full-spectrum model contract hashes differ.")
-    axis = np.asarray(model.energy_axis_keV, dtype=np.float64)
-    if (
-        axis.ndim != 1
-        or axis.size < 2
-        or not np.all(np.isfinite(axis))
-        or np.any(np.diff(axis) <= 0.0)
-    ):
-        raise PFReplayError(
-            "Full-spectrum model energy axis must be a finite increasing vector."
-        )
-    bin_width = float(axis[1] - axis[0])
-    canonical_edges = np.concatenate(
-        (axis, np.asarray([axis[-1] + bin_width], dtype=np.float64))
-    )
-    for record_index, record in enumerate(log.records):
-        if (
-            record.metadata.get(FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY)
-            != model.contract_hash_sha256
-        ):
-            raise PFReplayError(
-                f"Full-spectrum model hash mismatch at record {record_index}."
-            )
-        if not np.array_equal(
-            np.asarray(record.energy_bin_edges_keV, dtype=np.float64),
-            canonical_edges,
-        ):
-            raise PFReplayError(
-                f"Full-spectrum energy-bin edges mismatch at record {record_index}."
-            )
-        spectrum = np.asarray(record.spectrum_counts)
-        if (
-            spectrum.dtype != np.int64
-            or spectrum.shape != axis.shape
-            or np.any(spectrum < 0)
-        ):
-            raise PFReplayError(
-                "Replay spectra must be nonnegative int64 arrays on the "
-                f"approved axis (record {record_index})."
-            )
-    return model
-
-
-def _resolved_physical_config(
-    log: MeasurementLog,
-    full_spectrum_model: GeometryConditionedSpectralModel,
-) -> dict[str, Any]:
-    """Return replay physics with the authenticated spectrum asset inlined."""
-    physical_config = dict(log.runtime_config)
-    physical_config.pop("full_spectrum_generative_model_path", None)
-    physical_config.pop("full_spectrum_generative_model_file_sha256", None)
-    physical_config["full_spectrum_generative_model"] = (
-        full_spectrum_model.manifest_payload()
-    )
-    return physical_config
-
-
-def _obstacle_grid_from_log(log: MeasurementLog) -> ObstacleGrid | None:
-    """Build the logged obstacle grid without reading evaluation truth."""
-    if "obstacle_grid" not in log.environment:
-        raise PFReplayError("environment requires explicit obstacle_grid.")
-    raw = log.environment["obstacle_grid"]
-    if raw is None:
-        return None
-    if not isinstance(raw, Mapping):
-        raise PFReplayError("environment.obstacle_grid must be an object or null.")
-    try:
-        return ObstacleGrid.from_dict(dict(raw))
-    except (TypeError, ValueError) as exc:
-        raise PFReplayError("environment.obstacle_grid is incompatible.") from exc
-
-
-def _required_boolean(
-    config: Mapping[str, Any],
-    key: str,
-) -> bool:
-    """Return one exact boolean without accepting truthy strings or integers."""
-    if key not in config:
-        raise PFReplayError(f"{key} must be explicitly logged.")
-    raw = config[key]
-    if not isinstance(raw, bool):
-        raise PFReplayError(f"{key} must be a JSON boolean.")
-    return raw
-
-
-def _environment_config(log: MeasurementLog) -> EnvironmentConfig:
-    """Return strict logged room geometry without numeric coercion."""
-    required = ("size_x", "size_y", "size_z", "detector_position")
-    missing = [key for key in required if key not in log.environment]
-    if missing:
-        raise PFReplayError(
-            "MeasurementLog environment is incomplete: " + ", ".join(missing)
-        )
-    try:
-        return EnvironmentConfig(
-            size_x=log.environment["size_x"],
-            size_y=log.environment["size_y"],
-            size_z=log.environment["size_z"],
-            detector_position=log.environment["detector_position"],
-        )
-    except (TypeError, ValueError) as exc:
-        raise PFReplayError("MeasurementLog environment geometry is invalid.") from exc
-
-
-def _environment_bounds(
-    log: MeasurementLog,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Return source-position bounds from the logged environment."""
-    environment = _environment_config(log)
-    upper = np.asarray(
-        [environment.size_x, environment.size_y, environment.size_z],
-        dtype=np.float64,
-    )
-    return np.zeros(3, dtype=np.float64), upper
+    """Return the runtime-authenticated full-spectrum observation model."""
+    return _resolved_forward_context(log).spectral_model
 
 
 def _surface_atlas_replay_inputs(
-    log: MeasurementLog,
+    environment: EnvironmentConfig,
     *,
     pf_config: RotatingShieldPFConfig,
     obstacle_grid: ObstacleGrid | None,
@@ -422,7 +256,6 @@ def _surface_atlas_replay_inputs(
 ) -> NDArray[np.float64]:
     """Build deterministic PF diagnostics from shared physical geometry."""
     point_count = _DEFAULT_SURFACE_DIAGNOSTIC_POINT_COUNT
-    environment = _environment_config(log)
     try:
         geometry = build_surface_chart_geometry(
             environment,
@@ -509,18 +342,20 @@ def _external_replay_config(
     return merged
 
 
-def build_replay_estimator(
-    log: MeasurementLog,
+def _build_estimator_from_forward_context(
+    forward: ResolvedForwardContext,
     config: Mapping[str, Any],
     *,
     profile: str,
     seed: int,
+    measurement_log_schema_version: int,
+    measurement_runtime_config_sha256: str,
+    measurement_log_digest: str,
     config_hash: str | None = None,
     resolved_config_hash: str | None = None,
-    measurement_log_digest: str | None = None,
     inference_isotopes: Sequence[str] | None = None,
 ) -> PurePFEstimator:
-    """Construct a locally authenticated pure estimator for replay."""
+    """Build one PF from an authenticated shared physical context."""
     if not isinstance(config, Mapping):
         raise PFReplayError("Replay configuration must be an object.")
     if any(not isinstance(key, str) for key in config):
@@ -528,9 +363,19 @@ def build_replay_estimator(
     if not isinstance(profile, str):
         raise PFReplayError("Replay profile must be a JSON string.")
     replay_seed = _json_integer(seed, location="seed", minimum=0)
-    full_spectrum_model = validate_local_full_spectrum_contract(log)
-    validate_local_forward_model(log)
-    isotopes = tuple(log.run_manifest["isotopes"])
+    schema_version = _json_integer(
+        measurement_log_schema_version,
+        location="measurement_log_schema_version",
+        minimum=1,
+    )
+    logged_config_sha256 = _sha256_string(
+        measurement_runtime_config_sha256,
+        location="measurement_runtime_config_sha256",
+    )
+    if not isinstance(measurement_log_digest, str) or not measurement_log_digest:
+        raise PFReplayError("measurement_log_digest must be a nonempty string.")
+    full_spectrum_model = forward.spectral_model
+    isotopes = tuple(forward.isotopes)
     active_isotopes = (
         isotopes
         if inference_isotopes is None
@@ -548,7 +393,7 @@ def build_replay_estimator(
     active_isotopes = tuple(
         isotope for isotope in isotopes if isotope in set(active_isotopes)
     )
-    _, upper = _environment_bounds(log)
+    _, upper = forward.bounds_xyz
     replay_config = _external_replay_config(
         config,
         upper=upper,
@@ -575,28 +420,16 @@ def build_replay_estimator(
         raise PFReplayError(
             "External PF replay configuration is incompatible."
         ) from exc
-    physical_config = _resolved_physical_config(log, full_spectrum_model)
-    try:
-        observation_model = build_runtime_observation_model(
-            physical_config,
-            isotopes=isotopes,
-        )
-    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
-        raise PFReplayError(
-            "Cannot reconstruct the logged PF observation model."
-        ) from exc
-    obstacle_grid = _obstacle_grid_from_log(log)
-    obstacle_enabled = _required_boolean(
-        physical_config,
-        "obstacle_attenuation_enabled",
-    )
+    observation_model = forward.observation_model
+    obstacle_grid = forward.obstacle_grid
+    obstacle_enabled = forward.obstacle_attenuation_enabled
     if obstacle_grid is not None and not obstacle_enabled:
         raise PFReplayError(
             "A logged obstacle grid requires physical obstacle attenuation."
         )
     pf_obstacle_grid = obstacle_grid if obstacle_enabled else None
     surface_diagnostic_points = _surface_atlas_replay_inputs(
-        log,
+        forward.environment,
         pf_config=pf_config,
         obstacle_grid=pf_obstacle_grid,
         obstacle_height_m=observation_model.obstacle_height_m,
@@ -605,18 +438,9 @@ def build_replay_estimator(
         field.name: getattr(pf_config, field.name)
         for field in fields(RotatingShieldPFConfig)
     }
-    logged_config_sha256 = _sha256_string(
-        log.run_manifest.get("resolved_config_sha256"),
-        location="run_manifest.resolved_config_sha256",
-    )
-    effective_measurement_digest = (
-        log.log_sha256
-        if measurement_log_digest is None
-        else str(measurement_log_digest)
-    )
     replay_hash_payload: dict[str, object] = {
         "measurement_runtime_config_sha256": logged_config_sha256,
-        "measurement_log_sha256": effective_measurement_digest,
+        "measurement_log_sha256": measurement_log_digest,
         "pf_config": actual_pf,
         "pf_random_seed": replay_seed,
     }
@@ -666,17 +490,48 @@ def build_replay_estimator(
         source_extent_samples=observation_model.source_extent_samples,
         line_mu_by_isotope=observation_model.line_mu_by_isotope,
         full_spectrum_generative_model=full_spectrum_model,
-        measurement_log_schema_version=log.schema_version,
+        measurement_log_schema_version=schema_version,
         config_hash=input_config_sha256,
         resolved_config_hash=replay_config_sha256,
-        measurement_log_sha256=effective_measurement_digest,
+        measurement_log_sha256=measurement_log_digest,
         random_seed=replay_seed,
     )
-    environment = _environment_config(log)
+    environment = forward.environment
     assert environment.detector_position is not None
     initial_pose = np.asarray(environment.detector_position, dtype=np.float64)
     estimator.add_measurement_pose(initial_pose, reset_filters=False)
     return estimator
+
+
+def build_replay_estimator(
+    log: MeasurementLog,
+    config: Mapping[str, Any],
+    *,
+    profile: str,
+    seed: int,
+    config_hash: str | None = None,
+    resolved_config_hash: str | None = None,
+    measurement_log_digest: str | None = None,
+    inference_isotopes: Sequence[str] | None = None,
+) -> PurePFEstimator:
+    """Construct a locally authenticated pure estimator for replay."""
+    forward = _resolved_forward_context(log)
+    return _build_estimator_from_forward_context(
+        forward,
+        config,
+        profile=profile,
+        seed=seed,
+        measurement_log_schema_version=log.schema_version,
+        measurement_runtime_config_sha256=log.resolved_config_sha256,
+        measurement_log_digest=(
+            log.log_sha256
+            if measurement_log_digest is None
+            else measurement_log_digest
+        ),
+        config_hash=config_hash,
+        resolved_config_hash=resolved_config_hash,
+        inference_isotopes=inference_isotopes,
+    )
 
 
 def build_live_estimator(
@@ -695,43 +550,25 @@ def build_live_estimator(
     caller must bind the published digest before serializing a posterior.
     """
     root = Path(runtime_root).expanduser().resolve()
-    runtime_config = dict(context.runtime_config)
-    contract_hash = runtime_config.get("full_spectrum_contract_hash_sha256")
-    if not isinstance(contract_hash, str):
-        raise PFReplayError(
-            "Adaptive runtime context lacks the full-spectrum contract hash."
+    try:
+        forward = ResolvedForwardContext.from_run_context(
+            context,
+            run_root=root,
         )
-    manifest = {
-        "schema_version": int(context.schema_version),
-        "run_id": str(context.run_id),
-        "record_count": 0,
-        "repository_commit": str(context.repository_commit),
-        "resolved_config_sha256": str(context.runtime_config_sha256),
-        "source_rate_model": str(context.source_rate_model),
-        "source_rate_semantics": dict(context.source_rate_semantics),
-        "isotopes": list(context.isotopes),
-        "environment": dict(context.environment),
-        "obstacle_layout_path": context.obstacle_layout_path,
-        "source_layout_path": None,
-        "sim_backend": str(context.sim_backend),
-        "full_spectrum_contract_hash_sha256": contract_hash,
-        "metadata": dict(context.metadata),
-    }
-    live_log = MeasurementLog(
-        run_manifest=manifest,
-        runtime_config=runtime_config,
-        environment=dict(context.environment),
-        forward_model_manifest=dict(context.forward_model_manifest),
-        records=(),
-        path=root,
-    )
-    return build_replay_estimator(
-        live_log,
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise PFReplayError(
+            "Cannot resolve the live runtime-authenticated forward context: "
+            f"{exc}"
+        ) from exc
+    return _build_estimator_from_forward_context(
+        forward,
         config,
         profile=profile,
         seed=seed,
-        config_hash=config_hash,
+        measurement_log_schema_version=context.schema_version,
+        measurement_runtime_config_sha256=context.runtime_config_sha256,
         measurement_log_digest="unavailable",
+        config_hash=config_hash,
         inference_isotopes=inference_isotopes,
     )
 
@@ -759,8 +596,7 @@ def bind_finalized_measurement_log(
         raise PFReplayError(
             "Final MeasurementLog record count disagrees with the live PF."
         )
-    validate_local_forward_model(log)
-    validate_local_full_spectrum_contract(log)
+    _resolved_forward_context(log)
     actual_pf = {
         field.name: getattr(estimator.pf_config, field.name)
         for field in fields(RotatingShieldPFConfig)
@@ -942,6 +778,29 @@ def _trace_state_payload(
     return _sha256_bytes(serialized), estimator.posterior_snapshot().to_dict()
 
 
+def _validated_replay_views(
+    log: MeasurementLog,
+    record_count: int,
+) -> tuple[MeasurementLogStationView, MeasurementLogArrayView]:
+    """Return shared aligned views for one complete replay prefix."""
+    try:
+        station_view = log.prefix(record_count).station_view()
+        array_view = station_view.array_view()
+    except MeasurementLogValidationError as exc:
+        raise PFReplayError(f"Invalid shared MeasurementLog replay view: {exc}") from exc
+    incomplete = [
+        station.station_id
+        for station in station_view.stations
+        if not station.marked_complete
+    ]
+    if incomplete:
+        raise PFReplayError(
+            f"station_id {incomplete[0]} lacks station_complete at the "
+            "selected replay boundary."
+        )
+    return station_view, array_view
+
+
 def replay_records(
     log: MeasurementLog,
     estimator: PurePFEstimator,
@@ -971,133 +830,59 @@ def replay_records(
         log.run_manifest.get("full_spectrum_contract_hash_sha256"),
         location="run_manifest.full_spectrum_contract_hash_sha256",
     )
-    _, environment_upper = _environment_bounds(log)
-    station_pose: dict[int, NDArray[np.float64]] = {}
-    station_quaternion: dict[int, NDArray[np.float64]] = {}
-    station_pose_index: dict[int, int] = {}
-    trace: list[dict[str, Any]] = []
-    pending_station_id: int | None = None
-    pending_pose_idx: int | None = None
-    pending_records: list[tuple[object, ...]] = []
-    completed_station_ids: set[int] = set()
-    previous_station_id: int | None = None
-    trace_state_payload: tuple[str, dict[str, Any]] | None = None
-
-    for record_index, record in enumerate(log.records[:limit]):
-        step_id = _json_integer(
-            record.step_id,
-            location=f"records[{record_index}].step_id",
-            minimum=0,
+    environment_lower, environment_upper = _resolved_forward_context(log).bounds_xyz
+    station_view, array_view = _validated_replay_views(log, limit)
+    outside = np.flatnonzero(
+        np.any(
+            (array_view.detector_pose_xyz < environment_lower[None, :])
+            | (array_view.detector_pose_xyz > environment_upper[None, :]),
+            axis=1,
         )
-        action_id = _json_integer(
-            record.action_id,
-            location=f"records[{record_index}].action_id",
-            minimum=0,
-        )
-        station_id = _json_integer(
-            record.station_id,
-            location=f"records[{record_index}].station_id",
-            minimum=0,
-        )
-        if step_id != record_index or action_id != record_index:
-            raise PFReplayError(
-                "Replay step_id and action_id must equal zero-based record order."
-            )
-        if previous_station_id is None:
-            if station_id != 0:
-                raise PFReplayError("Replay station_id must start at zero.")
-        elif station_id not in {
-            previous_station_id,
-            previous_station_id + 1,
-        }:
-            raise PFReplayError(
-                "Replay station_id must form contiguous nondecreasing groups."
-            )
-        pose = _finite_vector(
-            record.detector_pose_xyz,
-            length=3,
-            location=f"records[{record_index}].detector_pose_xyz",
-        )
-        quaternion = _finite_vector(
-            record.detector_quat_wxyz,
-            length=4,
-            location=f"records[{record_index}].detector_quat_wxyz",
-        )
-        if np.any(pose < 0.0) or np.any(pose > environment_upper):
-            raise PFReplayError(
-                f"records[{record_index}] detector pose lies outside the "
-                "logged environment."
-            )
-        station_complete = _station_complete(record)
-        spectrum_record = measurement_record_to_spectrum_input(record)
-        if station_id in completed_station_ids:
-            raise PFReplayError(
-                f"station_id {station_id} has records after station_complete."
-            )
-        if pending_station_id is not None and station_id != pending_station_id:
-            raise PFReplayError(
-                f"station_id {pending_station_id} lacks station_complete."
-            )
-        if station_id not in station_pose:
-            if not station_pose and estimator.poses:
-                estimator.poses[-1] = pose.copy()
-                estimator.kernel_cache = None
-                pose_index = len(estimator.poses) - 1
-            else:
-                estimator.add_measurement_pose(pose, reset_filters=False)
-                pose_index = len(estimator.poses) - 1
-            station_pose[station_id] = pose.copy()
-            station_quaternion[station_id] = quaternion.copy()
-            station_pose_index[station_id] = pose_index
-            trace_state_payload = None
-        elif not np.array_equal(station_pose[station_id], pose) or not np.array_equal(
-            station_quaternion[station_id],
-            quaternion,
-        ):
-            raise PFReplayError(
-                f"station_id {station_id} contains multiple detector poses "
-                "or quaternions."
-            )
-        pose_idx = station_pose_index[station_id]
-        if pending_station_id is None:
-            pending_station_id = station_id
-            pending_pose_idx = pose_idx
-        if pre_record_callback is not None:
-            pre_record_callback(estimator, record, record_index, pose_idx)
-            # Callbacks may mutate estimator internals outside the replay API.
-            trace_state_payload = None
-        pending_records.append(spectrum_record)
-
-        if station_complete:
-            assert pending_pose_idx is not None
-            estimator.update_spectrum_station(
-                tuple(pending_records),
-                pose_idx=pending_pose_idx,
-                generative_contract_hash_sha256=contract_hash,
-            )
-            if station_complete_callback is not None:
-                station_complete_callback(estimator, record, record_index)
-            trace_state_payload = None
-            completed_station_ids.add(station_id)
-            pending_station_id = None
-            pending_pose_idx = None
-            pending_records = []
-        if trace_state_payload is None:
-            trace_state_payload = _trace_state_payload(estimator)
-        trace.append(
-            _trace_row(
-                estimator,
-                record,
-                record_index=record_index,
-                state_payload=trace_state_payload,
-            )
-        )
-        previous_station_id = station_id
-    if pending_station_id is not None:
+    )
+    if outside.size:
         raise PFReplayError(
-            f"station_id {pending_station_id} lacks station_complete at the "
-            "selected replay boundary."
+            f"records[{int(outside[0])}] detector pose lies outside the "
+            "logged environment."
         )
+    trace: list[dict[str, Any]] = []
+    trace_state_payload: tuple[str, dict[str, Any]] | None = None
+    for station_index, station in enumerate(station_view.stations):
+        pose = array_view.detector_pose_xyz[station.start_index]
+        if station_index == 0 and estimator.poses:
+            estimator.poses[-1] = pose.copy()
+            estimator.kernel_cache = None
+            pose_index = len(estimator.poses) - 1
+        else:
+            estimator.add_measurement_pose(pose, reset_filters=False)
+            pose_index = len(estimator.poses) - 1
+        trace_state_payload = None
+        pending_records: list[tuple[object, ...]] = []
+        for record_index in range(station.start_index, station.stop_index):
+            record = station_view.records[record_index]
+            if pre_record_callback is not None:
+                pre_record_callback(estimator, record, record_index, pose_index)
+                # Callbacks may mutate estimator internals outside the replay API.
+                trace_state_payload = None
+            pending_records.append(measurement_record_to_spectrum_input(record))
+            if record_index + 1 == station.stop_index:
+                estimator.update_spectrum_station(
+                    tuple(pending_records),
+                    pose_idx=pose_index,
+                    generative_contract_hash_sha256=contract_hash,
+                )
+                if station_complete_callback is not None:
+                    station_complete_callback(estimator, record, record_index)
+                trace_state_payload = None
+            if trace_state_payload is None:
+                trace_state_payload = _trace_state_payload(estimator)
+            trace.append(
+                _trace_row(
+                    estimator,
+                    record,
+                    record_index=record_index,
+                    state_payload=trace_state_payload,
+                )
+            )
     return tuple(trace)
 
 
@@ -1110,16 +895,12 @@ def _write_replay_outputs(
 ) -> Path:
     """Atomically publish the pure-PF replay result contract."""
     target = Path(output_dir)
-    if target.exists():
-        raise FileExistsError(f"Refusing to replace replay output {target}.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
-    if temporary.exists():
-        raise FileExistsError(f"Temporary replay output exists: {temporary}.")
-    temporary.mkdir()
-    try:
+    with AtomicBundlePublisher(target, policy="create") as publisher:
         posterior = estimator.posterior_snapshot().to_dict()
-        (temporary / "pf_posterior.json").write_bytes(canonical_json_bytes(posterior))
+        publisher.write_bytes(
+            "pf_posterior.json",
+            canonical_json_bytes(posterior),
+        )
         trace_bytes = b"".join(
             (
                 json.dumps(
@@ -1133,7 +914,7 @@ def _write_replay_outputs(
             ).encode("utf-8")
             for row in trace
         )
-        (temporary / "pf_trace.jsonl").write_bytes(trace_bytes)
+        publisher.write_bytes("pf_trace.jsonl", trace_bytes)
         final_state = estimator.serialized_state()
         structural = estimator.structural_transition_diagnostics()
         structural_model = dict(posterior["structural_model_manifest"])
@@ -1177,18 +958,16 @@ def _write_replay_outputs(
             ),
             "active_isotopes": list(estimator.joint_isotope_order()),
         }
-        (temporary / "pf_diagnostics.json").write_bytes(
-            canonical_json_bytes(diagnostics)
+        publisher.write_bytes(
+            "pf_diagnostics.json",
+            canonical_json_bytes(diagnostics),
         )
-        os.replace(temporary, target)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
+        publisher.publish()
     return target
 
 
 def replay_measurement_log(
-    measurement_log: str | Path,
+    measurement_log: str | Path | MeasurementLog,
     config: str | Path | Mapping[str, Any],
     *,
     profile: str = "pf_strict",
@@ -1200,7 +979,11 @@ def replay_measurement_log(
     if not isinstance(profile, str):
         raise PFReplayError("Replay profile must be a JSON string.")
     replay_seed = _json_integer(seed, location="seed", minimum=0)
-    log = load_measurement_log(measurement_log)
+    log = (
+        measurement_log
+        if isinstance(measurement_log, MeasurementLog)
+        else load_measurement_log(measurement_log)
+    )
     if isinstance(config, (str, Path)):
         config_path = Path(config)
         try:

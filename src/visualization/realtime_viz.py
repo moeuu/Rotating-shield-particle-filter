@@ -2,24 +2,30 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
-
-from pathlib import Path
 import multiprocessing as mp
 import pickle
 import queue
-import shutil
-import numpy as np
-from numpy.typing import NDArray
-import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Any, Sequence
+
 import matplotlib.colors as mcolors
 import matplotlib.patheffects as path_effects
+import matplotlib.pyplot as plt
+import numpy as np
+from measurement.model import EnvironmentConfig
+from measurement.obstacles import ObstacleGrid
 from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from numpy.typing import NDArray
+from runtime.artifacts import atomic_copy_file
+from runtime.cui import CUIRoute
+from runtime.cui_components import (
+    CUIScene,
+    pf_reference_panel_specs,
+    write_cui_index,
+)
 
-from measurement.obstacles import ObstacleGrid
 from visualization.frame import PFFrame
-
 
 DEFAULT_ISOTOPE_COLORS = {
     "Cs-137": "tab:red",
@@ -42,17 +48,6 @@ def _normalize_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
     if not np.isfinite(total) or total <= 0.0:
         raise ValueError("PF visualization requires strictly positive posterior mass.")
     return w / total
-
-
-def _coerce_path_waypoints(frame: PFFrame) -> NDArray[np.float64]:
-    """Return a valid path waypoint array from a PFFrame."""
-    waypoints = getattr(frame, "path_waypoints_xyz", None)
-    if waypoints is None:
-        return np.zeros((0, 3), dtype=float)
-    arr = np.asarray(waypoints, dtype=float)
-    if arr.ndim != 2 or arr.shape[1] != 3:
-        return np.zeros((0, 3), dtype=float)
-    return arr
 
 
 def _metric_ticks(vmin: float, vmax: float, step: float = 2.0) -> NDArray[np.float64]:
@@ -94,21 +89,6 @@ def _apply_metric_ticks_3d(
     ax.set_xticks(_metric_ticks(float(xlim[0]), float(xlim[1]), step))
     ax.set_yticks(_metric_ticks(float(ylim[0]), float(ylim[1]), step))
     ax.set_zticks(_metric_ticks(float(zlim[0]), float(zlim[1]), step))
-
-
-def _extend_trajectory_history(
-    history: list[NDArray[np.float64]],
-    frame: PFFrame,
-) -> None:
-    """Append obstacle-aware waypoints or the current robot pose to history."""
-    waypoints = _coerce_path_waypoints(frame)
-    if waypoints.size == 0:
-        waypoints = np.asarray(frame.robot_position, dtype=float).reshape(1, 3)
-    for waypoint in waypoints:
-        point = np.asarray(waypoint, dtype=float).reshape(3)
-        if history and float(np.linalg.norm(point - history[-1])) <= 1e-9:
-            continue
-        history.append(point.copy())
 
 
 def _active_display_positions(
@@ -283,6 +263,16 @@ class CUISplitPFVisualizer:
         self.true_sources = true_sources or {}
         self.true_strengths = true_strengths or {}
         self.obstacle_grid = obstacle_grid
+        xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
+        self.cui_scene = CUIScene.from_environment(
+            EnvironmentConfig(
+                size_x=float(xmax - xmin),
+                size_y=float(ymax - ymin),
+                size_z=float(zmax - zmin),
+            ),
+            obstacle_grid,
+            obstacle_height_m=min(2.0, float(zmax - zmin)),
+        )
         self.max_particles_per_isotope = (
             None
             if max_particles_per_isotope is None
@@ -294,9 +284,9 @@ class CUISplitPFVisualizer:
             or self.source_label_neighborhood_m <= 0.0
         ):
             raise ValueError("source_label_neighborhood_m must be positive and finite.")
-        self.trajectory: list[NDArray[np.float64]] = []
         self.path_segments: list[NDArray[np.float64]] = []
         self.measurement_points: list[NDArray[np.float64]] = []
+        self.measurement_station_ids: list[int] = []
         self.measurement_steps: list[int] = []
         self.measurement_visit_counts: list[int] = []
         self.update_index = 0
@@ -335,12 +325,11 @@ class CUISplitPFVisualizer:
 
     def update(self, frame: PFFrame) -> None:
         """Render and save the split CUI views for one PF frame."""
+        if not isinstance(frame.cui_route, CUIRoute):
+            raise TypeError("PF CUI frames require a cumulative runtime CUIRoute.")
         self.update_index += 1
         setattr(frame, "_cui_update_index", int(self.update_index))
-        _extend_trajectory_history(self.trajectory, frame)
-        self._record_path_segment(frame)
-        if bool(getattr(frame, "record_measurement", True)):
-            self._record_measurement_point(frame)
+        self._apply_route(frame.cui_route)
         step = max(0, int(frame.step_index))
         robot_step_path = self.output_dir / f"robot_2d_step_{step:04d}.png"
         overview_step_path = (
@@ -350,41 +339,39 @@ class CUISplitPFVisualizer:
         pf_labeled_step_path = self.output_dir / f"pf_3d_labeled_step_{step:04d}.png"
         spectrum_step_path = self.output_dir / f"spectrum_step_{step:04d}.png"
         self._save_robot_2d(frame, robot_step_path)
-        shutil.copyfile(robot_step_path, self.latest_robot_path)
+        atomic_copy_file(robot_step_path, self.latest_robot_path)
         self._save_experiment_overview(frame, overview_step_path)
-        shutil.copyfile(overview_step_path, self.latest_overview_path)
+        atomic_copy_file(overview_step_path, self.latest_overview_path)
         self._save_pf_3d(
             frame,
             pf_step_path,
             labeled_output_path=pf_labeled_step_path,
         )
-        shutil.copyfile(pf_step_path, self.latest_pf_path)
-        shutil.copyfile(pf_labeled_step_path, self.latest_pf_labeled_path)
+        atomic_copy_file(pf_step_path, self.latest_pf_path)
+        atomic_copy_file(pf_labeled_step_path, self.latest_pf_labeled_path)
         self._save_spectrum(frame, spectrum_step_path)
         if spectrum_step_path.exists():
-            shutil.copyfile(spectrum_step_path, self.latest_spectrum_path)
+            atomic_copy_file(spectrum_step_path, self.latest_spectrum_path)
 
-    def _record_path_segment(self, frame: PFFrame) -> None:
-        """Store the obstacle-aware segment associated with this frame, if any."""
-        waypoints = _coerce_path_waypoints(frame)
-        if waypoints.shape[0] < 2:
-            return
-        if self.path_segments:
-            prev = self.path_segments[-1]
-            if prev.shape == waypoints.shape and np.allclose(prev, waypoints):
-                return
-        self.path_segments.append(waypoints.copy())
-
-    def _record_measurement_point(self, frame: PFFrame) -> None:
-        """Store measurement stations and repeated shield visits for display."""
-        point = np.asarray(frame.robot_position, dtype=float).reshape(3)
-        if self.measurement_points:
-            if float(np.linalg.norm(point - self.measurement_points[-1])) <= 1e-6:
-                self.measurement_visit_counts[-1] += 1
-                return
-        self.measurement_points.append(point.copy())
-        self.measurement_steps.append(int(frame.step_index))
-        self.measurement_visit_counts.append(1)
+    def _apply_route(self, route: CUIRoute) -> None:
+        """Replace renderer route state from one cumulative shared snapshot."""
+        self.path_segments = [
+            np.asarray(segment, dtype=np.float64).copy()
+            for segment in route.travel_path_segments_xyz
+        ]
+        self.measurement_points = [
+            np.asarray(point, dtype=np.float64).copy()
+            for point in route.measurement_stations_xyz
+        ]
+        self.measurement_station_ids = [
+            int(value) for value in route.measurement_station_ids
+        ]
+        self.measurement_steps = [
+            int(value) for value in route.measurement_step_ids
+        ]
+        self.measurement_visit_counts = [
+            int(value) for value in route.measurement_visit_counts
+        ]
 
     def _unique_path_waypoints(self) -> NDArray[np.float64]:
         """Return traversed path waypoints that are not measurement stations."""
@@ -435,19 +422,28 @@ class CUISplitPFVisualizer:
 
     def _station_label(self, station_index: int) -> str:
         """Return a compact station label including repeated shield visits."""
+        station_id = (
+            self.measurement_station_ids[station_index]
+            if station_index < len(self.measurement_station_ids)
+            else station_index
+        )
         visits = (
             self.measurement_visit_counts[station_index]
             if station_index < len(self.measurement_visit_counts)
             else 1
         )
         if visits <= 1:
-            return str(station_index)
-        return f"{station_index}({visits})"
+            return str(station_id)
+        return f"{station_id}({visits})"
 
     def _frame_progress_label(self, frame: PFFrame) -> str:
         """Return a title suffix that separates measurement, render, and station progress."""
         update_idx = int(getattr(frame, "_cui_update_index", 0))
-        station_idx = max(0, len(self.measurement_points) - 1)
+        station_id = (
+            self.measurement_station_ids[-1]
+            if self.measurement_station_ids
+            else 0
+        )
         visit_count = (
             int(self.measurement_visit_counts[-1])
             if self.measurement_visit_counts
@@ -456,57 +452,24 @@ class CUISplitPFVisualizer:
         return (
             f"measurement={int(frame.step_index)} "
             f"update={update_idx} "
-            f"station={station_idx} visit={visit_count} "
+            f"station={station_id} visit={visit_count} "
             f"t={frame.time:.1f}s"
         )
 
     def _write_index_html(self) -> None:
-        """Write the browser page that auto-refreshes the latest PNG files."""
-        truth_status = (
-            "visible (evaluation overlay only; not provided to PF/planner)"
-            if self.true_sources
-            else "hidden"
+        """Publish the shared PF-reference five-panel browser shell."""
+        title = "Rotating Shield PF CUI View"
+        if self.true_sources:
+            title += (
+                " — truth: visible "
+                "(evaluation overlay only; not provided to PF/planner)"
+            )
+        self.index_path = write_cui_index(
+            self.output_dir,
+            pf_reference_panel_specs(),
+            title=title,
+            refresh_interval_ms=2000,
         )
-        html = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Rotating Shield PF CUI View</title>
-  <style>
-    body { margin: 0; background: #111; color: #eee; font-family: sans-serif; }
-    header { padding: 10px 16px; background: #1d1d1d; border-bottom: 1px solid #333; }
-    main { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px; }
-    section { background: #181818; border: 1px solid #333; padding: 8px; }
-    h2 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
-    img { width: 100%; height: calc(50vh - 70px); object-fit: contain; background: #fff; }
-    .wide { grid-column: 1 / span 2; }
-  </style>
-</head>
-<body>
-  <header>Rotating Shield PF CUI View - auto refresh every 2 s - truth: __TRUTH_STATUS__</header>
-  <main>
-    <section class="wide overview"><h2>RA-L experiment overview</h2><img id="overview" src="latest_experiment_overview.png"></section>
-    <section><h2>Robot position 2D</h2><img id="robot" src="latest_robot_2d.png"></section>
-    <section><h2>Particle filter 3D</h2><img id="pf" src="latest_pf_3d.png"></section>
-    <section class="wide"><h2>Particle filter 3D with source labels</h2><img id="pf-labeled" src="latest_pf_3d_labeled.png"></section>
-    <section class="wide"><h2>Raw native full spectrum</h2><img id="spectrum" src="latest_spectrum.png"></section>
-  </main>
-  <script>
-    function refresh() {
-      const t = Date.now();
-      document.getElementById("overview").src = "latest_experiment_overview.png?t=" + t;
-      document.getElementById("robot").src = "latest_robot_2d.png?t=" + t;
-      document.getElementById("pf").src = "latest_pf_3d.png?t=" + t;
-      document.getElementById("pf-labeled").src = "latest_pf_3d_labeled.png?t=" + t;
-      document.getElementById("spectrum").src = "latest_spectrum.png?t=" + t;
-    }
-    setInterval(refresh, 2000);
-  </script>
-</body>
-</html>
-"""
-        html = html.replace("__TRUTH_STATUS__", truth_status)
-        self.index_path.write_text(html, encoding="utf-8")
 
     def _save_overview_placeholder(self, output_path: Path) -> None:
         """Save a placeholder RA-L overview panel until the first frame arrives."""
@@ -545,17 +508,14 @@ class CUISplitPFVisualizer:
         plt.close(fig)
 
     def _draw_obstacles_2d(self, ax: plt.Axes) -> None:
-        """Draw the obstacle grid as 2D filled rectangles."""
-        if self.obstacle_grid is None:
-            return
-        from matplotlib.patches import Rectangle
+        """Draw canonical runtime obstacle footprints on a 2-D axis."""
+        from matplotlib.patches import Polygon
 
-        for x0, x1, y0, y1 in self.obstacle_grid.blocked_bounds():
+        for footprint in self.cui_scene.obstacle_footprints_xy:
             ax.add_patch(
-                Rectangle(
-                    (x0, y0),
-                    x1 - x0,
-                    y1 - y0,
+                Polygon(
+                    footprint,
+                    closed=True,
                     facecolor="black",
                     edgecolor="none",
                     alpha=0.75,
@@ -563,19 +523,12 @@ class CUISplitPFVisualizer:
             )
 
     def _draw_obstacles_3d(self, ax: plt.Axes) -> None:
-        """Draw obstacle cells as flat dark floor patches in the 3D PF view."""
-        if self.obstacle_grid is None:
-            return
+        """Draw canonical runtime obstacles as flat 3-D floor patches."""
         patches = []
         z0 = float(self.world_bounds[4])
-        for x0, x1, y0, y1 in self.obstacle_grid.blocked_bounds():
+        for footprint in self.cui_scene.obstacle_footprints_xy:
             patches.append(
-                [
-                    (x0, y0, z0),
-                    (x1, y0, z0),
-                    (x1, y1, z0),
-                    (x0, y1, z0),
-                ]
+                [(float(x), float(y), z0) for x, y in footprint]
             )
         if not patches:
             return

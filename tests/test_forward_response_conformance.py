@@ -13,9 +13,9 @@ from measurement.observation_model import (
     build_runtime_observation_model,
     continuous_kernel_from_observation_model,
 )
+from runtime.forward_conformance import ForwardConformanceFixture
 from pf.forward_response_conformance import (
     _REQUIRED_CASE_ORDER,
-    _obstacle_grid,
     evaluate_forward_response_fixture,
 )
 
@@ -63,6 +63,7 @@ def _fixture() -> dict[str, Any]:
 def _scalar_response_oracle(payload: Mapping[str, Any]) -> np.ndarray:
     """Evaluate the former scalar case ordering as a test-only oracle."""
     isotopes = tuple(str(value) for value in payload["isotopes"])
+    fixture = ForwardConformanceFixture.from_payload(payload)
     model = build_runtime_observation_model(
         {
             "source_rate_model": "detector_cps_1m",
@@ -70,11 +71,11 @@ def _scalar_response_oracle(payload: Mapping[str, Any]) -> np.ndarray:
         },
         isotopes=isotopes,
     )
-    obstacles = tuple(payload["obstacles"])
+    obstacles = fixture.obstacles
     kernels = {
-        str(obstacle["obstacle_id"]): continuous_kernel_from_observation_model(
+        obstacle.obstacle_id: continuous_kernel_from_observation_model(
             model,
-            obstacle_grid=_obstacle_grid(obstacle, isotopes=isotopes),
+            obstacle_grid=fixture.obstacle_grid(obstacle.obstacle_id),
             use_gpu=False,
         )
         for obstacle in obstacles
@@ -88,7 +89,7 @@ def _scalar_response_oracle(payload: Mapping[str, Any]) -> np.ndarray:
                     for source in payload["source_points"]:
                         for obstacle in obstacles:
                             values.append(
-                                kernels[str(obstacle["obstacle_id"])].expected_counts_pair(
+                                kernels[obstacle.obstacle_id].expected_counts_pair(
                                     isotope=isotope,
                                     detector_pos=np.asarray(pose["xyz"], dtype=np.float64),
                                     sources=np.asarray(

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import json
-import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -14,35 +14,44 @@ from typing import Any
 import numpy as np
 from measurement.obstacles import ObstacleGrid
 from runtime.adaptive_client import (
+    AdaptiveCandidateSnapshot,
+    AdaptiveRefineRequest,
     AdaptiveRuntimeClient,
-    adaptive_step_request,
+    AdaptiveStepRequest,
     candidate_index_for_pose,
-    parse_adaptive_record,
-    parse_adaptive_resume_prefix,
-    parse_candidate_snapshot,
-    parse_run_context,
 )
-from runtime.measurement_log import load_measurement_log
+from runtime.cui import CUIRoute, CUI_URL_MESSAGE_PREFIX, cui_route_from_records
+from runtime.cui_components import CUITruthDisplayMode
+from runtime.artifacts import DurableJSONLWriter
+from runtime.measurement_log import (
+    MeasurementLogRecord,
+    MeasurementLogView,
+    load_measurement_log,
+)
 from runtime.provenance import canonical_json_bytes
 
 from baselines.ral_ablation.path_policies import select_baseline_next_pose
 from baselines.ral_ablation.shield_policies import (
     select_baseline_shield_program,
 )
+from pf.atomic_io import atomic_write_bytes
 from pf.cui_runtime import (
     ensure_cui_view_server,
     resolve_cui_split_view_enabled,
 )
-from pf.atomic_io import atomic_write_bytes
+from pf.isotope_gate import FullSpectrumIsotopeGate
 from pf.live_resume import reconstruct_live_resume_state
-
 from pf.replay import (
     bind_finalized_measurement_log,
     build_live_estimator,
     load_pf_config,
     measurement_record_to_spectrum_input,
 )
-from pf.isotope_gate import FullSpectrumIsotopeGate
+from pf.runtime_defaults import (
+    DEFAULT_CUI_SPLIT_VIEW_DIR,
+    DEFAULT_CUI_SPLIT_VIEW_HOST,
+    DEFAULT_CUI_SPLIT_VIEW_PORT,
+)
 from planning.audit import PlannerAuditWriter, build_planner_audit
 from planning.configuration import dss_config_from_pf_settings
 from planning.dss_pp import (
@@ -52,12 +61,11 @@ from planning.dss_pp import (
     build_shield_program_library,
     select_dss_pp_next_station,
 )
-from pf.runtime_defaults import DEFAULT_CUI_SPLIT_VIEW_DIR
+from visualization.artifacts import publish_final_cui_split_views
 from visualization.realtime_viz import (
     AsyncCUISplitPFVisualizer,
     build_frame_from_pf,
 )
-from visualization.artifacts import publish_final_cui_split_views
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -77,21 +85,6 @@ def _finite_positive(value: object, *, name: str) -> float:
     if not np.isfinite(parsed) or parsed <= 0.0:
         raise ValueError(f"{name} must be finite and positive.")
     return parsed
-
-
-def _strict_fields(
-    payload: Mapping[str, object],
-    expected: set[str],
-    *,
-    name: str,
-) -> None:
-    """Require an exact controller-facing protocol schema."""
-    actual = set(payload)
-    if actual != expected:
-        raise ValueError(
-            f"{name} fields disagree: missing={sorted(expected - actual)}, "
-            f"unknown={sorted(actual - expected)}."
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,27 +233,6 @@ def _height_bounds(context: object) -> tuple[float, float] | None:
     )
 
 
-def _append_jsonl(path: Path, payload: Mapping[str, object]) -> None:
-    """Durably append one finite JSON object to a controller trace."""
-    line = (
-        json.dumps(
-            dict(payload),
-            sort_keys=True,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        )
-        + "\n"
-    ).encode("utf-8")
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    try:
-        if os.write(descriptor, line) != len(line):
-            raise OSError("PF controller trace append was incomplete.")
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _strict_cui_bool(
     settings: Mapping[str, object],
     key: str,
@@ -275,7 +247,7 @@ def _strict_cui_bool(
 
 def _strict_cui_host(settings: Mapping[str, object]) -> str:
     """Return the configured network bind host for the CUI server."""
-    value = settings.get("cui_split_view_host", "0.0.0.0")
+    value = settings.get("cui_split_view_host", DEFAULT_CUI_SPLIT_VIEW_HOST)
     if not isinstance(value, str) or not value.strip():
         raise TypeError("cui_split_view_host must be a nonempty string.")
     return value
@@ -283,7 +255,7 @@ def _strict_cui_host(settings: Mapping[str, object]) -> str:
 
 def _strict_cui_port(settings: Mapping[str, object]) -> int:
     """Return a valid TCP port for the CUI server."""
-    value = settings.get("cui_split_view_port", 8877)
+    value = settings.get("cui_split_view_port", DEFAULT_CUI_SPLIT_VIEW_PORT)
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("cui_split_view_port must be an integer.")
     if value < 1 or value > 65535:
@@ -292,16 +264,22 @@ def _strict_cui_port(settings: Mapping[str, object]) -> int:
 
 
 def _cui_truth_display_mode(settings: Mapping[str, object]) -> str:
-    """Return the requested evaluation-truth display mode for the CUI only."""
-    value = settings.get("cui_truth_display_mode", "post_run")
+    """Require a truth-free CUI inside the estimator-owned controller."""
+    value = settings.get("cui_truth_display_mode", "hidden")
     if not isinstance(value, str):
         raise TypeError("cui_truth_display_mode must be a string.")
-    mode = value.strip()
-    if mode not in {"hidden", "evaluation_live", "post_run"}:
+    try:
+        mode = CUITruthDisplayMode(value.strip())
+    except ValueError as exc:
         raise ValueError(
             "cui_truth_display_mode must be hidden, evaluation_live, or post_run."
+        ) from exc
+    if mode is not CUITruthDisplayMode.HIDDEN:
+        raise ValueError(
+            "PF closed-loop CUI must keep truth hidden; truth overlays belong to "
+            "a separate post-estimation evaluator."
         )
-    return mode
+    return mode.value
 
 
 def _cui_output_dir(settings: Mapping[str, object]) -> Path:
@@ -345,7 +323,8 @@ def _start_cui_split_view(
     output_hook(
         "CUI split visualization enabled: "
         f"{visualizer.index_path.as_posix()} "
-        "(latest_robot_2d.png, latest_pf_3d.png)"
+        "(latest_experiment_overview.png, latest_robot_2d.png, "
+        "latest_pf_3d.png, latest_pf_3d_labeled.png, latest_spectrum.png)"
     )
     output_hook("CUI split visualization rendering: async process")
     if _strict_cui_bool(settings, "cui_split_view_serve", True):
@@ -362,77 +341,29 @@ def _start_cui_split_view(
             port=_strict_cui_port(settings),
             public_host=(None if public_host_raw is None else str(public_host_raw)),
         )
-        output_hook(f"CUI split visualization URL: {split_url}")
+        output_hook(f"{CUI_URL_MESSAGE_PREFIX} {split_url}")
     return visualizer
-
-
-def _truth_arrays_from_cui_overlay(
-    payload: Mapping[str, object],
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-    """Return CUI-only truth arrays from the private runtime overlay payload."""
-    truth = payload.get("truth")
-    if truth is None:
-        return {}, {}
-    if not isinstance(truth, Mapping):
-        raise TypeError("CUI overlay truth must be an object or null.")
-    sources_raw = truth.get("true_sources")
-    strengths_raw = truth.get("true_strengths")
-    if not isinstance(sources_raw, Mapping) or not isinstance(
-        strengths_raw,
-        Mapping,
-    ):
-        raise TypeError("CUI overlay truth sources and strengths must be objects.")
-    if set(sources_raw) != set(strengths_raw):
-        raise ValueError("CUI overlay truth isotope sets differ.")
-    sources: dict[str, np.ndarray] = {}
-    strengths: dict[str, np.ndarray] = {}
-    for isotope, values in sources_raw.items():
-        positions = np.asarray(values, dtype=np.float64)
-        if positions.size == 0:
-            positions = positions.reshape((0, 3))
-        if (
-            positions.ndim != 2
-            or positions.shape[1] != 3
-            or np.any(~np.isfinite(positions))
-        ):
-            raise ValueError("CUI overlay truth positions must have shape (N, 3).")
-        strength = np.asarray(strengths_raw[isotope], dtype=np.float64).reshape(-1)
-        if strength.shape != (positions.shape[0],) or np.any(~np.isfinite(strength)):
-            raise ValueError("CUI overlay truth strengths must align with sources.")
-        sources[str(isotope)] = positions
-        strengths[str(isotope)] = strength
-    return sources, strengths
-
-
-def _record_path_waypoints(record: object) -> np.ndarray | None:
-    """Return truth-free travel waypoints from one runtime record metadata."""
-    metadata = getattr(record, "metadata", {})
-    if not isinstance(metadata, Mapping):
-        return None
-    raw = metadata.get("travel_waypoints_xyz")
-    if raw is None:
-        return None
-    waypoints = np.asarray(raw, dtype=np.float64)
-    if (
-        waypoints.ndim != 2
-        or waypoints.shape[1] != 3
-        or np.any(~np.isfinite(waypoints))
-    ):
-        raise ValueError("record.metadata.travel_waypoints_xyz must have shape (N, 3).")
-    if waypoints.shape[0] < 2:
-        return None
-    return waypoints.copy()
 
 
 def _publish_cui_frame(
     visualizer: AsyncCUISplitPFVisualizer,
     estimator: object,
-    record: object,
+    record: MeasurementLogRecord,
+    route_records: list[MeasurementLogRecord],
     *,
     elapsed_time_s: float,
     record_measurement: bool,
 ) -> None:
     """Queue one truth-free PF CUI frame without changing PF state."""
+    if record_measurement:
+        route: CUIRoute = cui_route_from_records((*route_records, record))
+        route_records.append(record)
+    else:
+        if not route_records or route_records[-1].step_id != record.step_id:
+            raise ValueError(
+                "Posterior-only CUI redraw must reference the latest routed record."
+            )
+        route = cui_route_from_records(route_records)
     energy_edges = np.asarray(record.energy_bin_edges_keV, dtype=np.float64)
     spectrum_counts = np.asarray(record.spectrum_counts, dtype=np.int64)
     if energy_edges.ndim != 1 or energy_edges.size != spectrum_counts.size + 1:
@@ -460,9 +391,9 @@ def _publish_cui_frame(
         spectrum_energy_keV=0.5 * (energy_edges[:-1] + energy_edges[1:]),
         spectrum_counts=spectrum_counts,
     )
-    path_waypoints = _record_path_waypoints(record)
-    if path_waypoints is not None:
-        frame.path_waypoints_xyz = path_waypoints
+    if route.travel_path_segments_xyz:
+        frame.path_waypoints_xyz = route.travel_path_segments_xyz[-1].copy()
+    frame.cui_route = route
     frame.record_measurement = bool(record_measurement)
     visualizer.update(frame)
 
@@ -648,7 +579,7 @@ def _assimilate_station(
 
 def _plan(
     estimator: object,
-    candidates: Mapping[str, object],
+    candidates: AdaptiveCandidateSnapshot,
     *,
     current_pose: np.ndarray,
     visited_poses: Sequence[np.ndarray],
@@ -662,7 +593,7 @@ def _plan(
 ) -> DSSPPResult:
     """Rank runtime actions under the declared proposed or baseline policy."""
     candidate_poses = np.asarray(
-        candidates["candidate_poses_xyz"],
+        candidates.candidate_poses_xyz,
         dtype=np.float64,
     )
     visited_array = np.asarray(visited_poses, dtype=np.float64)
@@ -673,7 +604,7 @@ def _plan(
         planner,
         settings,
         pose_index=station_index,
-        current_pair_id=int(candidates["current_pair_id"]),
+        current_pair_id=candidates.current_pair_id,
     )
     baseline_path = select_baseline_next_pose(
         settings.get("baseline_path_policy"),
@@ -712,7 +643,7 @@ def _plan(
         estimator,
         candidate_poses,
         current_pose,
-        current_pair_id=int(candidates["current_pair_id"]),
+        current_pair_id=candidates.current_pair_id,
         visited_poses_xyz=np.asarray(visited_poses, dtype=np.float64),
         map_api=obstacle_grid,
         bounds_xyz=room_bounds,
@@ -720,7 +651,7 @@ def _plan(
         config=active_planner,
         rng=rng,
         candidate_motion_times_s=np.asarray(
-            candidates["travel_costs"],
+            candidates.travel_costs,
             dtype=np.float64,
         ),
     )
@@ -736,7 +667,7 @@ def _planner_rng(seed: int, station_index: int) -> np.random.Generator:
 def _refine_and_replan(
     client: AdaptiveRuntimeClient,
     estimator: object,
-    candidates: Mapping[str, object],
+    candidates: AdaptiveCandidateSnapshot,
     initial: DSSPPResult,
     *,
     refinement_top_k: int,
@@ -749,10 +680,10 @@ def _refine_and_replan(
     rng: np.random.Generator,
     settings: Mapping[str, Any],
     station_index: int,
-) -> tuple[dict[str, object], DSSPPResult]:
+) -> tuple[AdaptiveCandidateSnapshot, DSSPPResult]:
     """Optionally request runtime-owned local poses and rerank them exactly."""
     if refinement_top_k <= 0 or settings.get("baseline_path_policy") is not None:
-        return dict(candidates), initial
+        return candidates, initial
     ranked = initial.diagnostics.get("ranked_nodes", [])
     seed_indices: list[int] = []
     for node in ranked:
@@ -764,12 +695,11 @@ def _refine_and_replan(
         if len(seed_indices) >= refinement_top_k:
             break
     if not seed_indices:
-        return dict(candidates), initial
-    event = client.request({"type": "refine", "candidate_indices": seed_indices})
-    _strict_fields(event, {"type", "candidates"}, name="refine event")
-    if event.get("type") != "candidates":
-        raise ValueError("Shared runtime did not return refined candidates.")
-    refined = parse_candidate_snapshot(event["candidates"])
+        return candidates, initial
+    event = client.refine_candidates(
+        AdaptiveRefineRequest.from_indices(seed_indices)
+    )
+    refined = event.candidates
     result = _plan(
         estimator,
         refined,
@@ -861,50 +791,35 @@ def run_pf_closed_loop(
     if target.exists():
         raise FileExistsError(f"Refusing to replace PF output {target}.")
     target.mkdir(parents=True)
-    planner_writer = PlannerAuditWriter(target / "planner_audit.jsonl")
-    controller_trace = target / "pf_station_trace.jsonl"
-    client = AdaptiveRuntimeClient(
-        scenario_path,
-        runtime_root=runtime_root,
-        private_scene_profile=private_scene_profile,
-        resume_stage_path=resume_stage_path,
-        resume_compatibility_path=resume_compatibility_path,
-        output_hook=output_hook,
-    )
+    resources = ExitStack()
+    client: AdaptiveRuntimeClient | None = None
     estimator = None
     cui_split_viz: AsyncCUISplitPFVisualizer | None = None
     completed_result: PFClosedLoopResult | None = None
     cui_frame_rendered = False
+    cui_route_records: list[MeasurementLogRecord] = []
     try:
-        ready = client.read_event()
-        schema_version = ready.get("schema_version")
-        if schema_version == 1:
-            _strict_fields(
-                ready,
-                {"type", "schema_version", "context", "candidates", "bootstrap"},
-                name="ready event",
-            )
-        elif schema_version == 2:
-            _strict_fields(
-                ready,
-                {"type", "schema_version", "context", "candidates", "resume"},
-                name="resume ready event",
-            )
-        else:
-            raise ValueError("Shared runtime returned an incompatible handshake.")
-        if ready.get("type") != "ready":
-            raise ValueError("Shared runtime did not return a ready handshake.")
-        context = parse_run_context(ready["context"])
-        candidates = parse_candidate_snapshot(ready["candidates"])
-        bootstrap = ready.get("bootstrap")
-        if schema_version == 1:
-            if not isinstance(bootstrap, Mapping):
-                raise TypeError("Runtime bootstrap must be a mapping.")
-            _strict_fields(
-                bootstrap,
-                {"candidate_index", "fe_orientation_index", "pb_orientation_index"},
-                name="bootstrap",
-            )
+        planner_writer = PlannerAuditWriter(target / "planner_audit.jsonl")
+        resources.callback(planner_writer.close)
+        controller_writer = DurableJSONLWriter(
+            target / "pf_station_trace.jsonl",
+            mode=0o644,
+        )
+        resources.callback(controller_writer.close)
+        client = AdaptiveRuntimeClient(
+            scenario_path,
+            runtime_root=runtime_root,
+            private_scene_profile=private_scene_profile,
+            resume_stage_path=resume_stage_path,
+            resume_compatibility_path=resume_compatibility_path,
+            output_hook=output_hook,
+        )
+        resources.callback(client.close)
+        ready = client.handshake()
+        schema_version = ready.schema_version
+        context = ready.context
+        candidates = ready.candidates
+        bootstrap = ready.bootstrap
         detected_only_raw = settings.get(
             "pf_detected_isotopes_only",
             settings.get("detected_isotopes_only", False),
@@ -945,7 +860,7 @@ def run_pf_closed_loop(
         obstacle_grid = _obstacle_grid(context)
         room_bounds = _bounds(context)
         height_bounds = _height_bounds(context)
-        cui_truth_mode = _cui_truth_display_mode(settings)
+        _cui_truth_display_mode(settings)
         cui_split_viz = _start_cui_split_view(
             settings,
             isotopes=getattr(context, "isotopes"),
@@ -953,15 +868,6 @@ def run_pf_closed_loop(
             obstacle_grid=obstacle_grid,
             output_hook=output_hook,
         )
-        if cui_split_viz is not None and cui_truth_mode == "evaluation_live":
-            truth_sources, truth_strengths = _truth_arrays_from_cui_overlay(
-                client.request_cui_overlay(include_truth=True)
-            )
-            cui_split_viz.set_truth(truth_sources, truth_strengths)
-            output_hook(
-                "CUI split visualization truth overlay: evaluation_live "
-                "(private runtime CUI channel; not estimator/planner input)"
-            )
         contract_hash = str(
             context.runtime_config["full_spectrum_contract_hash_sha256"]
         )
@@ -972,15 +878,14 @@ def run_pf_closed_loop(
         stop_reason = "maximum_station_budget"
         continue_acquisition = True
         if schema_version == 1:
-            assert isinstance(bootstrap, Mapping)
+            assert bootstrap is not None
             current_pose = np.asarray(
-                candidates["candidate_poses_xyz"][int(bootstrap["candidate_index"])],
+                candidates.candidate_poses_xyz[bootstrap.candidate_index],
                 dtype=np.float64,
             )
             visited = []
             record_count = 0
             cui_elapsed_time_s = 0.0
-            last_cui_record: object | None = None
             station_id = 0
             station_history = []
             planner_writer.append(
@@ -1022,9 +927,15 @@ def run_pf_closed_loop(
                 }
             )
         else:
-            prefix = parse_adaptive_resume_prefix(ready["resume"])
-            resume_state = reconstruct_live_resume_state(
+            prefix = ready.resume
+            assert prefix is not None
+            resume_station_view = MeasurementLogView.from_records(
+                context,
                 prefix.records,
+            ).station_view()
+            cui_route_records.extend(resume_station_view.records)
+            resume_state = reconstruct_live_resume_state(
+                resume_station_view,
                 next_station_id=prefix.next_station_id,
                 expected_views_per_station=budget.views_per_station,
             )
@@ -1036,11 +947,20 @@ def run_pf_closed_loop(
                     station_id=prefix_station_id,
                     contract_hash=contract_hash,
                 )
+            if cui_split_viz is not None:
+                _publish_cui_frame(
+                    cui_split_viz,
+                    estimator,
+                    resume_station_view.records[-1],
+                    cui_route_records,
+                    elapsed_time_s=resume_state.elapsed_time_s,
+                    record_measurement=False,
+                )
+                cui_frame_rendered = True
             current_pose = resume_state.current_pose.copy()
             visited = [pose.copy() for pose in resume_state.visited_poses]
             record_count = resume_state.record_count
             cui_elapsed_time_s = resume_state.elapsed_time_s
-            last_cui_record = prefix.records[-1]
             station_id = resume_state.next_station_id
             if record_count >= budget.max_measurements:
                 stop_reason = "maximum_measurement_budget"
@@ -1107,8 +1027,8 @@ def run_pf_closed_loop(
             for view_index, pair_id in enumerate(current_program.pair_ids):
                 candidate_index = candidate_index_for_pose(candidates, current_pose)
                 fe_index, pb_index = divmod(int(pair_id), 8)
-                event = client.request(
-                    adaptive_step_request(
+                event = client.acquire(
+                    AdaptiveStepRequest(
                         candidate_index=candidate_index,
                         fe_orientation_index=fe_index,
                         pb_orientation_index=pb_index,
@@ -1119,18 +1039,11 @@ def run_pf_closed_loop(
                         ),
                     )
                 )
-                _strict_fields(
-                    event,
-                    {"type", "record", "candidates"},
-                    name="record event",
-                )
-                if event.get("type") != "record":
-                    raise ValueError("Shared runtime did not return a record event.")
-                record = parse_adaptive_record(event["record"])
+                record = event.record
                 if int(record.station_id) != station_id:
                     raise ValueError("Runtime record station_id changed unexpectedly.")
                 station_records.append(record)
-                candidates = parse_candidate_snapshot(event["candidates"])
+                candidates = event.candidates
                 record_count += 1
                 cui_elapsed_time_s += (
                     float(record.live_time_s)
@@ -1142,11 +1055,11 @@ def run_pf_closed_loop(
                         cui_split_viz,
                         estimator,
                         record,
+                        cui_route_records,
                         elapsed_time_s=cui_elapsed_time_s,
                         record_measurement=True,
                     )
                     cui_frame_rendered = True
-                    last_cui_record = record
             if station_records[-1].metadata.get("station_complete") is not True:
                 raise ValueError("Runtime omitted the final station marker.")
             station_history.append(tuple(station_records))
@@ -1231,13 +1144,12 @@ def run_pf_closed_loop(
                     cui_split_viz,
                     estimator,
                     station_records[-1],
+                    cui_route_records,
                     elapsed_time_s=cui_elapsed_time_s,
                     record_measurement=False,
                 )
                 cui_frame_rendered = True
-                last_cui_record = station_records[-1]
-            _append_jsonl(
-                controller_trace,
+            controller_writer.append(
                 {
                     "schema_version": 1,
                     "station_id": station_id,
@@ -1248,7 +1160,7 @@ def run_pf_closed_loop(
                     "detected_isotope_gate": gate_diagnostics,
                     "particle_adequacy": _particle_diagnostics(estimator),
                     "posterior_snapshot": posterior_snapshot,
-                },
+                }
             )
             completed_stations = station_id + 1
             if record_count >= budget.max_measurements:
@@ -1307,37 +1219,9 @@ def run_pf_closed_loop(
             )
             current_pose = np.asarray(planned.next_pose, dtype=np.float64)
             current_program = planned.shield_program
-        if (
-            cui_split_viz is not None
-            and cui_truth_mode == "post_run"
-            and last_cui_record is not None
-        ):
-            truth_sources, truth_strengths = _truth_arrays_from_cui_overlay(
-                client.request_cui_overlay(include_truth=True)
-            )
-            cui_split_viz.set_truth(truth_sources, truth_strengths)
-            _publish_cui_frame(
-                cui_split_viz,
-                estimator,
-                last_cui_record,
-                elapsed_time_s=cui_elapsed_time_s,
-                record_measurement=False,
-            )
-            cui_frame_rendered = True
-            output_hook(
-                "CUI split visualization truth overlay: post_run "
-                "(private runtime CUI channel; not estimator/planner input)"
-            )
-        published = client.finalize()
-        _strict_fields(
-            published,
-            {"type", "path", "record_count"},
-            name="published event",
-        )
-        if published.get("type") != "published":
-            raise ValueError("Shared runtime did not publish MeasurementLog.")
-        log = load_measurement_log(published["path"])
-        if int(published["record_count"]) != len(log.records):
+        published = client.finalize_log()
+        log = load_measurement_log(published.path)
+        if published.record_count != len(log.records):
             raise RuntimeError("Published MeasurementLog record count is inconsistent.")
         if isotope_gate is not None and not isotope_gate.active_isotopes:
             raise RuntimeError(
@@ -1350,7 +1234,7 @@ def run_pf_closed_loop(
             pf_output_dir=target,
             run_id=log.run_id,
             record_count=len(log.records),
-            station_count=len({record.station_id for record in log.records}),
+            station_count=log.station_view().station_count,
             stop_reason=stop_reason,
         )
         _write_final_outputs(
@@ -1363,29 +1247,41 @@ def run_pf_closed_loop(
         completed_result = result
         return result
     except BaseException:
-        client.abort()
+        if client is not None:
+            client.abort()
         raise
     finally:
-        if cui_split_viz is not None:
-            cui_split_viz.close()
-            artifact_paths = (
-                getattr(cui_split_viz, "latest_robot_path", None),
-                getattr(cui_split_viz, "latest_pf_path", None),
-                getattr(cui_split_viz, "latest_pf_labeled_path", None),
-            )
-            if (
-                completed_result is not None
-                and cui_frame_rendered
-                and all(isinstance(path, Path) for path in artifact_paths)
-            ):
-                publish_final_cui_split_views(
-                    source_robot_path=artifact_paths[0],
-                    source_pf_path=artifact_paths[1],
-                    source_pf_labeled_path=artifact_paths[2],
-                    final_robot_path=target / "final_robot_2d.png",
-                    final_pf_path=target / "final_pf_3d.png",
-                    final_pf_labeled_path=target / "final_pf_3d_labeled.png",
+        try:
+            if cui_split_viz is not None:
+                cui_split_viz.close()
+                artifact_paths = (
+                    getattr(cui_split_viz, "latest_overview_path", None),
+                    getattr(cui_split_viz, "latest_robot_path", None),
+                    getattr(cui_split_viz, "latest_pf_path", None),
+                    getattr(cui_split_viz, "latest_pf_labeled_path", None),
+                    getattr(cui_split_viz, "latest_spectrum_path", None),
                 )
+                if (
+                    completed_result is not None
+                    and cui_frame_rendered
+                    and all(isinstance(path, Path) for path in artifact_paths)
+                ):
+                    publish_final_cui_split_views(
+                        source_overview_path=artifact_paths[0],
+                        source_robot_path=artifact_paths[1],
+                        source_pf_path=artifact_paths[2],
+                        source_pf_labeled_path=artifact_paths[3],
+                        source_spectrum_path=artifact_paths[4],
+                        final_overview_path=(
+                            target / "final_experiment_overview.png"
+                        ),
+                        final_robot_path=target / "final_robot_2d.png",
+                        final_pf_path=target / "final_pf_3d.png",
+                        final_pf_labeled_path=target / "final_pf_3d_labeled.png",
+                        final_spectrum_path=target / "final_spectrum.png",
+                    )
+        finally:
+            resources.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

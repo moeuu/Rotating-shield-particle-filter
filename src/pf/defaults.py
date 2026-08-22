@@ -1,5 +1,5 @@
 """Public particle-filter defaults."""
 
-from pf.runtime_defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
+DEFAULT_MAX_SOURCES_PER_ISOTOPE = 5
 
 __all__ = ["DEFAULT_MAX_SOURCES_PER_ISOTOPE"]

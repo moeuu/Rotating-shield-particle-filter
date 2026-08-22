@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+from runtime.cui import CUIRoute
 
 
 @dataclass
@@ -28,6 +29,7 @@ class PFFrame:
     spectrum_counts: NDArray[np.float64] | None = None
     particle_representative_positions: dict[str, NDArray[np.float64]] | None = None
     particle_representative_weights: dict[str, NDArray[np.float64]] | None = None
+    cui_route: CUIRoute | None = None
     record_measurement: bool = True
 
 

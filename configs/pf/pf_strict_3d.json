@@ -54,7 +54,7 @@
   "joint_strength_block_log_sigma": 0.15,
   "joint_strength_block_batch_size": 128,
   "joint_cross_isotope_state_block_probability": 0.05,
-  "cui_truth_display_mode": "evaluation_live",
+  "cui_truth_display_mode": "hidden",
   "orientation_k": 8,
   "use_gpu": true,
   "gpu_device": "cuda",

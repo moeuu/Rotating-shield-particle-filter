@@ -57,17 +57,37 @@ def publish_final_cui_split_views(
     final_robot_path: Path,
     final_pf_path: Path,
     final_pf_labeled_path: Path,
+    source_overview_path: Path | None = None,
+    source_spectrum_path: Path | None = None,
+    final_overview_path: Path | None = None,
+    final_spectrum_path: Path | None = None,
 ) -> None:
     """Publish completed CUI split views as stable result artifacts.
 
     Every source is validated and copied to a temporary file before any final
     path is replaced. A missing or unreadable source therefore leaves all
-    existing result artifacts untouched.
+    existing result artifacts untouched. Overview and spectrum paths are
+    optional for compatibility with callers that publish the original three
+    views; each optional source and target must be supplied together.
     """
-    source_target_pairs = (
+    optional_pairs = (
+        (source_overview_path, final_overview_path, "overview"),
+        (source_spectrum_path, final_spectrum_path, "spectrum"),
+    )
+    for source, target, name in optional_pairs:
+        if (source is None) != (target is None):
+            raise ValueError(
+                f"Final CUI {name} source and target paths must be supplied together."
+            )
+    source_target_pairs = [
         (Path(source_robot_path), Path(final_robot_path)),
         (Path(source_pf_path), Path(final_pf_path)),
         (Path(source_pf_labeled_path), Path(final_pf_labeled_path)),
+    ]
+    source_target_pairs.extend(
+        (Path(source), Path(target))
+        for source, target, _ in optional_pairs
+        if source is not None and target is not None
     )
     missing = [source for source, _ in source_target_pairs if not source.is_file()]
     if missing:

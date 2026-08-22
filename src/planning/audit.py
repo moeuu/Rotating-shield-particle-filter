@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
-import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+
+from runtime.artifacts import DurableJSONLWriter
+
 from planning.dss_pp import DSSPPResult
 
 
@@ -129,31 +130,29 @@ class PlannerAuditWriter:
         if self.path.exists():
             raise FileExistsError(f"Refusing to replace planner audit {self.path}.")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._writer = DurableJSONLWriter(self.path, mode=0o644)
 
     def append(self, payload: Mapping[str, object]) -> None:
         """Durably append one finite JSON object."""
-        line = (
-            json.dumps(
-                dict(payload),
-                sort_keys=True,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode("utf-8")
-        descriptor = os.open(
-            self.path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o644,
-        )
-        try:
-            written = os.write(descriptor, line)
-            if written != len(line):
-                raise OSError("Planner audit append was incomplete.")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        self._writer.append(dict(payload))
+
+    def close(self) -> None:
+        """Close the shared durable writer exactly once."""
+        self._writer.close()
+
+    def __enter__(self) -> "PlannerAuditWriter":
+        """Return this writer for one deterministic audit lifetime."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        """Close the audit writer when leaving a managed lifetime."""
+        del exc_type, exc, traceback
+        self.close()
 
 
 __all__ = ["PlannerAuditWriter", "build_planner_audit"]

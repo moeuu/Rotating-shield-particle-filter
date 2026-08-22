@@ -67,30 +67,68 @@ def test_prepare_final_visualization_frame_preserves_travel_segment() -> None:
 def test_publish_final_cui_split_views_copies_all_images(
     tmp_path: Path,
 ) -> None:
-    """Completed CUI images must include plain and labeled PF results."""
+    """Completed CUI artifacts must include all five browser panels."""
+    latest_overview = tmp_path / "cui" / "latest_experiment_overview.png"
     latest_robot = tmp_path / "cui" / "latest_robot_2d.png"
     latest_pf = tmp_path / "cui" / "latest_pf_3d.png"
     latest_pf_labeled = tmp_path / "cui" / "latest_pf_3d_labeled.png"
+    latest_spectrum = tmp_path / "cui" / "latest_spectrum.png"
     latest_robot.parent.mkdir(parents=True)
+    latest_overview.write_bytes(b"overview-png")
     latest_robot.write_bytes(b"robot-png")
     latest_pf.write_bytes(b"pf-png")
     latest_pf_labeled.write_bytes(b"pf-labeled-png")
+    latest_spectrum.write_bytes(b"spectrum-png")
+    final_overview = tmp_path / "results" / "result_overview_case.png"
     final_robot = tmp_path / "results" / "result_robot_2d_case.png"
     final_pf = tmp_path / "results" / "result_pf_3d_case.png"
     final_pf_labeled = tmp_path / "results" / "result_pf_3d_labeled_case.png"
+    final_spectrum = tmp_path / "results" / "result_spectrum_case.png"
 
     publish_final_cui_split_views(
+        source_overview_path=latest_overview,
         source_robot_path=latest_robot,
         source_pf_path=latest_pf,
         source_pf_labeled_path=latest_pf_labeled,
+        source_spectrum_path=latest_spectrum,
+        final_overview_path=final_overview,
         final_robot_path=final_robot,
         final_pf_path=final_pf,
         final_pf_labeled_path=final_pf_labeled,
+        final_spectrum_path=final_spectrum,
     )
 
+    assert final_overview.read_bytes() == b"overview-png"
     assert final_robot.read_bytes() == b"robot-png"
     assert final_pf.read_bytes() == b"pf-png"
     assert final_pf_labeled.read_bytes() == b"pf-labeled-png"
+    assert final_spectrum.read_bytes() == b"spectrum-png"
+
+
+def test_publish_final_cui_split_views_keeps_three_view_compatibility(
+    tmp_path: Path,
+) -> None:
+    """Legacy callers may continue publishing the original three views."""
+    sources = tuple(tmp_path / "cui" / f"source-{index}.png" for index in range(3))
+    targets = tuple(tmp_path / "results" / f"target-{index}.png" for index in range(3))
+    for index, source in enumerate(sources):
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(f"source-{index}".encode())
+
+    publish_final_cui_split_views(
+        source_robot_path=sources[0],
+        source_pf_path=sources[1],
+        source_pf_labeled_path=sources[2],
+        final_robot_path=targets[0],
+        final_pf_path=targets[1],
+        final_pf_labeled_path=targets[2],
+    )
+
+    assert [target.read_bytes() for target in targets] == [
+        b"source-0",
+        b"source-1",
+        b"source-2",
+    ]
 
 
 def test_publish_final_cui_split_views_rejects_missing_source(

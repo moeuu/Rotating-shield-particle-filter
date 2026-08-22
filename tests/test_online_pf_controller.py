@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 
-from pf.closed_loop import run_pf_closed_loop
+from pf.closed_loop import _refine_and_replan, run_pf_closed_loop
 from runtime.assets import simulation_runtime_root, standard_geant4_config_path
 from runtime.adaptive_client import AdaptiveRuntimeClient
 from runtime.session import estimator_neutral_runtime_config
@@ -41,8 +41,8 @@ def test_closed_loop_receives_runtime_record_before_pf_updates() -> None:
     """Acquired spectra must cross the runtime boundary before PF ingestion."""
     source = inspect.getsource(run_pf_closed_loop)
 
-    request_offset = source.index("event = client.request(")
-    parse_offset = source.index("record = parse_adaptive_record(")
+    request_offset = source.index("event = client.acquire(")
+    parse_offset = source.index("record = event.record")
     station_offset = source.index("station_records.append(record)")
     update_offset = source.index("_assimilate_station(", station_offset)
 
@@ -60,12 +60,26 @@ def test_closed_loop_uses_runtime_client_not_simulator_in_process() -> None:
     assert "run-adaptive-session" in client_source
 
 
+def test_closed_loop_uses_typed_adaptive_lifecycle_and_refinement() -> None:
+    """PF control must delegate adaptive envelope validation to runtime DTOs."""
+    source = inspect.getsource(run_pf_closed_loop)
+    refinement_source = inspect.getsource(_refine_and_replan)
+
+    assert "client.handshake()" in source
+    assert "client.acquire(" in source
+    assert "client.finalize_log()" in source
+    assert "client.refine_candidates(" in refinement_source
+    assert "AdaptiveRefineRequest.from_indices(" in refinement_source
+    assert "parse_adaptive_" not in source
+    assert "_strict_fields(" not in source
+
+
 def test_closed_loop_binds_final_log_after_live_assimilation() -> None:
     """Live posterior publication must wait for immutable MeasurementLog binding."""
     source = inspect.getsource(run_pf_closed_loop)
 
     update_offset = source.index("_assimilate_station(")
-    finalize_offset = source.index("published = client.finalize()")
+    finalize_offset = source.index("published = client.finalize_log()")
     bind_offset = source.index("bind_finalized_measurement_log(estimator, log)")
     write_offset = source.index("_write_final_outputs(")
 

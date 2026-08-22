@@ -30,4 +30,6 @@ def test_live_cli_runtime_helpers_are_in_wheel(tmp_path: Path) -> None:
 
     assert "pf/closed_loop.py" in names
     assert "pf/cui_runtime.py" in names
+    assert "pf/service.py" in names
     assert "rotating-shield-pf-live = pf.closed_loop:main" in entry_points
+    assert "rotating-shield-pf-service = pf.service:main" in entry_points

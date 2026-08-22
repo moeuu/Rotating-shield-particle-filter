@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 
 from pf.live_resume import reconstruct_live_resume_state, records_by_station
-from tests.pure_pf_test_support import records
+from runtime.measurement_log import load_measurement_log
+from tests.pure_pf_test_support import make_measurement_log, records
 
 
 def _complete_records(count: int, *, views_per_station: int) -> tuple[object, ...]:
@@ -75,3 +76,37 @@ def test_resume_rejects_partial_or_wrong_length_station() -> None:
             next_station_id=2,
             expected_views_per_station=4,
         )
+
+
+def test_resume_uses_shared_station_and_array_views_when_available(tmp_path) -> None:
+    """Finalized resume reconstruction should consume shared immutable views."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=4,
+            station_complete_markers=True,
+        )
+    )
+    station_view = log.station_view()
+    arrays = station_view.array_view()
+
+    state = reconstruct_live_resume_state(
+        station_view,
+        next_station_id=2,
+        expected_views_per_station=2,
+    )
+
+    assert [tuple(record.step_id for record in station) for station in state.stations] == [
+        tuple(record.step_id for record in station.records)
+        for station in station_view.stations
+    ]
+    assert state.record_count == station_view.record_count
+    assert state.elapsed_time_s == pytest.approx(
+        float(
+            np.sum(
+                arrays.live_time_s
+                + arrays.travel_time_s
+                + arrays.shield_actuation_time_s
+            )
+        )
+    )
