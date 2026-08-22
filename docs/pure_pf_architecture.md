@@ -215,7 +215,20 @@ proposes the next reachable pose and shield program. A resumed session may
 restore the runtime-provided active prefix before continuing, but no API or
 command runs inference from the beginning of an already finalized log.
 
+`PFLiveSession` owns this in-process causal boundary. It holds the estimator and
+ordered durable records together, uses the same canonical station assimilation
+helper as the standalone controller, and rejects record delivery after completion.
+Its planning DTO copies particle arrays into read-only storage and includes a
+canonical, truth-free PF posterior summary. The DTO deliberately preserves PF
+particle semantics; it is not reshaped into an MLE-style surface grid. The current
+estimator has no public deterministic latest predicted-spectrum snapshot, so the
+facade does not derive a surrogate from private model state or stochastic posterior
+predictive diagnostics.
+
 At termination PF asks the runtime to publish the immutable MeasurementLog,
 validates its exact ordered-record digest against the stations assimilated in
 that live session, and binds the posterior provenance to the published bundle
-digest. Contract mismatches fail before publication.
+digest. `complete_live_state()` seals the inference state before publication;
+`bind_published_log()` then changes only final provenance identities and exposes
+canonical posterior/state bytes through `PFBoundLiveState`. Contract mismatches
+fail before publication.

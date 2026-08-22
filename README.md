@@ -65,6 +65,23 @@ identity, energy axis, environment geometry, or full-spectrum contract is
 incompatible. Source truth is never accepted as estimator input. See
 [the repository boundary](docs/shared_simulation_runtime.md).
 
+For in-process integrations, `pf.PFLiveSession` is the package-owned lifecycle
+boundary. Construct it from the runtime `RunContext`, PF configuration/profile,
+seed, and runtime asset root; deliver only durably persisted records (or one complete
+persisted station); request its copied read-only particle snapshot for planning and
+PF-specific display; then call `complete_live_state()` before the runtime publishes
+the log and `bind_published_log()` afterward. Binding authenticates the exact run,
+context, and full ordered-record digest and never assimilates measurements. The
+resulting `PFBoundLiveState` contains canonical posterior bytes and the already
+completed state bytes so an outer application can publish them without reaching
+back into the estimator.
+
+The planning snapshot also carries a canonical truth-free posterior summary for the
+PF particle display. It does not invent an estimator-neutral grid or a predictive
+spectrum: `PurePFEstimator` currently has no public deterministic latest-spectrum
+snapshot API. The existing PF CUI therefore continues to render its native particle
+cloud and the latest raw spectrum from the persisted runtime record.
+
 ## Citation and license
 
 If this software contributes to research, use the metadata in

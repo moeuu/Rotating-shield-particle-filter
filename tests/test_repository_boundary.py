@@ -8,6 +8,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_pf_package_exports_the_owned_live_facade() -> None:
+    """Integrators should not reconstruct PF live state outside this package."""
+    from pf import PFLiveSession
+    from pf.live_session import PFLiveSession as implementation
+
+    assert PFLiveSession is implementation
+
+
 def test_pf_repository_contains_no_simulation_implementation() -> None:
     """Geant4, observation generation, and raw-log writing stay shared."""
     forbidden = (

@@ -42,9 +42,12 @@ from pf.cui_runtime import (
 from pf.configuration import load_pf_config
 from pf.isotope_gate import FullSpectrumIsotopeGate
 from pf.live_session import (
+    assimilate_persisted_station,
     bind_published_measurement_log,
     build_live_estimator,
+    live_posterior_summary,
     measurement_record_to_station_input,
+    register_persisted_station_pose,
 )
 from pf.live_resume import reconstruct_live_resume_state
 from pf.runtime_defaults import (
@@ -463,21 +466,7 @@ def _live_posterior_summary(estimator: object) -> dict[str, object]:
     The live controller therefore serializes only the current PF point
     estimates; final provenance remains exclusive to ``pf_posterior.json``.
     """
-    raw = estimator.posterior_point_estimate()
-    if not isinstance(raw, Mapping):
-        raise TypeError("PF live point estimates must be an isotope mapping.")
-    isotopes: dict[str, object] = {}
-    for isotope, estimate in raw.items():
-        to_dict = getattr(estimate, "to_dict", None)
-        if not callable(to_dict):
-            raise TypeError("Every PF live point estimate must be serializable.")
-        isotopes[str(isotope)] = to_dict()
-    return {
-        "schema_version": 1,
-        "publishable": False,
-        "provenance_status": "awaiting_finalized_measurement_log_digest",
-        "isotopes": isotopes,
-    }
+    return live_posterior_summary(estimator)
 
 
 def _baseline_shield_program(
@@ -537,24 +526,11 @@ def _register_station_pose(
     station_id: int,
 ) -> int:
     """Register one single-pose station and return its estimator pose index."""
-    if not records:
-        raise ValueError("A PF station must contain at least one record.")
-    poses = np.asarray([record.detector_pose_xyz for record in records], dtype=float)
-    quaternions = np.asarray(
-        [record.detector_quat_wxyz for record in records],
-        dtype=float,
+    return register_persisted_station_pose(
+        estimator,
+        records,
+        station_id=station_id,
     )
-    if not np.all(poses == poses[0]) or not np.all(quaternions == quaternions[0]):
-        raise ValueError("Every view in a PF station must share one detector pose.")
-    pose = poses[0]
-    if station_id == 0 and not estimator.measurements and len(estimator.poses) == 1:
-        estimator.poses[0] = pose.copy()
-        estimator.kernel_cache = None
-        pose_index = 0
-    else:
-        estimator.add_measurement_pose(pose, reset_filters=False)
-        pose_index = len(estimator.poses) - 1
-    return int(pose_index)
 
 
 def _assimilate_station(
@@ -565,14 +541,10 @@ def _assimilate_station(
     contract_hash: str,
 ) -> None:
     """Assimilate one durably staged, single-pose station block."""
-    pose_index = _register_station_pose(
+    assimilate_persisted_station(
         estimator,
         records,
         station_id=station_id,
-    )
-    estimator.update_spectrum_station(
-        tuple(measurement_record_to_station_input(record) for record in records),
-        pose_idx=pose_index,
         generative_contract_hash_sha256=contract_hash,
     )
 
