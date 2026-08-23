@@ -6,11 +6,18 @@ Codex sessions should use this plan unless the user explicitly changes it.
 ## Decision
 
 Generate one fresh scene seed for each new experiment batch. Record that seed
-in the generated PF config, private runtime scenario, and manifest so the batch
-remains exactly reproducible after generation.
+only in the sibling runtime's private config, scenario, truth manifest, and
+private experiment manifest. PF configs, PF output tags, MeasurementLog, and
+estimator-visible adaptive events must not contain it.
 
 - Omit `--seeds` for a new independent batch.
 - Use an explicit `--seeds <recorded-seed>` only to repeat a recorded live batch.
+- PF seeds are generated independently and reused across variants in the same
+  comparison batch. For an exact replay, pass a separately recorded
+  `--pf-seeds <recorded-pf-seed>`; it must not equal the scene seed.
+- Geant4 transport seeds are also generated independently. The transport seed
+  may remain in physical provenance, but it must not equal the private scene
+  seed or PF seed and therefore cannot reconstruct source placement.
 - All four methods in one comparison batch use the same generated environment
   and truth layout. A later batch must use a new seed.
 
@@ -82,25 +89,36 @@ PYTHONPATH=src uv run python -m baselines.ral_ablation.cli
 uv run python scripts/build_ral_paper_subset.py
 ```
 
-The paper subset files are:
+The truth-bearing paper subset files are owner-readable artifacts below the
+sibling runtime repository:
 
-- `results/ral_ablation/ral_paper_subset_manifest.csv`
-- `results/ral_ablation/run_paper_subset.sh`
+- `../Rotating-shield-simulation-runtime/private_runs/ral_ablation/ral_paper_subset_manifest.csv`
+- `../Rotating-shield-simulation-runtime/private_runs/ral_ablation/run_paper_subset.sh`
 
 Each row first invokes the sibling runtime's
-`rotating-shield-sim generate-ral-scenario`, then starts the PF-owned causal
-session with `rotating-shield-pf-live`. Truth-bearing scenarios and physical
-runtime overrides are kept below the sibling repository's ignored
+`rotating-shield-sim generate-ral-scenario`, which writes both the private
+scenario and a separate private truth manifest keyed by opaque `run_id`. It then
+starts the RA-L-only session adapter. The adapter gives the generic PF controller
+only an owner-only Unix socket, a truth-free PF config, and a separate RA-L control
+policy. The PF process receives no scenario path, source profile, scene seed, or
+source RNG provenance.
+
+Truth-bearing scenarios, truth manifests, physical runtime overrides, manifests,
+and run scripts are kept below the sibling repository's ignored
 `private_runs/ral_ablation/`; they are never written under this repository's
 `results/`. Each session publishes a unique truth-free MeasurementLog below
 `results/ral_ablation/measurement_logs/<output-tag>` and PF outputs below
 `results/ral_ablation/runs/<output-tag>`. These targets must not already exist
 when the run starts; archive them before repeating a recorded live batch.
+Post-run evaluation must call
+`evaluation.private_truth.load_private_truth_for_completed_result` with
+`closed_loop_result.json` and the corresponding private truth manifest. The
+loader rejects incomplete results and mismatched `run_id` values.
 
 Run the selected full simulations with:
 
 ```bash
-bash results/ral_ablation/run_paper_subset.sh
+bash ../Rotating-shield-simulation-runtime/private_runs/ral_ablation/run_paper_subset.sh
 ```
 
 Regenerate the RA-L manuscript figures after paper-scope results are available:

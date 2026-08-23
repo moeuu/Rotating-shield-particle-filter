@@ -52,12 +52,21 @@ def test_closed_loop_receives_runtime_record_before_pf_updates() -> None:
 def test_closed_loop_uses_runtime_client_not_simulator_in_process() -> None:
     """Estimator settings must stay outside direct simulator construction."""
     source = inspect.getsource(run_pf_closed_loop)
-    client_source = inspect.getsource(AdaptiveRuntimeClient.__init__)
+    client_source = inspect.getsource(AdaptiveRuntimeClient.connect)
 
-    assert "AdaptiveRuntimeClient(" in source
+    assert "AdaptiveRuntimeClient.connect(" in source
     assert "create_simulation_runtime" not in source
-    assert "rotating-shield-sim" in client_source
-    assert "run-adaptive-session" in client_source
+    assert "scenario_path" not in source
+    assert "private_scene_profile" not in source
+    assert "AF_UNIX" in client_source
+
+
+def test_generic_pf_has_no_ral_baseline_import() -> None:
+    """RA-L policy implementations must remain outside the generic PF package."""
+    source = inspect.getsource(__import__("pf.closed_loop", fromlist=["*"]))
+
+    assert "baselines.ral_ablation" not in source
+    assert "ral-mix9" not in source
 
 
 def test_closed_loop_uses_typed_adaptive_lifecycle_and_refinement() -> None:
@@ -85,10 +94,4 @@ def test_closed_loop_binds_final_log_after_live_assimilation() -> None:
     write_offset = source.index("_write_final_outputs(")
 
     assert "for station_records in station_history" in source
-    assert (
-        update_offset
-        < finalize_offset
-        < records_offset
-        < bind_offset
-        < write_offset
-    )
+    assert update_offset < finalize_offset < records_offset < bind_offset < write_offset

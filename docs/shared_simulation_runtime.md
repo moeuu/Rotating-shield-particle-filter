@@ -17,13 +17,18 @@ schema are common; PF particles and posterior presentation remain PF-owned.
 ```bash
 # In Rotating-shield-simulation-runtime: author physics, not actions
 uv run rotating-shield-sim generate-ral-scenario /private/run-001.json \
+  --truth-manifest-output /private/truth/run-001.json \
   --measurement-log-output /private/logs/run-001 \
   --run-id run-001 \
   --runtime-config configs/geant4/variance_reduction_external_no_isaac_32threads.json
 
-# In this repository: PF owns its planner and mission budget
+# Runtime serves the private scenario over an opaque local socket
+uv run rotating-shield-sim serve-adaptive-session-socket /private/run-001.json \
+  --socket-path /run/user/1000/rotating-shield/run-001.sock
+
+# In this repository: PF sees only the socket and owns its planner/budget
 uv run rotating-shield-pf-live \
-  --scenario /private/run-001.json \
+  --session-socket /run/user/1000/rotating-shield/run-001.sock \
   --runtime-root ../Rotating-shield-simulation-runtime \
   --config configs/pf/pf_strict_3d.json \
   --output-dir results/pf-live-run-001
@@ -39,5 +44,6 @@ station count, view count, shield program, or estimator stop rule. The 20-statio
 8-view, 160-observation RA-L limits are PF/experiment-harness settings rather than
 physical-runtime settings.
 
-The private runtime scenario may contain realized source truth. MeasurementLog
-and every estimator-visible adaptive event must not.
+The private runtime scenario and the separately joined private truth manifest may
+contain realized source truth. MeasurementLog and every estimator-visible adaptive
+event reject source profile, scene seed/RNG provenance, and realized source fields.

@@ -30,11 +30,8 @@ from runtime.measurement_log import (
 )
 from runtime.provenance import canonical_json_bytes
 
-from baselines.ral_ablation.path_policies import select_baseline_next_pose
-from baselines.ral_ablation.shield_policies import (
-    select_baseline_shield_program,
-)
 from pf.atomic_io import atomic_write_bytes
+from pf.control_policy import PFControlPolicy, validate_control_policy
 from pf.cui_runtime import (
     ensure_cui_view_server,
     resolve_cui_split_view_enabled,
@@ -469,41 +466,35 @@ def _live_posterior_summary(estimator: object) -> dict[str, object]:
     return live_posterior_summary(estimator)
 
 
-def _baseline_shield_program(
+def _external_shield_program(
     estimator: object,
     planner: DSSPPConfig,
-    settings: Mapping[str, Any],
+    control_policy: PFControlPolicy | None,
     *,
     pose_index: int,
     current_pair_id: int | None,
 ) -> ShieldProgram | None:
-    """Resolve one declared RA-L baseline shield program when configured."""
-    policy = select_baseline_shield_program(
-        settings.get("baseline_shield_policy"),
+    """Resolve one injected shield program without importing experiment code."""
+    if control_policy is None:
+        return None
+    return control_policy.select_shield_program(
         total_pairs=int(len(estimator.normals) ** 2),
         program_length=int(planner.program_length),
         pose_index=pose_index,
         current_pair_id=current_pair_id,
-    )
-    if policy is None:
-        return None
-    return ShieldProgram(
-        name=policy.name,
-        pair_ids=policy.pair_ids,
-        kind="ral_baseline",
     )
 
 
 def _bootstrap_program(
     estimator: object,
     planner: DSSPPConfig,
-    settings: Mapping[str, Any],
+    control_policy: PFControlPolicy | None,
 ) -> ShieldProgram:
-    """Choose the declared baseline or balanced first-station program."""
-    baseline = _baseline_shield_program(
+    """Choose an injected or balanced first-station shield program."""
+    baseline = _external_shield_program(
         estimator,
         planner,
-        settings,
+        control_policy,
         pose_index=0,
         current_pair_id=None,
     )
@@ -562,8 +553,9 @@ def _plan(
     rng: np.random.Generator,
     settings: Mapping[str, Any],
     station_index: int,
+    control_policy: PFControlPolicy | None,
 ) -> DSSPPResult:
-    """Rank runtime actions under the declared proposed or baseline policy."""
+    """Rank runtime actions under the standard or injected control policy."""
     candidate_poses = np.asarray(
         candidates.candidate_poses_xyz,
         dtype=np.float64,
@@ -571,19 +563,22 @@ def _plan(
     visited_array = np.asarray(visited_poses, dtype=np.float64)
     if visited_array.size == 0:
         visited_array = visited_array.reshape((0, 3))
-    baseline_program = _baseline_shield_program(
+    baseline_program = _external_shield_program(
         estimator,
         planner,
-        settings,
+        control_policy,
         pose_index=station_index,
         current_pair_id=candidates.current_pair_id,
     )
-    baseline_path = select_baseline_next_pose(
-        settings.get("baseline_path_policy"),
-        candidate_poses_xyz=candidate_poses,
-        current_pose_xyz=current_pose,
-        visited_poses_xyz=visited_array,
-        bounds_xyz=room_bounds,
+    baseline_path = (
+        None
+        if control_policy is None
+        else control_policy.select_path(
+            candidate_poses_xyz=candidate_poses,
+            current_pose_xyz=current_pose,
+            visited_poses_xyz=visited_array,
+            bounds_xyz=room_bounds,
+        )
     )
     if baseline_path is not None:
         if baseline_program is None:
@@ -597,8 +592,8 @@ def _plan(
             score=baseline_path.score,
             sequence=(),
             diagnostics={
-                "selection_mode": "ral_baseline_path",
-                "baseline_path_policy": baseline_path.name,
+                "selection_mode": "external_control_path",
+                "external_path_policy": baseline_path.policy_name,
                 "planning_particle_count": 0,
                 "ranked_nodes": [],
                 "component_leaders": {},
@@ -652,9 +647,12 @@ def _refine_and_replan(
     rng: np.random.Generator,
     settings: Mapping[str, Any],
     station_index: int,
+    control_policy: PFControlPolicy | None,
 ) -> tuple[AdaptiveCandidateSnapshot, DSSPPResult]:
     """Optionally request runtime-owned local poses and rerank them exactly."""
-    if refinement_top_k <= 0 or settings.get("baseline_path_policy") is not None:
+    if refinement_top_k <= 0 or (
+        control_policy is not None and control_policy.has_fixed_path
+    ):
         return candidates, initial
     ranked = initial.diagnostics.get("ranked_nodes", [])
     seed_indices: list[int] = []
@@ -668,9 +666,7 @@ def _refine_and_replan(
             break
     if not seed_indices:
         return candidates, initial
-    event = client.refine_candidates(
-        AdaptiveRefineRequest.from_indices(seed_indices)
-    )
+    event = client.refine_candidates(AdaptiveRefineRequest.from_indices(seed_indices))
     refined = event.candidates
     result = _plan(
         estimator,
@@ -684,6 +680,7 @@ def _refine_and_replan(
         rng=rng,
         settings=settings,
         station_index=station_index,
+        control_policy=control_policy,
     )
     return refined, result
 
@@ -740,19 +737,18 @@ def _write_final_outputs(
 
 
 def run_pf_closed_loop(
-    scenario_path: str | Path,
+    session_socket: str | Path,
     *,
     runtime_root: str | Path,
     pf_config_path: str | Path,
     output_dir: str | Path,
     profile: str = "pf_strict",
     seed: int = 0,
-    private_scene_profile: str | None = None,
-    resume_stage_path: str | Path | None = None,
-    resume_compatibility_path: str | Path | None = None,
+    control_policy: PFControlPolicy | None = None,
     output_hook: Any = print,
 ) -> PFClosedLoopResult:
-    """Run a PF-specific closed loop over the common adaptive runtime API."""
+    """Run a PF closed loop over an opaque truth-free runtime session socket."""
+    validate_control_policy(control_policy)
     settings, config_hash = load_pf_config(pf_config_path)
     planner = dss_config_from_pf_settings(settings)
     budget = PFControlBudget.from_settings(settings, planner)
@@ -775,12 +771,8 @@ def run_pf_closed_loop(
             mode=0o644,
         )
         resources.callback(controller_writer.close)
-        client = AdaptiveRuntimeClient(
-            scenario_path,
-            runtime_root=runtime_root,
-            private_scene_profile=private_scene_profile,
-            resume_stage_path=resume_stage_path,
-            resume_compatibility_path=resume_compatibility_path,
+        client = AdaptiveRuntimeClient.connect(
+            session_socket,
             output_hook=output_hook,
         )
         resources.callback(client.close)
@@ -840,7 +832,11 @@ def run_pf_closed_loop(
         contract_hash = str(
             context.runtime_config["full_spectrum_contract_hash_sha256"]
         )
-        current_program = _bootstrap_program(estimator, planner, settings)
+        current_program = _bootstrap_program(
+            estimator,
+            planner,
+            control_policy,
+        )
         visited: list[np.ndarray]
         station_history: list[tuple[MeasurementLogRecord, ...]]
         gate_diagnostics: dict[str, object] | None = None
@@ -862,8 +858,8 @@ def run_pf_closed_loop(
                     "schema_version": 1,
                     "station_id": 0,
                     "selection_mode": (
-                        "ral_baseline_bootstrap"
-                        if settings.get("baseline_shield_policy") is not None
+                        "external_control_bootstrap"
+                        if current_program.kind == "external_control"
                         else "pf_prior_balanced_bootstrap"
                     ),
                     "selected_pose_xyz": current_pose.tolist(),
@@ -958,6 +954,7 @@ def run_pf_closed_loop(
                     rng=resume_rng,
                     settings=settings,
                     station_index=station_id,
+                    control_policy=control_policy,
                 )
                 candidates, planned = _refine_and_replan(
                     client,
@@ -974,6 +971,7 @@ def run_pf_closed_loop(
                     rng=resume_rng,
                     settings=settings,
                     station_index=station_id,
+                    control_policy=control_policy,
                 )
                 planner_writer.append(
                     build_planner_audit(
@@ -1161,6 +1159,7 @@ def run_pf_closed_loop(
                 rng=station_planner_rng,
                 settings=settings,
                 station_index=completed_stations,
+                control_policy=control_policy,
             )
             candidates, planned = _refine_and_replan(
                 client,
@@ -1177,6 +1176,7 @@ def run_pf_closed_loop(
                 rng=station_planner_rng,
                 settings=settings,
                 station_index=completed_stations,
+                control_policy=control_policy,
             )
             station_id += 1
             planner_writer.append(
@@ -1248,9 +1248,7 @@ def run_pf_closed_loop(
                         source_pf_path=artifact_paths[2],
                         source_pf_labeled_path=artifact_paths[3],
                         source_spectrum_path=artifact_paths[4],
-                        final_overview_path=(
-                            target / "final_experiment_overview.png"
-                        ),
+                        final_overview_path=(target / "final_experiment_overview.png"),
                         final_robot_path=target / "final_robot_2d.png",
                         final_pf_path=target / "final_pf_3d.png",
                         final_pf_labeled_path=target / "final_pf_3d_labeled.png",
@@ -1263,40 +1261,20 @@ def run_pf_closed_loop(
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the public PF adaptive-controller command."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", type=Path, required=True)
+    parser.add_argument("--session-socket", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--profile", choices=("pf_strict",), default="pf_strict")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--private-scene-profile",
-        choices=("ral-mix9", "ral-cs4-co3-eu0"),
-        default=None,
-    )
-    parser.add_argument(
-        "--resume-stage",
-        type=Path,
-        default=None,
-        help="Shared-runtime MeasurementLog staging directory to resume.",
-    )
-    parser.add_argument(
-        "--resume-compatibility",
-        type=Path,
-        default=None,
-        help="Explicit shared-runtime cross-commit compatibility record.",
-    )
     args = parser.parse_args(None if argv is None else list(argv))
     result = run_pf_closed_loop(
-        args.scenario,
+        args.session_socket,
         runtime_root=args.runtime_root,
         pf_config_path=args.config,
         output_dir=args.output_dir,
         profile=args.profile,
         seed=args.seed,
-        private_scene_profile=args.private_scene_profile,
-        resume_stage_path=args.resume_stage,
-        resume_compatibility_path=args.resume_compatibility,
     )
     print(json.dumps(result.to_dict(), sort_keys=True, allow_nan=False))
     return 0

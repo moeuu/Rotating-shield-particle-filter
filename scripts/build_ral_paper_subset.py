@@ -19,16 +19,18 @@ if str(SRC) not in sys.path:
 
 from sim.runtime import load_runtime_config
 
-from baselines.ral_ablation.config_factory import MANIFEST_FIELDS
+from baselines.ral_ablation.config_factory import (
+    DEFAULT_PRIVATE_ROOT,
+    MANIFEST_FIELDS,
+)
+from baselines.ral_ablation.control_policy import load_ral_control_policy
 from pf.atomic_io import atomic_write_text
 from pf.configuration import load_pf_config
 from pf.profiles import enforce_pure_runtime_settings
 
-DEFAULT_FULL_MANIFEST = ROOT / "results" / "ral_ablation" / "manifest.csv"
-DEFAULT_SUBSET_MANIFEST = (
-    ROOT / "results" / "ral_ablation" / "ral_paper_subset_manifest.csv"
-)
-DEFAULT_RUN_SCRIPT = ROOT / "results" / "ral_ablation" / "run_paper_subset.sh"
+DEFAULT_FULL_MANIFEST = DEFAULT_PRIVATE_ROOT / "manifest.csv"
+DEFAULT_SUBSET_MANIFEST = DEFAULT_PRIVATE_ROOT / "ral_paper_subset_manifest.csv"
+DEFAULT_RUN_SCRIPT = DEFAULT_PRIVATE_ROOT / "run_paper_subset.sh"
 PAPER_CASES = ("mix9_multi_isotope_cardinality",)
 CORE_VARIANTS = (
     "proposed",
@@ -85,27 +87,32 @@ def _validated_scenario_command(row: Mapping[str, str]) -> str:
     ):
         raise ValueError("scenario_command path differs from the manifest.")
     expected_options = {
+        "--truth-manifest-output": row["truth_manifest_path"],
         "--measurement-log-output": row["measurement_log_path"],
         "--runtime-config": row["runtime_config_path"],
-        "--scene-seed": row["seed"],
+        "--scene-seed": row["scene_seed"],
         "--source-profile": row["source_profile"],
     }
     for option, expected in expected_options.items():
         actual = _required_option(tokens, option)
         equal = actual == expected
-        if option in {"--measurement-log-output", "--runtime-config"}:
+        if option in {
+            "--truth-manifest-output",
+            "--measurement-log-output",
+            "--runtime-config",
+        }:
             equal = _same_path(actual, expected)
         if not equal:
             raise ValueError(f"scenario_command {option} differs from the manifest.")
     return shlex.join(tokens)
 
 
-def _validated_pf_command(row: Mapping[str, str]) -> str:
-    """Validate and canonicalize one PF-owned live-control command."""
-    tokens = _tokens(str(row["pf_command"]), name="pf_command")
-    if tokens[:2] != ["uv", "run"] or "rotating-shield-pf-live" not in tokens:
-        raise ValueError("RA-L PF command must use uv run and rotating-shield-pf-live.")
-    executable_index = tokens.index("rotating-shield-pf-live")
+def _validated_session_command(row: Mapping[str, str]) -> str:
+    """Validate one adapter command while keeping PF inputs truth-free."""
+    tokens = _tokens(str(row["session_command"]), name="session_command")
+    expected_module = "baselines.ral_ablation.session_runner"
+    if tokens[:2] != ["uv", "run"] or expected_module not in tokens:
+        raise ValueError("RA-L session command must use the isolated adapter runner.")
     scenario_tokens = _tokens(
         str(row["scenario_command"]),
         name="scenario_command",
@@ -114,21 +121,33 @@ def _validated_pf_command(row: Mapping[str, str]) -> str:
     expected_options = {
         "--scenario": row["scenario_path"],
         "--runtime-root": runtime_root,
-        "--config": row["pf_config_path"],
-        "--output-dir": row["pf_output_dir"],
-        "--profile": "pf_strict",
-        "--seed": row["pf_seed"],
-        "--private-scene-profile": row["source_profile"],
+        "--pf-config": row["pf_config_path"],
+        "--control-policy": row["control_policy_path"],
+        "--pf-output-dir": row["pf_output_dir"],
+        "--pf-seed": row["pf_seed"],
     }
     for option, expected in expected_options.items():
         actual = _required_option(tokens, option)
         equal = actual == expected
-        if option in {"--scenario", "--runtime-root", "--config", "--output-dir"}:
+        if option in {
+            "--scenario",
+            "--runtime-root",
+            "--pf-config",
+            "--control-policy",
+            "--pf-output-dir",
+        }:
             equal = _same_path(actual, expected)
         if not equal:
-            raise ValueError(f"pf_command {option} differs from the manifest.")
-    if executable_index < 2:
-        raise ValueError("RA-L PF command has an invalid executable position.")
+            raise ValueError(f"session_command {option} differs from the manifest.")
+    forbidden = {
+        "--private-scene-profile",
+        "--scene-seed",
+        "--source-profile",
+        "--truth-manifest-output",
+    }
+    leaked = sorted(forbidden.intersection(tokens))
+    if leaked:
+        raise ValueError(f"session_command exposes private truth inputs: {leaked}")
     return shlex.join(tokens)
 
 
@@ -170,7 +189,7 @@ def select_paper_subset(
 ) -> list[dict[str, str]]:
     """Select and validate the four causal sessions for one scene seed."""
     available_seeds = sorted(
-        {str(row["seed"]) for row in rows if str(row["case"]) in PAPER_CASES}
+        {str(row["scene_seed"]) for row in rows if str(row["case"]) in PAPER_CASES}
     )
     if seed is None:
         if len(available_seeds) != 1:
@@ -188,7 +207,7 @@ def select_paper_subset(
     selected = [
         {field: str(row[field]) for field in MANIFEST_FIELDS}
         for row in rows
-        if str(row["seed"]) == str(seed)
+        if str(row["scene_seed"]) == str(seed)
         and (str(row["case"]), str(row["variant"])) in wanted
     ]
     order = {pair: index for index, pair in enumerate(wanted_order)}
@@ -203,7 +222,7 @@ def select_paper_subset(
         )
     for row in selected:
         row["scenario_command"] = _validated_scenario_command(row)
-        row["pf_command"] = _validated_pf_command(row)
+        row["session_command"] = _validated_session_command(row)
     return selected
 
 
@@ -218,8 +237,14 @@ def _validate_configs(row: Mapping[str, str]) -> None:
         raise ValueError("RA-L runtime config must not weight transport histories.")
     if runtime.get("target_sampled_primaries") is not None:
         raise ValueError("RA-L runtime config must not cap transport histories.")
+    transport_seed = int(row["transport_seed"])
+    if runtime.get("random_seed_base") != transport_seed:
+        raise ValueError("RA-L transport seed differs from the private manifest.")
+    if transport_seed in {int(row["scene_seed"]), int(row["pf_seed"])}:
+        raise ValueError("RA-L transport seed must be independent from scene/PF.")
     pf_config, _ = load_pf_config(Path(row["pf_config_path"]))
     enforce_pure_runtime_settings(pf_config, profile="pf_strict")
+    load_ral_control_policy(Path(row["control_policy_path"]))
 
 
 def write_manifest(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
@@ -232,6 +257,7 @@ def write_manifest(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
     for row in rows:
         writer.writerow({field: row[field] for field in MANIFEST_FIELDS})
     atomic_write_text(path, buffer.getvalue())
+    Path(path).chmod(0o600)
 
 
 def write_run_script(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
@@ -239,10 +265,10 @@ def write_run_script(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
     for row in rows:
         lines.append(_validated_scenario_command(row))
-        lines.append(_validated_pf_command(row))
+        lines.append(_validated_session_command(row))
     atomic_write_text(path, "\n".join(lines) + "\n")
     mode = Path(path).stat().st_mode
-    Path(path).chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    Path(path).chmod((mode | stat.S_IXUSR) & ~stat.S_IRWXG & ~stat.S_IRWXO)
 
 
 def build_subset(

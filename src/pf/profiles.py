@@ -328,6 +328,13 @@ _RETIRED_RUNTIME_PREFIXES = (
     "view_ratio_",
     "weak_source_prune_",
 )
+_EXPERIMENT_ONLY_TOP_LEVEL_KEYS = frozenset(
+    {
+        "baseline_path_policy",
+        "baseline_shield_policy",
+        "metadata",
+    }
+)
 
 
 def _validate_allowed_keys(
@@ -338,9 +345,7 @@ def _validate_allowed_keys(
     """Reject unknown keys from one versioned pure-PF object."""
     unknown = sorted(str(key) for key in payload if str(key) not in allowed)
     if unknown:
-        raise ValueError(
-            f"Unsupported {name} settings: " + ", ".join(unknown)
-        )
+        raise ValueError(f"Unsupported {name} settings: " + ", ".join(unknown))
 
 
 def _require_mapping(
@@ -378,6 +383,8 @@ def _validate_nested_runtime_settings(
                     "pf_obstacle_mu_by_isotope values must be finite "
                     f"nonnegative numbers; invalid value for {isotope!s}."
                 )
+
+
 def _validate_structural_runtime_values(
     runtime_config: Mapping[str, Any],
 ) -> None:
@@ -410,15 +417,15 @@ def _validate_structural_runtime_values(
             raise ValueError("pf_hard_max_sources must be a positive integer.")
         ordinary_value = runtime_config.get("pf_max_sources", hard_value)
         if hard_value < ordinary_value:
-            raise ValueError(
-                "pf_hard_max_sources must be at least pf_max_sources."
-            )
+            raise ValueError("pf_hard_max_sources must be at least pf_max_sources.")
     if "init_num_sources" in runtime_config:
         value = runtime_config["init_num_sources"]
         if (
             not isinstance(value, (list, tuple))
             or len(value) != 2
-            or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+            or any(
+                isinstance(item, bool) or not isinstance(item, int) for item in value
+            )
         ):
             raise ValueError(
                 "init_num_sources must contain exactly two integer bounds."
@@ -435,8 +442,7 @@ def resolve_estimator_profile(
         profile = EstimatorProfile.PF_STRICT
     else:
         raise ValueError(
-            f"Unsupported estimator profile {value!r}; "
-            "only 'pf_strict' is available."
+            f"Unsupported estimator profile {value!r}; only 'pf_strict' is available."
         )
     return profile, _PURE_CAPABILITIES
 
@@ -502,17 +508,22 @@ def enforce_pure_runtime_settings(
         or not isinstance(schema_version, int)
         or schema_version != PURE_PF_SCHEMA_VERSION
     ):
+        raise ValueError("Runtime configuration requires pure_pf_schema_version=1.")
+    experiment_only = sorted(
+        str(key)
+        for key in runtime_config
+        if str(key) in _EXPERIMENT_ONLY_TOP_LEVEL_KEYS
+    )
+    if experiment_only:
         raise ValueError(
-            "Runtime configuration requires pure_pf_schema_version=1."
+            "Experiment-only fields must stay outside PF configuration: "
+            + ", ".join(experiment_only)
         )
     retired_keys = sorted(
         str(key)
         for key in runtime_config
         if str(key) in _RETIRED_RUNTIME_KEYS
-        or any(
-            str(key).startswith(prefix)
-            for prefix in _RETIRED_RUNTIME_PREFIXES
-        )
+        or any(str(key).startswith(prefix) for prefix in _RETIRED_RUNTIME_PREFIXES)
     )
     if retired_keys:
         raise ValueError(
@@ -526,8 +537,7 @@ def enforce_pure_runtime_settings(
     )
     if unknown_pf_keys:
         raise ValueError(
-            "Unsupported pure-PF runtime settings: "
-            + ", ".join(unknown_pf_keys)
+            "Unsupported pure-PF runtime settings: " + ", ".join(unknown_pf_keys)
         )
     unknown_structural_keys = sorted(
         str(key)

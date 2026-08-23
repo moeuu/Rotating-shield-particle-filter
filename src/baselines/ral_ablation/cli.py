@@ -60,6 +60,26 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--pf-seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Independent PF seeds for exact replay. One is required per "
+            "explicit scene seed; fresh PF seeds are otherwise generated."
+        ),
+    )
+    parser.add_argument(
+        "--transport-seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Independent transport seeds for exact replay. One is required "
+            "per explicit scene seed; fresh values are otherwise generated."
+        ),
+    )
+    parser.add_argument(
         "--output-tag-suffix",
         default="",
         help="Optional safe suffix for isolated result and measurement-log paths.",
@@ -72,15 +92,27 @@ def main() -> None:
         output_dir=args.output_dir,
         private_root=args.private_root,
         seeds=(None if args.seeds is None else tuple(int(seed) for seed in args.seeds)),
+        pf_seeds=(
+            None
+            if args.pf_seeds is None
+            else tuple(int(seed) for seed in args.pf_seeds)
+        ),
+        transport_seeds=(
+            None
+            if args.transport_seeds is None
+            else tuple(int(seed) for seed in args.transport_seeds)
+        ),
         output_tag_suffix=str(args.output_tag_suffix),
     )
     manifest_path, script_path = write_ablation_plan(
-        entries, output_dir=args.output_dir
+        entries, private_root=args.private_root
     )
     print(f"Wrote {len(entries)} ablation trials.")
     print(
         "Scene seeds: "
-        + ", ".join(str(seed) for seed in sorted({entry.seed for entry in entries}))
+        + ", ".join(
+            str(seed) for seed in sorted({entry.scene_seed for entry in entries})
+        )
     )
     print(
         "Private scenario root: " + str(Path(args.private_root).expanduser().resolve())

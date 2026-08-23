@@ -39,7 +39,7 @@ lock file.
 
 ```bash
 uv run rotating-shield-pf-live \
-  --scenario /private/runtime/run-001.json \
+  --session-socket /run/user/1000/rotating-shield/run-001.sock \
   --runtime-root ../Rotating-shield-simulation-runtime \
   --config configs/pf/pf_strict_3d.json \
   --profile pf_strict \
@@ -47,8 +47,9 @@ uv run rotating-shield-pf-live \
   --output-dir results/pf-live-run-001
 ```
 
-Create the private, action-free scenario with the shared runtime's
-`generate-ral-scenario` command. PF never opens its realized source truth. The PF
+Create and serve the private, action-free scenario from the shared runtime. The
+generic PF command accepts only its opaque Unix socket and never receives a private
+scenario path, scene seed, or source profile. The PF
 configuration owns its particle count, planner objective, station/view/measurement
 budgets, and stopping rule. An MLE session may use entirely different estimator
 settings while connecting to the same runtime protocol.

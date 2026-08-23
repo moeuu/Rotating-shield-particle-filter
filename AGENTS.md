@@ -82,12 +82,18 @@
   policy.
 - Generate a fresh environment/truth seed for every new RA-L comparison batch
   by omitting `--seeds` from the ablation-plan CLI. Store the generated seed in
-  the manifest and reuse it only across variants within that same batch.
+  the sibling runtime's private manifest and reuse it only across variants
+  within that same batch. PF and transport seeds must be independently
+  generated and must not equal the private scene seed.
   Explicit `--seeds` is reserved for repeating a recorded live acquisition batch
   and must not be used as a new independent acceptance environment.
+- Keep the private scenario, source profile, scene seed/RNG provenance, truth
+  manifest, exhaustive manifest, and run scripts below the sibling runtime's
+  ignored `private_runs/ral_ablation/`. PF receives only a truth-free
+  MeasurementLog/adaptive stream through an opaque session socket.
 - Use `uv run python scripts/build_ral_paper_subset.py` to regenerate
-  `results/ral_ablation/ral_paper_subset_manifest.csv` and
-  `results/ral_ablation/run_paper_subset.sh` from the exhaustive manifest.
+  `../Rotating-shield-simulation-runtime/private_runs/ral_ablation/ral_paper_subset_manifest.csv`
+  and its sibling `run_paper_subset.sh` from the private exhaustive manifest.
 
 
 ## RA-L figure quality policy

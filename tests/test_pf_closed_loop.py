@@ -85,6 +85,16 @@ class _FakeRuntimeClient:
             "current_pair_id": 63,
         }
 
+    @classmethod
+    def connect(
+        cls,
+        socket_path: Path,
+        **kwargs: object,
+    ) -> "_FakeRuntimeClient":
+        """Construct a fake client from the generic socket-only boundary."""
+        del socket_path, kwargs
+        return cls()
+
     def read_event(self) -> dict[str, object]:
         """Return a bootstrap pair that PF is not required to execute."""
         return {
@@ -312,16 +322,17 @@ def test_pf_budget_requires_one_complete_estimator_station() -> None:
 
 def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
     """RA-L passive policy must bypass PF EIG for both action dimensions."""
+    from baselines.ral_ablation.control_policy import RALControlPolicy
     from pf import closed_loop
 
     estimator = SimpleNamespace(
         normals=np.asarray(generate_octant_orientations(), dtype=float)
     )
-    settings = {
-        "baseline_path_policy": {"name": "passive_serpentine", "row_count": 2},
-        "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-        "dss_pp": {"program_length": 2},
-    }
+    settings = {"dss_pp": {"program_length": 2}}
+    policy = RALControlPolicy(
+        path_policy={"name": "passive_serpentine", "row_count": 2},
+        shield_policy={"name": "fixed", "fixed_pair_id": 0},
+    )
     planner = dss_config_from_pf_settings(settings)
     candidates = AdaptiveCandidateSnapshot(
         candidate_poses_xyz=((0.0, 0.0, 0.5), (2.0, 2.0, 0.5)),
@@ -342,12 +353,13 @@ def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
         rng=np.random.default_rng(7),
         settings=settings,
         station_index=0,
+        control_policy=policy,
     )
 
     assert result.next_pose_index == 0
     assert result.shield_program.pair_ids == (0, 0)
     assert result.sequence == ()
-    assert result.diagnostics["selection_mode"] == "ral_baseline_path"
+    assert result.diagnostics["selection_mode"] == "external_control_path"
 
 
 def test_pf_closed_loop_owns_budget_and_shield_program(
@@ -411,7 +423,7 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
     )
 
     result = run_pf_closed_loop(
-        tmp_path / "private-scenario.json",
+        tmp_path / "runtime.sock",
         runtime_root=tmp_path,
         pf_config_path=config,
         output_dir=tmp_path / "output",
@@ -536,11 +548,10 @@ def test_pf_closed_loop_restores_runtime_resume_prefix(
     monkeypatch.setattr(closed_loop, "_publish_cui_frame", capture_resume_frame)
 
     result = run_pf_closed_loop(
-        tmp_path / "private-scenario.json",
+        tmp_path / "runtime.sock",
         runtime_root=tmp_path,
         pf_config_path=config,
         output_dir=tmp_path / "output",
-        resume_stage_path=tmp_path / "stage",
     )
 
     client = _FakeResumeRuntimeClient.instance
@@ -620,7 +631,7 @@ def test_detected_isotope_gate_builds_only_active_pf(
     )
 
     run_pf_closed_loop(
-        tmp_path / "private-scenario.json",
+        tmp_path / "runtime.sock",
         runtime_root=tmp_path,
         pf_config_path=config,
         output_dir=tmp_path / "output",
@@ -687,9 +698,7 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
             self.kwargs = kwargs
             output_dir = Path(str(kwargs["output_dir"]))
             output_dir.mkdir(parents=True, exist_ok=True)
-            self.latest_overview_path = (
-                output_dir / "latest_experiment_overview.png"
-            )
+            self.latest_overview_path = output_dir / "latest_experiment_overview.png"
             self.latest_robot_path = output_dir / "latest_robot_2d.png"
             self.latest_pf_path = output_dir / "latest_pf_3d.png"
             self.latest_pf_labeled_path = output_dir / "latest_pf_3d_labeled.png"
@@ -748,7 +757,7 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
     )
 
     run_pf_closed_loop(
-        tmp_path / "private-scenario.json",
+        tmp_path / "runtime.sock",
         runtime_root=tmp_path,
         pf_config_path=config,
         output_dir=tmp_path / "output",
@@ -772,8 +781,7 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
     assert client is not None
     assert client.overlay_requests == []
     assert (
-        "CUI split visualization URL: "
-        "http://example.test:8877/index.html"
+        "CUI split visualization URL: http://example.test:8877/index.html"
     ) in output_messages
     enabled_message = next(
         message
