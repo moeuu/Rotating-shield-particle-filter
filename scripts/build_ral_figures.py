@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable, Mapping
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import matplotlib
 
@@ -18,6 +19,7 @@ from matplotlib.collections import PatchCollection
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, FancyArrowPatch, Rectangle, Wedge
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from runtime.scenarios import RAL_ENVIRONMENT_CONFIG
 
 try:
     from scripts.ral_figure_common import (
@@ -105,7 +107,11 @@ def _arrow(
     )
 
 
-def _draw_schematic_obstacles(ax: Axes) -> None:
+def _draw_schematic_obstacles(
+    ax: Axes,
+    *,
+    scale_xy: tuple[float, float],
+) -> None:
     """Draw a deterministic obstacle layout for the problem schematic."""
     obstacles = [
         (1.2, 2.0, 1.1, 3.7, 1.6),
@@ -116,8 +122,15 @@ def _draw_schematic_obstacles(ax: Axes) -> None:
     ]
     patches: list[Rectangle] = []
     colors: list[float] = []
+    scale_x, scale_y = scale_xy
     for x0, y0, width, height, obstacle_height in obstacles:
-        patches.append(Rectangle((x0, y0), width, height))
+        patches.append(
+            Rectangle(
+                (x0 * scale_x, y0 * scale_y),
+                width * scale_x,
+                height * scale_y,
+            )
+        )
         colors.append(obstacle_height)
     collection = PatchCollection(
         patches,
@@ -133,15 +146,20 @@ def _draw_schematic_obstacles(ax: Axes) -> None:
 
 def _draw_problem_scene(ax: Axes, *, compact: bool = False) -> None:
     """Draw a compact multi-isotope surface-source scene for Fig. 1."""
+    room_x = float(RAL_ENVIRONMENT_CONFIG.size_x)
+    room_y = float(RAL_ENVIRONMENT_CONFIG.size_y)
+    scale_x = room_x / 10.0
+    scale_y = room_y / 20.0
     ax.add_patch(
-        Rectangle((0.0, 0.0), 10.0, 20.0, facecolor="#fbfbfb",
+        Rectangle((0.0, 0.0), room_x, room_y, facecolor="#fbfbfb",
                   edgecolor="#222222", lw=0.6, zorder=0)
     )
-    _draw_schematic_obstacles(ax)
+    _draw_schematic_obstacles(ax, scale_xy=(scale_x, scale_y))
     route = np.asarray(
         [[1.0, 1.0], [1.3, 3.8], [3.0, 6.2], [4.7, 10.0], [7.6, 15.4]],
         dtype=float,
     )
+    route *= np.asarray([scale_x, scale_y], dtype=float)
     ax.plot(route[:, 0], route[:, 1], color="#005bbb", lw=0.9, alpha=0.85, zorder=3)
     ax.scatter(route[:, 0], route[:, 1], s=12, color="#005bbb", zorder=4)
     ax.scatter(route[0, 0], route[0, 1], s=30, marker="s", color="#005bbb", zorder=5)
@@ -154,13 +172,14 @@ def _draw_problem_scene(ax: Axes, *, compact: bool = False) -> None:
     ]
     for isotope, xy, label in sources:
         color = ISOTOPE_COLORS[isotope]
-        ax.scatter(xy[0], xy[1], marker="*", s=68, color=color,
+        scaled_xy = (xy[0] * scale_x, xy[1] * scale_y)
+        ax.scatter(scaled_xy[0], scaled_xy[1], marker="*", s=68, color=color,
                    edgecolor="#222222", lw=0.35, zorder=6, clip_on=False)
         if not compact:
-            ax.text(xy[0] + 0.18, xy[1] + 0.18, label, fontsize=5.8,
+            ax.text(scaled_xy[0] + 0.18, scaled_xy[1] + 0.18, label, fontsize=5.8,
                     color=color, ha="left", va="bottom", zorder=7)
-    ax.set_xlim(-0.3, 10.3)
-    ax.set_ylim(-0.3, 20.3)
+    ax.set_xlim(-0.3, room_x + 0.3)
+    ax.set_ylim(-0.3, room_y + 0.3)
     ax.set_aspect("equal")
     ax.grid(True, lw=0.25, alpha=0.35)
     if compact:
@@ -169,8 +188,8 @@ def _draw_problem_scene(ax: Axes, *, compact: bool = False) -> None:
         for spine in ax.spines.values():
             spine.set_linewidth(0.55)
     else:
-        ax.set_xticks([0, 5, 10])
-        ax.set_yticks([0, 10, 20])
+        ax.set_xticks([0, room_x / 2.0, room_x])
+        ax.set_yticks([0, room_y / 2.0, room_y])
         ax.tick_params(labelsize=5.8, length=1.5)
         ax.set_xlabel("x [m]", fontsize=6.1, labelpad=0)
         ax.set_ylabel("y [m]", fontsize=6.1, labelpad=0)
@@ -593,22 +612,30 @@ def _draw_manifest_obstacles(ax: Axes, manifest: dict[str, Any]) -> None:
 
 
 def _room_size(summary: SummaryBundle, manifest: dict[str, Any] | None) -> tuple[float, float, float]:
-    """Return room dimensions from the manifest or source coordinates."""
-    if manifest is not None and "room_size_xyz" in manifest:
-        room = manifest["room_size_xyz"]
-        return float(room[0]), float(room[1]), float(room[2])
-    all_positions: list[list[float]] = []
-    for collection_name in ("ground_truth_sources", "estimated_sources"):
-        for sources in summary.payload.get(collection_name, {}).values():
-            all_positions.extend(source["pos"] for source in sources)
-    if not all_positions:
-        return 10.0, 20.0, 10.0
-    arr = np.asarray(all_positions, dtype=float)
-    return (
-        max(10.0, float(np.nanmax(arr[:, 0])) + 1.0),
-        max(10.0, float(np.nanmax(arr[:, 1])) + 1.0),
-        max(4.0, float(np.nanmax(arr[:, 2])) + 1.0),
-    )
+    """Return runtime-authored room dimensions without geometry inference."""
+    environment = summary.payload.get("environment")
+    raw_room: object | None = None
+    location = "result summary environment"
+    if isinstance(environment, Mapping) and all(
+        key in environment for key in ("size_x", "size_y", "size_z")
+    ):
+        raw_room = [
+            environment["size_x"],
+            environment["size_y"],
+            environment["size_z"],
+        ]
+    elif manifest is not None and "room_size_xyz" in manifest:
+        raw_room = manifest["room_size_xyz"]
+        location = "runtime environment manifest"
+    if not isinstance(raw_room, (list, tuple)) or len(raw_room) != 3:
+        raise ValueError(
+            "RA-L result figures require runtime-authored room dimensions in "
+            "summary.environment or manifest.room_size_xyz."
+        )
+    room = tuple(float(value) for value in raw_room)
+    if any(not np.isfinite(value) or value <= 0.0 for value in room):
+        raise ValueError(f"{location} room dimensions must be finite and positive.")
+    return room
 
 
 def _load_trace_positions(summary: SummaryBundle) -> np.ndarray:

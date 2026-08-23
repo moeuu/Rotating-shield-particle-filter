@@ -34,6 +34,11 @@ def _write_summary(
         encoding="utf-8",
     )
     payload = {
+        "environment": {
+            "size_x": 10.0,
+            "size_y": 15.0,
+            "size_z": 5.0,
+        },
         "ground_truth_sources": {
             "Cs-137": [
                 {"pos": [1.0, 3.0, 2.0], "strength": 30000.0},

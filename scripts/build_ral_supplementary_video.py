@@ -24,6 +24,8 @@ SANS_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.ral_figure_common import LATEX_ROOT  # noqa: E402
+
 
 @dataclass(frozen=True)
 class VideoSegment:
@@ -52,7 +54,6 @@ def _font(size_px: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | Image
 def discover_storyboard_segments(root: Path = ROOT) -> list[VideoSegment]:
     """Return available figure assets for a default RA-L supplementary video."""
     figure_root = root / "results" / "ral_isaac_figures"
-    latex_root = root.parent / "latex" / "projects" / "ieee-ra-l-letter"
     candidates = [
         VideoSegment(
             title="Problem setting",
@@ -92,7 +93,7 @@ def discover_storyboard_segments(root: Path = ROOT) -> list[VideoSegment]:
                 "The final figure summarizes source-term estimates, ground truth, "
                 "PF support, and the robot trajectory for the main multi-isotope run."
             ),
-            image_path=latex_root
+            image_path=LATEX_ROOT
             / "sections/05_experiments/figures/ral_result_overview.png",
         ),
     ]

@@ -43,6 +43,26 @@ fixed RA-L experiment-design value: it removes configurations that are not a
 meaningful test of separate-source recovery without screening locations for
 favourable visibility or response conditioning.
 
+The runtime is the single production source of the RA-L physical environment.
+`runtime.scenarios.RAL_ENVIRONMENT_CONFIG` in the sibling simulation-runtime
+repository defines the 10 x 15 x 5 m room, and both the runtime scene and the
+truth-free environment payload are derived from that object. Estimator
+repositories must not redeclare those dimensions; they consume the environment
+from the adaptive-session context and finalized MeasurementLog.
+
+Use the following fixed PF acquisition contract for every paper variant:
+
+- at most 16 stations;
+- 8 shield views per complete station;
+- 20.0 s live time per view;
+- at most 128 measurements;
+- 2560 s (42 min 40 s) maximum detector live time;
+- `min_station_separation_m = 3.0` and `coverage_radius_m = 3.0`.
+
+The station-separation term remains a planner penalty rather than a hard
+geometric exclusion. Physical reachability and collision clearance continue to
+come only from the runtime candidate contract.
+
 Run only four closed-loop full-simulation variants for the main paper table:
 
 - `proposed`

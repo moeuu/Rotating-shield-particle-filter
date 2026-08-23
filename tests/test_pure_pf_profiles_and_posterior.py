@@ -1569,8 +1569,9 @@ def test_strict_profile_keeps_pf_budget_and_retires_runtime_placeholders() -> No
     assert resolved["structural_cardinality_tail_ratio"] == pytest.approx(0.05)
     assert "adaptive_cardinality_dwell_enable" not in resolved
     assert resolved["adaptive_mission_stop"] is False
-    assert resolved["measurement_budget_max_steps"] == 160
-    assert resolved["mission_stop_max_poses"] == 20
+    assert resolved["measurement_budget_max_steps"] == 128
+    assert resolved["mission_stop_max_poses"] == 16
+    assert resolved["measurement_live_time_s"] == pytest.approx(20.0)
     assert resolved["cui_truth_display_mode"] == "hidden"
     assert "detector_height_sampling_mode" not in resolved
     assert "measurement_pose_clearance_enabled" not in resolved
@@ -1582,8 +1583,13 @@ def test_strict_profile_keeps_pf_budget_and_retires_runtime_placeholders() -> No
     dss = resolved["dss_pp"]
     # These inherited settings prove the nested section is fully specified,
     # not accidentally replaced by a three-key shallow override.
-    assert int(dss["program_length"]) >= 1
+    assert int(dss["program_length"]) == 8
     assert int(dss["max_programs"]) >= 1
+    assert dss["min_station_separation_m"] == pytest.approx(3.0)
+    assert dss["coverage_radius_m"] == pytest.approx(3.0)
+    assert resolved["measurement_budget_max_steps"] == (
+        resolved["mission_stop_max_poses"] * int(dss["program_length"])
+    )
 
 
 def test_standard_pf_config_selects_exact_surface_rj_kernel() -> None:

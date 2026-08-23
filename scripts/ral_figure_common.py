@@ -12,7 +12,9 @@ from typing import Any, Iterable
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[1]
-LATEX_ROOT = ROOT.parent / "latex" / "projects" / "ieee-ra-l-letter"
+LATEX_ROOT = (
+    ROOT.parent / "ai-latex-workspace" / "projects" / "ieee-ra-l-letter"
+)
 FIG1_PATH = LATEX_ROOT / "sections/01_introduction/figures/ral_problem_shield_code.pdf"
 FIG2_PATH = LATEX_ROOT / "sections/03_system_model/figures/ral_method_loop.pdf"
 EXPERIMENT_FIG_PATH = (

@@ -1,7 +1,7 @@
 # RA-L Manuscript Policy
 
 These rules apply whenever editing the RA-L manuscript in
-`/home/moeu/research/latex/projects/ieee-ra-l-letter`.
+`/home/moeu/research/ai-latex-workspace/projects/ieee-ra-l-letter`.
 
 ## Anonymous Funding Acknowledgment
 

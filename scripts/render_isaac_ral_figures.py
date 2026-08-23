@@ -20,13 +20,15 @@ from PIL import ImageFont
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-LATEX_ROOT = ROOT.parent / "latex" / "projects" / "ieee-ra-l-letter"
 OUTPUT_ROOT = ROOT / "results" / "ral_isaac_figures"
 SERIF_FONT_REGULAR = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
 
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+for import_root in (ROOT, SRC):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
+from scripts.ral_figure_common import LATEX_ROOT  # noqa: E402
+from runtime.scenarios import RAL_ENVIRONMENT_CONFIG  # noqa: E402
 from sim.isaacsim_app.app import IsaacSimApplication  # noqa: E402
 from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription  # noqa: E402
 from sim.protocol import SimulationCommand  # noqa: E402
@@ -46,16 +48,21 @@ def _obstacle_cells() -> list[tuple[int, int]]:
 
 def _scene_description() -> SceneDescription:
     """Create the deterministic Isaac Sim scene used for all captures."""
+    room_size = (
+        RAL_ENVIRONMENT_CONFIG.size_x,
+        RAL_ENVIRONMENT_CONFIG.size_y,
+        RAL_ENVIRONMENT_CONFIG.size_z,
+    )
     sources = [
         SourceDescription("Cs-137", (8.2, 13.3, 0.85), 30000.0),
         SourceDescription("Co-60", (2.1, 11.6, 0.85), 18000.0),
         SourceDescription("Eu-154", (7.4, 5.8, 0.85), 12000.0),
     ]
     return SceneDescription(
-        room_size_xyz=(10.0, 16.0, 4.0),
+        room_size_xyz=room_size,
         obstacle_origin_xy=(0.0, 0.0),
         obstacle_cell_size_m=1.0,
-        obstacle_grid_shape=(10, 16),
+        obstacle_grid_shape=(int(room_size[0]), int(room_size[1])),
         obstacle_material="concrete",
         obstacle_cells=_obstacle_cells(),
         author_obstacle_prims=True,
@@ -172,7 +179,7 @@ def _command(
         target_base_yaw_rad=yaw,
         fe_orientation_index=fe,
         pb_orientation_index=pb,
-        dwell_time_s=30.0,
+        dwell_time_s=20.0,
     )
 
 

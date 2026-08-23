@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
-
-RAL_MANUSCRIPT_ROOT = (
-    Path(__file__).resolve().parents[2] / "latex" / "projects" / "ieee-ra-l-letter"
-)
+from scripts.ral_figure_common import LATEX_ROOT
 
 
 def test_ral_funding_acknowledgment_is_first_page_footnote() -> None:
     """The anonymous RA-L funding acknowledgment must stay in the author footnote."""
-    main_tex = RAL_MANUSCRIPT_ROOT / "main.tex"
+    main_tex = LATEX_ROOT / "main.tex"
     content = main_tex.read_text(encoding="utf-8")
 
     assert r"\IEEEoverridecommandlockouts" in content
@@ -22,4 +17,3 @@ def test_ral_funding_acknowledgment_is_first_page_footnote() -> None:
     ) in content
     assert r"\thanks{\RALFundingAcknowledgment}" in content
     assert r"\section*{ACKNOWLEDGMENT}" not in content
-
