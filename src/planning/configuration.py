@@ -5,16 +5,48 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from runtime.experiment_profiles import AcquisitionContract
+
 from planning.dss_pp import DSSPPConfig
 
 
 def dss_config_from_pf_settings(
     settings: Mapping[str, Any],
+    *,
+    acquisition_contract: AcquisitionContract | None = None,
 ) -> DSSPPConfig:
     """Build live DSS-PP settings for runtime-owned candidate poses."""
     raw = settings.get("dss_pp", {})
     if not isinstance(raw, Mapping):
         raise TypeError("dss_pp must be a mapping.")
+    if acquisition_contract is not None:
+        top_level_overrides = sorted(
+            key
+            for key in (
+                "measurement_budget_max_steps",
+                "measurement_live_time_s",
+                "mission_stop_max_poses",
+                "orientation_k",
+            )
+            if key in settings
+        )
+        planner_overrides = sorted(
+            key
+            for key in (
+                "coverage_radius_m",
+                "min_station_separation_m",
+                "program_length",
+            )
+            if key in raw
+        )
+        if top_level_overrides or planner_overrides:
+            fields = top_level_overrides + [
+                f"dss_pp.{key}" for key in planner_overrides
+            ]
+            raise ValueError(
+                "Runtime-owned acquisition settings cannot appear in PF config: "
+                + ", ".join(fields)
+            )
     pf_cardinality_capacity = settings.get(
         "pf_hard_max_sources",
         settings.get("pf_max_sources", 5),
@@ -25,9 +57,29 @@ def dss_config_from_pf_settings(
     # The shared runtime owns obstacle-aware reachability and publishes
     # time-valued travel costs. The PF must not add a second Euclidean
     # distance surrogate for those same runtime-authored actions.
+    program_length = (
+        raw.get("program_length", 2)
+        if acquisition_contract is None
+        else acquisition_contract.views_per_station
+    )
+    live_time_s = (
+        settings.get("measurement_live_time_s", 30.0)
+        if acquisition_contract is None
+        else acquisition_contract.live_time_s
+    )
+    coverage_radius_m = (
+        raw.get("coverage_radius_m", 3.0)
+        if acquisition_contract is None
+        else acquisition_contract.coverage_radius_m
+    )
+    min_station_separation_m = (
+        raw.get("min_station_separation_m", 0.0)
+        if acquisition_contract is None
+        else acquisition_contract.min_station_separation_m
+    )
     return DSSPPConfig(
         max_programs=raw.get("max_programs", 40),
-        program_length=raw.get("program_length", 2),
+        program_length=program_length,
         mode_cluster_radius_m=raw.get("mode_cluster_radius_m", 1.5),
         max_modes_per_isotope=raw.get(
             "max_modes_per_isotope",
@@ -35,7 +87,7 @@ def dss_config_from_pf_settings(
         ),
         planning_particles=raw.get("planning_particles", 512),
         planning_method=planning_method,
-        live_time_s=settings.get("measurement_live_time_s", 30.0),
+        live_time_s=live_time_s,
         lambda_eig=raw.get("eig_weight", 1.0),
         lambda_distance=0.0,
         lambda_time=raw.get("time_weight", 0.0),
@@ -50,7 +102,7 @@ def dss_config_from_pf_settings(
             0.0,
         ),
         eta_revisit=raw.get("revisit_penalty_weight", 0.0),
-        coverage_radius_m=raw.get("coverage_radius_m", 3.0),
+        coverage_radius_m=coverage_radius_m,
         coverage_surface_quadrature_max_points=raw.get(
             "coverage_surface_quadrature_max_points",
             65536,
@@ -61,7 +113,7 @@ def dss_config_from_pf_settings(
         ),
         coverage_floor_quantile=raw.get("coverage_floor_quantile", 0.0),
         coverage_floor_weight=raw.get("coverage_floor_weight", 0.0),
-        min_station_separation_m=raw.get("min_station_separation_m", 0.0),
+        min_station_separation_m=min_station_separation_m,
         detector_aperture_samples=raw.get("detector_aperture_samples", 121),
         robot_speed_m_s=raw.get("robot_speed_m_s", 0.5),
         rotation_overhead_s=raw.get("rotation_overhead_s", 0.0),

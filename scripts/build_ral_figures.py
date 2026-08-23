@@ -19,7 +19,7 @@ from matplotlib.collections import PatchCollection
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, FancyArrowPatch, Rectangle, Wedge
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from runtime.scenarios import RAL_ENVIRONMENT_CONFIG
+from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
 
 try:
     from scripts.ral_figure_common import (
@@ -146,8 +146,8 @@ def _draw_schematic_obstacles(
 
 def _draw_problem_scene(ax: Axes, *, compact: bool = False) -> None:
     """Draw a compact multi-isotope surface-source scene for Fig. 1."""
-    room_x = float(RAL_ENVIRONMENT_CONFIG.size_x)
-    room_y = float(RAL_ENVIRONMENT_CONFIG.size_y)
+    room_x = float(STANDARD_EXPERIMENT_PROFILE.environment.size_x)
+    room_y = float(STANDARD_EXPERIMENT_PROFILE.environment.size_y)
     scale_x = room_x / 10.0
     scale_y = room_y / 20.0
     ax.add_patch(

@@ -16,6 +16,7 @@ from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import source_surface_kind
 from measurement.surface_charts import build_surface_chart_geometry
+from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
 from pf.estimator import (
     JointStationObservation,
     MeasurementRecord,
@@ -1569,9 +1570,10 @@ def test_strict_profile_keeps_pf_budget_and_retires_runtime_placeholders() -> No
     assert resolved["structural_cardinality_tail_ratio"] == pytest.approx(0.05)
     assert "adaptive_cardinality_dwell_enable" not in resolved
     assert resolved["adaptive_mission_stop"] is False
-    assert resolved["measurement_budget_max_steps"] == 128
-    assert resolved["mission_stop_max_poses"] == 16
-    assert resolved["measurement_live_time_s"] == pytest.approx(20.0)
+    assert "measurement_budget_max_steps" not in resolved
+    assert "mission_stop_max_poses" not in resolved
+    assert "measurement_live_time_s" not in resolved
+    assert "orientation_k" not in resolved
     assert resolved["cui_truth_display_mode"] == "hidden"
     assert "detector_height_sampling_mode" not in resolved
     assert "measurement_pose_clearance_enabled" not in resolved
@@ -1583,13 +1585,11 @@ def test_strict_profile_keeps_pf_budget_and_retires_runtime_placeholders() -> No
     dss = resolved["dss_pp"]
     # These inherited settings prove the nested section is fully specified,
     # not accidentally replaced by a three-key shallow override.
-    assert int(dss["program_length"]) == 8
+    assert "program_length" not in dss
     assert int(dss["max_programs"]) >= 1
-    assert dss["min_station_separation_m"] == pytest.approx(3.0)
-    assert dss["coverage_radius_m"] == pytest.approx(3.0)
-    assert resolved["measurement_budget_max_steps"] == (
-        resolved["mission_stop_max_poses"] * int(dss["program_length"])
-    )
+    assert "min_station_separation_m" not in dss
+    assert "coverage_radius_m" not in dss
+    assert STANDARD_EXPERIMENT_PROFILE.acquisition.max_measurements == 128
 
 
 def test_standard_pf_config_selects_exact_surface_rj_kernel() -> None:

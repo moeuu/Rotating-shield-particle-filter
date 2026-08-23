@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import pytest
+
 from scripts.ral_figure_common import LATEX_ROOT
 
 
 def test_ral_funding_acknowledgment_is_first_page_footnote() -> None:
     """The anonymous RA-L funding acknowledgment must stay in the author footnote."""
     main_tex = LATEX_ROOT / "main.tex"
+    if not main_tex.is_file():
+        pytest.skip(f"External RA-L manuscript checkout is unavailable: {main_tex}")
     content = main_tex.read_text(encoding="utf-8")
 
     assert r"\IEEEoverridecommandlockouts" in content

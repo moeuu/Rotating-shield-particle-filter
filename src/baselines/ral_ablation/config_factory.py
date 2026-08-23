@@ -12,21 +12,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
+
 from pf.atomic_io import atomic_write_json, atomic_write_text
 from pf.profiles import enforce_pure_runtime_settings
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RUNTIME_ROOT = ROOT.parent / "Rotating-shield-simulation-runtime"
 DEFAULT_RUNTIME_CONFIG = (
-    DEFAULT_RUNTIME_ROOT
-    / "configs"
-    / "geant4"
-    / "variance_reduction_external_no_isaac_32threads.json"
+    DEFAULT_RUNTIME_ROOT / STANDARD_EXPERIMENT_PROFILE.runtime_config_relative_path
 )
 DEFAULT_PF_CONFIG = ROOT / "configs" / "pf" / "pf_strict_3d.json"
 DEFAULT_OUTPUT_DIR = ROOT / "results" / "ral_ablation"
 DEFAULT_PRIVATE_ROOT = DEFAULT_RUNTIME_ROOT / "private_runs" / "ral_ablation"
-DEFAULT_SOURCE_PROFILE = "ral-mix9"
 MAX_FRESH_ABLATION_SEED = (1 << 48) - 18
 
 
@@ -185,26 +183,15 @@ def resolve_batch_ids(
 
 @dataclass(frozen=True, slots=True)
 class AblationCase:
-    """Describe one private runtime-authored RA-L source profile."""
+    """Describe one paper case whose private scene is runtime-authored."""
 
     name: str
     description: str
-    source_profile: str
-    isotope_counts: tuple[tuple[str, int], ...]
 
     def __post_init__(self) -> None:
         """Validate one private case declaration before plan generation."""
         _nonempty_string(self.name, name="AblationCase.name")
         _nonempty_string(self.description, name="AblationCase.description")
-        _nonempty_string(self.source_profile, name="AblationCase.source_profile")
-        if not self.isotope_counts:
-            raise ValueError("AblationCase.isotope_counts must not be empty.")
-        names: list[str] = []
-        for isotope, count in self.isotope_counts:
-            names.append(_nonempty_string(isotope, name="isotope"))
-            _json_integer(count, name="isotope count", minimum=1)
-        if len(set(names)) != len(names):
-            raise ValueError("AblationCase isotope names must be unique.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,7 +234,6 @@ class AblationPlanEntry:
     pf_seed: int
     transport_seed: int
     seed_policy: str
-    source_profile: str
     pf_config_path: Path
     control_policy_path: Path
     runtime_config_path: Path
@@ -262,9 +248,7 @@ class AblationPlanEntry:
 DEFAULT_ABLATION_CASES: tuple[AblationCase, ...] = (
     AblationCase(
         name="mix9_multi_isotope_cardinality",
-        description="4 Cs-137, 3 Co-60, and 2 Eu-154 surface sources.",
-        source_profile=DEFAULT_SOURCE_PROFILE,
-        isotope_counts=(("Cs-137", 4), ("Co-60", 3), ("Eu-154", 2)),
+        description="Runtime-default private multi-isotope surface scene.",
     ),
 )
 
@@ -393,7 +377,6 @@ def _scenario_command(
     run_id: str,
     runtime_config_path: Path,
     scene_seed: int,
-    source_profile: str,
 ) -> tuple[str, ...]:
     """Return the private runtime scenario and truth-manifest command."""
     return (
@@ -402,7 +385,7 @@ def _scenario_command(
         "--directory",
         runtime_root.as_posix(),
         "rotating-shield-sim",
-        "generate-ral-scenario",
+        "generate-scenario",
         scenario_path.as_posix(),
         "--truth-manifest-output",
         truth_manifest_path.as_posix(),
@@ -414,8 +397,6 @@ def _scenario_command(
         runtime_config_path.as_posix(),
         "--scene-seed",
         str(scene_seed),
-        "--source-profile",
-        source_profile,
     )
 
 
@@ -535,7 +516,6 @@ def build_ablation_plan(
                     run_id=tag,
                     runtime_config_path=generated_runtime_path,
                     scene_seed=scene_seed,
-                    source_profile=case.source_profile,
                 )
                 entries.append(
                     AblationPlanEntry(
@@ -546,7 +526,6 @@ def build_ablation_plan(
                         pf_seed=pf_seed,
                         transport_seed=transport_seed,
                         seed_policy=seed_policy,
-                        source_profile=case.source_profile,
                         pf_config_path=generated_pf_path,
                         control_policy_path=control_policy_path,
                         runtime_config_path=generated_runtime_path,
@@ -576,7 +555,6 @@ MANIFEST_FIELDS = (
     "pf_seed",
     "transport_seed",
     "seed_policy",
-    "source_profile",
     "pf_config_path",
     "control_policy_path",
     "runtime_config_path",
@@ -599,7 +577,6 @@ def _entry_row(entry: AblationPlanEntry) -> dict[str, object]:
         "pf_seed": entry.pf_seed,
         "transport_seed": entry.transport_seed,
         "seed_policy": entry.seed_policy,
-        "source_profile": entry.source_profile,
         "pf_config_path": entry.pf_config_path.as_posix(),
         "control_policy_path": entry.control_policy_path.as_posix(),
         "runtime_config_path": entry.runtime_config_path.as_posix(),

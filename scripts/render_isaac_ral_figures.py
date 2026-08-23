@@ -28,7 +28,7 @@ for import_root in (ROOT, SRC):
         sys.path.insert(0, str(import_root))
 
 from scripts.ral_figure_common import LATEX_ROOT  # noqa: E402
-from runtime.scenarios import RAL_ENVIRONMENT_CONFIG  # noqa: E402
+from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE  # noqa: E402
 from sim.isaacsim_app.app import IsaacSimApplication  # noqa: E402
 from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription  # noqa: E402
 from sim.protocol import SimulationCommand  # noqa: E402
@@ -49,9 +49,9 @@ def _obstacle_cells() -> list[tuple[int, int]]:
 def _scene_description() -> SceneDescription:
     """Create the deterministic Isaac Sim scene used for all captures."""
     room_size = (
-        RAL_ENVIRONMENT_CONFIG.size_x,
-        RAL_ENVIRONMENT_CONFIG.size_y,
-        RAL_ENVIRONMENT_CONFIG.size_z,
+        STANDARD_EXPERIMENT_PROFILE.environment.size_x,
+        STANDARD_EXPERIMENT_PROFILE.environment.size_y,
+        STANDARD_EXPERIMENT_PROFILE.environment.size_z,
     )
     sources = [
         SourceDescription("Cs-137", (8.2, 13.3, 0.85), 30000.0),

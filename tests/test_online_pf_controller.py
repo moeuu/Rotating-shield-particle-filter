@@ -66,7 +66,7 @@ def test_generic_pf_has_no_ral_baseline_import() -> None:
     source = inspect.getsource(__import__("pf.closed_loop", fromlist=["*"]))
 
     assert "baselines.ral_ablation" not in source
-    assert "ral-mix9" not in source
+    assert '"mix9"' not in source
 
 
 def test_closed_loop_uses_typed_adaptive_lifecycle_and_refinement() -> None:

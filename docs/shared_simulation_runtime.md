@@ -16,7 +16,7 @@ schema are common; PF particles and posterior presentation remain PF-owned.
 
 ```bash
 # In Rotating-shield-simulation-runtime: author physics, not actions
-uv run rotating-shield-sim generate-ral-scenario /private/run-001.json \
+uv run rotating-shield-sim generate-scenario /private/run-001.json \
   --truth-manifest-output /private/truth/run-001.json \
   --measurement-log-output /private/logs/run-001 \
   --run-id run-001 \
@@ -26,7 +26,7 @@ uv run rotating-shield-sim generate-ral-scenario /private/run-001.json \
 uv run rotating-shield-sim serve-adaptive-session-socket /private/run-001.json \
   --socket-path /run/user/1000/rotating-shield/run-001.sock
 
-# In this repository: PF sees only the socket and owns its planner/budget
+# In this repository: PF sees only the socket and owns inference/planning policy
 uv run rotating-shield-pf-live \
   --session-socket /run/user/1000/rotating-shield/run-001.sock \
   --runtime-root ../Rotating-shield-simulation-runtime \
@@ -39,11 +39,12 @@ one action to the sibling runtime, waits until that raw spectrum is durably stag
 and then calls the PF station update. After the final decision, PF asks the runtime
 to publish the immutable log and binds the posterior provenance to its digest. The
 published log is not accepted as a new batch inference input. The runtime scenario
-contains no action list,
-station count, view count, shield program, or estimator stop rule. The 20-station,
-8-view, 160-observation RA-L limits are PF/experiment-harness settings rather than
-physical-runtime settings.
+contains no action list, shield program, or estimator stop rule. It does publish the
+truth-free acquisition contract: the standard profile owns the 16-station, 8-view,
+20-second-per-view, 128-observation limits and the shared 3 m separation/coverage
+radii. PF owns only statistical stopping and action choice.
 
 The private runtime scenario and the separately joined private truth manifest may
 contain realized source truth. MeasurementLog and every estimator-visible adaptive
-event reject source profile, scene seed/RNG provenance, and realized source fields.
+event reject private scene variant, scene seed/RNG provenance, and realized source
+fields.

@@ -14,7 +14,8 @@ _TRUTH_MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
         "run_id",
-        "source_profile",
+        "experiment_profile_id",
+        "scene_variant_id",
         "scene_seed",
         "scene_rng_provenance",
         "sources",
@@ -27,7 +28,8 @@ class PrivateEvaluationTruth:
     """Hold private truth after an exact completed-run identifier join."""
 
     run_id: str
-    source_profile: str
+    experiment_profile_id: str
+    scene_variant_id: str
     scene_seed: int
     scene_rng_provenance: Mapping[str, object]
     sources: tuple[Mapping[str, object], ...]
@@ -76,12 +78,15 @@ def load_private_truth_for_completed_result(
         raise ValueError("Private truth manifest must match schema version 1 exactly.")
     if truth.get("run_id") != run_id:
         raise ValueError("Private truth manifest run_id differs from PF result run_id.")
-    source_profile = truth.get("source_profile")
+    experiment_profile_id = truth.get("experiment_profile_id")
+    scene_variant_id = truth.get("scene_variant_id")
     scene_seed = truth.get("scene_seed")
     provenance = truth.get("scene_rng_provenance")
     sources = truth.get("sources")
-    if not isinstance(source_profile, str) or not source_profile:
-        raise ValueError("Private truth source_profile must be nonempty.")
+    if not isinstance(experiment_profile_id, str) or not experiment_profile_id:
+        raise ValueError("Private truth experiment_profile_id must be nonempty.")
+    if not isinstance(scene_variant_id, str) or not scene_variant_id:
+        raise ValueError("Private truth scene_variant_id must be nonempty.")
     if isinstance(scene_seed, bool) or not isinstance(scene_seed, int):
         raise ValueError("Private truth scene_seed must be an integer.")
     if not isinstance(provenance, Mapping):
@@ -99,7 +104,8 @@ def load_private_truth_for_completed_result(
     )
     return PrivateEvaluationTruth(
         run_id=run_id,
-        source_profile=source_profile,
+        experiment_profile_id=experiment_profile_id,
+        scene_variant_id=scene_variant_id,
         scene_seed=scene_seed,
         scene_rng_provenance=frozen_provenance,
         sources=frozen_sources,

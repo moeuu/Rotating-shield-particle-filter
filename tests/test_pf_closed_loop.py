@@ -19,6 +19,7 @@ from runtime.adaptive_client import (
     AdaptiveRefineRequest,
     AdaptiveStepRequest,
 )
+from runtime.experiment_profiles import AcquisitionContract
 
 from pf.closed_loop import (
     PFClosedLoopResult,
@@ -41,6 +42,14 @@ def _context_payload() -> dict[str, object]:
             "size_y": 2.0,
             "size_z": 2.0,
             "detector_position": [0.5, 0.5, 0.5],
+            "acquisition_contract": AcquisitionContract(
+                max_stations=1,
+                views_per_station=1,
+                live_time_s=30.0,
+                max_measurements=1,
+                min_station_separation_m=3.0,
+                coverage_radius_m=3.0,
+            ).to_payload(),
         },
         "sim_backend": "test",
         "spectrum_count_method": "joint_full_spectrum_generative",
@@ -307,17 +316,23 @@ class _FakeLog:
 def test_pf_budget_requires_one_complete_estimator_station() -> None:
     """The runtime must never receive a truncated PF likelihood block."""
     settings = {
-        "orientation_k": 8,
-        "measurement_budget_max_steps": 7,
         "dss_pp": {
             "program_length": 8,
             "planning_method": "resample",
         },
     }
     planner = dss_config_from_pf_settings(settings)
+    contract = AcquisitionContract(
+        max_stations=1,
+        views_per_station=1,
+        live_time_s=30.0,
+        max_measurements=1,
+        min_station_separation_m=3.0,
+        coverage_radius_m=3.0,
+    )
 
-    with pytest.raises(ValueError, match="complete station"):
-        PFControlBudget.from_settings(settings, planner)
+    with pytest.raises(ValueError, match="views_per_station"):
+        PFControlBudget.from_runtime_contract(settings, planner, contract)
 
 
 def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
@@ -375,13 +390,8 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
             {
                 "pure_pf_schema_version": 1,
                 "estimator_profile": "pf_strict",
-                "mission_stop_max_poses": 1,
-                "measurement_budget_max_steps": 1,
-                "orientation_k": 1,
-                "measurement_live_time_s": 30.0,
                 "cui_split_view": False,
                 "dss_pp": {
-                    "program_length": 1,
                     "max_programs": 64,
                     "augment_candidates": False,
                 },
@@ -483,12 +493,8 @@ def test_pf_closed_loop_restores_runtime_resume_prefix(
             {
                 "pure_pf_schema_version": 1,
                 "estimator_profile": "pf_strict",
-                "mission_stop_max_poses": 1,
-                "measurement_budget_max_steps": 1,
-                "orientation_k": 1,
-                "measurement_live_time_s": 30.0,
                 "cui_split_view": False,
-                "dss_pp": {"program_length": 1, "max_programs": 64},
+                "dss_pp": {"max_programs": 64},
             }
         ),
         encoding="utf-8",
@@ -577,15 +583,10 @@ def test_detected_isotope_gate_builds_only_active_pf(
             {
                 "pure_pf_schema_version": 1,
                 "estimator_profile": "pf_strict",
-                "mission_stop_max_poses": 1,
-                "measurement_budget_max_steps": 1,
-                "orientation_k": 1,
-                "measurement_live_time_s": 30.0,
                 "cui_split_view": False,
                 "pf_detected_isotopes_only": True,
                 "detected_isotope_false_activation_probability": 0.001,
                 "dss_pp": {
-                    "program_length": 1,
                     "max_programs": 64,
                     "augment_candidates": False,
                 },
@@ -666,15 +667,10 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
             {
                 "pure_pf_schema_version": 1,
                 "estimator_profile": "pf_strict",
-                "mission_stop_max_poses": 1,
-                "measurement_budget_max_steps": 1,
-                "orientation_k": 1,
-                "measurement_live_time_s": 30.0,
                 "cui_split_view": True,
                 "cui_split_view_dir": (tmp_path / "cui").as_posix(),
                 "cui_truth_display_mode": "hidden",
                 "dss_pp": {
-                    "program_length": 1,
                     "max_programs": 64,
                     "augment_candidates": False,
                 },

@@ -10,7 +10,7 @@ definition, statistics, and observation path.
   acquisition. Every completed station is durably recorded before its event is
   assimilated and used to choose the next station and shield program.
 - Private physical scenarios are authored by
-  `rotating-shield-sim generate-ral-scenario` and executed only by
+  `rotating-shield-sim generate-scenario` and executed only by
   `rotating-shield-sim run-adaptive-session`.
 - PF controls that session through `rotating-shield-pf-live`; this repository has
   no finalized-log batch inference command or compatibility shim.

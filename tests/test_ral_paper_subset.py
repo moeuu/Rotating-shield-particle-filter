@@ -46,7 +46,6 @@ def _manifest_row(case: str, variant: str, seed: str = TEST_SEED) -> dict[str, s
         / f"{tag}.json"
     )
     pf_output = root / "results" / "ral_ablation" / "runs" / tag
-    source_profile = "ral-mix9"
     return {
         "case": case,
         "variant": variant,
@@ -55,7 +54,6 @@ def _manifest_row(case: str, variant: str, seed: str = TEST_SEED) -> dict[str, s
         "pf_seed": TEST_PF_SEED,
         "transport_seed": "864297531",
         "seed_policy": "fresh_per_batch",
-        "source_profile": source_profile,
         "pf_config_path": pf_config.as_posix(),
         "control_policy_path": control_policy.as_posix(),
         "runtime_config_path": runtime_config.as_posix(),
@@ -65,11 +63,10 @@ def _manifest_row(case: str, variant: str, seed: str = TEST_SEED) -> dict[str, s
         "pf_output_dir": pf_output.as_posix(),
         "scenario_command": (
             f"uv run --directory {runtime_root} rotating-shield-sim "
-            f"generate-ral-scenario {scenario} "
+            f"generate-scenario {scenario} "
             f"--truth-manifest-output {truth_manifest} "
             f"--measurement-log-output {log_path} --run-id {tag} "
-            f"--runtime-config {runtime_config} --scene-seed {seed} "
-            f"--source-profile {source_profile}"
+            f"--runtime-config {runtime_config} --scene-seed {seed}"
         ),
         "session_command": (
             f"uv run --directory {root} python -m "
@@ -91,7 +88,7 @@ def test_select_paper_subset_uses_mix9_four_run_plan() -> None:
 
     assert [row["variant"] for row in subset] == list(MODULE.CORE_VARIANTS)
     assert all(row["case"] == "mix9_multi_isotope_cardinality" for row in subset)
-    assert all("generate-ral-scenario" in row["scenario_command"] for row in subset)
+    assert all("generate-scenario" in row["scenario_command"] for row in subset)
     assert all(
         "baselines.ral_ablation.session_runner" in row["session_command"]
         for row in subset

@@ -44,7 +44,7 @@ meaningful test of separate-source recovery without screening locations for
 favourable visibility or response conditioning.
 
 The runtime is the single production source of the RA-L physical environment.
-`runtime.scenarios.RAL_ENVIRONMENT_CONFIG` in the sibling simulation-runtime
+`runtime.experiment_profiles.STANDARD_EXPERIMENT_PROFILE` in the sibling runtime
 repository defines the 10 x 15 x 5 m room, and both the runtime scene and the
 truth-free environment payload are derived from that object. Estimator
 repositories must not redeclare those dimensions; they consume the environment
@@ -116,7 +116,7 @@ sibling runtime repository:
 - `../Rotating-shield-simulation-runtime/private_runs/ral_ablation/run_paper_subset.sh`
 
 Each row first invokes the sibling runtime's
-`rotating-shield-sim generate-ral-scenario`, which writes both the private
+`rotating-shield-sim generate-scenario`, which writes both the private
 scenario and a separate private truth manifest keyed by opaque `run_id`. It then
 starts the RA-L-only session adapter. The adapter gives the generic PF controller
 only an owner-only Unix socket, a truth-free PF config, and a separate RA-L control

@@ -78,7 +78,7 @@ def _validated_scenario_command(row: Mapping[str, str]) -> str:
     if "rotating-shield-sim" not in tokens:
         raise ValueError("RA-L scenario command must use rotating-shield-sim.")
     executable_index = tokens.index("rotating-shield-sim")
-    expected_prefix = ["rotating-shield-sim", "generate-ral-scenario"]
+    expected_prefix = ["rotating-shield-sim", "generate-scenario"]
     if tokens[executable_index : executable_index + 2] != expected_prefix:
         raise ValueError("RA-L scenario command must generate a private scenario.")
     scenario_index = executable_index + 2
@@ -91,7 +91,6 @@ def _validated_scenario_command(row: Mapping[str, str]) -> str:
         "--measurement-log-output": row["measurement_log_path"],
         "--runtime-config": row["runtime_config_path"],
         "--scene-seed": row["scene_seed"],
-        "--source-profile": row["source_profile"],
     }
     for option, expected in expected_options.items():
         actual = _required_option(tokens, option)
@@ -142,7 +141,7 @@ def _validated_session_command(row: Mapping[str, str]) -> str:
     forbidden = {
         "--private-scene-profile",
         "--scene-seed",
-        "--source-profile",
+        "--scene-variant",
         "--truth-manifest-output",
     }
     leaked = sorted(forbidden.intersection(tokens))

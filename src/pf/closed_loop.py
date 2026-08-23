@@ -23,6 +23,10 @@ from runtime.adaptive_client import (
 from runtime.cui import CUIRoute, CUI_URL_MESSAGE_PREFIX, cui_route_from_records
 from runtime.cui_components import CUITruthDisplayMode
 from runtime.artifacts import DurableJSONLWriter
+from runtime.experiment_profiles import (
+    AcquisitionContract,
+    acquisition_contract_from_environment,
+)
 from runtime.measurement_log import (
     MeasurementLogRecord,
     MeasurementLogView,
@@ -77,19 +81,9 @@ def _exact_integer(value: object, *, name: str, minimum: int) -> int:
     return int(value)
 
 
-def _finite_positive(value: object, *, name: str) -> float:
-    """Return one finite, strictly positive real value."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be a real number.")
-    parsed = float(value)
-    if not np.isfinite(parsed) or parsed <= 0.0:
-        raise ValueError(f"{name} must be finite and positive.")
-    return parsed
-
-
 @dataclass(frozen=True, slots=True)
 class PFControlBudget:
-    """Keep PF mission limits separate from physical runtime configuration."""
+    """Combine runtime acquisition limits with PF-owned stopping controls."""
 
     max_stations: int
     max_measurements: int
@@ -101,39 +95,21 @@ class PFControlBudget:
     planner_audit_top_k: int
 
     @classmethod
-    def from_settings(
+    def from_runtime_contract(
         cls,
         settings: Mapping[str, Any],
         planner: DSSPPConfig,
+        acquisition_contract: AcquisitionContract,
     ) -> "PFControlBudget":
-        """Resolve PF-owned station, view, and stopping limits."""
-        max_stations = _exact_integer(
-            settings.get("mission_stop_max_poses", 20),
-            name="mission_stop_max_poses",
-            minimum=1,
-        )
-        max_measurements = _exact_integer(
-            settings.get(
-                "measurement_budget_max_steps",
-                max_stations * int(planner.program_length),
-            ),
-            name="measurement_budget_max_steps",
-            minimum=1,
-        )
-        configured_views = _exact_integer(
-            settings.get("orientation_k", int(planner.program_length)),
-            name="orientation_k",
-            minimum=1,
-        )
+        """Resolve runtime limits without accepting estimator-side overrides."""
+        configured_views = int(acquisition_contract.views_per_station)
         if configured_views != int(planner.program_length):
             raise ValueError(
-                "orientation_k and dss_pp.program_length must agree for one "
-                "station likelihood block."
+                "Runtime views_per_station and planner program_length must agree."
             )
-        if max_measurements < configured_views:
+        if acquisition_contract.max_measurements < configured_views:
             raise ValueError(
-                "measurement_budget_max_steps must accommodate at least one "
-                "complete station program."
+                "Runtime max_measurements must accommodate one complete station."
             )
         adaptive_stop = settings.get("adaptive_mission_stop", False)
         if not isinstance(adaptive_stop, bool):
@@ -152,13 +128,10 @@ class PFControlBudget:
             minimum=0,
         )
         return cls(
-            max_stations=max_stations,
-            max_measurements=max_measurements,
+            max_stations=acquisition_contract.max_stations,
+            max_measurements=acquisition_contract.max_measurements,
             views_per_station=configured_views,
-            live_time_s=_finite_positive(
-                settings.get("measurement_live_time_s", planner.live_time_s),
-                name="measurement_live_time_s",
-            ),
+            live_time_s=acquisition_contract.live_time_s,
             adaptive_stop=adaptive_stop,
             minimum_stop_stations=_exact_integer(
                 settings.get("mission_stop_min_convergence_poses", 4),
@@ -750,8 +723,6 @@ def run_pf_closed_loop(
     """Run a PF closed loop over an opaque truth-free runtime session socket."""
     validate_control_policy(control_policy)
     settings, config_hash = load_pf_config(pf_config_path)
-    planner = dss_config_from_pf_settings(settings)
-    budget = PFControlBudget.from_settings(settings, planner)
     target = Path(output_dir).expanduser().resolve()
     if target.exists():
         raise FileExistsError(f"Refusing to replace PF output {target}.")
@@ -781,6 +752,18 @@ def run_pf_closed_loop(
         context = ready.context
         candidates = ready.candidates
         bootstrap = ready.bootstrap
+        acquisition_contract = acquisition_contract_from_environment(
+            context.environment
+        )
+        planner = dss_config_from_pf_settings(
+            settings,
+            acquisition_contract=acquisition_contract,
+        )
+        budget = PFControlBudget.from_runtime_contract(
+            settings,
+            planner,
+            acquisition_contract,
+        )
         detected_only_raw = settings.get(
             "pf_detected_isotopes_only",
             settings.get("detected_isotopes_only", False),

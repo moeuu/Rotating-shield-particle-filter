@@ -132,7 +132,7 @@ def test_ral_controller_process_receives_no_private_scene_inputs(
     rendered = " ".join(command)
 
     assert "private-scenario" not in rendered
-    assert "source-profile" not in rendered
+    assert "scene-variant" not in rendered
     assert "scene-seed" not in rendered
     assert "truth-manifest" not in rendered
     assert "runtime.sock" in rendered
@@ -210,7 +210,7 @@ def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) ->
         assert "baseline_shield_policy" not in pf_config
         serialized_pf = json.dumps(pf_config, sort_keys=True)
         assert "1234" not in serialized_pf
-        assert "ral-mix9" not in serialized_pf
+        assert '"mix9"' not in serialized_pf
         assert "backend" not in pf_config
         assert "shield_thickness_scale" not in pf_config
         assert "1234" not in entry.pf_config_path.name
@@ -226,14 +226,13 @@ def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) ->
         assert runtime_config["random_seed_base"] == 8765
         assert runtime_config["random_seed_base"] != entry.scene_seed
 
-        assert "generate-ral-scenario" in entry.scenario_command
+        assert "generate-scenario" in entry.scenario_command
         assert "--scene-seed" in entry.scenario_command
         assert "--truth-manifest-output" in entry.scenario_command
         assert "baselines.ral_ablation.session_runner" in entry.session_command
         assert "--scene-seed" not in entry.session_command
-        assert "--source-profile" not in entry.session_command
+        assert "--scene-variant" not in entry.session_command
         assert "--private-scene-profile" not in entry.session_command
-        assert entry.source_profile not in entry.session_command
         assert "--full-simulation" not in entry.scenario_command
         assert "main.py" not in entry.session_command
 
@@ -269,18 +268,18 @@ def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) ->
     with manifest_path.open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 4
-    assert rows[0]["source_profile"] == "ral-mix9"
+    assert "scene_variant" not in rows[0]
     assert manifest_path.is_relative_to(private_root)
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(script_path.stat().st_mode) == 0o700
     script = script_path.read_text(encoding="utf-8")
-    assert script.count("generate-ral-scenario") == 4
+    assert script.count("generate-scenario") == 4
     assert script.count("baselines.ral_ablation.session_runner") == 4
     assert "--full-simulation" not in script
 
     controller_source = inspect.getsource(live_controller_main)
     assert "--scenario" not in controller_source
-    assert "--source-profile" not in controller_source
+    assert "--scene-variant" not in controller_source
     assert "--scene-seed" not in controller_source
 
 

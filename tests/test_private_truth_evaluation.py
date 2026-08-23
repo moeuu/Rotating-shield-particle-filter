@@ -20,7 +20,8 @@ def _truth(run_id: str) -> dict[str, object]:
     return {
         "schema_version": 1,
         "run_id": run_id,
-        "source_profile": "private-profile",
+        "experiment_profile_id": "test-profile",
+        "scene_variant_id": "private-variant",
         "scene_seed": 1234,
         "scene_rng_provenance": {"algorithm": "test"},
         "sources": [
