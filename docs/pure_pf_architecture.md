@@ -149,6 +149,15 @@ Proposal scoring may use observations to improve mixing, but it does not alter
 the target likelihood and every non-prior proposal density appears in the MH/RJ
 ratio. Accepted rejuvenation moves leave outer particle weights unchanged.
 
+An in-process caller may optionally stage an immutable external surface-density grid
+for one exact incoming record prefix. This is a proposal contract, not an estimator
+contract: PF maps the grid to its own chart atlas in one batched neighbor query and
+mixes it with the native residual proposal. The positive area-prior component retains
+full support, and the same frozen proposal density is used in every forward/reverse
+MH/RJ term. Standalone PF does not stage this value; the MLE-guided hybrid orchestrator
+uses it to alter the accepted finite particle realization without changing the PF
+target or weights directly.
+
 Diagnostics report the current ESS after all applied likelihood, the number of
 surviving station-start ancestors, and attempted/accepted posterior weight mass
 for every structural move. Rejections also retain quantiles of the likelihood,
@@ -218,6 +227,10 @@ command runs inference from the beginning of an already finalized log.
 `PFLiveSession` owns this in-process causal boundary. It holds the estimator and
 ordered durable records together, uses the same canonical station assimilation
 helper as the standalone controller, and rejects record delivery after completion.
+Optional surface guidance is accepted only at a station boundary and must identify the
+run, station, final step, record count, and ordered-prefix digest exactly. The returned
+receipt records the mapped chart count and all isotopes for which the proposal evaluator
+consumed the guide.
 Its planning DTO copies particle arrays into read-only storage and includes a
 canonical, truth-free PF posterior summary. The DTO deliberately preserves PF
 particle semantics; it is not reshaped into an MLE-style surface grid. The current

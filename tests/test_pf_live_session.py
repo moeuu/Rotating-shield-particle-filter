@@ -11,8 +11,11 @@ from typing import Any
 import numpy as np
 import pytest
 from runtime.measurement_log import load_measurement_log
+from runtime.prefix import measurement_records_digest
+from runtime.provenance import DigestIdentity
 
 from pf.live_session import (
+    PFExternalSurfaceGuidance,
     PFLiveSession,
     PFLiveSessionError,
     bind_published_measurement_log,
@@ -20,6 +23,7 @@ from pf.live_session import (
     load_live_pf_config,
     measurement_record_to_station_input,
 )
+from pf.estimator_structural import EstimatorStructuralProposalMixin
 from pf.estimator_types import JointPlanningParticles
 from pf.pure_estimator import RotatingShieldPFConfig
 from tests.pure_pf_test_support import make_measurement_log
@@ -351,9 +355,33 @@ class _SpyEstimator:
                 "records": records,
                 "pose_idx": pose_idx,
                 "contract": generative_contract_hash_sha256,
+                "surface_guidance": getattr(
+                    self,
+                    "_joint_external_surface_guidance_by_isotope",
+                    None,
+                ),
+                "surface_guidance_mass": getattr(
+                    self,
+                    "_joint_external_surface_guidance_mass",
+                    0.0,
+                ),
             }
         )
+        guidance = getattr(self, "_joint_external_surface_guidance_by_isotope", None)
+        if guidance is not None:
+            self.last_external_surface_guidance_evaluated_isotopes = set(guidance)
         self.measurements.extend(object() for _ in records)
+
+    def continuous_surface_atlas(self) -> SimpleNamespace:
+        """Return two deterministic chart centers for guidance interpolation."""
+        return SimpleNamespace(
+            geometry=SimpleNamespace(
+                centers_xyz=np.asarray(
+                    [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                    dtype=np.float64,
+                )
+            )
+        )
 
     def planning_joint_particles(
         self,
@@ -458,6 +486,122 @@ def test_facade_assimilates_only_complete_persisted_stations(
     )
     assert session.records == log.records
     assert session.station_count == 1
+
+
+def test_mle_style_surface_guidance_adjusts_pf_proposals_without_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A causal surface grid must guide the exact-RJ proposal for that station."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=2,
+            station_complete_markers=True,
+        )
+    )
+    session, estimator = _facade_with_spy(monkeypatch, log)
+    isotopes = tuple(log.context.isotopes)
+    guidance = PFExternalSurfaceGuidance(
+        source_run_id=log.context.run_id,
+        record_count=len(log.records),
+        data_cutoff_step=log.records[-1].step_id,
+        data_cutoff_station=log.records[-1].station_id,
+        covered_records_digest=measurement_records_digest(log.records),
+        isotope_order=isotopes,
+        patch_centroids_xyz=np.asarray(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        density_by_isotope=np.asarray(
+            [[1.0, 4.0] for _ in isotopes],
+            dtype=np.float64,
+        ),
+        proposal_mass=0.6,
+        bandwidth_m=0.25,
+    )
+
+    session.stage_external_surface_guidance(guidance)
+    session.receive_persisted_station(log.records)
+
+    mapped = estimator.update_calls[0]["surface_guidance"]
+    assert isinstance(mapped, dict)
+    assert tuple(mapped) == isotopes
+    assert estimator.update_calls[0]["surface_guidance_mass"] == 0.6
+    assert estimator._joint_external_surface_guidance_by_isotope is None
+    assert estimator._joint_external_surface_guidance_mass == 0.0
+    receipt = session.last_surface_guidance_receipt
+    assert receipt is not None
+    assert receipt.guidance_sha256 == guidance.guidance_sha256
+    assert receipt.source_run_id == log.context.run_id
+    assert receipt.record_count == len(log.records)
+    assert receipt.informative_isotopes == isotopes
+    assert receipt.evaluated_isotopes == isotopes
+    assert receipt.mapped_chart_count == 2
+    assert receipt.target_preserving is True
+    assert receipt.direct_weight_update is False
+
+
+def test_surface_guidance_mix_is_vectorized_and_proposal_only() -> None:
+    """The configured mass must mix normalized grids without a weight update."""
+    owner = EstimatorStructuralProposalMixin()
+    owner._joint_external_surface_guidance_by_isotope = {
+        "Cs-137": np.asarray([0.0, 4.0], dtype=np.float64)
+    }
+    owner._joint_external_surface_guidance_mass = 0.25
+    owner.last_external_surface_guidance_diagnostics = {}
+    owner.last_external_surface_guidance_evaluated_isotopes = set()
+    particle_weights = np.asarray([0.7, 0.3], dtype=np.float64)
+
+    mixed, informative = owner._mix_external_surface_guidance(
+        isotope="Cs-137",
+        alignment=np.asarray([2.0, 0.0], dtype=np.float64),
+    )
+
+    np.testing.assert_allclose(mixed, [0.75, 0.25], rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(particle_weights, [0.7, 0.3])
+    assert informative is True
+    assert owner.last_external_surface_guidance_evaluated_isotopes == {"Cs-137"}
+    assert owner.last_external_surface_guidance_diagnostics["Cs-137"][
+        "target_preserving_proposal_only"
+    ] == 1.0
+
+
+def test_surface_guidance_rejects_a_different_record_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PF must fail closed when MLE guidance does not bind the incoming station."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=2,
+            station_complete_markers=True,
+        )
+    )
+    session, estimator = _facade_with_spy(monkeypatch, log)
+    isotopes = tuple(log.context.isotopes)
+    actual_digest = measurement_records_digest(log.records)
+    guidance = PFExternalSurfaceGuidance(
+        source_run_id=log.context.run_id,
+        record_count=len(log.records),
+        data_cutoff_step=log.records[-1].step_id,
+        data_cutoff_station=log.records[-1].station_id,
+        covered_records_digest=DigestIdentity(
+            algorithm=actual_digest.algorithm,
+            sha256="f" * 64,
+        ),
+        isotope_order=isotopes,
+        patch_centroids_xyz=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
+        density_by_isotope=np.ones((len(isotopes), 1), dtype=np.float64),
+        proposal_mass=0.5,
+        bandwidth_m=0.5,
+    )
+
+    session.stage_external_surface_guidance(guidance)
+    with pytest.raises(PFLiveSessionError, match="exact incoming PF prefix"):
+        session.receive_persisted_station(log.records)
+    assert estimator.update_calls == []
 
 
 def test_facade_particle_snapshot_is_an_immutable_copy(

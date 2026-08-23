@@ -1,6 +1,8 @@
 """Public live facade and particle-filter implementation package."""
 
 from pf.live_session import (
+    PFExternalSurfaceGuidance,
+    PFExternalSurfaceGuidanceReceipt,
     PFBoundLiveState,
     PFCompletedLiveState,
     PFLiveParticleSnapshot,
@@ -15,6 +17,8 @@ from pf.live_session import (
 
 
 __all__ = [
+    "PFExternalSurfaceGuidance",
+    "PFExternalSurfaceGuidanceReceipt",
     "PFBoundLiveState",
     "PFCompletedLiveState",
     "PFLiveParticleSnapshot",

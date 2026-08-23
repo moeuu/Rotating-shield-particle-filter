@@ -76,6 +76,15 @@ resulting `PFBoundLiveState` contains canonical posterior bytes and the already
 completed state bytes so an outer application can publish them without reaching
 back into the estimator.
 
+The session also exposes an optional, typed `PFExternalSurfaceGuidance` proposal
+boundary for the sibling orchestrator's MLE-guided particle estimator. A surface grid
+must bind the exact incoming run and record prefix. PF performs the batched mapping to
+its own continuous-surface charts, mixes the result only into its full-support
+structural proposal, and returns a `PFExternalSurfaceGuidanceReceipt` after every
+configured isotope evaluated it. The existing forward/reverse MH/RJ terms remain
+authoritative: external density never becomes another likelihood, directly changes
+outer particle weights, or introduces an MLE dependency into the standalone PF.
+
 The planning snapshot also carries a canonical truth-free posterior summary for the
 PF particle display. It does not invent an estimator-neutral grid or a predictive
 spectrum: `PurePFEstimator` currently has no public deterministic latest-spectrum

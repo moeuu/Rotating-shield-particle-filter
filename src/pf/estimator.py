@@ -333,6 +333,16 @@ class RotatingShieldPFEstimator(
         self.last_joint_birth_proposal_cache_hits = 0
         self.last_joint_birth_proposal_cache_misses = 0
         self._joint_birth_proposal_reference_mean_vb: NDArray[np.float64] | None = None
+        self._joint_external_surface_guidance_by_isotope: dict[
+            str,
+            NDArray[np.float64],
+        ] | None = None
+        self._joint_external_surface_guidance_mass = 0.0
+        self.last_external_surface_guidance_diagnostics: dict[
+            str,
+            dict[str, float],
+        ] = {}
+        self.last_external_surface_guidance_evaluated_isotopes: set[str] = set()
         self._joint_random_generator = named_random_generator(
             self.random_seed,
             "joint_isotope_particle_filter",

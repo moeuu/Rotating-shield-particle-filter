@@ -26,6 +26,53 @@ def _runtime_facade_constants(*names: str) -> tuple[object, ...]:
 class EstimatorStructuralProposalMixin:
     """Provide structural proposals, transport caching, and target scoring."""
 
+    def _mix_external_surface_guidance(
+        self,
+        *,
+        isotope: str,
+        alignment: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], bool]:
+        """Mix one external grid into a full-support proposal, never its target."""
+        internal = np.asarray(alignment, dtype=np.float64).reshape(-1)
+        external_by_isotope = self._joint_external_surface_guidance_by_isotope
+        if external_by_isotope is None:
+            return internal, False
+        raw_external = external_by_isotope.get(str(isotope))
+        if raw_external is None:
+            raise RuntimeError(
+                "External surface guidance lacks one configured PF isotope."
+            )
+        external = np.asarray(raw_external, dtype=np.float64).reshape(-1)
+        if (
+            external.shape != internal.shape
+            or np.any(~np.isfinite(external))
+            or np.any(external < 0.0)
+        ):
+            raise RuntimeError(
+                "External surface guidance is misaligned with the PF atlas."
+            )
+        self.last_external_surface_guidance_evaluated_isotopes.add(str(isotope))
+        external_maximum = float(np.max(external, initial=0.0))
+        if external_maximum <= 0.0:
+            return internal, False
+        mass = float(self._joint_external_surface_guidance_mass)
+        if not 0.0 < mass <= 1.0:
+            raise RuntimeError("External surface-guidance proposal mass is invalid.")
+        external = external / external_maximum
+        internal_maximum = float(np.max(internal, initial=0.0))
+        if internal_maximum > 0.0:
+            internal = internal / internal_maximum
+            mixed = (1.0 - mass) * internal + mass * external
+        else:
+            mixed = external
+        self.last_external_surface_guidance_diagnostics[str(isotope)] = {
+            "proposal_mass": mass,
+            "external_maximum": external_maximum,
+            "mapped_chart_count": float(internal.size),
+            "target_preserving_proposal_only": 1.0,
+        }
+        return np.asarray(mixed, dtype=np.float64), True
+
     @staticmethod
     def _joint_birth_proposal_station_digest(
         *,
@@ -538,13 +585,22 @@ class EstimatorStructuralProposalMixin:
         best_locations = strength_grid[best_grid_indices]
         maximum = float(np.max(best_scores))
         informative = bool(np.isfinite(maximum) and maximum > 1.0e-9)
+        alignment = (
+            np.exp(np.clip(best_scores - maximum, -745.0, 0.0))
+            if informative
+            else np.zeros(chart_count, dtype=np.float64)
+        )
+        alignment, external_informative = self._mix_external_surface_guidance(
+            isotope=str(filt.isotope),
+            alignment=np.asarray(alignment, dtype=np.float64),
+        )
+        informative = informative or external_informative
         if not informative:
             return (
                 np.zeros(chart_count, dtype=np.float64),
                 np.full(chart_count, midpoint, dtype=np.float64),
                 False,
             )
-        alignment = np.exp(np.clip(best_scores - maximum, -745.0, 0.0))
         return (
             np.asarray(alignment, dtype=np.float64),
             np.asarray(best_locations, dtype=np.float64),

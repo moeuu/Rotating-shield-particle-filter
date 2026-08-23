@@ -34,6 +34,7 @@ from runtime.measurement_log import (
 from runtime.prefix import measurement_records_digest
 from runtime.provenance import DigestIdentity
 from runtime.records import RunContext
+from scipy.spatial import cKDTree
 
 from pf.estimator_types import JointPlanningParticles
 from pf.gpu_utils import preflight_compute_backend
@@ -75,6 +76,205 @@ class PFLiveParticleSnapshot:
         if not isinstance(payload, dict):
             raise PFLiveSessionError("PF live posterior summary must be an object.")
         return payload
+
+
+@dataclass(frozen=True, slots=True)
+class PFExternalSurfaceGuidance:
+    """Carry causal surface density used only as an exact-RJ proposal guide."""
+
+    source_run_id: str
+    record_count: int
+    data_cutoff_step: int
+    data_cutoff_station: int
+    covered_records_digest: DigestIdentity
+    isotope_order: tuple[str, ...]
+    patch_centroids_xyz: NDArray[np.float64]
+    density_by_isotope: NDArray[np.float64]
+    proposal_mass: float
+    bandwidth_m: float
+
+    def __post_init__(self) -> None:
+        """Validate lineage and freeze the estimator-neutral surface arrays."""
+        run_id = str(self.source_run_id).strip()
+        if not run_id:
+            raise ValueError("source_run_id must be non-empty.")
+        record_count = _json_integer(
+            self.record_count,
+            location="record_count",
+            minimum=1,
+        )
+        cutoff_step = _json_integer(
+            self.data_cutoff_step,
+            location="data_cutoff_step",
+            minimum=0,
+        )
+        cutoff_station = _json_integer(
+            self.data_cutoff_station,
+            location="data_cutoff_station",
+            minimum=0,
+        )
+        if not isinstance(self.covered_records_digest, DigestIdentity):
+            raise TypeError("covered_records_digest must be a DigestIdentity.")
+        isotope_order = tuple(str(value).strip() for value in self.isotope_order)
+        if (
+            not isotope_order
+            or any(not value for value in isotope_order)
+            or len(set(isotope_order)) != len(isotope_order)
+        ):
+            raise ValueError("isotope_order must contain unique non-empty names.")
+        centroids = np.asarray(self.patch_centroids_xyz, dtype=np.float64)
+        density = np.asarray(self.density_by_isotope, dtype=np.float64)
+        if (
+            centroids.ndim != 2
+            or centroids.shape[0] < 1
+            or centroids.shape[1] != 3
+            or np.any(~np.isfinite(centroids))
+        ):
+            raise ValueError(
+                "patch_centroids_xyz must be a non-empty finite (P, 3) array."
+            )
+        if (
+            density.shape != (len(isotope_order), centroids.shape[0])
+            or np.any(~np.isfinite(density))
+            or np.any(density < 0.0)
+        ):
+            raise ValueError(
+                "density_by_isotope must be finite, non-negative, and shaped (I, P)."
+            )
+        proposal_mass = _finite_real(self.proposal_mass, location="proposal_mass")
+        bandwidth_m = _finite_real(self.bandwidth_m, location="bandwidth_m")
+        if proposal_mass <= 0.0 or proposal_mass > 1.0:
+            raise ValueError("proposal_mass must lie in (0, 1].")
+        if bandwidth_m <= 0.0:
+            raise ValueError("bandwidth_m must be positive.")
+        immutable_centroids = np.frombuffer(
+            np.ascontiguousarray(centroids, dtype=np.float64).tobytes(),
+            dtype=np.float64,
+        ).reshape(centroids.shape)
+        immutable_density = np.frombuffer(
+            np.ascontiguousarray(density, dtype=np.float64).tobytes(),
+            dtype=np.float64,
+        ).reshape(density.shape)
+        object.__setattr__(self, "source_run_id", run_id)
+        object.__setattr__(self, "record_count", record_count)
+        object.__setattr__(self, "data_cutoff_step", cutoff_step)
+        object.__setattr__(self, "data_cutoff_station", cutoff_station)
+        object.__setattr__(self, "isotope_order", isotope_order)
+        object.__setattr__(self, "patch_centroids_xyz", immutable_centroids)
+        object.__setattr__(self, "density_by_isotope", immutable_density)
+        object.__setattr__(self, "proposal_mass", proposal_mass)
+        object.__setattr__(self, "bandwidth_m", bandwidth_m)
+
+    @property
+    def guidance_sha256(self) -> str:
+        """Return a deterministic digest over lineage and all proposal inputs."""
+        digest = sha256(b"pf_external_surface_guidance_v1\0")
+        digest.update(self.source_run_id.encode("utf-8"))
+        digest.update(
+            np.asarray(
+                [
+                    self.record_count,
+                    self.data_cutoff_step,
+                    self.data_cutoff_station,
+                ],
+                dtype="<i8",
+            ).tobytes()
+        )
+        digest.update(self.covered_records_digest.algorithm.encode("utf-8"))
+        digest.update(self.covered_records_digest.sha256.encode("ascii"))
+        for isotope in self.isotope_order:
+            encoded = isotope.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "little"))
+            digest.update(encoded)
+        for values in (self.patch_centroids_xyz, self.density_by_isotope):
+            array = np.ascontiguousarray(values, dtype="<f8")
+            digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+            digest.update(array.tobytes(order="C"))
+        digest.update(
+            np.asarray(
+                [self.proposal_mass, self.bandwidth_m],
+                dtype="<f8",
+            ).tobytes()
+        )
+        return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class PFExternalSurfaceGuidanceReceipt:
+    """Describe one MLE-style surface guide consumed by a PF station update."""
+
+    guidance_sha256: str
+    source_run_id: str
+    record_count: int
+    data_cutoff_step: int
+    data_cutoff_station: int
+    covered_records_digest: DigestIdentity
+    proposal_mass: float
+    bandwidth_m: float
+    informative_isotopes: tuple[str, ...]
+    evaluated_isotopes: tuple[str, ...]
+    mapped_chart_count: int
+    target_preserving: bool = True
+    direct_weight_update: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate the immutable audit receipt returned after PF evaluation."""
+        guidance_sha256 = _sha256_string(
+            self.guidance_sha256,
+            location="guidance_sha256",
+        )
+        source_run_id = str(self.source_run_id).strip()
+        if not source_run_id:
+            raise ValueError("source_run_id must be non-empty.")
+        record_count = _json_integer(
+            self.record_count,
+            location="record_count",
+            minimum=1,
+        )
+        cutoff_step = _json_integer(
+            self.data_cutoff_step,
+            location="data_cutoff_step",
+            minimum=0,
+        )
+        cutoff_station = _json_integer(
+            self.data_cutoff_station,
+            location="data_cutoff_station",
+            minimum=0,
+        )
+        if not isinstance(self.covered_records_digest, DigestIdentity):
+            raise TypeError("covered_records_digest must be a DigestIdentity.")
+        proposal_mass = _finite_real(self.proposal_mass, location="proposal_mass")
+        bandwidth_m = _finite_real(self.bandwidth_m, location="bandwidth_m")
+        if proposal_mass <= 0.0 or proposal_mass > 1.0:
+            raise ValueError("proposal_mass must lie in (0, 1].")
+        if bandwidth_m <= 0.0:
+            raise ValueError("bandwidth_m must be positive.")
+        informative = tuple(str(value).strip() for value in self.informative_isotopes)
+        evaluated = tuple(str(value).strip() for value in self.evaluated_isotopes)
+        if (
+            any(not value for value in (*informative, *evaluated))
+            or len(set(informative)) != len(informative)
+            or len(set(evaluated)) != len(evaluated)
+            or not set(informative).issubset(evaluated)
+        ):
+            raise ValueError("Receipt isotope lists must be unique and consistent.")
+        mapped_chart_count = _json_integer(
+            self.mapped_chart_count,
+            location="mapped_chart_count",
+            minimum=1,
+        )
+        if self.target_preserving is not True or self.direct_weight_update is not False:
+            raise ValueError("Surface guidance must preserve the target and PF weights.")
+        object.__setattr__(self, "guidance_sha256", guidance_sha256)
+        object.__setattr__(self, "source_run_id", source_run_id)
+        object.__setattr__(self, "record_count", record_count)
+        object.__setattr__(self, "data_cutoff_step", cutoff_step)
+        object.__setattr__(self, "data_cutoff_station", cutoff_station)
+        object.__setattr__(self, "proposal_mass", proposal_mass)
+        object.__setattr__(self, "bandwidth_m", bandwidth_m)
+        object.__setattr__(self, "informative_isotopes", informative)
+        object.__setattr__(self, "evaluated_isotopes", evaluated)
+        object.__setattr__(self, "mapped_chart_count", mapped_chart_count)
 
 
 @dataclass(frozen=True, slots=True)
@@ -838,13 +1038,77 @@ def register_persisted_station_pose(
     return len(estimator.poses) - 1
 
 
+def _map_surface_guidance_to_pf_charts(
+    estimator: PurePFEstimator,
+    guidance: PFExternalSurfaceGuidance,
+) -> tuple[dict[str, NDArray[np.float64]], tuple[str, ...], int]:
+    """Map a surface grid to PF charts with one bounded vectorized neighbor query."""
+    atlas = estimator.continuous_surface_atlas()
+    chart_centers = np.asarray(
+        atlas.geometry.centers_xyz,
+        dtype=np.float64,
+    ).reshape(-1, 3)
+    if chart_centers.shape[0] < 1 or np.any(~np.isfinite(chart_centers)):
+        raise PFLiveSessionError("PF continuous-surface atlas is invalid.")
+    neighbor_count = min(8, int(guidance.patch_centroids_xyz.shape[0]))
+    distances, indices = cKDTree(guidance.patch_centroids_xyz).query(
+        chart_centers,
+        k=neighbor_count,
+        workers=-1,
+    )
+    distance_array = np.asarray(distances, dtype=np.float64).reshape(
+        chart_centers.shape[0],
+        neighbor_count,
+    )
+    index_array = np.asarray(indices, dtype=np.int64).reshape(
+        chart_centers.shape[0],
+        neighbor_count,
+    )
+    if (
+        np.any(~np.isfinite(distance_array))
+        or np.any(index_array < 0)
+        or np.any(index_array >= guidance.patch_centroids_xyz.shape[0])
+    ):
+        raise PFLiveSessionError("Surface-guidance neighbor mapping is invalid.")
+    log_kernel = -0.5 * np.square(
+        distance_array / float(guidance.bandwidth_m)
+    )
+    log_kernel -= np.max(log_kernel, axis=1, keepdims=True)
+    kernel = np.exp(log_kernel)
+    normalizer = np.sum(kernel, axis=1, keepdims=True, dtype=np.float64)
+    if np.any(~np.isfinite(normalizer)) or np.any(normalizer <= 0.0):
+        raise PFLiveSessionError("Surface-guidance interpolation has zero mass.")
+    mapped_ic = np.einsum(
+        "ick,ck->ic",
+        guidance.density_by_isotope[:, index_array],
+        kernel,
+        optimize=True,
+    ) / normalizer[:, 0][None, :]
+    if (
+        mapped_ic.shape != (len(guidance.isotope_order), chart_centers.shape[0])
+        or np.any(~np.isfinite(mapped_ic))
+        or np.any(mapped_ic < 0.0)
+    ):
+        raise PFLiveSessionError("Mapped surface guidance is invalid.")
+    mapped: dict[str, NDArray[np.float64]] = {}
+    informative: list[str] = []
+    for isotope_index, isotope in enumerate(guidance.isotope_order):
+        values = np.ascontiguousarray(mapped_ic[isotope_index], dtype=np.float64)
+        values.setflags(write=False)
+        mapped[isotope] = values
+        if float(np.max(values, initial=0.0)) > 0.0:
+            informative.append(isotope)
+    return mapped, tuple(informative), int(chart_centers.shape[0])
+
+
 def assimilate_persisted_station(
     estimator: PurePFEstimator,
     records: Sequence[MeasurementLogRecord],
     *,
     station_id: int,
     generative_contract_hash_sha256: str,
-) -> None:
+    surface_guidance: PFExternalSurfaceGuidance | None = None,
+) -> PFExternalSurfaceGuidanceReceipt | None:
     """Assimilate one canonical single-pose station through the PF spectrum path."""
     rows = tuple(records)
     if any(record.station_id != station_id for record in rows):
@@ -862,11 +1126,55 @@ def assimilate_persisted_station(
         rows,
         station_id=station_id,
     )
-    estimator.update_spectrum_station(
-        tuple(measurement_record_to_station_input(record) for record in rows),
-        pose_idx=int(pose_index),
-        generative_contract_hash_sha256=generative_contract_hash_sha256,
-    )
+    receipt = None
+    mapped: dict[str, NDArray[np.float64]] | None = None
+    informative: tuple[str, ...] = ()
+    chart_count = 0
+    if surface_guidance is not None:
+        mapped, informative, chart_count = _map_surface_guidance_to_pf_charts(
+            estimator,
+            surface_guidance,
+        )
+        estimator._joint_external_surface_guidance_by_isotope = mapped
+        estimator._joint_external_surface_guidance_mass = float(
+            surface_guidance.proposal_mass
+        )
+        estimator.last_external_surface_guidance_diagnostics = {}
+        estimator.last_external_surface_guidance_evaluated_isotopes = set()
+    try:
+        estimator.update_spectrum_station(
+            tuple(measurement_record_to_station_input(record) for record in rows),
+            pose_idx=int(pose_index),
+            generative_contract_hash_sha256=generative_contract_hash_sha256,
+        )
+    finally:
+        estimator._joint_external_surface_guidance_by_isotope = None
+        estimator._joint_external_surface_guidance_mass = 0.0
+    if surface_guidance is not None:
+        expected_isotopes = tuple(surface_guidance.isotope_order)
+        evaluated_isotopes = tuple(
+            isotope
+            for isotope in expected_isotopes
+            if isotope in estimator.last_external_surface_guidance_evaluated_isotopes
+        )
+        if evaluated_isotopes != expected_isotopes:
+            raise RuntimeError(
+                "PF station update did not evaluate external guidance for every isotope."
+            )
+        receipt = PFExternalSurfaceGuidanceReceipt(
+            guidance_sha256=surface_guidance.guidance_sha256,
+            source_run_id=surface_guidance.source_run_id,
+            record_count=surface_guidance.record_count,
+            data_cutoff_step=surface_guidance.data_cutoff_step,
+            data_cutoff_station=surface_guidance.data_cutoff_station,
+            covered_records_digest=surface_guidance.covered_records_digest,
+            proposal_mass=surface_guidance.proposal_mass,
+            bandwidth_m=surface_guidance.bandwidth_m,
+            informative_isotopes=informative,
+            evaluated_isotopes=evaluated_isotopes,
+            mapped_chart_count=chart_count,
+        )
+    return receipt
 
 
 class PFLiveSession:
@@ -923,6 +1231,10 @@ class PFLiveSession:
         self._phase = "receiving"
         self._completed_state: PFCompletedLiveState | None = None
         self._bound_state: PFBoundLiveState | None = None
+        self._pending_surface_guidance: PFExternalSurfaceGuidance | None = None
+        self._last_surface_guidance_receipt: (
+            PFExternalSurfaceGuidanceReceipt | None
+        ) = None
 
     @property
     def context(self) -> RunContext:
@@ -948,6 +1260,13 @@ class PFLiveSession:
     def phase(self) -> str:
         """Return the current receiving, completed, bound, or failed phase."""
         return self._phase
+
+    @property
+    def last_surface_guidance_receipt(
+        self,
+    ) -> PFExternalSurfaceGuidanceReceipt | None:
+        """Return the most recent target-preserving surface-guidance receipt."""
+        return self._last_surface_guidance_receipt
 
     def _ensure_receiving(self) -> None:
         """Reject observation delivery after completion or a failed update."""
@@ -979,6 +1298,38 @@ class PFLiveSession:
                 )
         return view
 
+    def stage_external_surface_guidance(
+        self,
+        guidance: PFExternalSurfaceGuidance,
+    ) -> None:
+        """Stage one exact-prefix surface proposal for the next PF station update."""
+        self._ensure_receiving()
+        if not isinstance(guidance, PFExternalSurfaceGuidance):
+            raise TypeError("guidance must be a PFExternalSurfaceGuidance.")
+        if self._pending_surface_guidance is not None:
+            raise PFLiveSessionError("A surface-guidance proposal is already staged.")
+        if self._records and (
+            self._records[-1].metadata.get("station_complete") is not True
+        ):
+            raise PFLiveSessionError(
+                "Surface guidance may be staged only at a PF station boundary."
+            )
+        if guidance.source_run_id != self._context.run_id:
+            raise PFLiveSessionError("Surface guidance belongs to another run_id.")
+        if guidance.isotope_order != tuple(self._estimator.joint_isotope_order()):
+            raise PFLiveSessionError(
+                "Surface-guidance isotope order differs from the live PF."
+            )
+        if guidance.data_cutoff_station != self._station_count:
+            raise PFLiveSessionError(
+                "Surface guidance must cover exactly the next PF station."
+            )
+        if guidance.record_count <= len(self._records):
+            raise PFLiveSessionError(
+                "Surface guidance must extend the current PF record prefix."
+            )
+        self._pending_surface_guidance = guidance
+
     def receive_persisted(self, record: MeasurementLogRecord) -> bool:
         """Receive one durable record and assimilate only at its station marker."""
         self._ensure_receiving()
@@ -995,6 +1346,19 @@ class PFLiveSession:
             )
         prospective = (*self._records, record)
         view = self._validated_view(prospective)
+        guidance = self._pending_surface_guidance
+        if record.metadata.get("station_complete") is True and guidance is not None:
+            if (
+                guidance.record_count != len(prospective)
+                or guidance.data_cutoff_step != record.step_id
+                or guidance.data_cutoff_station != record.station_id
+                or guidance.covered_records_digest
+                != measurement_records_digest(prospective)
+            ):
+                self._phase = "failed"
+                raise PFLiveSessionError(
+                    "Surface guidance does not bind the exact incoming PF prefix."
+                )
         self._records.append(record)
         if record.metadata.get("station_complete") is not True:
             return False
@@ -1005,17 +1369,20 @@ class PFLiveSession:
                 "Persisted PF station sequence differs from completed assimilation."
             )
         try:
-            assimilate_persisted_station(
+            receipt = assimilate_persisted_station(
                 self._estimator,
                 station.records,
                 station_id=station.station_id,
                 generative_contract_hash_sha256=(
                     self._generative_contract_hash_sha256
                 ),
+                surface_guidance=guidance,
             )
         except BaseException:
             self._phase = "failed"
             raise
+        self._pending_surface_guidance = None
+        self._last_surface_guidance_receipt = receipt
         self._station_count += 1
         if len(self._estimator.measurements) != len(self._records):
             self._phase = "failed"
