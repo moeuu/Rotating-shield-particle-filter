@@ -52,6 +52,9 @@ def _result() -> DSSPPResult:
                 "total_action_count": 128,
                 "proxy_action_count": 128,
                 "exact_action_count": 32,
+                "shortlisted_pose_count": 2,
+                "programs_per_shortlisted_pose": 16,
+                "full_program_sweep_per_shortlisted_pose": True,
                 "shortlist_selected_proxy_rank": 3,
                 "shortlist_formal_recall_certificate_available": True,
                 "shortlist_mc_winner_exceeds_universal_excluded_bound": True,
@@ -59,6 +62,9 @@ def _result() -> DSSPPResult:
                 "shortlist_max_excluded_universal_objective_upper_bound": 3.2,
                 "exact_eig_seed": 41,
             },
+            "selected_pose_exact_information_gain_leader": 2.5,
+            "selected_program_is_exact_eig_leader_at_selected_pose": True,
+            "selected_pose_exact_program_count": 16,
             "component_leaders": {
                 "score": leader,
                 "information_gain": leader,
@@ -78,6 +84,12 @@ def test_planner_audit_captures_domain_shortlist_and_leaders() -> None:
     assert audit["exact_action_count"] == 32
     assert audit["selected_information_gain"] == 2.5
     assert audit["best_exact_information_gain"] == 2.5
+    assert audit["selected_pose_best_exact_information_gain"] == 2.5
+    assert audit["selected_program_is_exact_eig_leader_at_selected_pose"] is True
+    assert audit["selected_pose_exact_program_count"] == 16
+    assert audit["shortlisted_pose_count"] == 2
+    assert audit["programs_per_shortlisted_pose"] == 16
+    assert audit["full_program_sweep_per_shortlisted_pose"] is True
     assert audit["score_leader"]["pose_index"] == 2
     assert audit["information_gain_leader"]["pose_index"] == 2
     assert len(audit["top_ranked_actions"]) == 1

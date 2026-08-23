@@ -1236,48 +1236,6 @@ def _response_equivalent_surface_coverage_gains(
     )
 
 
-def _shield_transition_cost(
-    normals: NDArray[np.float64],
-    from_pair_id: int | None,
-    program: ShieldProgram,
-) -> float:
-    """Return batched Fe/Pb angular transitions for one shield program."""
-    if not program.pair_ids:
-        return 0.0
-    normal_arr = np.asarray(normals, dtype=float)
-    if (
-        normal_arr.ndim != 2
-        or normal_arr.shape[1] != 3
-        or np.any(~np.isfinite(normal_arr))
-    ):
-        raise ValueError("normals must be finite and shaped (N, 3).")
-    num_orients = int(normal_arr.shape[0])
-    sequence_prefix: tuple[int, ...] = ()
-    if from_pair_id is not None and int(from_pair_id) >= 0:
-        sequence_prefix = (int(from_pair_id),)
-    pair_sequence = np.asarray(
-        sequence_prefix + tuple(int(pair_id) for pair_id in program.pair_ids),
-        dtype=np.int64,
-    )
-    if pair_sequence.size < 2:
-        return 0.0
-    if np.any(pair_sequence < 0) or np.any(pair_sequence >= num_orients**2):
-        raise ValueError("Shield transition pair IDs are outside the normal table.")
-    previous_pairs = pair_sequence[:-1]
-    next_pairs = pair_sequence[1:]
-    previous_indices = np.column_stack(
-        (previous_pairs // num_orients, previous_pairs % num_orients)
-    )
-    next_indices = np.column_stack(
-        (next_pairs // num_orients, next_pairs % num_orients)
-    )
-    dots = np.sum(
-        normal_arr[previous_indices] * normal_arr[next_indices],
-        axis=2,
-    )
-    return float(np.sum(np.arccos(np.clip(dots, -1.0, 1.0))))
-
-
 def _compose_transition_score(
     *,
     node: DSSPPNode,
@@ -1313,16 +1271,11 @@ def _compose_transition_score(
     time_cost = travel_time + len(node.program.pair_ids) * (
         float(config.rotation_overhead_s) + float(config.live_time_s)
     )
-    rotation_cost = _shield_transition_cost(
-        estimator.normals,
-        previous_pair_id,
-        node.program,
-    )
+    del previous_pair_id, estimator
     score = (
         float(node.static_score)
         - float(node.distance_weight) * float(path_length)
         - float(config.lambda_time) * float(time_cost)
-        - float(config.lambda_rotation) * float(rotation_cost)
     )
     return float(score), float(path_length)
 
@@ -1347,7 +1300,7 @@ def _exact_eig_shortlist(
     *,
     config: DSSPPConfig,
 ) -> tuple[NDArray[np.int64], NDArray[np.float64], dict[str, int]]:
-    """Choose a fixed-budget exact-EIG set with coverage and program reserves."""
+    """Shortlist poses, then retain every program at each selected pose."""
     pending_nodes = list(pending)
     if not pending_nodes:
         return (
@@ -1357,6 +1310,9 @@ def _exact_eig_shortlist(
                 "global": 0,
                 "coverage": 0,
                 "program_diversity": 0,
+                "global_pose_count": 0,
+                "coverage_pose_count": 0,
+                "shortlisted_pose_count": 0,
             },
         )
     proxy = np.asarray(proxy_information_scores_pp, dtype=np.float64)
@@ -1378,7 +1334,18 @@ def _exact_eig_shortlist(
     if len(program_index) != len(programs):
         raise ValueError("DSS shield programs must be unique.")
     ranking_scores = np.zeros(len(pending_nodes), dtype=np.float64)
-    pending_program_indices = np.zeros(len(pending_nodes), dtype=np.int64)
+    pose_indices = np.asarray(
+        sorted({int(item.pose_index) for item in pending_nodes}),
+        dtype=np.int64,
+    )
+    pose_row_by_index = {
+        int(pose_index): row for row, pose_index in enumerate(pose_indices)
+    }
+    action_matrix = np.full(
+        (pose_indices.size, len(programs)),
+        -1,
+        dtype=np.int64,
+    )
     for index, item in enumerate(pending_nodes):
         key = (
             str(item.program.name),
@@ -1390,83 +1357,94 @@ def _exact_eig_shortlist(
             raise RuntimeError("Pending DSS node references an unknown program.")
         if int(item.pose_index) < 0 or int(item.pose_index) >= proxy.shape[0]:
             raise IndexError("Pending DSS node references an unknown pose.")
-        pending_program_indices[index] = int(resolved_program_index)
+        pose_row = int(pose_row_by_index[int(item.pose_index)])
+        if int(action_matrix[pose_row, int(resolved_program_index)]) >= 0:
+            raise RuntimeError(
+                "A DSS pose contains a duplicate pending shield program."
+            )
+        action_matrix[pose_row, int(resolved_program_index)] = int(index)
         ranking_scores[index] = float(item.static_score) + float(
             config.lambda_eig
         ) * float(proxy[int(item.pose_index), int(resolved_program_index)])
-    limit = min(int(config.exact_eig_action_limit), len(pending_nodes))
-    if limit == len(pending_nodes):
+    if np.any(action_matrix < 0):
+        raise RuntimeError(
+            "Every DSS pose must expose the complete predeclared program library."
+        )
+    pose_ranking_scores = np.max(ranking_scores[action_matrix], axis=1)
+    pose_limit = min(int(config.exact_eig_pose_limit), int(pose_indices.size))
+    required_action_count = int(pose_limit * len(programs))
+    if required_action_count > int(config.exact_eig_action_limit):
+        raise ValueError(
+            "exact_eig_action_limit cannot hold a complete program sweep for "
+            "every shortlisted pose: "
+            f"{pose_limit} poses * {len(programs)} programs = "
+            f"{required_action_count} actions, but the limit is "
+            f"{int(config.exact_eig_action_limit)}."
+        )
+    if pose_limit == int(pose_indices.size):
         return (
             np.arange(len(pending_nodes), dtype=np.int64),
             ranking_scores,
             {
-                "global": int(limit),
+                "global": int(len(pending_nodes)),
                 "coverage": 0,
                 "program_diversity": 0,
+                "global_pose_count": int(pose_limit),
+                "coverage_pose_count": 0,
+                "shortlisted_pose_count": int(pose_limit),
             },
         )
-    selected: set[int] = set()
+    selected_pose_rows: set[int] = set()
     category_counts = {
         "global": 0,
         "coverage": 0,
         "program_diversity": 0,
+        "global_pose_count": 0,
+        "coverage_pose_count": 0,
+        "shortlisted_pose_count": int(pose_limit),
     }
 
-    coverage_candidates: list[int] = []
-    for pose_index in sorted({int(item.pose_index) for item in pending_nodes}):
-        pose_rows = np.asarray(
-            [
-                index
-                for index, item in enumerate(pending_nodes)
-                if int(item.pose_index) == pose_index
-            ],
-            dtype=np.int64,
-        )
-        pose_best = pose_rows[_stable_descending_indices(ranking_scores[pose_rows])[0]]
-        coverage_candidates.append(int(pose_best))
-    coverage_candidates.sort(
-        key=lambda index: (
-            -float(pending_nodes[index].coverage_gain),
-            -float(ranking_scores[index]),
-            int(index),
+    coverage_pose_rows = sorted(
+        range(int(pose_indices.size)),
+        key=lambda pose_row: (
+            -float(pending_nodes[int(action_matrix[pose_row, 0])].coverage_gain),
+            -float(pose_ranking_scores[pose_row]),
+            int(pose_indices[pose_row]),
         )
     )
-    for index in coverage_candidates[: int(config.exact_eig_coverage_reserve)]:
-        if len(selected) >= limit:
-            break
-        selected.add(int(index))
-        category_counts["coverage"] += 1
+    coverage_limit = min(int(config.exact_eig_coverage_reserve), pose_limit)
+    for pose_row in coverage_pose_rows[:coverage_limit]:
+        selected_pose_rows.add(int(pose_row))
+        category_counts["coverage_pose_count"] += 1
 
-    program_candidates: list[int] = []
-    for resolved_program_index in range(len(programs)):
-        program_rows = np.flatnonzero(pending_program_indices == resolved_program_index)
-        if program_rows.size == 0:
-            continue
-        best = program_rows[_stable_descending_indices(ranking_scores[program_rows])[0]]
-        program_candidates.append(int(best))
-    program_candidates.sort(
-        key=lambda index: (-float(ranking_scores[index]), int(index))
-    )
-    for index in program_candidates[: int(config.exact_eig_program_diversity_reserve)]:
-        if len(selected) >= limit:
+    for pose_row_raw in _stable_descending_indices(pose_ranking_scores):
+        if len(selected_pose_rows) >= pose_limit:
             break
-        if int(index) not in selected:
-            selected.add(int(index))
-            category_counts["program_diversity"] += 1
-
-    for index_raw in _stable_descending_indices(ranking_scores):
-        if len(selected) >= limit:
-            break
-        index = int(index_raw)
-        if index not in selected:
-            selected.add(index)
-            category_counts["global"] += 1
-    ordered = np.asarray(
-        sorted(selected, key=lambda index: (-ranking_scores[index], index)),
-        dtype=np.int64,
+        pose_row = int(pose_row_raw)
+        if pose_row not in selected_pose_rows:
+            selected_pose_rows.add(pose_row)
+            category_counts["global_pose_count"] += 1
+    ordered_pose_rows = sorted(
+        selected_pose_rows,
+        key=lambda pose_row: (
+            -float(pose_ranking_scores[pose_row]),
+            int(pose_indices[pose_row]),
+        ),
     )
-    if ordered.size != limit:
-        raise RuntimeError("Exact-EIG shortlist did not fill its fixed budget.")
+    ordered_actions: list[int] = []
+    for pose_row in ordered_pose_rows:
+        pose_actions = action_matrix[int(pose_row)]
+        local_order = _stable_descending_indices(ranking_scores[pose_actions])
+        ordered_actions.extend(int(pose_actions[index]) for index in local_order)
+    ordered = np.asarray(ordered_actions, dtype=np.int64)
+    if ordered.size != required_action_count:
+        raise RuntimeError("Exact-EIG pose shortlist lost a shield program.")
+    category_counts["coverage"] = int(
+        category_counts["coverage_pose_count"] * len(programs)
+    )
+    category_counts["global"] = int(
+        category_counts["global_pose_count"] * len(programs)
+    )
     return ordered, ranking_scores, category_counts
 
 
@@ -1686,6 +1664,23 @@ def _build_nodes(
             "path_length_support": path_length_support,
         }
     total_action_count = len(pending)
+    available_pose_count = len({int(item.pose_index) for item in pending})
+    exact_pose_count = min(
+        int(config.exact_eig_pose_limit),
+        int(available_pose_count),
+    )
+    required_exact_action_count = int(exact_pose_count * len(programs))
+    if (
+        float(config.lambda_eig) > 0.0
+        and required_exact_action_count > int(config.exact_eig_action_limit)
+    ):
+        raise ValueError(
+            "exact_eig_action_limit cannot hold all programs for the "
+            "configured exact_eig_pose_limit: "
+            f"{exact_pose_count} poses * {len(programs)} programs = "
+            f"{required_exact_action_count} actions, but the limit is "
+            f"{int(config.exact_eig_action_limit)}."
+        )
     proxy_wall_s = 0.0
     exact_wall_s = 0.0
     proxy_information_scores = np.zeros(
@@ -1701,6 +1696,9 @@ def _build_nodes(
         "global": int(total_action_count),
         "coverage": 0,
         "program_diversity": 0,
+        "global_pose_count": int(available_pose_count),
+        "coverage_pose_count": 0,
+        "shortlisted_pose_count": int(available_pose_count),
     }
     proxy_action_count = 0
     proxy_particle_count = 0
@@ -1714,8 +1712,9 @@ def _build_nodes(
             dtype=np.int64,
         )
     )
-    if float(config.lambda_eig) > 0.0 and total_action_count > int(
-        config.exact_eig_action_limit
+    if (
+        float(config.lambda_eig) > 0.0
+        and available_pose_count > int(config.exact_eig_pose_limit)
     ):
         proxy_joint_particles = estimator.planning_joint_particles(
             max_particles=int(config.proxy_planning_particles),
@@ -2098,6 +2097,21 @@ def _build_nodes(
     exact_action_count = (
         int(evaluated_pending_indices.size) if float(config.lambda_eig) > 0.0 else 0
     )
+    evaluated_pose_array = np.asarray(
+        [
+            int(pending[int(index)].pose_index)
+            for index in evaluated_pending_indices
+        ],
+        dtype=np.int64,
+    )
+    evaluated_pose_indices, evaluated_program_counts = np.unique(
+        evaluated_pose_array,
+        return_counts=True,
+    )
+    full_program_sweep = bool(
+        evaluated_program_counts.size > 0
+        and np.all(evaluated_program_counts == len(programs))
+    )
     diagnostics: dict[str, object] = {
         "total_action_count": int(total_action_count),
         "path_length_support": path_length_support,
@@ -2108,7 +2122,15 @@ def _build_nodes(
             config.detector_aperture_samples
         ),
         "exact_action_count": int(exact_action_count),
+        "exact_eig_pose_limit": int(config.exact_eig_pose_limit),
         "exact_eig_action_limit": int(config.exact_eig_action_limit),
+        "shortlisted_pose_count": int(evaluated_pose_indices.size),
+        "programs_per_shortlisted_pose": int(len(programs)),
+        "full_program_sweep_per_shortlisted_pose": bool(full_program_sweep),
+        "pose_shortlist_contract": (
+            "proxy_ranks_poses_by_best_proxy_program_then_exact_evaluates_"
+            "every_predeclared_program_at_each_shortlisted_pose"
+        ),
         "exact_eig_seed": int(exact_eig_seed),
         "adaptive_exact_eig_round_count": int(adaptive_round_count),
         "adaptive_exact_eig_exhausted_all_actions": bool(
@@ -2171,12 +2193,12 @@ def _build_nodes(
             shortlist_bound_certified
         ),
         "shortlist_certification_note": (
-            "Every action is ranked by the shared full-spectrum proxy. The "
-            "predeclared exact_eig_action_limit then bounds high-fidelity EIG "
-            "evaluation with coverage and program-diversity reserves. A "
-            "formal recall certificate is reported only when the evaluated "
-            "set also exceeds the safe finite-sample objective bound; the "
-            "runtime never silently expands beyond the configured budget."
+            "Every pose is ranked by its best shared full-spectrum proxy "
+            "program. Every predeclared program is then exactly evaluated at "
+            "each shortlisted pose; exact_eig_action_limit is only a safety "
+            "cap and may never truncate a pose's program sweep. A formal "
+            "pose-recall certificate is reported only when the evaluated set "
+            "also exceeds the safe finite-sample objective bound."
         ),
         "eig_shortlist_wall_s": float(proxy_wall_s + exact_wall_s),
     }
@@ -2371,7 +2393,46 @@ def select_dss_pp_next_station(
     )
     if not nodes:
         raise ValueError("DSS-PP could not evaluate any station-program node.")
-    first = nodes[0]
+    nodes_by_pose: dict[int, list[DSSPPNode]] = {}
+    for node in nodes:
+        nodes_by_pose.setdefault(int(node.pose_index), []).append(node)
+    pose_program_leaders = [
+        max(
+            pose_nodes,
+            key=lambda node: (
+                float(node.information_gain),
+                float(node.score),
+                str(node.program.name),
+            ),
+        )
+        for _, pose_nodes in sorted(nodes_by_pose.items())
+    ]
+    first = max(
+        pose_program_leaders,
+        key=lambda node: (float(node.score), -int(node.pose_index)),
+    )
+    selected_pose_nodes = nodes_by_pose[int(first.pose_index)]
+    selected_pose_eig_leader = max(
+        float(node.information_gain) for node in selected_pose_nodes
+    )
+    selected_program_is_eig_leader = bool(
+        np.isclose(
+            float(first.information_gain),
+            selected_pose_eig_leader,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        )
+    )
+    if float(cfg.lambda_eig) > 0.0:
+        if len(selected_pose_nodes) != len(programs):
+            raise RuntimeError(
+                "The selected DSS pose was not exactly evaluated with every "
+                "predeclared shield program."
+            )
+        if not selected_program_is_eig_leader:
+            raise RuntimeError(
+                "DSS shield selection must maximize exact EIG at the selected pose."
+            )
     sequence = (first,)
     best_score = float(first.score)
     mode_count = sum(len(mode_list) for mode_list in modes.values())
@@ -2387,6 +2448,8 @@ def select_dss_pp_next_station(
         "path_filtered_candidates": int(path_filtered),
         "runtime_motion_times_applied": bool(motion_times is not None),
         "program_count": int(len(programs)),
+        "program_library_configured_capacity": int(cfg.max_programs),
+        "program_library_realized_count": int(len(programs)),
         "program_library_policy": (
             "forced_predeclared_baseline"
             if cfg.forced_program_pair_ids is not None
@@ -2396,6 +2459,12 @@ def select_dss_pp_next_station(
         "program_library_exact_eig_over_every_predeclared_action": bool(
             int(shortlist_diagnostics.get("exact_action_count", 0))
             == int(shortlist_diagnostics.get("total_action_count", 0))
+        ),
+        "program_library_exact_eig_over_every_program_at_shortlisted_pose": bool(
+            shortlist_diagnostics.get(
+                "full_program_sweep_per_shortlisted_pose",
+                False,
+            )
         ),
         "program_library_unique_pair_count": int(np.count_nonzero(pair_occurrences)),
         "program_library_pair_occurrence_min": int(np.min(positive_occurrences)),
@@ -2433,6 +2502,13 @@ def select_dss_pp_next_station(
             "synthetic_xyz_centroids": False,
         },
         "planning_policy": "one_step_joint_eig",
+        "pose_selection_objective": (
+            "best_exact_program_eig_plus_spatial_coverage_and_robot_motion_terms"
+        ),
+        "program_selection_objective": (
+            "maximum_exact_eig_within_predeclared_program_library"
+        ),
+        "shield_rotation_cost_applied": False,
         "first_program_kind": first.program.kind,
         "planning_eig_joint_program_views": True,
         "planning_eig_joint_isotope_vector": True,
@@ -2456,6 +2532,13 @@ def select_dss_pp_next_station(
         ),
         "planning_eig_shortlist": dict(shortlist_diagnostics),
         "first_information_gain": float(first.information_gain),
+        "selected_pose_exact_program_count": int(len(selected_pose_nodes)),
+        "selected_pose_exact_information_gain_leader": float(
+            selected_pose_eig_leader
+        ),
+        "selected_program_is_exact_eig_leader_at_selected_pose": bool(
+            selected_program_is_eig_leader
+        ),
         "first_coverage_gain": float(first.coverage_gain),
         "coverage_support": str(
             shortlist_diagnostics.get(

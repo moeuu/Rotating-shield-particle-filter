@@ -2123,44 +2123,6 @@ def test_shield_program_batch_schedule_matches_scalar_test_oracle(
     assert [(program.name, program.pair_ids) for program in programs] == expected
 
 
-def test_shield_transition_batch_matches_scalar_test_oracle() -> None:
-    """Vectorized Fe/Pb rotation cost must match the scalar angle sequence."""
-    normals = np.asarray(generate_octant_orientations(), dtype=np.float64)
-    from_pair_id = 7
-    program = dss_pp.ShieldProgram(
-        name="transition_test",
-        pair_ids=(0, 9, 18, 63, 27),
-        kind="test",
-    )
-    sequence = (from_pair_id,) + program.pair_ids
-    expected = 0.0
-    for previous_pair, next_pair in zip(sequence[:-1], sequence[1:]):
-        for previous_index, next_index in (
-            (previous_pair // 8, next_pair // 8),
-            (previous_pair % 8, next_pair % 8),
-        ):
-            expected += float(
-                np.arccos(
-                    np.clip(
-                        np.dot(
-                            normals[previous_index],
-                            normals[next_index],
-                        ),
-                        -1.0,
-                        1.0,
-                    )
-                )
-            )
-
-    actual = dss_pp._shield_transition_cost(
-        normals,
-        from_pair_id,
-        program,
-    )
-
-    assert actual == pytest.approx(expected, rel=1.0e-14, abs=1.0e-14)
-
-
 def test_dss_pp_program_library_rejects_insufficient_pair_capacity() -> None:
     """A truncated library must not silently hide valid shield actions."""
     normals = np.asarray(generate_octant_orientations(), dtype=float)
@@ -2171,6 +2133,19 @@ def test_dss_pp_program_library_rejects_insufficient_pair_capacity() -> None:
             program_length=8,
             max_programs=47,
         )
+
+
+def test_canonical_program_capacity_does_not_request_extra_programs() -> None:
+    """A capacity above 48 must not invent arbitrary non-Latin programs."""
+    normals = np.asarray(generate_octant_orientations(), dtype=float)
+
+    programs = build_shield_program_library(
+        normals,
+        program_length=8,
+        max_programs=64,
+    )
+
+    assert len(programs) == 48
 
 
 def test_extract_signature_modes_uses_pf_posterior_weights() -> None:
@@ -2890,10 +2865,10 @@ def test_dss_evaluates_every_action_below_shortlist_threshold(
     assert diagnostics["exact_eig_wall_s"] >= 0.0
 
 
-def test_dss_exact_eig_respects_predeclared_action_budget(
+def test_dss_exact_eig_respects_predeclared_pose_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The exact stage must not expand past its real-time action budget."""
+    """The exact stage must shortlist poses without truncating their programs."""
     estimator = _build_simple_estimator()
     candidates = np.asarray(
         [
@@ -2985,6 +2960,7 @@ def test_dss_exact_eig_respects_predeclared_action_budget(
         current_pose_xyz=np.zeros(3, dtype=np.float64),
         config=DSSPPConfig(
             **common_config,
+            exact_eig_pose_limit=4,
             exact_eig_action_limit=4,
         ),
     )
@@ -2995,6 +2971,7 @@ def test_dss_exact_eig_respects_predeclared_action_budget(
         current_pose_xyz=np.zeros(3, dtype=np.float64),
         config=DSSPPConfig(
             **common_config,
+            exact_eig_pose_limit=2,
             exact_eig_action_limit=2,
         ),
     )
@@ -3017,6 +2994,99 @@ def test_dss_exact_eig_respects_predeclared_action_budget(
     assert diagnostics["shortlist_mc_winner_exceeds_universal_excluded_bound"] is False
     assert diagnostics["shortlist_formal_recall_certificate_available"] is False
     assert "joint_full_spectrum" in diagnostics["proxy_contract"]
+
+
+def test_dss_exactly_sweeps_every_program_at_shortlisted_poses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pose proxy pruning must retain all 48 programs for batched exact EIG."""
+    estimator = _build_simple_estimator(canonical_octants=True)
+    candidates = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    exact_batch_shapes: list[tuple[int, tuple[int, ...]]] = []
+
+    def fake_proxy(
+        _estimator: object,
+        detector_positions: np.ndarray,
+        programs: list[object],
+        **_kwargs: object,
+    ) -> np.ndarray:
+        """Rank the first two poses while keeping program order tied."""
+        pose_scores = np.asarray([0.9, 0.8, 0.1], dtype=np.float64)
+        return np.broadcast_to(
+            pose_scores[:, None],
+            (len(detector_positions), len(programs)),
+        ).copy()
+
+    def fake_exact_eig(
+        _estimator: object,
+        detector_positions: np.ndarray,
+        programs_by_pose: list[list[object]],
+        **_kwargs: object,
+    ) -> list[np.ndarray]:
+        """Make the last program at the second shortlisted pose optimal."""
+        exact_batch_shapes.append(
+            (
+                int(len(detector_positions)),
+                tuple(len(programs) for programs in programs_by_pose),
+            )
+        )
+        return [
+            np.arange(len(programs), dtype=np.float64)
+            + 100.0 * int(float(position[0]) == 2.0)
+            for position, programs in zip(
+                np.asarray(detector_positions, dtype=np.float64),
+                programs_by_pose,
+                strict=True,
+            )
+        ]
+
+    monkeypatch.setattr(
+        dss_pp,
+        "_program_information_proxy_for_poses",
+        fake_proxy,
+    )
+    monkeypatch.setattr(
+        dss_pp,
+        "_program_information_gains_for_poses",
+        fake_exact_eig,
+    )
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(29),
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.zeros(3, dtype=np.float64),
+        config=DSSPPConfig(
+            max_programs=48,
+            program_length=8,
+            lambda_eig=1.0,
+            lambda_distance=0.0,
+            lambda_time=0.0,
+            lambda_rotation=0.0,
+            augment_candidates=False,
+            min_station_separation_m=0.0,
+            exact_eig_pose_limit=2,
+            exact_eig_action_limit=96,
+            exact_eig_coverage_reserve=0,
+        ),
+    )
+
+    assert exact_batch_shapes == [(2, (48, 48))]
+    assert result.next_pose[0] == pytest.approx(2.0)
+    assert result.diagnostics["selected_pose_exact_program_count"] == 48
+    assert result.diagnostics[
+        "selected_program_is_exact_eig_leader_at_selected_pose"
+    ] is True
+    diagnostics = result.diagnostics["planning_eig_shortlist"]
+    assert diagnostics["shortlisted_pose_count"] == 2
+    assert diagnostics["exact_action_count"] == 96
+    assert diagnostics["full_program_sweep_per_shortlisted_pose"] is True
 
 
 def test_dss_canonical_program_diagnostics_cover_all_pairs_at_horizon_one() -> None:

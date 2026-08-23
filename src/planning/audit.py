@@ -86,7 +86,26 @@ def build_planner_audit(
         "selected_score": float(result.score),
         "selected_information_gain": selected_eig,
         "best_exact_information_gain": best_exact_eig,
+        "selected_pose_best_exact_information_gain": diagnostics.get(
+            "selected_pose_exact_information_gain_leader"
+        ),
+        "selected_program_is_exact_eig_leader_at_selected_pose": bool(
+            diagnostics.get(
+                "selected_program_is_exact_eig_leader_at_selected_pose",
+                False,
+            )
+        ),
+        "selected_pose_exact_program_count": int(
+            diagnostics.get("selected_pose_exact_program_count", 0)
+        ),
         "total_action_count": int(shortlist.get("total_action_count", 0)),
+        "shortlisted_pose_count": int(shortlist.get("shortlisted_pose_count", 0)),
+        "programs_per_shortlisted_pose": int(
+            shortlist.get("programs_per_shortlisted_pose", 0)
+        ),
+        "full_program_sweep_per_shortlisted_pose": bool(
+            shortlist.get("full_program_sweep_per_shortlisted_pose", False)
+        ),
         "selected_proxy_rank": int(shortlist.get("shortlist_selected_proxy_rank", 0)),
         "exact_action_count": int(shortlist.get("exact_action_count", 0)),
         "proxy_action_count": int(shortlist.get("proxy_action_count", 0)),

@@ -73,7 +73,7 @@ class DSSPPConfig:
     lambda_eig: float = 1.0
     lambda_distance: float | None = None
     lambda_time: float = 0.0
-    lambda_rotation: float = 0.15
+    lambda_rotation: float = 0.0
     lambda_coverage: float = 0.0
     lambda_bearing_diversity: float = 0.0
     lambda_frontier: float = 0.0
@@ -100,9 +100,10 @@ class DSSPPConfig:
     elevation_angle_threshold_deg: float = 15.0
     forced_program_pair_ids: tuple[int, ...] | None = None
     diagnostic_ranked_node_limit: int = 64
-    exact_eig_action_limit: int = 32
-    exact_eig_coverage_reserve: int = 4
-    exact_eig_program_diversity_reserve: int = 4
+    exact_eig_pose_limit: int = 4
+    exact_eig_action_limit: int = 192
+    exact_eig_coverage_reserve: int = 1
+    exact_eig_program_diversity_reserve: int = 0
     exact_eig_memory_budget_bytes: int = 4 * 1024 * 1024 * 1024
     proxy_memory_budget_bytes: int = 256 * 1024 * 1024
     proxy_planning_particles: int = 16
@@ -166,6 +167,7 @@ class DSSPPConfig:
             ),
             "detector_aperture_samples": self.detector_aperture_samples,
             "max_augmented_candidates": self.max_augmented_candidates,
+            "exact_eig_pose_limit": self.exact_eig_pose_limit,
             "exact_eig_action_limit": self.exact_eig_action_limit,
             "exact_eig_memory_budget_bytes": (self.exact_eig_memory_budget_bytes),
             "proxy_memory_budget_bytes": self.proxy_memory_budget_bytes,
@@ -220,6 +222,12 @@ class DSSPPConfig:
             nonnegative_fields["lambda_distance"] = self.lambda_distance
         for name, value in nonnegative_fields.items():
             _number(value, name, minimum=0.0)
+        if float(self.lambda_rotation) != 0.0:
+            raise ValueError(
+                "lambda_rotation is retired: shield programs must be selected "
+                "by exact EIG. Model a measured rotation duration through the "
+                "time-cost contract if it becomes physically material."
+            )
 
         positive_fields = {
             "mode_cluster_radius_m": self.mode_cluster_radius_m,
@@ -265,11 +273,20 @@ class DSSPPConfig:
                 )
             if len(set(pair_ids)) != len(pair_ids):
                 raise ValueError("forced_program_pair_ids must not contain duplicates.")
-        if int(self.exact_eig_coverage_reserve) + int(
-            self.exact_eig_program_diversity_reserve
-        ) > int(self.exact_eig_action_limit):
+        if int(self.exact_eig_coverage_reserve) > int(self.exact_eig_pose_limit):
             raise ValueError(
-                "Exact-EIG reserve counts must fit within exact_eig_action_limit."
+                "exact_eig_coverage_reserve must fit within "
+                "exact_eig_pose_limit."
+            )
+        if int(self.exact_eig_program_diversity_reserve) != 0:
+            raise ValueError(
+                "exact_eig_program_diversity_reserve is retired because every "
+                "program is exactly evaluated at every shortlisted pose."
+            )
+        if int(self.exact_eig_pose_limit) > int(self.exact_eig_action_limit):
+            raise ValueError(
+                "exact_eig_action_limit must accommodate at least one program "
+                "for every shortlisted pose."
             )
 
 

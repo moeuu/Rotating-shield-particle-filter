@@ -23,7 +23,12 @@ def build_shield_program_library(
     program_length: int = 2,
     max_programs: int = 40,
 ) -> list[ShieldProgram]:
-    """Build balanced, repetition-free programs covering every Fe/Pb pair."""
+    """Build the complete structured library within a declared capacity.
+
+    ``max_programs`` is a safety capacity, not a requested output count. The
+    canonical eight-orientation, eight-view construction has exactly 48
+    programs even when the supplied capacity is larger.
+    """
     normal_arr = np.asarray(normals, dtype=float)
     if (
         normal_arr.ndim != 2
@@ -54,6 +59,10 @@ def build_shield_program_library(
         )
     if num_orients == 8 and length == 8:
         orientation_axis = np.arange(num_orients, dtype=np.int64)
+        # The four units modulo eight generate bijective Pb tours for every
+        # Fe orientation. Together with the fixed-Fe and fixed-Pb partitions,
+        # this yields (4 + 2) * 8 = 48 structured programs. The number is not
+        # a truncation of the 64 individual Fe/Pb posture pairs.
         slopes = orientation_axis[np.gcd(orientation_axis, num_orients) == 1]
         latin_pb = (
             slopes[:, None, None] * orientation_axis[None, None, :]

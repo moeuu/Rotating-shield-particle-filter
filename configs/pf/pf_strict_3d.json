@@ -76,6 +76,10 @@
     "detector_aperture_samples": 121,
     "diagnostic_ranked_node_limit": 10,
     "distance_weight": 0,
+    "exact_eig_action_limit": 192,
+    "exact_eig_coverage_reserve": 1,
+    "exact_eig_pose_limit": 4,
+    "exact_eig_program_diversity_reserve": 0,
     "elevation_angle_threshold_deg": 15,
     "elevation_condition_weight": 4,
     "elevation_pair_xy_scale_m": 4,
@@ -88,7 +92,7 @@
     "planning_particles": 512,
     "program_length": 8,
     "revisit_penalty_weight": 6,
-    "rotation_weight": 0.15,
+    "rotation_weight": 0,
     "time_weight": 0.02,
     "turn_smoothness_weight": 2.5
   }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from planning.configuration import dss_config_from_pf_settings
 
 
@@ -41,3 +43,23 @@ def test_runtime_planner_defaults_to_pf_hard_cardinality_capacity() -> None:
     )
 
     assert config.max_modes_per_isotope == 8
+
+
+def test_runtime_planner_retires_angular_rotation_penalty() -> None:
+    """Production shield choice must not trade exact EIG for angular motion."""
+    config = dss_config_from_pf_settings(
+        {"dss_pp": {"planning_method": "resample"}},
+    )
+
+    assert config.lambda_rotation == 0.0
+    assert config.exact_eig_pose_limit == 4
+    assert config.exact_eig_action_limit == 192
+    with pytest.raises(ValueError, match="lambda_rotation is retired"):
+        dss_config_from_pf_settings(
+            {
+                "dss_pp": {
+                    "planning_method": "resample",
+                    "rotation_weight": 0.15,
+                }
+            },
+        )

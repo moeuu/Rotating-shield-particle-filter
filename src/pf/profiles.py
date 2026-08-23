@@ -156,6 +156,7 @@ _DSS_PP_RUNTIME_KEYS = frozenset(
         "exact_eig_action_limit",
         "exact_eig_coverage_reserve",
         "exact_eig_memory_budget_bytes",
+        "exact_eig_pose_limit",
         "exact_eig_program_diversity_reserve",
         "elevation_angle_threshold_deg",
         "elevation_condition_weight",
