@@ -178,7 +178,6 @@ class PFSourceMode:
                 [float(value) for value in row] for row in self.position_covariance_xyz
             ],
             "credible_radius_95_m": float(self.credible_radius_95_m),
-            "credible_radius_m": float(self.credible_radius_95_m),
             "credible_surface_path_radius_95_m": (
                 None
                 if self.credible_surface_path_radius_95_m is None
@@ -201,9 +200,6 @@ class PFSourceMode:
             "strength_mean_cps_1m": float(self.strength_mean_cps_1m),
             "strength_median_cps_1m": float(self.strength_median_cps_1m),
             "strength_credible_interval_95_cps_1m": [
-                float(value) for value in self.strength_credible_interval_95_cps_1m
-            ],
-            "strength_credible_interval_cps_1m": [
                 float(value) for value in self.strength_credible_interval_95_cps_1m
             ],
             "posterior_mass": posterior_mass,
@@ -308,7 +304,7 @@ class PFPosteriorSnapshot:
     profile_capability_map: Mapping[str, bool]
     record_count: int
     structural_transition_provenance: Mapping[str, Any] = field(default_factory=dict)
-    schema_version: int = 1
+    schema_version: int = 2
     structural_model_manifest: Mapping[str, Any] = field(default_factory=dict)
     pure_pf_schema_version: int = 1
 
@@ -316,7 +312,7 @@ class PFPosteriorSnapshot:
         """Return the required JSON-safe PF result contract."""
         validated_schema_fields: dict[str, int] = {}
         for field_name, value, expected in (
-            ("schema_version", self.schema_version, 1),
+            ("schema_version", self.schema_version, 2),
             ("pure_pf_schema_version", self.pure_pf_schema_version, 1),
             (
                 "measurement_log_schema_version",
@@ -506,12 +502,8 @@ class PFPosteriorSnapshot:
             "resolved_config_sha256": resolved_config_hash,
             "config_sha256": config_hash,
             "random_seed": random_seed,
-            "pure_pf_schema_version": validated_schema_fields[
-                "pure_pf_schema_version"
-            ],
             "planner_belief_sources": list(planner_belief_sources),
             "batch_feedback_applied": False,
-            "posterior_semantics": structural["posterior_semantics"],
             "structural_transition_provenance": dict(structural),
             "structural_model_manifest": dict(structural_model),
         }
@@ -521,35 +513,11 @@ class PFPosteriorSnapshot:
                 "pure_pf_schema_version"
             ],
             "estimator_family": "particle_filter",
-            "estimator_variant": estimator_variant,
             "estimator_profile": estimator_variant,
             "final_estimate_source": "pf_posterior",
             "uses_all_history_batch_fit": False,
             "uses_surface_map": False,
             "uses_batch_model_order": False,
-            "posterior_semantics": structural["posterior_semantics"],
-            "structural_kernel_family": structural["structural_kernel_family"],
-            "structural_kernel_target_preserving": structural[
-                "structural_kernel_target_preserving"
-            ],
-            "structural_kernel_exact_rj": structural[
-                "structural_kernel_exact_rj"
-            ],
-            "reversible_jump_mcmc_used": structural[
-                "reversible_jump_mcmc_used"
-            ],
-            "structural_transition_provenance": dict(structural),
-            "structural_model_manifest": dict(structural_model),
-            "planner_belief_sources": list(planner_belief_sources),
-            "repository_commit": repository_commit,
-            "measurement_log_schema_version": validated_schema_fields[
-                "measurement_log_schema_version"
-            ],
-            "resolved_config_hash": resolved_config_hash,
-            "resolved_config_sha256": resolved_config_hash,
-            "config_sha256": config_hash,
-            "measurement_log_sha256": measurement_log_sha256,
-            "random_seed": random_seed,
             "provenance": provenance,
             "profile_capability_map": profile_capability_map,
             "record_count": record_count,

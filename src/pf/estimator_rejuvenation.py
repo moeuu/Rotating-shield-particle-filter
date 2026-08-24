@@ -1800,9 +1800,6 @@ class JointRejuvenationMixin:
             return {}
         state_before = self._joint_mixing_snapshot()
         diagnostics: dict[str, float] = {}
-        rejuvenation_start = time.perf_counter()
-        cache_hits_start = int(self.last_joint_structural_unit_cache_hits)
-        cache_misses_start = int(self.last_joint_structural_unit_cache_misses)
         cross_attempted_start = float(
             self.last_joint_cross_isotope_attempted_weight_mass
         )
@@ -1818,13 +1815,6 @@ class JointRejuvenationMixin:
         )
         strength_block_accepted_start = float(
             self.last_joint_strength_block_accepted_weight_mass
-        )
-        print(
-            "[joint-smc] rejuvenation-start "
-            f"beta={float(target_beta):.12g} "
-            f"stations={len(active)} "
-            f"particles={int(self.pf_config.num_particles)}",
-            flush=True,
         )
         active_station_ids = tuple(id(station) for station in active)
         if active_station_ids != self._joint_torch_context_station_ids:
@@ -1877,14 +1867,6 @@ class JointRejuvenationMixin:
             ).copy()
             last_changed_rows = np.empty(0, dtype=np.int64)
             for isotope_index, isotope in enumerate(isotope_order):
-                isotope_start = time.perf_counter()
-                print(
-                    "[joint-smc] isotope-sweep-start "
-                    f"beta={float(target_beta):.12g} "
-                    f"isotope={isotope} "
-                    f"ordinal={isotope_index + 1}/{len(isotope_order)}",
-                    flush=True,
-                )
                 filt = self.filters[isotope]
                 cache_state_before = self._joint_isotope_cache_state(filt)
                 evidence = self._joint_history_structural_geometry(
@@ -1918,27 +1900,6 @@ class JointRejuvenationMixin:
                     filt,
                 )
                 last_changed_rows = changed_rows
-                timing = filt.last_structural_timing_s
-                attempt_count = sum(
-                    int(timing.get(key, 0.0))
-                    for key in (
-                        "rj_birth_attempted",
-                        "rj_death_attempted",
-                        "rj_global_position_attempted",
-                        "rj_local_position_attempted",
-                        "rj_strength_attempted",
-                        "rj_split_attempted",
-                        "rj_merge_attempted",
-                    )
-                )
-                print(
-                    "[joint-smc] isotope-sweep-done "
-                    f"beta={float(target_beta):.12g} "
-                    f"isotope={isotope} "
-                    f"elapsed_s={time.perf_counter() - isotope_start:.3f} "
-                    f"attempts={attempt_count}",
-                    flush=True,
-                )
                 if isotope_index + 1 < len(isotope_order):
                     self._refresh_joint_structural_transport_cache_isotope(
                         active,
@@ -2011,16 +1972,6 @@ class JointRejuvenationMixin:
             self._joint_structural_transport_cache = None
             self._active_joint_station_history = None
             self._active_joint_tempering_prefix_count = None
-            print(
-                "[joint-smc] rejuvenation-done "
-                f"beta={float(target_beta):.12g} "
-                f"elapsed_s={time.perf_counter() - rejuvenation_start:.3f} "
-                "unit_transport_cache_hits="
-                f"{self.last_joint_structural_unit_cache_hits - cache_hits_start} "
-                "unit_transport_cache_misses="
-                f"{self.last_joint_structural_unit_cache_misses - cache_misses_start}",
-                flush=True,
-            )
         return diagnostics
 
     def _joint_rejuvenate_adaptive(
@@ -2566,15 +2517,6 @@ class JointRejuvenationMixin:
             device=device,
             dtype=torch.float64,
         )
-        print(
-            "[joint-smc] station-update-start "
-            f"station={len(all_stations) - 1} "
-            f"particles={particle_count} "
-            f"view_prefixes={view_count} "
-            f"initial_ess={initial_ess:.6f} "
-            f"target_ess={target_ess:.6f}",
-            flush=True,
-        )
         if initial_ess <= target_ess + 1.0e-9:
             indices = self._resample_joint_particles(log_weights.detach().cpu().numpy())
             station_ancestor_ids = station_ancestor_ids[indices]
@@ -2634,15 +2576,6 @@ class JointRejuvenationMixin:
                             dtype=torch.float64,
                             device=device,
                         )
-                    print(
-                        "[joint-smc] temper-recovery "
-                        f"step={len(steps) + 1} "
-                        f"prefix={prefix_count}/{view_count} "
-                        f"beta={beta_total:.12g} "
-                        f"ess={current_ess:.6f} "
-                        f"resampled={int(resampled)}",
-                        flush=True,
-                    )
                     self._joint_rejuvenate_adaptive(
                         all_stations,
                         target_beta=float(beta_total),
@@ -2694,15 +2627,6 @@ class JointRejuvenationMixin:
                     ),
                 }
                 steps.append(step)
-                print(
-                    "[joint-smc] temper-step "
-                    f"step={len(steps)} "
-                    f"prefix={prefix_count}/{view_count} "
-                    f"beta={beta_total:.12g} "
-                    f"delta_beta={float(delta_beta):.12g} "
-                    f"ess={float(ess):.6f}",
-                    flush=True,
-                )
                 if beta_total >= 1.0 - 1.0e-12:
                     beta_total = 1.0
                     break

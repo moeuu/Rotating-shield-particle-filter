@@ -36,6 +36,7 @@ from pf.particle_filter import (
 from pf.posterior import (
     PFPointEstimate,
     PFPosteriorSnapshot,
+    PFSourceMode,
     _surface_mode_medoid_coordinates_batched,
     align_surface_modes_batched,
     posterior_point_estimate_from_states,
@@ -435,10 +436,38 @@ def test_posterior_snapshot_accepts_required_measurement_log() -> None:
 
     payload = snapshot.to_dict()
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["pure_pf_schema_version"] == 1
-    assert payload["measurement_log_schema_version"] == 2
     assert payload["provenance"]["measurement_log_schema_version"] == 2
+    assert payload["provenance"]["measurement_log_sha256"] == "d" * 64
+    assert payload["estimator_profile"] == "pf_strict"
+    assert "estimator_variant" not in payload
+    assert "measurement_log_sha256" not in payload
+    assert "resolved_config_hash" not in payload
+    assert "resolved_config_sha256" not in payload
+    assert "structural_transition_provenance" not in payload
+
+
+def test_source_mode_uses_only_confidence_explicit_uncertainty_fields() -> None:
+    """Posterior modes must not emit the ambiguous legacy uncertainty aliases."""
+    mode = PFSourceMode(
+        label_index=0,
+        position_medoid_xyz=(0.0, 0.0, 0.0),
+        position_covariance_xyz=((1.0, 0.0, 0.0),) * 3,
+        credible_radius_95_m=1.0,
+        strength_representative_cps_1m=1.0,
+        strength_mean_cps_1m=1.0,
+        strength_median_cps_1m=1.0,
+        strength_credible_interval_95_cps_1m=(0.5, 1.5),
+        posterior_mass=1.0,
+    )
+
+    payload = mode.to_dict()
+
+    assert payload["credible_radius_95_m"] == 1.0
+    assert payload["strength_credible_interval_95_cps_1m"] == [0.5, 1.5]
+    assert "credible_radius_m" not in payload
+    assert "strength_credible_interval_cps_1m" not in payload
 
 
 @pytest.mark.parametrize(

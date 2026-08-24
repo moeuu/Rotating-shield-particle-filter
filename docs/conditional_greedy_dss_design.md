@@ -152,10 +152,11 @@ sample, but does not prove optimality outside those candidates. The 8--16 pose
 shortlist is an uncertainty-controlled compute budget, not proof that the
 selected pose is globally optimal among all reachable poses.
 
-Diagnostics record proxy replicas, shortlist boundaries and Jaccard stability,
-exact pose programs/EIG/scores, greedy and swap candidate counts, legacy-floor
-use, independent-confirmation counts, selected source, timing, and all relevant
-seeds.
+The planner may use detailed runtime diagnostics internally, but the durable audit
+keeps only physical pose/subset counts, selected action/EIG, the EIG leader, compact
+top-k actions, relevant seeds, and the statistical evidence needed by the
+fixed-eight shadow audit. Runtime chunk/memory telemetry and derivable counters are
+not persisted.
 
 ## Fixed-eight shield-view shadow audit
 
@@ -188,17 +189,16 @@ non-controlling shadow policy over view counts `{2, 4, 8}`:
   Particle-diversity warnings, sampler failures, upper-cardinality-boundary
   mass, latest full-spectrum innovation failure, newly activated isotopes, or
   unavailable health force the hypothetical health-gated action to eight.
-- `measurement_time_weight` is recorded only as an uncalibrated counterfactual.
-  It does not enter the shadow decision, pose score used by that decision, the
-  returned `ShieldProgram`, runtime station completion, or measurement budget.
-  The audit saves live time, rotation-overhead-inclusive elapsed time, marginal
-  EIG per added second, and the action that the configured time weight alone
-  would have selected; this action is explicitly not calibrated for execution.
+- `measurement_time_weight` does not enter the shadow decision, pose score used by
+  that decision, the returned `ShieldProgram`, runtime station completion, or
+  measurement budget. The compact audit retains marginal EIG per added live second,
+  but drops the uncalibrated time-weight counterfactual and derivable elapsed-time
+  arrays.
 
-The audit stores point-rule, paired-LCB, and health-gated hypothetical actions
-alongside the actually executed eight-view action. Enabling or disabling the
-shadow path must leave the controlling pose, ordered pair IDs, EIG, score, and
-planner RNG stream unchanged.
+The audit stores point-rule, paired-LCB, and health-gated hypothetical actions. The
+top-level selected action plus `actual_execution` records that acquisition remained
+fixed at eight views. Enabling or disabling the shadow path must leave the
+controlling pose, ordered pair IDs, EIG, score, and planner RNG stream unchanged.
 
 The holdout adds one virtual-observation cache construction and three batched
 fixed-prefix likelihood reductions per exact pose chunk. It does not repeat

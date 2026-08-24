@@ -35,26 +35,49 @@ def _leader(
     leaders: Mapping[str, object],
     name: str,
 ) -> dict[str, object] | None:
-    """Return one JSON-safe planner component leader when available."""
+    """Return one compact JSON-safe planner component leader."""
     value = leaders.get(name)
     if value is None:
         return None
-    return dict(_mapping(value, name=f"component_leaders.{name}"))
+    return _compact_ranked_action(
+        _mapping(value, name=f"component_leaders.{name}"),
+        name=f"component_leaders.{name}",
+    )
+
+
+def _compact_ranked_action(
+    value: Mapping[str, object],
+    *,
+    name: str,
+) -> dict[str, object]:
+    """Keep only fields needed to audit one ranked pose/program action."""
+    pose_xyz = _sequence(value.get("pose_xyz"), name=f"{name}.pose_xyz")
+    pair_ids = _sequence(value.get("pair_ids"), name=f"{name}.pair_ids")
+    pose = [float(item) for item in pose_xyz]
+    pairs = [int(item) for item in pair_ids]
+    if len(pose) != 3 or any(not math.isfinite(item) for item in pose):
+        raise ValueError(f"{name} must contain one finite 3-D pose.")
+    if any(item < 0 or item >= 64 for item in pairs):
+        raise ValueError(f"{name} pair IDs must lie in the 64-pair domain.")
+    return {
+        "rank": int(value["rank"]),
+        "pose_index": int(value["pose_index"]),
+        "pose_xyz": pose,
+        "program_name": str(value["program_name"]),
+        "program_kind": str(value["program_kind"]),
+        "pair_ids": pairs,
+        "score": float(value["score"]),
+        "information_gain": float(value["information_gain"]),
+    }
 
 
 def _shadow_action(
     raw: Mapping[str, object],
     *,
     score_field: str,
-    score_semantics: str,
-    selection_reason: str,
-    fallback_applied: bool = False,
-    fallback_reasons: Sequence[str] = (),
-    program_name: str | None = None,
-    program_kind: str | None = "nested_conditional_greedy_prefix",
     require_unique_pairs: bool = True,
 ) -> dict[str, object]:
-    """Normalize every persisted shadow action to one stable schema."""
+    """Normalize one compact hypothetical shadow action."""
     pose_xyz = raw.get("pose_xyz")
     pair_ids = raw.get("pair_ids")
     if not isinstance(pose_xyz, Sequence) or isinstance(pose_xyz, (str, bytes)):
@@ -93,26 +116,10 @@ def _shadow_action(
         "pose_xyz": resolved_pose,
         "selected_view_count": selected_view_count,
         "pair_ids": resolved_pairs,
-        "program_name": program_name,
-        "program_kind": program_kind,
         "information_gain_mean_nat": (
             None if information_gain is None else float(information_gain)
         ),
         "selection_score": None if score is None else float(score),
-        "score_semantics": str(score_semantics),
-        "selection_reason": str(selection_reason),
-        "fallback_applied": bool(fallback_applied),
-        "fallback_reasons": [str(value) for value in fallback_reasons],
-        "configured_measurement_time_weight": (
-            None
-            if raw.get("configured_measurement_time_weight") is None
-            else float(raw["configured_measurement_time_weight"])
-        ),
-        "calibrated_for_dynamic_acquisition": (
-            None
-            if raw.get("calibrated_for_dynamic_acquisition") is None
-            else bool(raw["calibrated_for_dynamic_acquisition"])
-        ),
     }
 
 
@@ -135,10 +142,6 @@ def _executed_shadow_action(
             "pose_score": score,
         },
         score_field="pose_score",
-        score_semantics="executed_planner_score",
-        selection_reason="runtime_contract_fixed_view_count",
-        program_name=str(program.name),
-        program_kind=str(program.kind),
         require_unique_pairs=False,
     )
 
@@ -150,8 +153,6 @@ def _unavailable_shadow_health(
 ) -> dict[str, object]:
     """Return one truth-free fail-closed health payload."""
     return {
-        "policy_schema_version": 1,
-        "hard_gate_contract": list(SHIELD_VIEW_COUNT_SHADOW_HEALTH_GATES),
         "available": False,
         "passed": False,
         "source_station_id": belief_after_station_id,
@@ -190,8 +191,13 @@ def _validated_shadow_health(
         raise ValueError("Passing posterior health must be available and reason-free.")
     if not passed and not resolved_reasons:
         raise ValueError("Failing posterior health must state at least one reason.")
-    health["hard_failure_reasons"] = resolved_reasons
-    return health
+    return {
+        "available": available,
+        "passed": passed,
+        "source_station_id": belief_after_station_id,
+        "hard_failure_reasons": resolved_reasons,
+        "truth_used": False,
+    }
 
 
 def _validated_pose_rows(
@@ -234,7 +240,8 @@ def _validate_view_count_pair_rows(
     pose_count: int,
     name: str,
 ) -> None:
-    """Validate every persisted shield-pair row for all view counts."""
+    """Validate nested shield-pair rows before retaining only K=8 rows."""
+    pairs_by_view_count: dict[int, np.ndarray] = {}
     for view_count in candidate_view_counts:
         count_payload = _mapping(
             by_view_count.get(str(view_count)),
@@ -254,6 +261,292 @@ def _validate_view_count_pair_rows(
         )
         if np.any(pairs < 0) or np.any(pairs >= 64) or np.any(duplicated):
             raise ValueError(f"{name} shield pair row violates the 64-pair domain.")
+        pairs_by_view_count[int(view_count)] = pairs
+    reference = pairs_by_view_count[int(candidate_view_counts[-1])]
+    for view_count in candidate_view_counts[:-1]:
+        if not np.array_equal(
+            pairs_by_view_count[int(view_count)],
+            reference[:, : int(view_count)],
+        ):
+            raise ValueError(f"{name} shield programs must be nested prefixes.")
+
+
+def _float_vector(
+    value: object,
+    *,
+    size: int,
+    name: str,
+    nonnegative: bool = False,
+) -> list[float]:
+    """Return one aligned finite vector as JSON-native floats."""
+    vector = np.asarray(value, dtype=np.float64)
+    if vector.shape != (size,) or np.any(~np.isfinite(vector)):
+        raise ValueError(f"{name} must be one aligned finite vector.")
+    if nonnegative and np.any(vector < 0.0):
+        raise ValueError(f"{name} must be nonnegative.")
+    return [float(item) for item in vector]
+
+
+def _compact_seed_blocks(value: object, *, name: str) -> list[dict[str, object]]:
+    """Remove repeated RNG stream labels while preserving resolved seeds."""
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError(f"{name} must be a sequence.")
+    compact: list[dict[str, object]] = []
+    for offset, raw in enumerate(value):
+        block = _mapping(raw, name=f"{name}[{offset}]")
+        pose_indices = block.get("pose_indices")
+        if not isinstance(pose_indices, Sequence) or isinstance(
+            pose_indices,
+            (str, bytes),
+        ):
+            raise TypeError(f"{name} pose indices must be a sequence.")
+        compact.append(
+            {
+                "seed": int(block["seed"]),
+                "pose_indices": [int(item) for item in pose_indices],
+                "samples_per_pose": int(block["samples_per_pose"]),
+            }
+        )
+    return compact
+
+
+def _compact_proxy_shadow(
+    proxy: Mapping[str, object],
+    *,
+    candidate_view_counts: tuple[int, ...],
+) -> dict[str, object]:
+    """Keep all-pose proxy EIG while dropping derivable scores and prefixes."""
+    status = str(proxy.get("status", "not_evaluated"))
+    if status != "evaluated":
+        compact: dict[str, object] = {"status": status}
+        for key in (
+            "executed_fixed_8_shortlist_pose_indices",
+            "view_count_union_exact_pose_indices",
+        ):
+            raw_indices = proxy.get(key)
+            if isinstance(raw_indices, Sequence) and not isinstance(
+                raw_indices,
+                (str, bytes),
+            ):
+                compact[key] = [int(item) for item in raw_indices]
+        return compact
+
+    pose_indices = _validated_pose_rows(
+        proxy.get("pose_indices"),
+        proxy.get("pose_xyz"),
+        name="proxy shadow",
+    )
+    pose_count = len(pose_indices)
+    by_view_count = _mapping(
+        proxy.get("by_view_count"),
+        name="proxy.by_view_count",
+    )
+    reference_count = int(candidate_view_counts[-1])
+    compact_by_count: dict[str, object] = {}
+    for view_count in candidate_view_counts:
+        raw_count = _mapping(
+            by_view_count.get(str(view_count)),
+            name=f"proxy.by_view_count[{view_count}]",
+        )
+        count_payload: dict[str, object] = {
+            "information_gain_mean_nat": _float_vector(
+                raw_count.get("information_gain_mean_nat"),
+                size=pose_count,
+                name=f"proxy I_{view_count}",
+                nonnegative=True,
+            )
+        }
+        if view_count == reference_count:
+            count_payload["pair_ids"] = [
+                [int(item) for item in row]
+                for row in _mapping_sequence(
+                    raw_count.get("pair_ids"),
+                    name="proxy reference pair rows",
+                )
+            ]
+        compact_by_count[str(view_count)] = count_payload
+    seed_blocks = _compact_seed_blocks(
+        proxy.get("selection_seed_blocks"),
+        name="proxy selection seed blocks",
+    )
+    if len(seed_blocks) != 1:
+        raise ValueError("Proxy shadow must have one resolved selection seed.")
+    return {
+        "status": "evaluated",
+        "particle_count": int(proxy["particle_count"]),
+        "samples_per_pose": int(proxy["samples_per_seed"]),
+        "pose_indices": pose_indices,
+        "pose_xyz": [
+            [float(item) for item in row]
+            for row in _mapping_sequence(
+                proxy.get("pose_xyz"),
+                name="proxy pose rows",
+            )
+        ],
+        "selection_seed": int(seed_blocks[0]["seed"]),
+        "by_view_count": compact_by_count,
+        "executed_fixed_8_shortlist_pose_indices": [
+            int(item)
+            for item in _sequence(
+                proxy.get("executed_fixed_8_shortlist_pose_indices"),
+                name="executed fixed-eight shortlist pose indices",
+            )
+        ],
+        "view_count_union_exact_pose_indices": [
+            int(item)
+            for item in _sequence(
+                proxy.get("view_count_union_exact_pose_indices"),
+                name="view-count union exact pose indices",
+            )
+        ],
+    }
+
+
+def _sequence(value: object, *, name: str) -> Sequence[object]:
+    """Return one non-string sequence or reject malformed diagnostics."""
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError(f"{name} must be a sequence.")
+    return value
+
+
+def _mapping_sequence(value: object, *, name: str) -> Sequence[Sequence[object]]:
+    """Return one sequence of non-string rows."""
+    rows = _sequence(value, name=name)
+    for row in rows:
+        _sequence(row, name=f"{name} row")
+    return rows  # type: ignore[return-value]
+
+
+def _compact_exact_shadow(
+    exact: Mapping[str, object],
+    *,
+    candidate_view_counts: tuple[int, ...],
+    include_pose_xyz: bool,
+) -> dict[str, object]:
+    """Keep paired exact evidence and omit poses already stored by proxy."""
+    pose_indices = _validated_pose_rows(
+        exact.get("pose_indices"),
+        exact.get("pose_xyz"),
+        name="exact shadow",
+    )
+    pose_count = len(pose_indices)
+    by_view_count = _mapping(exact.get("by_view_count"), name="exact.by_view_count")
+    reference_count = int(candidate_view_counts[-1])
+    compact_by_count: dict[str, object] = {}
+    for view_count in candidate_view_counts:
+        raw_count = _mapping(
+            by_view_count.get(str(view_count)),
+            name=f"exact.by_view_count[{view_count}]",
+        )
+        increment = _mapping(
+            raw_count.get("nested_prefix_increment"),
+            name=f"exact I_{view_count} marginal evidence",
+        )
+        count_payload: dict[str, object] = {
+            "information_gain_mean_nat": _float_vector(
+                raw_count.get("information_gain_mean_nat"),
+                size=pose_count,
+                name=f"exact I_{view_count}",
+                nonnegative=True,
+            ),
+            "information_gain_standard_error_nat": _float_vector(
+                raw_count.get("information_gain_standard_error_nat"),
+                size=pose_count,
+                name=f"exact I_{view_count} standard error",
+                nonnegative=True,
+            ),
+            "marginal_information_gain": {
+                "mean_nat": _float_vector(
+                    increment.get("mean_nat"),
+                    size=pose_count,
+                    name=f"exact I_{view_count} increment",
+                ),
+                "paired_standard_error_nat": _float_vector(
+                    increment.get("paired_standard_error_nat"),
+                    size=pose_count,
+                    name=f"exact I_{view_count} increment standard error",
+                    nonnegative=True,
+                ),
+                "one_sided_mc_lcb_nat": _float_vector(
+                    increment.get("one_sided_mc_lcb_nat"),
+                    size=pose_count,
+                    name=f"exact I_{view_count} increment LCB",
+                ),
+                "mean_nat_per_added_live_second": _float_vector(
+                    increment.get("mean_nat_per_added_live_second"),
+                    size=pose_count,
+                    name=f"exact I_{view_count} increment rate",
+                ),
+            },
+        }
+        if view_count == reference_count:
+            count_payload["pair_ids"] = [
+                [int(item) for item in row]
+                for row in _mapping_sequence(
+                    raw_count.get("pair_ids"),
+                    name="exact reference pair rows",
+                )
+            ]
+        else:
+            retention = _mapping(
+                raw_count.get("retention_vs_reference"),
+                name=f"exact I_{view_count} retention evidence",
+            )
+            count_payload["retention_vs_reference"] = {
+                "paired_margin_mean_nat": _float_vector(
+                    retention.get("paired_margin_mean_nat"),
+                    size=pose_count,
+                    name=f"exact I_{view_count} retention margin",
+                ),
+                "paired_margin_standard_error_nat": _float_vector(
+                    retention.get("paired_margin_standard_error_nat"),
+                    size=pose_count,
+                    name=f"exact I_{view_count} retention standard error",
+                    nonnegative=True,
+                ),
+                "paired_margin_one_sided_mc_lcb_nat": _float_vector(
+                    retention.get("paired_margin_one_sided_mc_lcb_nat"),
+                    size=pose_count,
+                    name=f"exact I_{view_count} retention LCB",
+                ),
+            }
+        compact_by_count[str(view_count)] = count_payload
+    compact: dict[str, object] = {
+        "status": "evaluated",
+        "particle_count": int(exact["particle_count"]),
+        "sample_count": int(exact["sample_count"]),
+        "pose_indices": pose_indices,
+        "prefix_selection_seed_blocks": _compact_seed_blocks(
+            exact.get("prefix_selection_seed_blocks"),
+            name="exact prefix selection seed blocks",
+        ),
+        "paired_holdout_seed_blocks": _compact_seed_blocks(
+            exact.get("paired_evaluation_holdout_seed_blocks"),
+            name="exact paired holdout seed blocks",
+        ),
+        "by_view_count": compact_by_count,
+    }
+    if include_pose_xyz:
+        compact["pose_xyz"] = [
+            [float(item) for item in row]
+            for row in _mapping_sequence(
+                exact.get("pose_xyz"),
+                name="exact pose rows",
+            )
+        ]
+    return compact
+
+
+def _candidate_pose_count(shortlist: Mapping[str, object]) -> int:
+    """Convert legacy pose-program action counts to physical pose counts."""
+    action_count = int(shortlist.get("total_action_count", 0))
+    programs_per_pose = max(
+        int(shortlist.get("programs_per_shortlisted_pose", 1)),
+        1,
+    )
+    if action_count < 0 or action_count % programs_per_pose != 0:
+        raise ValueError("Planner action count cannot be converted to pose units.")
+    return int(action_count // programs_per_pose)
 
 
 def build_planner_audit(
@@ -261,11 +554,10 @@ def build_planner_audit(
     station_id: int,
     result: DSSPPResult,
     top_k: int = 10,
-    mc_rank_stability: Mapping[str, object] | None = None,
     belief_after_station_id: int | None = None,
     posterior_health: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Build one compact audit of the action domain and selected EIG."""
+    """Build one schema-v3 compact audit of a PF planner decision."""
     if isinstance(station_id, bool) or not isinstance(station_id, int):
         raise TypeError("station_id must be an integer.")
     if station_id < 0:
@@ -308,22 +600,6 @@ def build_planner_audit(
         None if not result.sequence else float(result.sequence[0].information_gain)
     )
     information_leader = _leader(leaders, "information_gain")
-    best_exact_eig = (
-        selected_eig
-        if information_leader is None
-        else float(information_leader["information_gain"])
-    )
-    stability = (
-        {
-            "status": "not_evaluated_in_control_loop",
-            "reason": (
-                "Independent-seed EIG repetition is an offline diagnostic "
-                "because it doubles expensive planning work."
-            ),
-        }
-        if mc_rank_stability is None
-        else dict(mc_rank_stability)
-    )
     shadow = _resolved_shield_view_count_shadow(
         raw=shortlist.get("shield_view_count_shadow"),
         result=result,
@@ -331,8 +607,15 @@ def build_planner_audit(
         belief_after_station_id=belief_after_station_id,
         posterior_health=validated_health,
     )
-    return {
-        "schema_version": 2,
+    compact_ranked = [
+        _compact_ranked_action(
+            _mapping(value, name="ranked node"),
+            name="ranked node",
+        )
+        for value in ranked[:top_k]
+    ]
+    audit = {
+        "schema_version": 3,
         "station_id": int(station_id),
         "belief_after_station_id": belief_after_station_id,
         "selected_pose_index": int(result.next_pose_index),
@@ -344,61 +627,39 @@ def build_planner_audit(
             "pair_ids": [int(value) for value in result.shield_program.pair_ids],
         },
         "selected_score": float(result.score),
-        "selected_information_gain": selected_eig,
-        "best_exact_information_gain": best_exact_eig,
-        "selected_pose_best_exact_information_gain": diagnostics.get(
-            "selected_pose_exact_information_gain_leader"
-        ),
-        "selected_program_is_exact_eig_leader_at_selected_pose": bool(
-            diagnostics.get(
-                "selected_program_is_exact_eig_leader_at_selected_pose",
-                False,
+        "candidate_pose_count": _candidate_pose_count(shortlist),
+        "exact_pose_count": int(
+            shortlist.get(
+                "shortlisted_pose_count",
+                shortlist.get("exact_action_count", 0),
             )
         ),
-        "selected_pose_exact_program_count": int(
-            diagnostics.get("selected_pose_exact_program_count", 0)
+        "proxy_subset_evaluation_count": int(
+            shortlist.get(
+                "proxy_subset_evaluation_count",
+                shortlist.get("proxy_action_count", 0),
+            )
         ),
-        "total_action_count": int(shortlist.get("total_action_count", 0)),
-        "shortlisted_pose_count": int(shortlist.get("shortlisted_pose_count", 0)),
-        "programs_per_shortlisted_pose": int(
-            shortlist.get("programs_per_shortlisted_pose", 0)
+        "exact_subset_evaluation_count": int(
+            shortlist.get(
+                "exact_subset_evaluation_count",
+                shortlist.get("exact_action_count", 0),
+            )
         ),
-        "full_program_sweep_per_shortlisted_pose": bool(
-            shortlist.get("full_program_sweep_per_shortlisted_pose", False)
-        ),
-        "selected_proxy_rank": int(shortlist.get("shortlist_selected_proxy_rank", 0)),
-        "exact_action_count": int(shortlist.get("exact_action_count", 0)),
-        "proxy_action_count": int(shortlist.get("proxy_action_count", 0)),
         "planning_particle_count": int(diagnostics.get("planning_particle_count", 0)),
-        "score_leader": _leader(leaders, "score"),
-        "information_gain_leader": information_leader,
-        "top_ranked_actions": [
-            dict(_mapping(value, name="ranked node")) for value in ranked[:top_k]
-        ],
-        "shortlist_certificate": {
-            "available": bool(
-                shortlist.get(
-                    "shortlist_formal_recall_certificate_available",
-                    False,
-                )
-            ),
-            "winner_exceeds_excluded_bound": bool(
-                shortlist.get(
-                    "shortlist_mc_winner_exceeds_universal_excluded_bound",
-                    False,
-                )
-            ),
-            "evaluated_objective_lower_bound": shortlist.get(
-                "shortlist_evaluated_objective_lower_bound"
-            ),
-            "excluded_objective_upper_bound": shortlist.get(
-                "shortlist_max_excluded_universal_objective_upper_bound"
-            ),
-        },
-        "exact_eig_seed": shortlist.get("exact_eig_seed"),
-        "mc_seed_rank_stability": stability,
-        "shield_view_count_shadow": shadow,
     }
+    if selected_eig is not None:
+        audit["selected_information_gain"] = selected_eig
+    if information_leader is not None:
+        audit["information_gain_leader"] = information_leader
+    if compact_ranked:
+        audit["top_ranked_actions"] = compact_ranked
+    exact_eig_seed = shortlist.get("exact_eig_seed")
+    if exact_eig_seed is not None:
+        audit["exact_eig_seed"] = exact_eig_seed
+    if shadow is not None:
+        audit["shield_view_count_shadow"] = shadow
+    return audit
 
 
 def build_bootstrap_planner_audit(
@@ -438,74 +699,29 @@ def build_bootstrap_planner_audit(
         raise ValueError(
             "Enabled bootstrap shadow execution must use eight unique views."
         )
-    executed = _executed_shadow_action(
-        pose_index=int(pose_index),
-        pose_xyz=pose,
-        program=program,
-        information_gain=None,
-        score=None,
-    )
-    bootstrap_action = {
-        **executed,
-        "selection_reason": "bootstrap_prior_only_forced_reference_view_count",
-        "fallback_applied": True,
-        "fallback_reasons": ["bootstrap_prior_only"],
-    }
-    shadow = {
-        "schema_version": 1,
-        "status": "bootstrap_forced" if shadow_enabled else "not_applicable",
-        "mode": (
-            "audit_only_fixed_8_execution" if shadow_enabled else "not_applicable"
-        ),
-        "truth_used": False,
-        "belief_after_station_id": None,
-        "policy": {
+    shadow = None
+    if shadow_enabled:
+        shadow = {
+            "schema_version": 2,
+            "status": "bootstrap_forced",
+            "truth_used": False,
             "candidate_view_counts": [int(value) for value in counts],
             "reference_view_count": int(counts[-1]),
-            "bootstrap_forced_view_count": int(counts[-1]),
             "retention_fraction": float(retention_fraction),
-            "per_comparison_one_sided_confidence": float(per_comparison_confidence),
-            "global_coverage_claimed": False,
-            "selection_statistic": (
-                "paired_lcb_of_information_gain_short_minus_retention_"
-                "times_information_gain_reference"
+            "per_comparison_one_sided_confidence": float(
+                per_comparison_confidence
             ),
-            "lcb_pass_condition": "strictly_greater_than_zero",
-            "program_semantics": "nested_conditional_greedy_prefix",
-            "measurement_time_weight_affects_selection": False,
-            "configured_measurement_time_weight_audit_only": None,
-        },
-        "mc_contract": {
-            "status": "not_evaluated_before_first_observation",
-            "paired_across_view_counts": True,
-            "paired_across_poses": False,
-            "paired_across_proxy_and_exact": False,
-            "prefix_selection_independent_of_exact_lcb_samples": None,
-            "selection_bias_control": "not_evaluated_before_first_observation",
-            "predictive_pairing": "not_evaluated_before_first_observation",
-        },
-        "health": _unavailable_shadow_health(
-            None,
-            reason="bootstrap_prior_only",
-        ),
-        "proxy": {"status": "not_evaluated_before_first_observation"},
-        "exact": {"status": "not_evaluated_before_first_observation"},
-        "hypothetical_actions": {
-            "point_rule": dict(bootstrap_action),
-            "paired_lcb_rule": dict(bootstrap_action),
-            "health_gated_rule": dict(bootstrap_action),
-            "configured_time_weight_counterfactual": None,
-        },
-        "executed_action": executed,
-        "comparison": {
-            "saved_view_count": 0,
-            "saved_live_time_s": None,
-            "saved_measurement_elapsed_time_s": None,
-            "shadow_reference_relationship": None,
-        },
-    }
-    return {
-        "schema_version": 2,
+            "actual_execution": {
+                "view_count": int(len(program.pair_ids)),
+                "fixed_to_reference_view_count": True,
+            },
+            "health": _unavailable_shadow_health(
+                None,
+                reason="bootstrap_prior_only",
+            ),
+        }
+    audit = {
+        "schema_version": 3,
         "station_id": 0,
         "belief_after_station_id": None,
         "selected_pose_index": int(pose_index),
@@ -520,33 +736,15 @@ def build_bootstrap_planner_audit(
             "kind": str(program.kind),
             "pair_ids": [int(value) for value in program.pair_ids],
         },
-        "selected_score": None,
-        "selected_information_gain": None,
-        "best_exact_information_gain": None,
-        "selected_pose_best_exact_information_gain": None,
-        "selected_program_is_exact_eig_leader_at_selected_pose": False,
-        "selected_pose_exact_program_count": 0,
-        "total_action_count": 0,
-        "shortlisted_pose_count": 0,
-        "programs_per_shortlisted_pose": 0,
-        "full_program_sweep_per_shortlisted_pose": False,
-        "selected_proxy_rank": 0,
-        "exact_action_count": 0,
-        "proxy_action_count": 0,
+        "candidate_pose_count": 0,
+        "exact_pose_count": 0,
+        "proxy_subset_evaluation_count": 0,
+        "exact_subset_evaluation_count": 0,
         "planning_particle_count": 0,
-        "score_leader": None,
-        "information_gain_leader": None,
-        "top_ranked_actions": [],
-        "shortlist_certificate": {
-            "available": False,
-            "winner_exceeds_excluded_bound": False,
-            "evaluated_objective_lower_bound": None,
-            "excluded_objective_upper_bound": None,
-        },
-        "exact_eig_seed": None,
-        "mc_seed_rank_stability": {"status": "not_applicable_before_first_observation"},
-        "shield_view_count_shadow": shadow,
     }
+    if shadow is not None:
+        audit["shield_view_count_shadow"] = shadow
+    return audit
 
 
 def _resolved_shield_view_count_shadow(
@@ -556,7 +754,7 @@ def _resolved_shield_view_count_shadow(
     selected_information_gain: float | None,
     belief_after_station_id: int | None,
     posterior_health: Mapping[str, object] | None,
-) -> dict[str, object]:
+) -> dict[str, object] | None:
     """Join truth-free PF health to one planner-owned shadow calculation."""
     executed = _executed_shadow_action(
         pose_index=int(result.next_pose_index),
@@ -574,49 +772,17 @@ def _resolved_shield_view_count_shadow(
         else dict(posterior_health)
     )
     if raw is None:
+        if posterior_health is None:
+            return None
         return {
-            "schema_version": 1,
-            "status": "not_applicable",
-            "mode": "not_applicable",
+            "schema_version": 2,
+            "status": "not_evaluated",
             "truth_used": False,
-            "belief_after_station_id": belief_after_station_id,
-            "policy": {
-                "candidate_view_counts": None,
-                "reference_view_count": None,
-                "retention_fraction": None,
-                "per_comparison_one_sided_confidence": None,
-                "global_coverage_claimed": False,
-                "selection_statistic": None,
-                "lcb_pass_condition": None,
-                "program_semantics": None,
-                "measurement_time_weight_affects_selection": False,
-                "configured_measurement_time_weight_audit_only": None,
-            },
-            "mc_contract": {
-                "status": "not_applicable",
-                "paired_across_view_counts": None,
-                "paired_across_poses": None,
-                "paired_across_proxy_and_exact": None,
-                "prefix_selection_independent_of_exact_lcb_samples": None,
-                "selection_bias_control": None,
-                "predictive_pairing": None,
+            "actual_execution": {
+                "view_count": int(len(result.shield_program.pair_ids)),
+                "fixed_to_reference_view_count": None,
             },
             "health": health,
-            "proxy": {"status": "not_evaluated"},
-            "exact": {"status": "not_evaluated"},
-            "hypothetical_actions": {
-                "point_rule": None,
-                "paired_lcb_rule": None,
-                "health_gated_rule": dict(executed),
-                "configured_time_weight_counterfactual": None,
-            },
-            "executed_action": executed,
-            "comparison": {
-                "saved_view_count": 0,
-                "saved_live_time_s": None,
-                "saved_measurement_elapsed_time_s": None,
-                "shadow_reference_relationship": None,
-            },
         }
     payload = dict(_mapping(raw, name="shield_view_count_shadow"))
     if payload.get("status") != "evaluated":
@@ -677,128 +843,56 @@ def _resolved_shield_view_count_shadow(
         exact.get("paired_lcb_rule_action"),
         name="paired_lcb_rule_action",
     )
-    raw_time_action = _mapping(
-        exact.get("configured_time_weight_counterfactual_action"),
-        name="configured_time_weight_counterfactual_action",
-    )
-    point_count = int(raw_point_action["selected_view_count"])
-    lcb_count = int(raw_lcb_action["selected_view_count"])
     point_action = _shadow_action(
         raw_point_action,
         score_field="pose_score_without_measurement_time_penalty",
-        score_semantics="eig_plus_spatial_and_motion_without_measurement_time",
-        selection_reason=(
-            "no_shorter_view_count_met_point_retention"
-            if point_count == reference_count
-            else "shortest_view_count_met_point_retention"
-        ),
     )
     lcb_action = _shadow_action(
         raw_lcb_action,
         score_field="pose_score_without_measurement_time_penalty",
-        score_semantics="eig_plus_spatial_and_motion_without_measurement_time",
-        selection_reason=(
-            "no_shorter_view_count_passed_strict_paired_lcb"
-            if lcb_count == reference_count
-            else "shortest_view_count_passed_strict_paired_lcb"
-        ),
-    )
-    time_action = _shadow_action(
-        raw_time_action,
-        score_field="pose_score_with_configured_measurement_time_weight",
-        score_semantics="uncalibrated_configured_measurement_time_counterfactual",
-        selection_reason="configured_time_weight_counterfactual_only",
     )
     health_passed = bool(health.get("available")) and bool(health.get("passed"))
-    failure_reasons = health.get("hard_failure_reasons", [])
-    if not isinstance(failure_reasons, Sequence) or isinstance(
-        failure_reasons,
-        (str, bytes),
-    ):
-        raise TypeError("posterior health failure reasons must be a sequence.")
-    if health_passed:
-        health_action = {
-            **lcb_action,
-            "fallback_applied": False,
-            "fallback_reasons": [],
-        }
-    else:
-        health_action = {
-            **executed,
-            "selection_reason": "posterior_health_forced_reference_view_count",
-            "fallback_applied": True,
-            "fallback_reasons": [str(value) for value in failure_reasons],
-        }
-    selected_count = int(health_action["selected_view_count"])
-    reference_payload = _mapping(
-        exact_by_count.get(str(reference_count)),
-        name="reference view-count exact payload",
-    )
-    selected_payload = _mapping(
-        exact_by_count.get(str(selected_count)),
-        name="selected view-count exact payload",
-    )
-    saved_live_time = float(reference_payload["measurement_live_time_s"]) - float(
-        selected_payload["measurement_live_time_s"]
-    )
-    saved_elapsed_time = float(reference_payload["measurement_elapsed_time_s"]) - float(
-        selected_payload["measurement_elapsed_time_s"]
-    )
-    reference_pairs_raw = reference_payload.get("pair_ids")
-    if not isinstance(reference_pairs_raw, Sequence) or isinstance(
-        reference_pairs_raw,
-        (str, bytes),
-    ):
-        raise TypeError("Exact reference pair rows must be a sequence.")
+    health_action = lcb_action if health_passed else executed
     try:
-        executed_pose_offset = exact_pose_indices.index(int(result.next_pose_index))
+        exact_pose_indices.index(int(result.next_pose_index))
     except ValueError as error:
         raise ValueError(
             "Executed pose is absent from the exact shadow union."
         ) from error
-    reference_pair_row = reference_pairs_raw[executed_pose_offset]
-    if not isinstance(reference_pair_row, Sequence) or isinstance(
-        reference_pair_row,
-        (str, bytes),
-    ):
-        raise TypeError("Exact reference shield pairs must be a sequence.")
-    reference_pairs = [int(value) for value in reference_pair_row]
-    executed_pairs = [int(value) for value in result.shield_program.pair_ids]
-    payload.update(
-        {
-            "belief_after_station_id": belief_after_station_id,
-            "health": health,
-            "hypothetical_actions": {
-                "point_rule": point_action,
-                "paired_lcb_rule": lcb_action,
-                "health_gated_rule": health_action,
-                "configured_time_weight_counterfactual": time_action,
-            },
-            "executed_action": executed,
-            "comparison": {
-                "saved_view_count": int(reference_count - selected_count),
-                "saved_live_time_s": float(saved_live_time),
-                "saved_measurement_elapsed_time_s": float(saved_elapsed_time),
-                "shadow_reference_relationship": {
-                    "executed_pose_present": True,
-                    "executed_program_matches_greedy_prefix_reference": (
-                        executed_pairs == reference_pairs
-                    ),
-                    "shadow_reference_program_semantics": (
-                        "nested_conditional_greedy_prefix"
-                    ),
-                    "executed_program_kind": str(result.shield_program.kind),
-                    "shadow_reference_eig_is_executed_eig": False,
-                    "reason": (
-                        "executed EIG may use one-swap, legacy guard, or "
-                        "independent confirmation; shadow I8 uses independent "
-                        "holdout samples for the fixed greedy prefix"
-                    ),
-                },
-            },
-        }
-    )
-    return payload
+    retention_fraction = float(policy["retention_fraction"])
+    confidence = float(policy["per_comparison_one_sided_confidence"])
+    if not 0.0 < retention_fraction <= 1.0:
+        raise ValueError("Shadow retention fraction must lie in (0, 1].")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("Shadow confidence must lie in (0, 1).")
+    return {
+        "schema_version": 2,
+        "status": "evaluated",
+        "truth_used": False,
+        "candidate_view_counts": [int(value) for value in candidate_counts],
+        "reference_view_count": reference_count,
+        "retention_fraction": retention_fraction,
+        "per_comparison_one_sided_confidence": confidence,
+        "actual_execution": {
+            "view_count": int(len(result.shield_program.pair_ids)),
+            "fixed_to_reference_view_count": True,
+        },
+        "health": health,
+        "proxy": _compact_proxy_shadow(
+            proxy,
+            candidate_view_counts=candidate_counts,
+        ),
+        "exact": _compact_exact_shadow(
+            exact,
+            candidate_view_counts=candidate_counts,
+            include_pose_xyz=proxy.get("status") != "evaluated",
+        ),
+        "hypothetical_actions": {
+            "point_rule": point_action,
+            "paired_lcb_rule": lcb_action,
+            "health_gated_rule": health_action,
+        },
+    }
 
 
 class PlannerAuditWriter:

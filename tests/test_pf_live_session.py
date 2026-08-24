@@ -278,14 +278,13 @@ class _SpyPosterior:
     def to_dict(self) -> dict[str, object]:
         """Return a complete package-owned PF posterior contract."""
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "estimator_family": "particle_filter",
-            "estimator_variant": "pf_strict",
+            "estimator_profile": "pf_strict",
             "final_estimate_source": "pf_posterior",
             "uses_all_history_batch_fit": False,
             "uses_surface_map": False,
             "uses_batch_model_order": False,
-            "measurement_log_sha256": self.estimator.measurement_log_sha256,
             "record_count": len(self.estimator.measurements),
             "isotopes": {
                 isotope: {
@@ -309,7 +308,6 @@ class _SpyPosterior:
             "provenance": {
                 "estimator_repository": "Rotating-shield-particle-filter",
                 "estimator_commit": "a" * 40,
-                "estimator_variant": "pf_strict",
                 "measurement_log_schema_version": 2,
                 "measurement_log_sha256": self.estimator.measurement_log_sha256,
                 "resolved_config_sha256": self.estimator.resolved_config_hash,
@@ -447,6 +445,26 @@ class _SpyEstimator:
             isotope: SimpleNamespace(
                 to_dict=lambda isotope=isotope: {
                     "map_cardinality": 1,
+                    "cardinality_distribution": {"0": 0.1, "1": 0.9},
+                    "selected_stratum_mass": 0.9,
+                    "modes": [
+                        {
+                            "label_index": 0,
+                            "position_medoid_xyz": [0.1, 0.2, 0.3],
+                            "position_covariance_xyz": [
+                                [0.1, 0.0, 0.0],
+                                [0.0, 0.1, 0.0],
+                                [0.0, 0.0, 0.1],
+                            ],
+                            "credible_radius_95_m": 0.5,
+                            "strength_representative_cps_1m": 2.0,
+                            "strength_mean_cps_1m": 2.1,
+                            "strength_median_cps_1m": 2.0,
+                            "strength_credible_interval_95_cps_1m": [1.0, 3.0],
+                            "posterior_mass": 0.9,
+                            "belief_source": "pf_posterior",
+                        }
+                    ],
                     "isotope": isotope,
                 }
             )
@@ -467,6 +485,27 @@ class _SpyEstimator:
     def posterior_snapshot(self) -> _SpyPosterior:
         """Return a result view using identities set by log binding."""
         return _SpyPosterior(self)
+
+    def posterior_convergence_diagnostics(self) -> dict[str, object]:
+        """Return compactable truth-free convergence evidence."""
+        sampler_health = {
+            "smc_soft_budget_respected": True,
+            "rejuvenation_mixing_complete": True,
+            "structural_mixing_complete": True,
+        }
+        return {
+            "ready": False,
+            "sampler_health": sampler_health,
+            "joint_gates": {
+                **sampler_health,
+                "joint_map_cardinality_probability": False,
+            },
+            "isotopes": {},
+        }
+
+    def posterior_predictive_check(self) -> dict[str, object]:
+        """Return one unavailable predictive-check result."""
+        return {"available": False}
 
 
 def _facade_with_spy(
@@ -677,8 +716,20 @@ def test_facade_particle_snapshot_is_an_immutable_copy(
     with pytest.raises(TypeError):
         snapshot.positions_nk3_by_isotope["new"] = np.zeros((2, 1, 3))
     summary = snapshot.posterior_summary()
+    assert summary["schema_version"] == 2
     assert summary["publishable"] is False
     assert set(summary["isotopes"]) == set(log.context.isotopes)
+    isotope_summary = summary["isotopes"][log.context.isotopes[0]]
+    assert isotope_summary["map_cardinality"] == 1
+    assert set(isotope_summary["modes"][0]) == {
+        "label_index",
+        "position_medoid_xyz",
+        "credible_radius_95_m",
+        "strength_representative_cps_1m",
+        "posterior_mass",
+    }
+    assert "position_covariance_xyz" not in isotope_summary["modes"][0]
+    assert "strength_credible_interval_95_cps_1m" not in isotope_summary["modes"][0]
     summary["isotopes"] = {}
     assert snapshot.posterior_summary()["isotopes"]
     assert estimator.posterior_summary_calls == 1
@@ -762,6 +813,10 @@ def test_facade_delegates_pose_and_shield_planning_to_pf_package(
     assert action.detector_pose_xyz == (1.0, 1.5, 0.5)
     assert action.shield_pair_ids == (7, 23)
     assert action.diagnostics()["selected_information_gain"] == 2.25
+    assert set(action.diagnostics()) == {
+        "schema_version",
+        "selected_information_gain",
+    }
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["current_pair_id"] == (
@@ -837,7 +892,8 @@ def test_bind_and_publication_never_advance_completed_pf(
     assert publication is bound
     assert bound.completed is completed
     assert bound.checkpoint_state == completed.checkpoint_state
-    assert json.loads(bound.posterior_json)["measurement_log_sha256"] == log.log_sha256
+    posterior = json.loads(bound.posterior_json)
+    assert posterior["provenance"]["measurement_log_sha256"] == log.log_sha256
     assert session.phase == "bound"
 
 
@@ -845,7 +901,7 @@ def test_bound_facade_publishes_package_owned_result_bundle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """PF publication writes posterior, trace, checkpoint, and particles once."""
+    """PF publication writes posterior, checkpoint, and particles once."""
     log = load_measurement_log(
         make_measurement_log(
             tmp_path / "measurement-log",
@@ -866,6 +922,16 @@ def test_bound_facade_publishes_package_owned_result_bundle(
     assert published.checkpoint_path.is_file()
     assert published.checkpoint_state_path.is_file()
     assert published.particle_snapshot_path.is_file()
+    assert published.diagnostics_path.is_file()
+    diagnostics = json.loads(
+        published.diagnostics_path.read_text(encoding="utf-8")
+    )
+    assert diagnostics["schema_version"] == 2
+    assert diagnostics["posterior_predictive_check"] == {"available": False}
+    assert diagnostics["sampler_health"]["smc_soft_budget_respected"] is True
+    assert "measurement_log_sha256" not in diagnostics
+    assert "config" not in diagnostics
+    assert not (published.root / "pf_trace.jsonl").exists()
     assert len(published.result_sha256) == 64
     assert len(estimator.update_calls) == update_count
     checkpoint = json.loads(published.checkpoint_path.read_text(encoding="utf-8"))

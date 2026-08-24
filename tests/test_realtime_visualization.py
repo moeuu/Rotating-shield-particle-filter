@@ -228,13 +228,74 @@ def test_cui_writes_plain_and_neighborhood_labeled_pf_images(
 
     visualizer.update(frame)
 
-    assert (tmp_path / "pf_3d_step_0003.png").is_file()
-    assert (tmp_path / "pf_3d_labeled_step_0003.png").is_file()
-    assert visualizer.latest_pf_path.is_file()
-    assert visualizer.latest_pf_labeled_path.is_file()
+    for latest_path in (
+        visualizer.latest_robot_path,
+        visualizer.latest_overview_path,
+        visualizer.latest_pf_path,
+        visualizer.latest_pf_labeled_path,
+        visualizer.latest_spectrum_path,
+    ):
+        assert latest_path.is_file()
+    assert not tuple(tmp_path.glob("*_step_*.png"))
+    assert not tuple(tmp_path.glob(".*.render.png"))
     assert "latest_pf_3d_labeled.png" in visualizer.index_path.read_text(
         encoding="utf-8"
     )
+
+
+def test_cui_step_history_requires_explicit_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """History mode should retain each rendered panel only when requested."""
+    route = cui_route_from_records(
+        (_route_record(0, 0, pose_xyz=(1.0, 2.0, 0.5)),)
+    )
+    visualizer = CUISplitPFVisualizer(
+        isotopes=["Cs-137"],
+        output_dir=tmp_path,
+        save_step_history=True,
+    )
+
+    def save_panel(frame: PFFrame, path: Path) -> None:
+        """Write one small stand-in panel for output-routing tests."""
+        del frame
+        path.write_bytes(b"panel")
+
+    def save_pf_panels(
+        frame: PFFrame,
+        path: Path,
+        *,
+        labeled_output_path: Path,
+    ) -> None:
+        """Write small stand-ins for both PF panels."""
+        del frame
+        path.write_bytes(b"pf")
+        labeled_output_path.write_bytes(b"pf-labeled")
+
+    monkeypatch.setattr(visualizer, "_save_robot_2d", save_panel)
+    monkeypatch.setattr(visualizer, "_save_experiment_overview", save_panel)
+    monkeypatch.setattr(visualizer, "_save_pf_3d", save_pf_panels)
+    monkeypatch.setattr(visualizer, "_save_spectrum", save_panel)
+
+    visualizer.update(_empty_frame(4, route))
+
+    expected_history = {
+        "robot_2d_step_0004.png",
+        "experiment_overview_step_0004.png",
+        "pf_3d_step_0004.png",
+        "pf_3d_labeled_step_0004.png",
+        "spectrum_step_0004.png",
+    }
+    assert {path.name for path in tmp_path.glob("*_step_*.png")} == expected_history
+    for filename in (
+        "latest_robot_2d.png",
+        "latest_experiment_overview.png",
+        "latest_pf_3d.png",
+        "latest_pf_3d_labeled.png",
+        "latest_spectrum.png",
+    ):
+        assert (tmp_path / filename).is_file()
 
 
 def test_latest_image_copy_is_atomic_on_copy_failure(

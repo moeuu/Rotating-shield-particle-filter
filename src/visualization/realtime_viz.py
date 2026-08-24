@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import pickle
 import queue
+import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -53,6 +55,19 @@ PF_RESULT_PANEL_SPECS = (
 def pf_cui_panel_specs() -> tuple[CUIPanelSpec, ...]:
     """Return the shared context shell with PF-owned particle result panels."""
     return shared_cui_panel_specs(PF_RESULT_PANEL_SPECS)
+
+
+def _temporary_png_path(target: Path) -> Path:
+    """Reserve a unique render path beside one atomically published PNG."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=".render.png",
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    temporary.unlink()
+    return temporary
 
 
 def _normalize_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -274,6 +289,7 @@ class CUISplitPFVisualizer:
         obstacle_grid: ObstacleGrid | None = None,
         max_particles_per_isotope: int | None = None,
         source_label_neighborhood_m: float = 1.0,
+        save_step_history: bool = False,
     ) -> None:
         """Initialize output paths and static scene metadata."""
         self.isotopes = list(isotopes)
@@ -304,6 +320,9 @@ class CUISplitPFVisualizer:
             or self.source_label_neighborhood_m <= 0.0
         ):
             raise ValueError("source_label_neighborhood_m must be positive and finite.")
+        if not isinstance(save_step_history, bool):
+            raise TypeError("save_step_history must be a boolean.")
+        self.save_step_history = save_step_history
         self.path_segments: list[NDArray[np.float64]] = []
         self.measurement_points: list[NDArray[np.float64]] = []
         self.measurement_station_ids: list[int] = []
@@ -351,27 +370,60 @@ class CUISplitPFVisualizer:
         setattr(frame, "_cui_update_index", int(self.update_index))
         self._apply_route(frame.cui_route)
         step = max(0, int(frame.step_index))
-        robot_step_path = self.output_dir / f"robot_2d_step_{step:04d}.png"
-        overview_step_path = (
-            self.output_dir / f"experiment_overview_step_{step:04d}.png"
+        rendered_paths = (
+            self._frame_render_path(
+                self.latest_robot_path,
+                f"robot_2d_step_{step:04d}.png",
+            ),
+            self._frame_render_path(
+                self.latest_overview_path,
+                f"experiment_overview_step_{step:04d}.png",
+            ),
+            self._frame_render_path(
+                self.latest_pf_path,
+                f"pf_3d_step_{step:04d}.png",
+            ),
+            self._frame_render_path(
+                self.latest_pf_labeled_path,
+                f"pf_3d_labeled_step_{step:04d}.png",
+            ),
+            self._frame_render_path(
+                self.latest_spectrum_path,
+                f"spectrum_step_{step:04d}.png",
+            ),
         )
-        pf_step_path = self.output_dir / f"pf_3d_step_{step:04d}.png"
-        pf_labeled_step_path = self.output_dir / f"pf_3d_labeled_step_{step:04d}.png"
-        spectrum_step_path = self.output_dir / f"spectrum_step_{step:04d}.png"
-        self._save_robot_2d(frame, robot_step_path)
-        atomic_copy_file(robot_step_path, self.latest_robot_path)
-        self._save_experiment_overview(frame, overview_step_path)
-        atomic_copy_file(overview_step_path, self.latest_overview_path)
-        self._save_pf_3d(
-            frame,
-            pf_step_path,
-            labeled_output_path=pf_labeled_step_path,
-        )
-        atomic_copy_file(pf_step_path, self.latest_pf_path)
-        atomic_copy_file(pf_labeled_step_path, self.latest_pf_labeled_path)
-        self._save_spectrum(frame, spectrum_step_path)
-        if spectrum_step_path.exists():
-            atomic_copy_file(spectrum_step_path, self.latest_spectrum_path)
+        (
+            robot_path,
+            overview_path,
+            pf_path,
+            pf_labeled_path,
+            spectrum_path,
+        ) = rendered_paths
+        try:
+            self._save_robot_2d(frame, robot_path)
+            atomic_copy_file(robot_path, self.latest_robot_path)
+            self._save_experiment_overview(frame, overview_path)
+            atomic_copy_file(overview_path, self.latest_overview_path)
+            self._save_pf_3d(
+                frame,
+                pf_path,
+                labeled_output_path=pf_labeled_path,
+            )
+            atomic_copy_file(pf_path, self.latest_pf_path)
+            atomic_copy_file(pf_labeled_path, self.latest_pf_labeled_path)
+            self._save_spectrum(frame, spectrum_path)
+            if spectrum_path.exists():
+                atomic_copy_file(spectrum_path, self.latest_spectrum_path)
+        finally:
+            if not self.save_step_history:
+                for rendered_path in rendered_paths:
+                    rendered_path.unlink(missing_ok=True)
+
+    def _frame_render_path(self, latest_path: Path, history_name: str) -> Path:
+        """Return a persistent history path or an ephemeral staging path."""
+        if self.save_step_history:
+            return self.output_dir / history_name
+        return _temporary_png_path(latest_path)
 
     def _apply_route(self, route: CUIRoute) -> None:
         """Replace renderer route state from one cumulative shared snapshot."""
@@ -1566,8 +1618,11 @@ class AsyncCUISplitPFVisualizer:
         max_particles_per_isotope: int | None = None,
         source_label_neighborhood_m: float = 1.0,
         queue_size: int = 2,
+        save_step_history: bool = False,
     ) -> None:
         """Start a renderer process that consumes latest PF frames asynchronously."""
+        if not isinstance(save_step_history, bool):
+            raise TypeError("save_step_history must be a boolean.")
         self.isotopes = list(isotopes)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1589,6 +1644,7 @@ class AsyncCUISplitPFVisualizer:
             "obstacle_grid": obstacle_grid,
             "max_particles_per_isotope": max_particles_per_isotope,
             "source_label_neighborhood_m": source_label_neighborhood_m,
+            "save_step_history": save_step_history,
         }
         self._process = self._ctx.Process(
             target=_async_cui_split_worker,

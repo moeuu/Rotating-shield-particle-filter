@@ -40,7 +40,7 @@ from pf.estimator_types import JointPlanningParticles
 from pf.gpu_utils import preflight_compute_backend
 from pf.configuration import load_pf_config
 from pf.profiles import apply_profile_to_config, enforce_pure_runtime_settings
-from pf.provenance import canonical_json_bytes, json_safe, sha256_json
+from pf.provenance import canonical_json_bytes, sha256_json
 from pf.pure_estimator import PurePFEstimator, RotatingShieldPFConfig
 from planning.dss_pp import DSSPPConfig, select_dss_pp_next_station
 
@@ -297,6 +297,37 @@ class PFNextAction:
         return payload
 
 
+def _compact_next_action_diagnostics(result: object) -> dict[str, object]:
+    """Return only non-duplicated scalar evidence for one runtime action."""
+    raw = getattr(result, "diagnostics", None)
+    if not isinstance(raw, Mapping):
+        raise PFLiveSessionError("PF planner diagnostics must be an object.")
+    compact: dict[str, object] = {"schema_version": 1}
+    selection_mode = raw.get("selection_mode")
+    if selection_mode is not None:
+        compact["selection_mode"] = str(selection_mode)
+    selected_information_gain = raw.get("selected_information_gain")
+    if selected_information_gain is None:
+        sequence = getattr(result, "sequence", ())
+        if isinstance(sequence, Sequence) and sequence:
+            selected_information_gain = getattr(
+                sequence[0],
+                "information_gain",
+                None,
+            )
+    if selected_information_gain is not None:
+        information_gain = _finite_real(
+            selected_information_gain,
+            location="PF selected information gain",
+        )
+        if information_gain < 0.0:
+            raise PFLiveSessionError(
+                "PF selected information gain must be nonnegative."
+            )
+        compact["selected_information_gain"] = information_gain
+    return compact
+
+
 @dataclass(frozen=True, slots=True)
 class PFCompletedLiveState:
     """Seal a completed live posterior before MeasurementLog publication."""
@@ -310,6 +341,7 @@ class PFCompletedLiveState:
     covered_records_digest: DigestIdentity
     checkpoint_state: bytes
     checkpoint_sha256: str
+    diagnostics_json: bytes
     particle_snapshot: PFLiveParticleSnapshot
 
 
@@ -339,6 +371,7 @@ class PFPublishedLiveResult:
 
     root: Path
     posterior_path: Path
+    diagnostics_path: Path
     checkpoint_path: Path
     checkpoint_state_path: Path
     particle_snapshot_path: Path
@@ -477,6 +510,45 @@ def _finite_real(value: object, *, location: str) -> float:
     if not np.isfinite(parsed):
         raise PFLiveSessionError(f"{location} must be a finite JSON number.")
     return parsed
+
+
+def _compact_pf_diagnostics(estimator: object) -> dict[str, object]:
+    """Build compact final diagnostics without duplicating posterior provenance."""
+    convergence_method = getattr(
+        estimator,
+        "posterior_convergence_diagnostics",
+        None,
+    )
+    predictive_method = getattr(estimator, "posterior_predictive_check", None)
+    if not callable(convergence_method) or not callable(predictive_method):
+        raise PFLiveSessionError(
+            "PF estimator does not expose final diagnostic methods."
+        )
+    raw_convergence = convergence_method()
+    raw_predictive = predictive_method()
+    if not isinstance(raw_convergence, Mapping) or not isinstance(
+        raw_predictive,
+        Mapping,
+    ):
+        raise PFLiveSessionError("PF final diagnostics must serialize objects.")
+    convergence = dict(raw_convergence)
+    sampler_health = convergence.pop("sampler_health", {})
+    if not isinstance(sampler_health, Mapping):
+        raise PFLiveSessionError("PF sampler health must be an object.")
+    joint_gates = convergence.get("joint_gates")
+    if isinstance(joint_gates, Mapping):
+        convergence["joint_gates"] = {
+            str(name): value
+            for name, value in joint_gates.items()
+            if name not in sampler_health
+        }
+    return {
+        "schema_version": 2,
+        "estimator_family": "pure_particle_filter",
+        "posterior_convergence": convergence,
+        "posterior_predictive_check": dict(raw_predictive),
+        "sampler_health": dict(sampler_health),
+    }
 
 
 def _surface_atlas_diagnostic_points(
@@ -1011,8 +1083,110 @@ def _immutable_particle_snapshot(
     )
 
 
+def _compact_live_point_estimate(
+    payload: Mapping[str, object],
+    *,
+    isotope: str,
+) -> dict[str, object]:
+    """Keep only the posterior trajectory fields needed for station audit."""
+    map_cardinality = _json_integer(
+        payload.get("map_cardinality"),
+        location=f"live posterior {isotope}.map_cardinality",
+        minimum=0,
+    )
+    distribution = payload.get("cardinality_distribution")
+    if not isinstance(distribution, Mapping):
+        raise PFLiveSessionError(
+            f"Live posterior {isotope} lacks a cardinality distribution."
+        )
+    selected_stratum_mass = _finite_real(
+        payload.get("selected_stratum_mass"),
+        location=f"live posterior {isotope}.selected_stratum_mass",
+    )
+    if not 0.0 <= selected_stratum_mass <= 1.0:
+        raise PFLiveSessionError(
+            f"Live posterior {isotope} selected-stratum mass is invalid."
+        )
+    raw_modes = payload.get("modes")
+    if not isinstance(raw_modes, Sequence) or isinstance(raw_modes, (str, bytes)):
+        raise PFLiveSessionError(f"Live posterior {isotope} modes are invalid.")
+    if len(raw_modes) != map_cardinality:
+        raise PFLiveSessionError(
+            f"Live posterior {isotope} mode count and MAP cardinality disagree."
+        )
+    modes: list[dict[str, object]] = []
+    for index, raw_mode in enumerate(raw_modes):
+        if not isinstance(raw_mode, Mapping):
+            raise PFLiveSessionError(
+                f"Live posterior {isotope} mode {index} is invalid."
+            )
+        raw_position = raw_mode.get("position_medoid_xyz")
+        if not isinstance(raw_position, Sequence) or isinstance(
+            raw_position,
+            (str, bytes),
+        ):
+            raise PFLiveSessionError(
+                f"Live posterior {isotope} mode {index} lacks a position."
+            )
+        position = [
+            _finite_real(
+                value,
+                location=f"live posterior {isotope} mode {index} position",
+            )
+            for value in raw_position
+        ]
+        if len(position) != 3:
+            raise PFLiveSessionError(
+                f"Live posterior {isotope} mode {index} position is not 3-D."
+            )
+        radius = _finite_real(
+            raw_mode.get("credible_radius_95_m"),
+            location=f"live posterior {isotope} mode {index} credible radius",
+        )
+        strength = _finite_real(
+            raw_mode.get("strength_representative_cps_1m"),
+            location=f"live posterior {isotope} mode {index} strength",
+        )
+        posterior_mass = _finite_real(
+            raw_mode.get("posterior_mass"),
+            location=f"live posterior {isotope} mode {index} mass",
+        )
+        if radius < 0.0 or strength < 0.0 or not 0.0 <= posterior_mass <= 1.0:
+            raise PFLiveSessionError(
+                f"Live posterior {isotope} mode {index} has invalid uncertainty."
+            )
+        modes.append(
+            {
+                "label_index": _json_integer(
+                    raw_mode.get("label_index"),
+                    location=f"live posterior {isotope} mode {index} label",
+                    minimum=0,
+                ),
+                "position_medoid_xyz": position,
+                "credible_radius_95_m": radius,
+                "strength_representative_cps_1m": strength,
+                "posterior_mass": posterior_mass,
+            }
+        )
+    return {
+        "map_cardinality": map_cardinality,
+        "cardinality_distribution": {
+            str(cardinality): _finite_real(
+                probability,
+                location=(
+                    f"live posterior {isotope} cardinality probability "
+                    f"{cardinality}"
+                ),
+            )
+            for cardinality, probability in distribution.items()
+        },
+        "selected_stratum_mass": selected_stratum_mass,
+        "modes": modes,
+    }
+
+
 def live_posterior_summary(estimator: object) -> dict[str, object]:
-    """Return a truth-free, explicitly non-publishable station summary."""
+    """Return a compact truth-free, non-publishable station summary."""
     method = getattr(estimator, "posterior_point_estimate", None)
     if not callable(method):
         raise PFLiveSessionError(
@@ -1033,11 +1207,14 @@ def live_posterior_summary(estimator: object) -> dict[str, object]:
             raise PFLiveSessionError(
                 "Every PF live point estimate must serialize an object."
             )
-        isotopes[str(isotope)] = dict(payload)
+        isotope_name = str(isotope)
+        isotopes[isotope_name] = _compact_live_point_estimate(
+            payload,
+            isotope=isotope_name,
+        )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "publishable": False,
-        "provenance_status": "awaiting_finalized_measurement_log_digest",
         "isotopes": isotopes,
     }
 
@@ -1616,9 +1793,7 @@ class PFLiveSession:
             )
         except (TypeError, ValueError, RuntimeError) as exc:
             raise PFLiveSessionError(f"PF action planning failed: {exc}") from exc
-        diagnostics = json_safe(result.diagnostics)
-        if not isinstance(diagnostics, dict):
-            raise PFLiveSessionError("PF planner diagnostics must be an object.")
+        diagnostics = _compact_next_action_diagnostics(result)
         selected_pose = np.asarray(result.next_pose, dtype=np.float64).reshape(3)
         matching_candidates = np.flatnonzero(
             np.all(candidates == selected_pose[None, :], axis=1)
@@ -1667,6 +1842,9 @@ class PFLiveSession:
             max_particles=0,
             method="top_weight",
         )
+        diagnostics_json = canonical_json_bytes(
+            _compact_pf_diagnostics(self._estimator)
+        )
         raw_checkpoint = self._estimator.serialized_state()
         if not isinstance(raw_checkpoint, (bytes, bytearray, memoryview)):
             raise PFLiveSessionError("PF serialized_state() must return bytes.")
@@ -1684,6 +1862,7 @@ class PFLiveSession:
             covered_records_digest=digest,
             checkpoint_state=checkpoint,
             checkpoint_sha256=sha256(checkpoint).hexdigest(),
+            diagnostics_json=diagnostics_json,
             particle_snapshot=final_particles,
         )
         self._completed_state = completed
@@ -1743,8 +1922,11 @@ class PFLiveSession:
         payload = to_dict()
         if not isinstance(payload, Mapping):
             raise PFLiveSessionError("PF posterior snapshot must serialize an object.")
+        provenance = payload.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise PFLiveSessionError("Bound PF posterior lacks provenance.")
         log_digest = log.log_sha256
-        if payload.get("measurement_log_sha256") != log_digest or (
+        if provenance.get("measurement_log_sha256") != log_digest or (
             payload.get("record_count") != len(self._records)
         ):
             raise PFLiveSessionError(
@@ -1796,51 +1978,9 @@ class PFLiveSession:
             target / "pf_posterior.json",
             bound.posterior_json,
         )
-        diagnostics_payload = {
-            "schema_version": 2,
-            "estimator_family": "pure_particle_filter",
-            "measurement_log_schema_version": self._context.schema_version,
-            "measurement_log_sha256": bound.measurement_log_sha256,
-            "record_count": bound.completed.record_count,
-            "station_count": bound.completed.station_count,
-            "covered_records_sha256": (
-                bound.completed.covered_records_digest.sha256
-            ),
-            "config": json_safe(dict(self._input_config)),
-            "profile": self._profile,
-            "random_seed": self._seed,
-            "particle_representation": "continuous_surface_particles",
-            "predicted_spectrum_available": False,
-        }
-        atomic_write_bytes(
+        diagnostics_path = atomic_write_bytes(
             target / "pf_diagnostics.json",
-            canonical_json_bytes(diagnostics_payload),
-        )
-        trace_lines = []
-        for index, record in enumerate(self._records):
-            trace_lines.append(
-                json.dumps(
-                    {
-                        "schema_version": 2,
-                        "estimator_family": "pure_particle_filter",
-                        "step_id": int(record.step_id),
-                        "station_id": int(record.station_id),
-                        "station_complete": (
-                            record.metadata.get("station_complete") is True
-                        ),
-                        "covered_records_sha256": measurement_records_digest(
-                            self._records[: index + 1]
-                        ).sha256,
-                    },
-                    allow_nan=False,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-            )
-        atomic_write_bytes(
-            target / "pf_trace.jsonl",
-            ("\n".join(trace_lines) + "\n").encode("utf-8"),
+            bound.completed.diagnostics_json,
         )
         checkpoint_state_path = atomic_write_bytes(
             target / "pf_state.json",
@@ -1929,6 +2069,7 @@ class PFLiveSession:
         return PFPublishedLiveResult(
             root=target,
             posterior_path=posterior_path,
+            diagnostics_path=diagnostics_path,
             checkpoint_path=checkpoint_path,
             checkpoint_state_path=checkpoint_state_path,
             particle_snapshot_path=particle_snapshot_path,

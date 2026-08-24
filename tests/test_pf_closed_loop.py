@@ -29,6 +29,7 @@ from pf.closed_loop import (
     _cui_truth_display_mode,
     _particle_diagnostics,
     _shield_view_count_shadow_health,
+    _write_final_outputs,
     run_pf_closed_loop,
 )
 from planning.configuration import dss_config_from_pf_settings
@@ -209,6 +210,61 @@ def test_missing_particle_diversity_evidence_fails_closed() -> None:
     )
     assert health["passed"] is False
     assert health["hard_failure_reasons"] == ["particle_diversity_evidence_unavailable"]
+
+
+def test_particle_diagnostics_omit_deep_rejection_payloads() -> None:
+    """The durable station trace must retain only compact particle health."""
+    estimator = SimpleNamespace(
+        pf_config=SimpleNamespace(num_particles=100, target_ess_ratio=0.4),
+        step_diagnostics=lambda **_kwargs: {
+            "Cs-137": {
+                "particle_count": 100,
+                "current_ess": 50.0,
+                "current_ess_ratio": 0.5,
+                "temper_resamples": 1,
+                "temper_min_ess": 35.0,
+                "joint_guided_initialization_ess": 60.0,
+                "station_unique_ancestor_count": 50,
+                "cumulative_unique_ancestor_count": 40,
+                "r_probability_by_count": {"1": 0.7, "2": 0.3},
+                "joint_smc_soft_budget_exceeded": False,
+                "joint_rejuvenation_mixing_incomplete": False,
+                "joint_structural_mixing_incomplete": False,
+                "transition_weight_mass": {
+                    "birth_attempted_weight_mass": 0.6,
+                    "birth_accepted_weight_mass": 0.2,
+                    "death_attempted_weight_mass": 0.4,
+                    "death_accepted_weight_mass": 0.1,
+                    "block_cardinality_changed_weight_mass": 0.05,
+                },
+                "structural_rejection_diagnostics": {"large": [1] * 100},
+                "joint_cross_isotope_rejection_diagnostics": {
+                    "large": [1] * 100
+                },
+                "joint_cross_isotope_state_rejection_diagnostics": {
+                    "large": [1] * 100
+                },
+            }
+        },
+    )
+
+    payload = _particle_diagnostics(estimator)
+
+    isotope = payload["isotopes"]["Cs-137"]
+    assert isotope["cardinality_distribution"] == {"1": 0.7, "2": 0.3}
+    assert isotope["structural_transition_weight_mass"] == {
+        "attempted": 1.0,
+        "accepted": pytest.approx(0.3),
+    }
+    assert payload["sampler_health"] == {
+        "smc_soft_budget_respected": True,
+        "rejuvenation_mixing_complete": True,
+        "structural_mixing_complete": True,
+    }
+    assert "interpretation" not in payload["assessment"]
+    assert "structural_rejection_diagnostics" not in isotope
+    assert "joint_cross_isotope_rejection_diagnostics" not in isotope
+    assert "joint_cross_isotope_state_rejection_diagnostics" not in isotope
 
 
 class _FakeRuntimeClient:
@@ -433,7 +489,20 @@ class _FakeEstimator:
         """Return one truth-free point estimate for the station trace."""
         return {
             "Cs-137": SimpleNamespace(
-                to_dict=lambda: {"map_cardinality": 1},
+                to_dict=lambda: {
+                    "map_cardinality": 1,
+                    "cardinality_distribution": {"0": 0.1, "1": 0.9},
+                    "selected_stratum_mass": 0.9,
+                    "modes": [
+                        {
+                            "label_index": 0,
+                            "position_medoid_xyz": [0.1, 0.2, 0.3],
+                            "credible_radius_95_m": 0.5,
+                            "strength_representative_cps_1m": 2.0,
+                            "posterior_mass": 0.9,
+                        }
+                    ],
+                },
             )
         }
 
@@ -448,6 +517,91 @@ class _FakeLog:
     def station_view(self) -> SimpleNamespace:
         """Return the station count used by closed-loop result publication."""
         return SimpleNamespace(station_count=1)
+
+
+def test_final_diagnostics_keep_one_compact_copy_of_each_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """Final diagnostics must not repeat posterior identity or full step state."""
+    sampler_health = {
+        "smc_soft_budget_respected": True,
+        "rejuvenation_mixing_complete": True,
+        "structural_mixing_complete": True,
+    }
+    estimator = SimpleNamespace(
+        posterior_snapshot=lambda: SimpleNamespace(
+            to_dict=lambda: {"schema_version": 2, "isotopes": {}}
+        ),
+        posterior_convergence_diagnostics=lambda: {
+            "ready": False,
+            "sampler_health": sampler_health,
+            "joint_gates": {
+                **sampler_health,
+                "joint_map_cardinality_probability": False,
+            },
+            "isotopes": {},
+        },
+        posterior_predictive_check=lambda: {"available": False},
+        detected_isotope_gate_diagnostics=None,
+    )
+    budget = PFControlBudget(
+        max_stations=1,
+        max_measurements=1,
+        views_per_station=1,
+        live_time_s=1.0,
+        adaptive_stop_enabled=False,
+        stop_assessment_start_station=1,
+        stop_required_consecutive_stations=1,
+        runtime_refinement_top_k=0,
+        planner_audit_top_k=0,
+    )
+    result = PFClosedLoopResult(
+        measurement_log_path=tmp_path / "measurement-log",
+        pf_output_dir=tmp_path,
+        run_id="run",
+        record_count=1,
+        station_count=1,
+        stop_reason="maximum_station_budget",
+    )
+
+    _write_final_outputs(
+        tmp_path,
+        estimator=estimator,
+        result=result,
+        budget=budget,
+        adaptive_stop_status={
+            "assessed": False,
+            "instantaneous_ready": None,
+            "consecutive_ready_stations": 0,
+            "stop_ready": False,
+            "posterior_convergence": {"duplicated": True},
+        },
+    )
+
+    diagnostics = json.loads(
+        (tmp_path / "pf_diagnostics.json").read_text(encoding="utf-8")
+    )
+    assert diagnostics["schema_version"] == 2
+    assert diagnostics["sampler_health"] == sampler_health
+    assert "sampler_health" not in diagnostics["posterior_convergence"]
+    assert not set(sampler_health).intersection(
+        diagnostics["posterior_convergence"].get("joint_gates", {})
+    )
+    assert diagnostics["posterior_convergence"]["joint_gates"] == {
+        "joint_map_cardinality_probability": False
+    }
+    assert diagnostics["stop"]["adaptive"] == {
+        "assessed": False,
+        "consecutive_ready_stations": 0,
+        "stop_ready": False,
+    }
+    assert "measurement_log_sha256" not in diagnostics
+    assert "record_count" not in diagnostics
+    assert "station_count" not in diagnostics
+    assert "structural_transition_provenance" not in diagnostics
+    assert "last_pf_step_diagnostics" not in diagnostics
+    assert "adaptive_stop_status" not in diagnostics
+    assert "detected_isotope_gate" not in diagnostics
 
 
 def test_pf_budget_requires_one_complete_estimator_station() -> None:
@@ -688,11 +842,11 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
         .splitlines()[0]
     )
     assert audit["selection_mode"] == "pf_prior_balanced_bootstrap"
-    assert audit["total_action_count"] == 0
-    assert audit["selected_information_gain"] is None
-    assert audit["mc_seed_rank_stability"]["status"] == (
-        "not_applicable_before_first_observation"
-    )
+    assert audit["schema_version"] == 3
+    assert audit["candidate_pose_count"] == 0
+    assert "selected_information_gain" not in audit
+    assert "mc_seed_rank_stability" not in audit
+    assert "shield_view_count_shadow" not in audit
     assert len(estimator.measurements) == 1
     assert result.station_count == 1
     station_trace = json.loads(
@@ -700,12 +854,23 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
         .read_text(encoding="utf-8")
         .splitlines()[0]
     )
+    assert station_trace["schema_version"] == 2
     assert station_trace["pf_update_elapsed_s"] >= 0.0
     assert (
         station_trace["posterior_snapshot"]["isotopes"]["Cs-137"]["map_cardinality"]
         == 1
     )
     assert station_trace["posterior_snapshot"]["publishable"] is False
+    assert set(station_trace["adaptive_stop"]) == {
+        "assessed",
+        "consecutive_ready_stations",
+        "stop_ready",
+    }
+    assert "record_count" not in station_trace
+    assert "pose_xyz" not in station_trace
+    assert "pair_ids" not in station_trace
+    assert "detected_isotope_gate" not in station_trace
+    assert "shield_view_count_shadow_health" not in station_trace
 
 
 def test_pf_closed_loop_restores_runtime_resume_prefix(
@@ -911,6 +1076,7 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
     frames: list[object] = []
     truth_updates: list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = []
     output_messages: list[str] = []
+    cui_constructor_kwargs: list[dict[str, object]] = []
 
     class _FakeCUI:
         """Capture CUI frames without spawning a renderer process."""
@@ -920,6 +1086,7 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
         def __init__(self, **kwargs: object) -> None:
             """Record construction arguments for the CUI sidecar."""
             self.kwargs = kwargs
+            cui_constructor_kwargs.append(dict(kwargs))
             output_dir = Path(str(kwargs["output_dir"]))
             output_dir.mkdir(parents=True, exist_ok=True)
             self.latest_overview_path = output_dir / "latest_experiment_overview.png"
@@ -1001,6 +1168,8 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
         np.asarray([1], dtype=np.int64),
     )
     assert truth_updates == []
+    assert len(cui_constructor_kwargs) == 1
+    assert cui_constructor_kwargs[0]["save_step_history"] is False
     client = _FakeRuntimeClient.instance
     assert client is not None
     assert client.overlay_requests == []

@@ -59,10 +59,13 @@ estimator settings while connecting to the same runtime protocol.
 
 The runtime owns reachable candidate poses and their physical motion costs. PF owns
 candidate ranking and shield-program selection. Every selected station writes
-`planner_audit.jsonl`, including the full action count, proxy rank, exact-EIG count,
-selected and best exact EIG, score/EIG leaders, top-ranked actions, shortlist
-certificate, and MC seed. Independent-seed rank stability remains an explicit
-offline diagnostic so it cannot silently double closed-loop planning time.
+the compact schema-v3 `planner_audit.jsonl`: selected pose/program/score/EIG,
+physical pose and proxy/exact subset-evaluation counts, the EIG leader, compact
+top-ranked actions, and resolved EIG seeds. When the fixed-eight shadow audit is
+enabled, it additionally retains all-pose proxy `I_2/I_4/I_8`, paired exact
+uncertainty/LCBs, health reasons, hypothetical actions, and the actual fixed-eight
+execution state. Legacy 48-program counters, proxy-rank placeholders, repeated
+policy prose, runtime chunk telemetry, and derivable fields are not persisted.
 
 The live command fails closed if the runtime context, source-rate semantics, model
 identity, energy axis, environment geometry, or full-spectrum contract is
@@ -94,6 +97,11 @@ PF particle display. It does not invent an estimator-neutral grid or a predictiv
 spectrum: `PurePFEstimator` currently has no public deterministic latest-spectrum
 snapshot API. The existing PF CUI therefore continues to render its native particle
 cloud and the latest raw spectrum from the persisted runtime record.
+
+The CUI overwrites `latest_*.png` during a normal run and publishes `final_*.png`
+at completion; it does not retain per-view PNG history or HTTP access logs. Set
+`cui_split_view_save_step_history: true` only for an explicit video/debug run that
+needs the five `*_step_*.png` panels per view.
 
 ## Citation and license
 

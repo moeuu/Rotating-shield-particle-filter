@@ -3707,7 +3707,7 @@ def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> N
         result=shadow,
     )
     assert (
-        persisted["shield_view_count_shadow"]["executed_action"]["selected_view_count"]
+        persisted["shield_view_count_shadow"]["actual_execution"]["view_count"]
         == 8
     )
     assert isinstance(json_safe(persisted), dict)
@@ -3775,7 +3775,20 @@ def test_shield_view_count_shadow_logs_all_proxy_poses_and_exact_union() -> None
         belief_after_station_id=0,
         result=result,
     )
-    assert persisted["shield_view_count_shadow"]["proxy"]["pose_count"] == 10
+    persisted_proxy = persisted["shield_view_count_shadow"]["proxy"]
+    persisted_exact = persisted["shield_view_count_shadow"]["exact"]
+    assert len(persisted_proxy["pose_indices"]) == 10
+    assert all(
+        len(persisted_proxy["by_view_count"][str(view_count)][
+            "information_gain_mean_nat"
+        ])
+        == 10
+        for view_count in (2, 4, 8)
+    )
+    assert "pair_ids" not in persisted_proxy["by_view_count"]["2"]
+    assert "pair_ids" not in persisted_proxy["by_view_count"]["4"]
+    assert len(persisted_proxy["by_view_count"]["8"]["pair_ids"]) == 10
+    assert "pose_xyz" not in persisted_exact
 
 
 def test_dss_conditional_policy_has_a_legacy_free_execution_path() -> None:

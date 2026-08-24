@@ -43,6 +43,7 @@ from pf.cui_runtime import (
 from pf.configuration import load_pf_config
 from pf.isotope_gate import FullSpectrumIsotopeGate
 from pf.live_session import (
+    _compact_pf_diagnostics,
     assimilate_persisted_station,
     bind_published_measurement_log,
     build_live_estimator,
@@ -234,6 +235,26 @@ class AdaptiveStopTracker:
         }
 
 
+def _compact_adaptive_stop_status(
+    status: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    """Return only station-varying adaptive-stop decision fields."""
+    if status is None:
+        return None
+    compact = {
+        "assessed": status.get("assessed"),
+        "instantaneous_ready": status.get("instantaneous_ready"),
+        "consecutive_ready_stations": status.get(
+            "consecutive_ready_stations"
+        ),
+        "stop_ready": status.get("stop_ready"),
+    }
+    retained = {
+        key: value for key, value in compact.items() if value is not None
+    }
+    return retained or None
+
+
 @dataclass(frozen=True, slots=True)
 class PFClosedLoopResult:
     """Describe one completed PF-controlled acquisition and posterior."""
@@ -383,6 +404,11 @@ def _start_cui_split_view(
         max_particles_per_isotope=settings.get(
             "cui_split_view_max_particles_per_isotope"
         ),
+        save_step_history=_strict_cui_bool(
+            settings,
+            "cui_split_view_save_step_history",
+            False,
+        ),
     )
     output_hook(
         "CUI split visualization enabled: "
@@ -476,25 +502,67 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         "cumulative_unique_ancestor_count",
         "r_probability_by_count",
         "transition_weight_mass",
-        "structural_rejection_diagnostics",
-        "joint_cross_isotope_rejection_diagnostics",
-        "joint_cross_isotope_state_rejection_diagnostics",
         "joint_smc_soft_budget_exceeded",
+        "joint_rejuvenation_mixing_incomplete",
+        "joint_structural_mixing_incomplete",
     )
-    isotopes = {
+    retained = {
         str(isotope): {key: values.get(key) for key in keep}
         for isotope, values in raw.items()
     }
+    isotopes = {}
+    for isotope, values in retained.items():
+        transition_mass = values["transition_weight_mass"]
+        aggregate_transition_mass: dict[str, float] = {}
+        if isinstance(transition_mass, Mapping):
+            attempted = sum(
+                float(value)
+                for name, value in transition_mass.items()
+                if str(name).endswith("_attempted_weight_mass")
+            )
+            accepted = sum(
+                float(value)
+                for name, value in transition_mass.items()
+                if str(name).endswith("_accepted_weight_mass")
+            )
+            if any(
+                str(name).endswith("_attempted_weight_mass")
+                for name in transition_mass
+            ):
+                aggregate_transition_mass = {
+                    "attempted": float(attempted),
+                    "accepted": float(accepted),
+                }
+        compact = {
+            "particle_count": values["particle_count"],
+            "current_ess": values["current_ess"],
+            "current_ess_ratio": values["current_ess_ratio"],
+            "temper_resamples": values["temper_resamples"],
+            "temper_min_ess": values["temper_min_ess"],
+            "station_unique_ancestor_count": values[
+                "station_unique_ancestor_count"
+            ],
+            "cumulative_unique_ancestor_count": values[
+                "cumulative_unique_ancestor_count"
+            ],
+            "cardinality_distribution": values["r_probability_by_count"],
+            "structural_transition_weight_mass": (
+                aggregate_transition_mass or None
+            ),
+        }
+        isotopes[isotope] = {
+            key: value for key, value in compact.items() if value is not None
+        }
     configured_count = int(estimator.pf_config.num_particles)
     target_ratio = float(estimator.pf_config.target_ess_ratio)
     guided_ratios = [
         float(values["joint_guided_initialization_ess"]) / configured_count
-        for values in isotopes.values()
+        for values in retained.values()
         if values.get("joint_guided_initialization_ess") is not None
     ]
     ancestry_counts = [
         int(values["cumulative_unique_ancestor_count"])
-        for values in isotopes.values()
+        for values in retained.values()
         if values.get("cumulative_unique_ancestor_count") is not None
     ]
     evidence = {
@@ -512,13 +580,29 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
             or (guided_ratios and min(guided_ratios) < target_ratio)
             or (ancestry_counts and min(ancestry_counts) <= 1)
         ),
-        "interpretation": (
-            "A warning means particle diversity may be insufficient, but "
-            "particle count alone is not identified without independent-seed "
-            "2k/4k/8k live-session stability."
+    }
+    evidence = {
+        key: value for key, value in evidence.items() if value is not None
+    }
+    sampler_health = {
+        "smc_soft_budget_respected": all(
+            values.get("joint_smc_soft_budget_exceeded") is False
+            for values in retained.values()
+        ),
+        "rejuvenation_mixing_complete": all(
+            values.get("joint_rejuvenation_mixing_incomplete") is False
+            for values in retained.values()
+        ),
+        "structural_mixing_complete": all(
+            values.get("joint_structural_mixing_incomplete") is False
+            for values in retained.values()
         ),
     }
-    return {"assessment": evidence, "isotopes": isotopes}
+    return {
+        "assessment": evidence,
+        "sampler_health": sampler_health,
+        "isotopes": isotopes,
+    }
 
 
 def _shield_view_count_shadow_health(
@@ -894,43 +978,26 @@ def _write_final_outputs(
     output_dir: Path,
     *,
     estimator: object,
-    log: object,
     result: PFClosedLoopResult,
     budget: PFControlBudget,
     adaptive_stop_status: Mapping[str, object] | None,
 ) -> None:
     """Publish the final posterior and controller provenance atomically per file."""
     posterior = estimator.posterior_snapshot().to_dict()
-    diagnostics = {
-        "schema_version": 1,
-        "estimator_family": "pure_particle_filter",
-        "measurement_log_sha256": log.log_sha256,
-        "record_count": len(log.records),
-        "station_count": result.station_count,
-        "stop_reason": result.stop_reason,
-        "control_budget": asdict(budget),
-        "adaptive_stop_status": (
-            None if adaptive_stop_status is None else dict(adaptive_stop_status)
-        ),
-        "posterior_convergence": estimator.posterior_convergence_diagnostics(),
-        "posterior_predictive_check": estimator.posterior_predictive_check(),
-        "structural_transition_provenance": (
-            estimator.structural_transition_diagnostics()
-        ),
-        "last_pf_step_diagnostics": estimator.step_diagnostics(
-            top_k=0,
-            include_estimates=False,
-        ),
-        "detected_isotope_gate": getattr(
-            estimator,
-            "detected_isotope_gate_diagnostics",
-            None,
-        ),
-        "candidate_isotopes": list(
-            getattr(estimator, "candidate_isotopes", estimator.isotopes)
-        ),
-        "active_isotopes": list(estimator.joint_isotope_order()),
-    }
+    diagnostics = _compact_pf_diagnostics(estimator)
+    stop: dict[str, object] = {"reason": result.stop_reason}
+    compact_stop = _compact_adaptive_stop_status(adaptive_stop_status)
+    if compact_stop is not None:
+        stop["adaptive"] = compact_stop
+    diagnostics["stop"] = stop
+    diagnostics["control_budget"] = asdict(budget)
+    detected_isotope_gate = getattr(
+        estimator,
+        "detected_isotope_gate_diagnostics",
+        None,
+    )
+    if detected_isotope_gate is not None:
+        diagnostics["detected_isotope_gate"] = detected_isotope_gate
     atomic_write_bytes(
         output_dir / "pf_posterior.json",
         canonical_json_bytes(posterior),
@@ -1348,21 +1415,21 @@ def run_pf_closed_loop(
                     record_measurement=False,
                 )
                 cui_frame_rendered = True
-            controller_writer.append(
-                {
-                    "schema_version": 1,
-                    "station_id": station_id,
-                    "record_count": record_count,
-                    "pose_xyz": current_pose.tolist(),
-                    "pair_ids": [int(value) for value in current_program.pair_ids],
-                    "pf_update_elapsed_s": float(assimilation_elapsed_s),
-                    "detected_isotope_gate": gate_diagnostics,
-                    "particle_adequacy": particle_adequacy,
-                    "shield_view_count_shadow_health": shadow_health,
-                    "posterior_snapshot": posterior_snapshot,
-                    "adaptive_stop": latest_adaptive_stop_status,
-                }
+            station_trace = {
+                "schema_version": 2,
+                "station_id": station_id,
+                "pf_update_elapsed_s": float(assimilation_elapsed_s),
+                "particle_adequacy": particle_adequacy,
+                "posterior_snapshot": posterior_snapshot,
+            }
+            compact_stop = _compact_adaptive_stop_status(
+                latest_adaptive_stop_status
             )
+            if compact_stop is not None:
+                station_trace["adaptive_stop"] = compact_stop
+            if gate_diagnostics is not None:
+                station_trace["detected_isotope_gate"] = gate_diagnostics
+            controller_writer.append(station_trace)
             if record_count >= budget.max_measurements:
                 stop_reason = "maximum_measurement_budget"
                 break
@@ -1444,7 +1511,6 @@ def run_pf_closed_loop(
         _write_final_outputs(
             target,
             estimator=estimator,
-            log=log,
             result=result,
             budget=budget,
             adaptive_stop_status=latest_adaptive_stop_status,
