@@ -1499,6 +1499,9 @@ class PFLiveSession:
         *,
         candidate_motion_times_s: object,
         config: DSSPPConfig | Mapping[str, Any],
+        candidate_horizontal_travel_times_s: object | None = None,
+        candidate_mast_vertical_times_s: object | None = None,
+        candidate_settling_times_s: object | None = None,
         current_pose_xyz: object | None = None,
         current_pair_id: int | None = None,
         visited_poses_xyz: object | None = None,
@@ -1535,6 +1538,21 @@ class PFLiveSession:
             )
         candidates = np.asarray(candidate_poses_xyz, dtype=np.float64)
         motion_times = np.asarray(candidate_motion_times_s, dtype=np.float64)
+        raw_motion_components = (
+            candidate_horizontal_travel_times_s,
+            candidate_mast_vertical_times_s,
+            candidate_settling_times_s,
+        )
+        motion_components = None
+        if any(values is not None for values in raw_motion_components):
+            if not all(values is not None for values in raw_motion_components):
+                raise PFLiveSessionError(
+                    "PF action planning requires all three motion-time components."
+                )
+            motion_components = tuple(
+                np.asarray(values, dtype=np.float64)
+                for values in raw_motion_components
+            )
         if current_pose_xyz is None:
             current_pose = np.asarray(
                 self._records[-1].detector_pose_xyz,
@@ -1586,6 +1604,15 @@ class PFLiveSession:
                 config=planner_config,
                 rng=planning_rng,
                 candidate_motion_times_s=motion_times,
+                candidate_horizontal_travel_times_s=(
+                    None if motion_components is None else motion_components[0]
+                ),
+                candidate_mast_vertical_times_s=(
+                    None if motion_components is None else motion_components[1]
+                ),
+                candidate_settling_times_s=(
+                    None if motion_components is None else motion_components[2]
+                ),
             )
         except (TypeError, ValueError, RuntimeError) as exc:
             raise PFLiveSessionError(f"PF action planning failed: {exc}") from exc

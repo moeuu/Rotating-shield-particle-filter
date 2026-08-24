@@ -752,6 +752,9 @@ def test_facade_delegates_pose_and_shield_planning_to_pf_package(
     action = session.plan_next_action(
         [[0.5, 0.5, 0.5], [1.0, 1.5, 0.5]],
         candidate_motion_times_s=[0.0, 2.0],
+        candidate_horizontal_travel_times_s=[0.0, 1.0],
+        candidate_mast_vertical_times_s=[0.0, 0.5],
+        candidate_settling_times_s=[0.0, 0.5],
         config={"augment_candidates": False, "program_length": 2},
     )
 
@@ -767,6 +770,18 @@ def test_facade_delegates_pose_and_shield_planning_to_pf_package(
     )
     assert kwargs["map_api"] is _Forward.obstacle_grid
     assert kwargs["config"].augment_candidates is False
+    np.testing.assert_allclose(
+        kwargs["candidate_horizontal_travel_times_s"],
+        [0.0, 1.0],
+    )
+    np.testing.assert_allclose(
+        kwargs["candidate_mast_vertical_times_s"],
+        [0.0, 0.5],
+    )
+    np.testing.assert_allclose(
+        kwargs["candidate_settling_times_s"],
+        [0.0, 0.5],
+    )
 
 
 def test_facade_rejects_unknown_pf_planning_configuration(

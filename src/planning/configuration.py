@@ -90,7 +90,22 @@ def dss_config_from_pf_settings(
         live_time_s=live_time_s,
         lambda_eig=raw.get("eig_weight", 1.0),
         lambda_distance=0.0,
-        lambda_time=raw.get("time_weight", 0.0),
+        lambda_time=raw.get(
+            "measurement_time_weight",
+            raw.get("time_weight", 0.0),
+        ),
+        lambda_horizontal_time=raw.get(
+            "horizontal_time_weight",
+            raw.get("time_weight"),
+        ),
+        lambda_mast_vertical_time=raw.get(
+            "mast_vertical_time_weight",
+            raw.get("time_weight"),
+        ),
+        lambda_settling_time=raw.get(
+            "settling_time_weight",
+            raw.get("time_weight"),
+        ),
         lambda_rotation=raw.get("rotation_weight", 0.0),
         lambda_coverage=raw.get("coverage_weight", 0.0),
         lambda_bearing_diversity=raw.get("bearing_diversity_weight", 0.0),

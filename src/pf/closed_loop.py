@@ -692,6 +692,24 @@ def _plan(
             candidates.travel_costs,
             dtype=np.float64,
         ),
+        candidate_horizontal_travel_times_s=np.asarray(
+            candidates.horizontal_travel_times_s,
+            dtype=np.float64,
+        )
+        if candidates.has_motion_time_components
+        else None,
+        candidate_mast_vertical_times_s=np.asarray(
+            candidates.mast_vertical_times_s,
+            dtype=np.float64,
+        )
+        if candidates.has_motion_time_components
+        else None,
+        candidate_settling_times_s=np.asarray(
+            candidates.settling_times_s,
+            dtype=np.float64,
+        )
+        if candidates.has_motion_time_components
+        else None,
     )
 
 

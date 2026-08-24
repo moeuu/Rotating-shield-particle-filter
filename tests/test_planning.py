@@ -2003,6 +2003,51 @@ def test_dss_runtime_motion_times_need_no_local_map_geometry() -> None:
     )
 
 
+def test_dss_runtime_scores_motion_time_components_with_separate_weights() -> None:
+    """Mast motion must not inherit the full horizontal travel penalty."""
+    estimator = _build_simple_estimator()
+    candidates = np.array(
+        [[1.5, 1.5, 0.5], [2.5, 1.5, 0.5]],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(123),
+        candidate_poses_xyz=candidates,
+        candidate_motion_times_s=np.array([2.0, 4.0], dtype=float),
+        candidate_horizontal_travel_times_s=np.array([2.0, 0.0], dtype=float),
+        candidate_mast_vertical_times_s=np.array([0.0, 4.0], dtype=float),
+        candidate_settling_times_s=np.array([0.0, 0.0], dtype=float),
+        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
+        map_api=object(),
+        config=DSSPPConfig(
+            max_programs=4,
+            program_length=1,
+            forced_program_pair_ids=(0,),
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_distance=0.0,
+            lambda_time=0.0,
+            lambda_horizontal_time=1.0,
+            lambda_mast_vertical_time=0.1,
+            lambda_settling_time=1.0,
+            lambda_rotation=0.0,
+            lambda_coverage=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    np.testing.assert_allclose(result.next_pose, candidates[1])
+    assert result.diagnostics["runtime_motion_time_components_applied"] is True
+    assert result.diagnostics["motion_time_weights"] == {
+        "horizontal": 1.0,
+        "mast_vertical": 0.1,
+        "settling": 1.0,
+        "measurement": 0.0,
+    }
+
+
 def test_estimate_lambda_cost_range_scales_motion() -> None:
     """Range-based lambda should match uncertainty and motion-cost ranges."""
     uncertainties = np.array([1.0, 2.0, 4.0], dtype=float)

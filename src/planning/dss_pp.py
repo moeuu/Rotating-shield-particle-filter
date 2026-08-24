@@ -1245,6 +1245,9 @@ def _compose_transition_score(
     map_api: object | None,
     config: DSSPPConfig,
     travel_time_override_s: float | None = None,
+    horizontal_time_override_s: float | None = None,
+    mast_vertical_time_override_s: float | None = None,
+    settling_time_override_s: float | None = None,
     path_length_override_m: float | None = None,
 ) -> tuple[float, float]:
     """Return node score and path length for a specific predecessor."""
@@ -1268,14 +1271,59 @@ def _compose_transition_score(
         travel_time = float(travel_time_override_s)
         if not np.isfinite(travel_time) or travel_time < 0.0:
             raise ValueError("travel_time_override_s must be finite and nonnegative.")
-    time_cost = travel_time + len(node.program.pair_ids) * (
+    motion_components = (
+        horizontal_time_override_s,
+        mast_vertical_time_override_s,
+        settling_time_override_s,
+    )
+    if all(value is None for value in motion_components):
+        motion_penalty = float(config.lambda_time) * float(travel_time)
+    elif any(value is None for value in motion_components):
+        raise ValueError("Motion-time component overrides must be supplied together.")
+    else:
+        component_values = tuple(float(value) for value in motion_components)
+        if any(not np.isfinite(value) or value < 0.0 for value in component_values):
+            raise ValueError(
+                "Motion-time component overrides must be finite and nonnegative."
+            )
+        if not np.isclose(
+            sum(component_values),
+            travel_time,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        ):
+            raise ValueError(
+                "Motion-time component overrides must sum to travel time."
+            )
+        horizontal_weight = (
+            float(config.lambda_time)
+            if config.lambda_horizontal_time is None
+            else float(config.lambda_horizontal_time)
+        )
+        mast_weight = (
+            float(config.lambda_time)
+            if config.lambda_mast_vertical_time is None
+            else float(config.lambda_mast_vertical_time)
+        )
+        settling_weight = (
+            float(config.lambda_time)
+            if config.lambda_settling_time is None
+            else float(config.lambda_settling_time)
+        )
+        motion_penalty = (
+            horizontal_weight * component_values[0]
+            + mast_weight * component_values[1]
+            + settling_weight * component_values[2]
+        )
+    measurement_time_cost = len(node.program.pair_ids) * (
         float(config.rotation_overhead_s) + float(config.live_time_s)
     )
     del previous_pair_id, estimator
     score = (
         float(node.static_score)
         - float(node.distance_weight) * float(path_length)
-        - float(config.lambda_time) * float(time_cost)
+        - float(motion_penalty)
+        - float(config.lambda_time) * float(measurement_time_cost)
     )
     return float(score), float(path_length)
 
@@ -1463,6 +1511,12 @@ def _build_nodes(
     rng: np.random.Generator,
     joint_particles: JointPlanningParticles,
     candidate_motion_times_s: NDArray[np.float64] | None = None,
+    candidate_motion_time_components_s: tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]
+    | None = None,
 ) -> tuple[list[DSSPPNode], dict[str, object]]:
     """Shortlist all actions cheaply, then exactly evaluate a fixed subset."""
     kernel = _continuous_kernel_for_estimator(
@@ -1487,6 +1541,53 @@ def _build_nodes(
                 "candidate_motion_times_s must align with candidates and "
                 "contain finite nonnegative values."
             )
+    motion_time_components = None
+    if candidate_motion_time_components_s is not None:
+        if len(candidate_motion_time_components_s) != 3:
+            raise ValueError("Candidate motion times require exactly three components.")
+        motion_time_components = tuple(
+            np.asarray(values, dtype=np.float64).reshape(-1)
+            for values in candidate_motion_time_components_s
+        )
+        if any(
+            values.shape != (candidate_poses.shape[0],)
+            or np.any(~np.isfinite(values))
+            or np.any(values < 0.0)
+            for values in motion_time_components
+        ):
+            raise ValueError(
+                "Candidate motion-time components must align with candidates and "
+                "contain finite nonnegative values."
+            )
+        if motion_times is None or not np.allclose(
+            np.sum(np.vstack(motion_time_components), axis=0),
+            motion_times,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        ):
+            raise ValueError(
+                "Candidate motion-time components must sum to motion times."
+            )
+
+    def _motion_component_overrides(pose_index: int) -> dict[str, float | None]:
+        """Return score-call overrides for one candidate motion quote."""
+        if motion_time_components is None:
+            return {
+                "horizontal_time_override_s": None,
+                "mast_vertical_time_override_s": None,
+                "settling_time_override_s": None,
+            }
+        return {
+            "horizontal_time_override_s": float(
+                motion_time_components[0][int(pose_index)]
+            ),
+            "mast_vertical_time_override_s": float(
+                motion_time_components[1][int(pose_index)]
+            ),
+            "settling_time_override_s": float(
+                motion_time_components[2][int(pose_index)]
+            ),
+        }
     info_gains = np.zeros(candidate_poses.shape[0], dtype=float)
     map_has_native_motion = (
         map_api is None
@@ -1962,6 +2063,7 @@ def _build_nodes(
                     if motion_times is None
                     else float(motion_times[int(placeholder_node.pose_index)])
                 ),
+                **_motion_component_overrides(int(placeholder_node.pose_index)),
             )
             raw_nodes.append(
                 DSSPPNode(
@@ -2017,6 +2119,7 @@ def _build_nodes(
                     if motion_times is None
                     else float(motion_times[int(lower_node.pose_index)])
                 ),
+                **_motion_component_overrides(int(lower_node.pose_index)),
             )
             evaluated_lower_scores.append(float(lower_score))
         evaluated_objective_lower = float(max(evaluated_lower_scores))
@@ -2055,6 +2158,7 @@ def _build_nodes(
                     if motion_times is None
                     else float(motion_times[int(upper_node.pose_index)])
                 ),
+                **_motion_component_overrides(int(upper_node.pose_index)),
             )
             excluded_upper_scores.append(float(upper_score))
         excluded_universal_upper = float(max(excluded_upper_scores))
@@ -2218,6 +2322,9 @@ def select_dss_pp_next_station(
     config: DSSPPConfig | None = None,
     rng: np.random.Generator | None = None,
     candidate_motion_times_s: NDArray[np.float64] | None = None,
+    candidate_horizontal_travel_times_s: NDArray[np.float64] | None = None,
+    candidate_mast_vertical_times_s: NDArray[np.float64] | None = None,
+    candidate_settling_times_s: NDArray[np.float64] | None = None,
 ) -> DSSPPResult:
     """Select the next station and its actually executed shield program.
 
@@ -2301,6 +2408,49 @@ def select_dss_pp_next_station(
                 "Runtime motion times require augment_candidates=False; "
                 "new physical poses must be authored and timed by runtime."
             )
+    raw_motion_components = (
+        candidate_horizontal_travel_times_s,
+        candidate_mast_vertical_times_s,
+        candidate_settling_times_s,
+    )
+    input_motion_components = None
+    if any(values is not None for values in raw_motion_components):
+        if not all(values is not None for values in raw_motion_components):
+            raise ValueError(
+                "Candidate horizontal, mast, and settling times must be supplied "
+                "together."
+            )
+        input_motion_components = tuple(
+            np.asarray(values, dtype=np.float64).reshape(-1)
+            for values in raw_motion_components
+        )
+        if any(
+            values.shape != (input_candidates.shape[0],)
+            or np.any(~np.isfinite(values))
+            or np.any(values < 0.0)
+            for values in input_motion_components
+        ):
+            raise ValueError(
+                "Candidate motion-time components must align with candidates and "
+                "contain finite nonnegative values."
+            )
+        component_totals = np.sum(np.vstack(input_motion_components), axis=0)
+        if input_motion_times is None:
+            input_motion_times = component_totals
+        elif not np.allclose(
+            input_motion_times,
+            component_totals,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        ):
+            raise ValueError(
+                "Candidate motion-time components must sum to motion times."
+            )
+        if cfg.augment_candidates:
+            raise ValueError(
+                "Runtime motion times require augment_candidates=False; "
+                "new physical poses must be authored and timed by runtime."
+            )
     if cfg.augment_candidates:
         candidates = augment_candidate_stations(
             candidates,
@@ -2336,6 +2486,18 @@ def select_dss_pp_next_station(
             input_candidates,
             input_motion_times,
             candidates,
+        )
+    )
+    motion_time_components = (
+        None
+        if input_motion_components is None
+        else tuple(
+            _align_candidate_values(
+                input_candidates,
+                values,
+                candidates,
+            )
+            for values in input_motion_components
         )
     )
     if candidates.size == 0:
@@ -2390,6 +2552,7 @@ def select_dss_pp_next_station(
         rng=planning_rng,
         joint_particles=joint_particles,
         candidate_motion_times_s=motion_times,
+        candidate_motion_time_components_s=motion_time_components,
     )
     if not nodes:
         raise ValueError("DSS-PP could not evaluate any station-program node.")
@@ -2447,6 +2610,27 @@ def select_dss_pp_next_station(
         "separation_filtered_candidates": int(separation_filtered),
         "path_filtered_candidates": int(path_filtered),
         "runtime_motion_times_applied": bool(motion_times is not None),
+        "runtime_motion_time_components_applied": bool(
+            motion_time_components is not None
+        ),
+        "motion_time_weights": {
+            "horizontal": float(
+                cfg.lambda_time
+                if cfg.lambda_horizontal_time is None
+                else cfg.lambda_horizontal_time
+            ),
+            "mast_vertical": float(
+                cfg.lambda_time
+                if cfg.lambda_mast_vertical_time is None
+                else cfg.lambda_mast_vertical_time
+            ),
+            "settling": float(
+                cfg.lambda_time
+                if cfg.lambda_settling_time is None
+                else cfg.lambda_settling_time
+            ),
+            "measurement": float(cfg.lambda_time),
+        },
         "program_count": int(len(programs)),
         "program_library_configured_capacity": int(cfg.max_programs),
         "program_library_realized_count": int(len(programs)),

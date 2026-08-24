@@ -73,6 +73,9 @@ class DSSPPConfig:
     lambda_eig: float = 1.0
     lambda_distance: float | None = None
     lambda_time: float = 0.0
+    lambda_horizontal_time: float | None = None
+    lambda_mast_vertical_time: float | None = None
+    lambda_settling_time: float | None = None
     lambda_rotation: float = 0.0
     lambda_coverage: float = 0.0
     lambda_bearing_diversity: float = 0.0
@@ -220,6 +223,18 @@ class DSSPPConfig:
         }
         if self.lambda_distance is not None:
             nonnegative_fields["lambda_distance"] = self.lambda_distance
+        if self.lambda_horizontal_time is not None:
+            nonnegative_fields["lambda_horizontal_time"] = (
+                self.lambda_horizontal_time
+            )
+        if self.lambda_mast_vertical_time is not None:
+            nonnegative_fields["lambda_mast_vertical_time"] = (
+                self.lambda_mast_vertical_time
+            )
+        if self.lambda_settling_time is not None:
+            nonnegative_fields["lambda_settling_time"] = (
+                self.lambda_settling_time
+            )
         for name, value in nonnegative_fields.items():
             _number(value, name, minimum=0.0)
         if float(self.lambda_rotation) != 0.0:

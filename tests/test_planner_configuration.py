@@ -94,3 +94,23 @@ def test_runtime_planner_retires_angular_rotation_penalty() -> None:
                 }
             },
         )
+
+
+def test_runtime_planner_separates_mast_from_horizontal_time_weight() -> None:
+    """Production motion scoring must discount mast time without hiding travel."""
+    config = dss_config_from_pf_settings(
+        {
+            "dss_pp": {
+                "planning_method": "resample",
+                "measurement_time_weight": 0.02,
+                "horizontal_time_weight": 0.02,
+                "mast_vertical_time_weight": 0.005,
+                "settling_time_weight": 0.02,
+            }
+        },
+    )
+
+    assert config.lambda_time == pytest.approx(0.02)
+    assert config.lambda_horizontal_time == pytest.approx(0.02)
+    assert config.lambda_mast_vertical_time == pytest.approx(0.005)
+    assert config.lambda_settling_time == pytest.approx(0.02)
