@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from numbers import Integral
 from typing import Any
 
 from runtime.experiment_profiles import AcquisitionContract
@@ -77,7 +78,7 @@ def dss_config_from_pf_settings(
         if acquisition_contract is None
         else acquisition_contract.min_station_separation_m
     )
-    return DSSPPConfig(
+    config = DSSPPConfig(
         max_programs=raw.get("max_programs", 40),
         program_length=program_length,
         mode_cluster_radius_m=raw.get("mode_cluster_radius_m", 1.5),
@@ -162,7 +163,53 @@ def dss_config_from_pf_settings(
         ),
         proxy_planning_particles=raw.get("proxy_planning_particles", 16),
         proxy_eig_samples=raw.get("proxy_eig_samples", 2),
+        shield_program_search_policy=raw.get(
+            "shield_program_search_policy",
+            "predeclared_library",
+        ),
+        legacy_program_guard_enabled=raw.get(
+            "legacy_program_guard_enabled",
+            True,
+        ),
+        conditional_greedy_one_swap=raw.get(
+            "conditional_greedy_one_swap",
+            True,
+        ),
+        exact_eig_pose_min=raw.get("exact_eig_pose_min", 8),
+        exact_eig_pose_max=raw.get("exact_eig_pose_max", 16),
+        exact_eig_pose_step=raw.get("exact_eig_pose_step", 4),
+        proxy_stability_refinement_pool=raw.get(
+            "proxy_stability_refinement_pool",
+            24,
+        ),
+        proxy_stability_replicates=raw.get(
+            "proxy_stability_replicates",
+            3,
+        ),
+        proxy_boundary_confidence=raw.get(
+            "proxy_boundary_confidence",
+            0.95,
+        ),
+        proxy_top_k_jaccard_min=raw.get(
+            "proxy_top_k_jaccard_min",
+            0.75,
+        ),
     )
+    if config.shield_program_search_policy in {
+        "conditional_greedy_shadow",
+        "conditional_greedy_all_pairs",
+    }:
+        exact_samples = settings.get("planning_eig_samples", 50)
+        if (
+            isinstance(exact_samples, bool)
+            or not isinstance(exact_samples, Integral)
+            or int(exact_samples) < 2
+        ):
+            raise ValueError(
+                "Conditional-greedy shield search requires the PF-level "
+                "planning_eig_samples setting to be an integer >= 2."
+            )
+    return config
 
 
 __all__ = ["dss_config_from_pf_settings"]

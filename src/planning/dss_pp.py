@@ -7,11 +7,13 @@ with the same sole full-spectrum likelihood used by the online PF.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 import time
 from typing import Any, Mapping, Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.stats import t as student_t
 from scipy.spatial import cKDTree
 
 from measurement.continuous_kernels import ContinuousKernel
@@ -91,7 +93,16 @@ from planning.dss_types import (
     _PendingDSSPPNode,
     estimate_lambda_cost,
 )
-from planning.shield_programs import ShieldProgram, build_shield_program_library
+from planning.adaptive_shortlist import select_adaptive_pose_shortlist
+from planning.conditional_eig import prepare_conditional_observation_cache
+from planning.conditional_greedy import (
+    ConditionalGreedyResult,
+    evaluate_subset_information_gain_torch,
+    select_conditional_greedy_programs,
+)
+from planning.conditional_memory import plan_conditional_pose_chunk
+from planning.pose_scoring import compose_pose_scores
+from planning.program_types import ShieldProgram
 
 
 __all__ = [
@@ -103,7 +114,6 @@ __all__ = [
     "extract_signature_modes",
     "augment_candidate_stations",
     "ShieldProgram",
-    "build_shield_program_library",
     "select_dss_pp_next_station",
 ]
 
@@ -170,6 +180,7 @@ def _full_spectrum_joint_program_components(
     live_time_s: float,
     detector_aperture_samples: int,
     device_resident: bool = False,
+    working_memory_budget_bytes: int | None = None,
 ) -> _JointProgramSpectrumComponents | _DeviceJointProgramSpectrumComponents:
     """Build batched source-resolved inputs for the shared spectrum model."""
     detectors = np.asarray(detector_positions, dtype=np.float64)
@@ -196,6 +207,14 @@ def _full_spectrum_joint_program_components(
         raise ValueError("DSS live_time_s must be finite and positive.")
     if not isinstance(device_resident, bool):
         raise TypeError("device_resident must be a boolean.")
+    if working_memory_budget_bytes is not None and (
+        isinstance(working_memory_budget_bytes, bool)
+        or not isinstance(working_memory_budget_bytes, (int, np.integer))
+        or int(working_memory_budget_bytes) <= 0
+    ):
+        raise ValueError(
+            "working_memory_budget_bytes must be a positive integer."
+        )
     model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
     isotope_order = tuple(str(value) for value in joint_particles.isotope_order)
     if isotope_order != tuple(sorted(str(value) for value in estimator.isotopes)):
@@ -220,10 +239,10 @@ def _full_spectrum_joint_program_components(
     }
     source_slot_count = int(sum(slot_counts.values()))
     action_count = int(detectors.shape[0])
-    flattened_view_count = action_count * view_count
-    flat_shape = (
-        flattened_view_count,
+    component_shape = (
+        action_count,
         particle_count,
+        view_count,
         source_slot_count,
         line_count,
     )
@@ -235,22 +254,22 @@ def _full_spectrum_joint_program_components(
                 "Device-resident DSS components require the configured GPU path."
             )
         component_device = torch.device(str(estimator.pf_config.gpu_device))
-        total_flat = torch.zeros(
-            flat_shape,
+        total_components = torch.zeros(
+            component_shape,
             device=component_device,
             dtype=torch.float64,
         )
-        uncollided_flat = torch.zeros_like(total_flat)
-        features_flat = torch.zeros(
-            flat_shape + (len(feature_order),),
+        uncollided_components = torch.zeros_like(total_components)
+        feature_components = torch.zeros(
+            component_shape + (len(feature_order),),
             device=component_device,
             dtype=torch.float64,
         )
     else:
-        total_flat = np.zeros(flat_shape, dtype=np.float64)
-        uncollided_flat = np.zeros_like(total_flat)
-        features_flat = np.zeros(
-            flat_shape + (len(feature_order),),
+        total_components = np.zeros(component_shape, dtype=np.float64)
+        uncollided_components = np.zeros_like(total_components)
+        feature_components = np.zeros(
+            component_shape + (len(feature_order),),
             dtype=np.float64,
         )
     pair_ids = _program_pair_id_matrix(programs)
@@ -271,7 +290,6 @@ def _full_spectrum_joint_program_components(
         estimator,
         detector_aperture_samples=int(detector_aperture_samples),
     )
-    flat_view_axis = np.arange(flattened_view_count, dtype=np.int64)
     slot_offset = 0
     for isotope in isotope_order:
         positions = np.asarray(
@@ -376,6 +394,7 @@ def _full_spectrum_joint_program_components(
             sources=active_transport_positions,
             positive_line_indices=local_line_indices,
             device_resident=device_resident,
+            working_memory_budget_bytes=working_memory_budget_bytes,
         )
         expected_program_shape = (
             action_count,
@@ -384,30 +403,38 @@ def _full_spectrum_joint_program_components(
             int(global_line_indices.size),
         )
 
-        def _local_component(field_name: str) -> object:
+        def _local_component(
+            field_name: str,
+            component_values: dict[str, object] = component_arrays,
+        ) -> object:
             """Return one validated reshaped physical component."""
             if device_resident:
                 import torch
 
                 values = torch.as_tensor(
-                    component_arrays[field_name],
-                    device=total_flat.device,
-                    dtype=total_flat.dtype,
-                ).reshape(expected_program_shape)
+                    component_values[field_name],
+                    device=total_components.device,
+                    dtype=total_components.dtype,
+                )
+                if tuple(values.shape) != expected_program_shape:
+                    raise RuntimeError(
+                        f"Full-spectrum component {field_name!r} has an "
+                        "invalid shape."
+                    )
             else:
                 values = np.asarray(
-                    component_arrays[field_name],
+                    component_values[field_name],
                     dtype=np.float64,
-                ).reshape(expected_program_shape)
-                if np.any(~np.isfinite(values)) or np.any(values < 0.0):
+                )
+                if (
+                    values.shape != expected_program_shape
+                    or np.any(~np.isfinite(values))
+                    or np.any(values < 0.0)
+                ):
                     raise RuntimeError(
                         f"Full-spectrum component {field_name!r} is invalid."
                     )
-            return values.reshape(
-                flattened_view_count,
-                int(active_particle_indices.size),
-                int(global_line_indices.size),
-            )
+            return values
 
         total_local = _local_component("total_kernel")
         uncollided_local = _local_component("uncollided_kernel")
@@ -421,20 +448,20 @@ def _full_spectrum_joint_program_components(
             source_scale = (
                 torch.as_tensor(
                     strengths[source_mask],
-                    device=total_flat.device,
-                    dtype=total_flat.dtype,
+                    device=total_components.device,
+                    dtype=total_components.dtype,
                 )
-                .reshape(1, -1, 1)
+                .reshape(1, 1, -1, 1)
                 * torch.as_tensor(
                     branching_weights,
-                    device=total_flat.device,
-                    dtype=total_flat.dtype,
-                ).reshape(1, 1, -1)
+                    device=total_components.device,
+                    dtype=total_components.dtype,
+                ).reshape(1, 1, 1, -1)
             )
         else:
             source_scale = (
-                strengths[source_mask][None, :, None]
-                * branching_weights[None, None, :]
+                strengths[source_mask][None, None, :, None]
+                * branching_weights[None, None, None, :]
             )
         total_local *= source_scale
         uncollided_local *= source_scale
@@ -451,73 +478,78 @@ def _full_spectrum_joint_program_components(
         )
         active_global_slots = int(slot_offset) + active_slot_indices
         if device_resident:
-            flat_view_target = torch.as_tensor(
-                flat_view_axis,
-                device=total_flat.device,
+            action_target = torch.arange(
+                action_count,
+                device=total_components.device,
+                dtype=torch.long,
+            )
+            view_target = torch.arange(
+                view_count,
+                device=total_components.device,
                 dtype=torch.long,
             )
             particle_target = torch.as_tensor(
                 active_particle_indices,
-                device=total_flat.device,
+                device=total_components.device,
                 dtype=torch.long,
             )
             slot_target = torch.as_tensor(
                 active_global_slots,
-                device=total_flat.device,
+                device=total_components.device,
                 dtype=torch.long,
             )
             line_target = torch.as_tensor(
                 global_line_indices,
-                device=total_flat.device,
+                device=total_components.device,
                 dtype=torch.long,
             )
         else:
-            flat_view_target = flat_view_axis
+            action_target = np.arange(action_count, dtype=np.int64)
+            view_target = np.arange(view_count, dtype=np.int64)
             particle_target = active_particle_indices
             slot_target = active_global_slots
             line_target = global_line_indices
         target = (
-            flat_view_target[:, None, None],
-            particle_target[None, :, None],
-            slot_target[None, :, None],
-            line_target[None, None, :],
+            action_target[:, None, None, None],
+            particle_target[None, None, :, None],
+            view_target[None, :, None, None],
+            slot_target[None, None, :, None],
+            line_target[None, None, None, :],
         )
-        total_flat[target] = total_local
-        uncollided_flat[target] = uncollided_local
-        features_flat[target] = local_features
+        total_components[target] = total_local
+        uncollided_components[target] = uncollided_local
+        feature_components[target] = local_features
+        del (
+            component_arrays,
+            _local_component,
+            total_local,
+            uncollided_local,
+            tau_fe,
+            tau_pb,
+            tau_obstacle,
+            distance_m,
+            source_scale,
+            local_features,
+            target,
+            action_target,
+            view_target,
+            particle_target,
+            slot_target,
+            line_target,
+        )
         slot_offset += slot_count
-    output_shape = (
-        action_count,
-        view_count,
-        particle_count,
-        source_slot_count,
-        line_count,
-    )
     if device_resident:
-        total = (
-            total_flat.reshape(output_shape)
-            .permute(0, 2, 1, 3, 4)
-            .contiguous()
-        )
-        uncollided = (
-            uncollided_flat.reshape(output_shape)
-            .permute(0, 2, 1, 3, 4)
-            .contiguous()
-        )
-        features = (
-            features_flat.reshape(output_shape + (len(feature_order),))
-            .permute(0, 2, 1, 3, 4, 5)
-            .contiguous()
-        )
         invalid = torch.stack(
             (
-                torch.any(~torch.isfinite(total)),
-                torch.any(~torch.isfinite(uncollided)),
-                torch.any(~torch.isfinite(features)),
-                torch.any(total < 0.0),
-                torch.any(uncollided < 0.0),
-                torch.any(features < 0.0),
-                torch.any(uncollided > total + 1.0e-10),
+                torch.any(~torch.isfinite(total_components)),
+                torch.any(~torch.isfinite(uncollided_components)),
+                torch.any(~torch.isfinite(feature_components)),
+                torch.any(total_components < 0.0),
+                torch.any(uncollided_components < 0.0),
+                torch.any(feature_components < 0.0),
+                torch.any(
+                    uncollided_components > total_components + 1.0e-10
+                ),
             )
         ).any()
         if bool(invalid.item()):
@@ -525,34 +557,23 @@ def _full_spectrum_joint_program_components(
                 "Full-spectrum DSS device transport components are invalid."
             )
         return _DeviceJointProgramSpectrumComponents(
-            total_pnvsl=total,
-            uncollided_pnvsl=uncollided,
-            features_pnvslf=features,
+            total_pnvsl=total_components,
+            uncollided_pnvsl=uncollided_components,
+            features_pnvslf=feature_components,
             live_times_v=torch.full(
                 (view_count,),
                 resolved_live_time,
-                device=total.device,
-                dtype=total.dtype,
+                device=total_components.device,
+                dtype=total_components.dtype,
             ),
             contract_hash_sha256=str(model.contract_hash_sha256),
         )
-    total = total_flat.reshape(output_shape).transpose(0, 2, 1, 3, 4)
-    uncollided = uncollided_flat.reshape(output_shape).transpose(
-        0,
-        2,
-        1,
-        3,
-        4,
-    )
-    features = features_flat.reshape(output_shape + (len(feature_order),)).transpose(
-        0, 2, 1, 3, 4, 5
-    )
-    if np.any(uncollided > total + 1.0e-10):
+    if np.any(uncollided_components > total_components + 1.0e-10):
         raise RuntimeError("Full-spectrum DSS transport violates uncollided <= total.")
     return _JointProgramSpectrumComponents(
-        total_pnvsl=np.ascontiguousarray(total),
-        uncollided_pnvsl=np.ascontiguousarray(uncollided),
-        features_pnvslf=np.ascontiguousarray(features),
+        total_pnvsl=np.ascontiguousarray(total_components),
+        uncollided_pnvsl=np.ascontiguousarray(uncollided_components),
+        features_pnvslf=np.ascontiguousarray(feature_components),
         live_times_v=np.full(
             view_count,
             resolved_live_time,
@@ -764,6 +785,9 @@ def _program_information_gains_for_poses(
     attempted_action_batch_sizes: list[int] = []
     successful_action_batch_sizes: list[int] = []
     successful_likelihood_action_chunk_sizes: list[int] = []
+    successful_response_resident_bytes: list[int] = []
+    successful_response_materialization_peak_bytes: list[int] = []
+    successful_response_scratch_budget_bytes: list[int] = []
     oom_retry_events: list[dict[str, int]] = []
     for view_count_raw in np.unique(action_lengths):
         view_count = int(view_count_raw)
@@ -833,6 +857,53 @@ def _program_information_gains_for_poses(
             components = None
             retry_after_memory_error = False
             try:
+                response_field_bytes = int(
+                    int(action_indices.size)
+                    * particle_count
+                    * view_count
+                    * max(source_slot_count, 1)
+                    * max(line_count, 1)
+                    * np.dtype(np.float64).itemsize
+                )
+                planner_destination_bytes = int(
+                    (2 + max(feature_count, 1)) * response_field_bytes
+                )
+                # The host generic path preallocates a six-field selected-
+                # action result before runtime transport. The device path
+                # allocates it only after transport, so it is not resident
+                # during scratch. Dense all-pair requests use less memory,
+                # but these generic bounds keep every legacy policy covered.
+                selected_response_bytes = int(
+                    (0 if use_gpu else 6) * response_field_bytes
+                )
+                runtime_retained_bytes = int(8 * response_field_bytes)
+                response_resident_bytes = int(
+                    planner_destination_bytes
+                    + selected_response_bytes
+                    + runtime_retained_bytes
+                )
+                response_assembly_peak_bytes = int(
+                    (20 if use_gpu else 28) * response_field_bytes
+                )
+                response_materialization_peak_bytes = int(
+                    max(
+                        response_assembly_peak_bytes,
+                        response_resident_bytes,
+                    )
+                )
+                if response_materialization_peak_bytes > memory_budget_bytes:
+                    raise MemoryError(
+                        "DSS response materialization exceeds the configured "
+                        "phase budget."
+                    )
+                response_scratch_budget_bytes = (
+                    memory_budget_bytes - response_resident_bytes
+                )
+                if response_scratch_budget_bytes <= 0:
+                    raise MemoryError(
+                        "DSS response buffers exhaust the configured phase "
+                        "budget before transport scratch."
+                    )
                 components = _full_spectrum_joint_program_components(
                     estimator,
                     detectors[action_pose_indices[action_indices]],
@@ -841,6 +912,9 @@ def _program_information_gains_for_poses(
                     live_time_s=float(config.live_time_s),
                     detector_aperture_samples=int(config.detector_aperture_samples),
                     device_resident=use_gpu,
+                    working_memory_budget_bytes=int(
+                        response_scratch_budget_bytes
+                    ),
                 )
                 batch_gains = _full_spectrum_information_gain(
                     estimator,
@@ -864,6 +938,7 @@ def _program_information_gains_for_poses(
                 components = None
                 if not _is_dss_eig_memory_error(error):
                     raise
+                error.__traceback__ = None
                 failed_action_batch_size = action_stop - action_start
                 if failed_action_batch_size <= 1 and state_chunk_size <= 1:
                     raise RuntimeError(
@@ -901,6 +976,15 @@ def _program_information_gains_for_poses(
             successful_likelihood_action_chunk_sizes.append(
                 int(likelihood_action_chunk_size)
             )
+            successful_response_resident_bytes.append(
+                int(response_resident_bytes)
+            )
+            successful_response_materialization_peak_bytes.append(
+                int(response_materialization_peak_bytes)
+            )
+            successful_response_scratch_budget_bytes.append(
+                int(response_scratch_budget_bytes)
+            )
             action_start = action_stop
     for pose_index in range(int(detectors.shape[0])):
         action_start = int(offsets[pose_index])
@@ -926,6 +1010,15 @@ def _program_information_gains_for_poses(
                 "successful_action_batch_sizes": successful_action_batch_sizes,
                 "successful_likelihood_action_chunk_sizes": (
                     successful_likelihood_action_chunk_sizes
+                ),
+                "successful_response_resident_bytes": (
+                    successful_response_resident_bytes
+                ),
+                "successful_response_materialization_peak_bytes": (
+                    successful_response_materialization_peak_bytes
+                ),
+                "successful_response_scratch_budget_bytes": (
+                    successful_response_scratch_budget_bytes
                 ),
                 "oom_retry_count": int(len(oom_retry_events)),
                 "oom_retry_events": oom_retry_events,
@@ -1496,6 +1589,1601 @@ def _exact_eig_shortlist(
     return ordered, ranking_scores, category_counts
 
 
+@dataclass(frozen=True, slots=True)
+class _ConditionalSearchBatch:
+    """Store one batched all-pair program search and its MC evidence."""
+
+    program_pair_ids_al: NDArray[np.int64]
+    information_gains_a: NDArray[np.float64]
+    selection_sources_a: tuple[str, ...]
+    selected_base_kl_samples_aq: NDArray[np.float64]
+    selected_combined_kl_samples_a: tuple[NDArray[np.float64], ...]
+    diagnostics: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _ConditionalPoseEvaluation:
+    """Store one or more MC-seed evaluations over aligned pose batches."""
+
+    information_gains_ra: NDArray[np.float64]
+    program_pair_ids_ral: NDArray[np.int64]
+    selection_sources_r: tuple[tuple[str, ...], ...]
+    selected_base_kl_samples_raq: NDArray[np.float64]
+    selected_combined_kl_samples_r: tuple[
+        tuple[NDArray[np.float64], ...],
+        ...,
+    ]
+    diagnostics: dict[str, object]
+
+
+def _conditional_minimum_response_scratch_budget(
+    estimator: RotatingShieldPFEstimator,
+    *,
+    detector_aperture_samples: int,
+    pair_count: int,
+) -> int:
+    """Return the runtime-owned minimum scratch budget for one source row."""
+    kernel = _continuous_kernel_for_estimator(
+        estimator,
+        detector_aperture_samples=int(detector_aperture_samples),
+    )
+    estimator_method = getattr(
+        kernel,
+        "minimum_line_transport_working_memory_budget_bytes",
+        None,
+    )
+    if not callable(estimator_method):
+        raise RuntimeError(
+            "Conditional DSS requires the runtime response-memory contract."
+        )
+    budgets = [
+        int(
+            estimator_method(
+                isotope=str(isotope),
+                orientation_pair_count=int(pair_count),
+                dtype_bytes=np.dtype(np.float64).itemsize,
+            )
+        )
+        for isotope in sorted(str(value) for value in estimator.isotopes)
+    ]
+    if not budgets or any(value <= 0 for value in budgets):
+        raise RuntimeError("Runtime returned an invalid response scratch budget.")
+    return int(max(budgets))
+
+
+def _all_pair_component_programs(
+    *,
+    action_count: int,
+    pair_count: int,
+) -> list[ShieldProgram]:
+    """Return one dense pair-ID-ordered response request per pose."""
+    if action_count <= 0 or pair_count <= 0:
+        raise ValueError("All-pair component dimensions must be positive.")
+    dense_program = ShieldProgram(
+        name="conditional_all_pair_response_cache",
+        pair_ids=tuple(range(int(pair_count))),
+        kind="internal_all_pair_response_cache",
+    )
+    return [dense_program] * int(action_count)
+
+
+def _slice_joint_program_components(
+    components: (
+        _JointProgramSpectrumComponents
+        | _DeviceJointProgramSpectrumComponents
+    ),
+    action_indices_a: NDArray[np.int64],
+) -> _JointProgramSpectrumComponents | _DeviceJointProgramSpectrumComponents:
+    """Select a batched pose subset without changing response semantics."""
+    indices = np.asarray(action_indices_a, dtype=np.int64).reshape(-1)
+    if indices.size == 0 or np.any(indices < 0):
+        raise ValueError("Component slicing requires nonempty action indices.")
+    if isinstance(components, _DeviceJointProgramSpectrumComponents):
+        if indices.size == 1:
+            action_selector: object = slice(
+                int(indices[0]),
+                int(indices[0]) + 1,
+            )
+        else:
+            import torch
+
+            action_selector = torch.as_tensor(
+                indices,
+                device=components.total_pnvsl.device,
+                dtype=torch.long,
+            )
+        return _DeviceJointProgramSpectrumComponents(
+            total_pnvsl=components.total_pnvsl[action_selector],
+            uncollided_pnvsl=components.uncollided_pnvsl[action_selector],
+            features_pnvslf=components.features_pnvslf[action_selector],
+            live_times_v=components.live_times_v,
+            contract_hash_sha256=components.contract_hash_sha256,
+        )
+    host_selector: object = (
+        slice(int(indices[0]), int(indices[0]) + 1)
+        if indices.size == 1
+        else indices
+    )
+    return _JointProgramSpectrumComponents(
+        total_pnvsl=components.total_pnvsl[host_selector],
+        uncollided_pnvsl=components.uncollided_pnvsl[host_selector],
+        features_pnvslf=components.features_pnvslf[host_selector],
+        live_times_v=np.ascontiguousarray(components.live_times_v),
+        contract_hash_sha256=components.contract_hash_sha256,
+    )
+
+
+def _conditional_contender_subsets(
+    result: ConditionalGreedyResult,
+) -> tuple[NDArray[np.int64], tuple[str, ...]]:
+    """Return greedy, best one-swap, and optional incumbent contenders."""
+    contenders = [
+        np.asarray(result.greedy_program_pair_ids_al, dtype=np.int64),
+    ]
+    names = ["greedy"]
+    if int(result.one_swap_candidate_count_per_action) > 0:
+        contenders.append(
+            np.asarray(
+                result.one_swap_best_program_pair_ids_al,
+                dtype=np.int64,
+            )
+        )
+        names.append("one_swap")
+    if int(result.incumbent_candidate_count_per_action) > 0:
+        contenders.append(
+            np.asarray(
+                result.incumbent_best_program_pair_ids_al,
+                dtype=np.int64,
+            )
+        )
+        names.append("legacy48_guard")
+    subsets = np.stack(contenders, axis=1)
+    return np.asarray(subsets, dtype=np.int64), tuple(names)
+
+
+def _distinct_contender_mask(
+    subsets_ack: NDArray[np.int64],
+) -> NDArray[np.bool_]:
+    """Mask the first occurrence of each pose-specific program contender."""
+    subsets = np.asarray(subsets_ack, dtype=np.int64)
+    if subsets.ndim != 3:
+        raise ValueError("Program contenders must be shaped action/candidate/view.")
+    canonical = np.sort(subsets, axis=2)
+    equal = np.all(
+        canonical[:, :, np.newaxis, :] == canonical[:, np.newaxis, :, :],
+        axis=-1,
+    )
+    earlier = np.tril(
+        np.ones((subsets.shape[1], subsets.shape[1]), dtype=bool),
+        k=-1,
+    )
+    duplicated = np.any(equal & earlier[np.newaxis, :, :], axis=2)
+    return np.asarray(~duplicated, dtype=np.bool_)
+
+
+def _paired_gap_lower_confidence(
+    left_aq: NDArray[np.float64],
+    right_aq: NDArray[np.float64],
+    *,
+    confidence: float,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Return paired mean, standard error, and one-sided lower bounds."""
+    left = np.asarray(left_aq, dtype=np.float64)
+    right = np.asarray(right_aq, dtype=np.float64)
+    if (
+        left.ndim != 2
+        or right.shape != left.shape
+        or left.shape[1] < 2
+        or np.any(~np.isfinite(left))
+        or np.any(~np.isfinite(right))
+    ):
+        raise ValueError("Paired MC samples must be finite aligned matrices.")
+    gap = left - right
+    mean = np.mean(gap, axis=1, dtype=np.float64)
+    standard_error = np.std(gap, axis=1, ddof=1) / np.sqrt(float(gap.shape[1]))
+    critical = float(student_t.ppf(float(confidence), int(gap.shape[1] - 1)))
+    lower = mean - critical * standard_error
+    return (
+        np.asarray(mean, dtype=np.float64),
+        np.asarray(standard_error, dtype=np.float64),
+        np.asarray(lower, dtype=np.float64),
+    )
+
+
+def _select_contenders_from_kl_samples(
+    subsets_ack: NDArray[np.int64],
+    kl_samples_acq: NDArray[np.float64],
+    *,
+    confidence: float,
+) -> tuple[
+    NDArray[np.int64],
+    NDArray[np.float64],
+    NDArray[np.int64],
+    NDArray[np.bool_],
+    NDArray[np.float64],
+]:
+    """Select distinct contenders and identify statistically ambiguous poses."""
+    subsets = np.asarray(subsets_ack, dtype=np.int64)
+    samples = np.asarray(kl_samples_acq, dtype=np.float64)
+    if (
+        subsets.ndim != 3
+        or samples.ndim != 3
+        or subsets.shape[:2] != samples.shape[:2]
+        or samples.shape[2] < 2
+        or np.any(~np.isfinite(samples))
+    ):
+        raise ValueError("Contender subsets and KL samples are inconsistent.")
+    means = np.mean(samples, axis=2, dtype=np.float64)
+    distinct = _distinct_contender_mask(subsets)
+    ranked_means = np.where(distinct, means, -np.inf)
+    order = np.argsort(-ranked_means, axis=1, kind="stable")
+    rows = np.arange(subsets.shape[0], dtype=np.int64)
+    best = order[:, 0]
+    distinct_count = np.sum(distinct, axis=1, dtype=np.int64)
+    runner_position = np.where(distinct_count > 1, 1, 0).astype(
+        np.int64,
+        copy=False,
+    )
+    runner = order[rows, runner_position]
+    best_samples = samples[rows, best]
+    runner_samples = samples[rows, runner]
+    _, _, lower = _paired_gap_lower_confidence(
+        best_samples,
+        runner_samples,
+        confidence=float(confidence),
+    )
+    ambiguous = (distinct_count > 1) & (lower <= 0.0)
+    selected_subsets = subsets[rows, best]
+    selected_means = means[rows, best]
+    return (
+        np.asarray(selected_subsets, dtype=np.int64),
+        np.asarray(selected_means, dtype=np.float64),
+        np.asarray(best, dtype=np.int64),
+        np.asarray(ambiguous, dtype=np.bool_),
+        np.asarray(lower, dtype=np.float64),
+    )
+
+
+def _conditional_search_with_components(
+    *,
+    estimator: RotatingShieldPFEstimator,
+    components: (
+        _JointProgramSpectrumComponents
+        | _DeviceJointProgramSpectrumComponents
+    ),
+    detector_positions_a3: NDArray[np.float64],
+    particle_weights_n: NDArray[np.float64],
+    program_length: int,
+    sample_count: int,
+    eig_call_seed: int,
+    stream_name: str,
+    enable_one_swap: bool,
+    incumbent_subsets_ck: NDArray[np.int64] | None,
+    confirm_ambiguous: bool,
+    confidence: float,
+) -> _ConditionalSearchBatch:
+    """Search all pair subsets, confirming only ambiguous final contenders."""
+    import torch
+
+    prepared = prepare_conditional_observation_cache(
+        estimator,
+        components,
+        particle_weights_n,
+        detector_positions_a3,
+        sample_count=int(sample_count),
+        eig_call_seed=int(eig_call_seed),
+        stream_name=str(stream_name),
+    )
+    result = select_conditional_greedy_programs(
+        prepared.cache,
+        particle_weights_n,
+        num_orientations=int(estimator.num_orientations),
+        program_length=int(program_length),
+        enable_one_swap=bool(enable_one_swap),
+        incumbent_subsets=incumbent_subsets_ck,
+    )
+    contenders, contender_names = _conditional_contender_subsets(result)
+    contender_tensor = torch.as_tensor(
+        contenders,
+        device=getattr(prepared.cache, "device"),
+        dtype=torch.long,
+    )
+    _initial_eig, initial_kl_tensor = evaluate_subset_information_gain_torch(
+        prepared.cache,
+        contender_tensor,
+        particle_weights_n,
+    )
+    initial_kl = np.asarray(
+        initial_kl_tensor.detach().cpu().numpy(),
+        dtype=np.float64,
+    )
+    (
+        selected_programs,
+        selected_gains,
+        selected_indices,
+        ambiguous,
+        initial_lower,
+    ) = _select_contenders_from_kl_samples(
+        contenders,
+        initial_kl,
+        confidence=float(confidence),
+    )
+    base_selected_kl = initial_kl[
+        np.arange(initial_kl.shape[0], dtype=np.int64),
+        selected_indices,
+    ].copy()
+    selected_combined_kl = [
+        np.asarray(values, dtype=np.float64).copy()
+        for values in base_selected_kl
+    ]
+    # All tensors needed from the first seed are now on the host. Releasing
+    # its opaque cache before an independent confirmation prevents two full
+    # action caches from overlapping in device memory.
+    del _initial_eig, initial_kl_tensor, contender_tensor, prepared
+    confirmation_count = 0
+    confirmation_batch_sizes: list[int] = []
+    confirmation_component_strategy = "not_requested"
+    combined_lower = initial_lower.copy()
+    if bool(confirm_ambiguous) and np.any(ambiguous):
+        _release_dss_gpu_cache()
+        ambiguous_indices = np.flatnonzero(ambiguous).astype(np.int64, copy=False)
+        confirmation_count = int(ambiguous_indices.size)
+        confirmation_seed = int(
+            named_stream_seed(
+                int(eig_call_seed),
+                "dss_pp",
+                "conditional_all_pairs",
+                str(stream_name),
+                "ambiguous_program_confirmation",
+            )
+            & ((1 << 63) - 1)
+        )
+        confirmation_kl = np.empty_like(initial_kl[ambiguous_indices])
+        all_actions_ambiguous = bool(
+            ambiguous_indices.size == initial_kl.shape[0]
+            and np.array_equal(
+                ambiguous_indices,
+                np.arange(initial_kl.shape[0], dtype=np.int64),
+            )
+        )
+        confirmation_batches = (
+            (ambiguous_indices,)
+            if all_actions_ambiguous
+            else tuple(
+                np.asarray([value], dtype=np.int64)
+                for value in ambiguous_indices
+            )
+        )
+        confirmation_component_strategy = (
+            "reuse_original_all_actions"
+            if all_actions_ambiguous
+            else "single_pose_views_without_full_ambiguous_copy"
+        )
+        confirmation_offset = 0
+        for confirmation_indices in confirmation_batches:
+            confirmation_batch_sizes.append(int(confirmation_indices.size))
+            confirmation_components = (
+                components
+                if all_actions_ambiguous
+                else _slice_joint_program_components(
+                    components,
+                    confirmation_indices,
+                )
+            )
+            confirmation = prepare_conditional_observation_cache(
+                estimator,
+                confirmation_components,
+                particle_weights_n,
+                np.asarray(detector_positions_a3, dtype=np.float64)[
+                    confirmation_indices
+                ],
+                sample_count=int(sample_count),
+                eig_call_seed=confirmation_seed,
+                stream_name=(
+                    f"{stream_name}_ambiguous_program_confirmation"
+                ),
+            )
+            confirmation_contenders = torch.as_tensor(
+                contenders[confirmation_indices],
+                device=getattr(confirmation.cache, "device"),
+                dtype=torch.long,
+            )
+            _confirmation_eig, confirmation_kl_tensor = (
+                evaluate_subset_information_gain_torch(
+                    confirmation.cache,
+                    confirmation_contenders,
+                    particle_weights_n,
+                )
+            )
+            confirmation_stop = (
+                confirmation_offset + int(confirmation_indices.size)
+            )
+            confirmation_kl[confirmation_offset:confirmation_stop] = np.asarray(
+                confirmation_kl_tensor.detach().cpu().numpy(),
+                dtype=np.float64,
+            )
+            confirmation_offset = confirmation_stop
+            del (
+                _confirmation_eig,
+                confirmation_kl_tensor,
+                confirmation_contenders,
+                confirmation,
+                confirmation_components,
+            )
+            _release_dss_gpu_cache()
+        combined_kl = np.concatenate(
+            (initial_kl[ambiguous_indices], confirmation_kl),
+            axis=2,
+        )
+        (
+            confirmed_programs,
+            confirmed_gains,
+            confirmed_indices,
+            _still_ambiguous,
+            confirmed_lower,
+        ) = _select_contenders_from_kl_samples(
+            contenders[ambiguous_indices],
+            combined_kl,
+            confidence=float(confidence),
+        )
+        selected_programs[ambiguous_indices] = confirmed_programs
+        selected_gains[ambiguous_indices] = confirmed_gains
+        selected_indices[ambiguous_indices] = confirmed_indices
+        combined_lower[ambiguous_indices] = confirmed_lower
+        base_selected_kl[ambiguous_indices] = initial_kl[
+            ambiguous_indices,
+            confirmed_indices,
+        ]
+        for local_index, action_index in enumerate(ambiguous_indices):
+            selected_combined_kl[int(action_index)] = np.asarray(
+                combined_kl[local_index, confirmed_indices[local_index]],
+                dtype=np.float64,
+            ).copy()
+    selected_sources = tuple(
+        contender_names[int(index)] for index in selected_indices
+    )
+    diagnostics: dict[str, object] = {
+        "greedy_candidate_count_per_pose": int(
+            result.greedy_candidate_count_per_action
+        ),
+        "one_swap_candidate_count_per_pose": int(
+            result.one_swap_candidate_count_per_action
+        ),
+        "legacy_guard_candidate_count_per_pose": int(
+            result.incumbent_candidate_count_per_action
+        ),
+        "initial_selection_sources": list(result.selection_source_a),
+        "selected_sources": list(selected_sources),
+        "ambiguous_program_pose_count": int(np.count_nonzero(ambiguous)),
+        "independently_confirmed_program_pose_count": int(confirmation_count),
+        "initial_cache_released_before_confirmation": True,
+        "confirmation_component_strategy": str(
+            confirmation_component_strategy
+        ),
+        "confirmation_pose_batch_sizes": confirmation_batch_sizes,
+        "confirmation_additional_component_pose_limit": int(
+            0
+            if confirmation_component_strategy == "reuse_original_all_actions"
+            else 1
+            if confirmation_count > 0
+            else 0
+        ),
+        "program_gap_lower_confidence_initial": [
+            float(value) for value in initial_lower
+        ],
+        "program_gap_lower_confidence_combined": [
+            float(value) for value in combined_lower
+        ],
+        "one_swap_applied_count": int(np.count_nonzero(result.one_swap_applied_a)),
+        "legacy_guard_applied_count": int(
+            np.count_nonzero(result.incumbent_floor_applied_a)
+        ),
+    }
+    return _ConditionalSearchBatch(
+        program_pair_ids_al=np.asarray(selected_programs, dtype=np.int64),
+        information_gains_a=np.asarray(selected_gains, dtype=np.float64),
+        selection_sources_a=selected_sources,
+        selected_base_kl_samples_aq=np.asarray(base_selected_kl, dtype=np.float64),
+        selected_combined_kl_samples_a=tuple(selected_combined_kl),
+        diagnostics=diagnostics,
+    )
+
+
+def _evaluate_conditional_pose_batches(
+    *,
+    estimator: RotatingShieldPFEstimator,
+    detector_positions_a3: NDArray[np.float64],
+    joint_particles: JointPlanningParticles,
+    config: DSSPPConfig,
+    sample_count: int,
+    eig_call_seeds_r: NDArray[np.int64],
+    stream_name: str,
+    workload: str,
+    working_memory_budget_bytes: int,
+    maximum_subset_candidate_count: int,
+    enable_one_swap: bool,
+    incumbent_subsets_ck: NDArray[np.int64] | None,
+    confirm_ambiguous: bool,
+) -> _ConditionalPoseEvaluation:
+    """Evaluate all-pair searches in response-preserving batched pose chunks."""
+    detectors = np.asarray(detector_positions_a3, dtype=np.float64)
+    seeds = np.asarray(eig_call_seeds_r)
+    if (
+        detectors.ndim != 2
+        or detectors.shape[1] != 3
+        or detectors.shape[0] <= 0
+        or np.any(~np.isfinite(detectors))
+    ):
+        raise ValueError("Conditional detector poses must be finite and nonempty.")
+    if (
+        seeds.ndim != 1
+        or seeds.size <= 0
+        or not np.issubdtype(seeds.dtype, np.integer)
+        or np.any(seeds < 0)
+    ):
+        raise ValueError("Conditional EIG seeds must be nonnegative integers.")
+    pair_count = int(estimator.num_orientations) ** 2
+    program_length = int(config.program_length)
+    action_count = int(detectors.shape[0])
+    replica_count = int(seeds.size)
+    source_slot_count = int(
+        sum(
+            np.asarray(values).shape[1]
+            for values in joint_particles.strengths_nk_by_isotope.values()
+        )
+    )
+    model = validate_full_spectrum_model(
+        estimator.full_spectrum_generative_model
+    )
+    minimum_response_scratch = _conditional_minimum_response_scratch_budget(
+        estimator,
+        detector_aperture_samples=int(config.detector_aperture_samples),
+        pair_count=int(pair_count),
+    )
+    chunk_plan = plan_conditional_pose_chunk(
+        model,
+        workload=str(workload),
+        requested_pose_count=int(action_count),
+        particle_count=int(np.asarray(joint_particles.weights_n).size),
+        sample_count=int(sample_count),
+        source_slot_count=max(1, source_slot_count),
+        pair_count=int(pair_count),
+        program_length=int(program_length),
+        line_count=len(tuple(model.line_identity)),
+        feature_count=len(tuple(model.transport_feature_order)),
+        maximum_subset_candidate_count=int(maximum_subset_candidate_count),
+        configured_total_budget_bytes=int(working_memory_budget_bytes),
+        minimum_response_scratch_budget_bytes=int(minimum_response_scratch),
+        use_gpu=bool(estimator.pf_config.use_gpu),
+        gpu_device=str(estimator.pf_config.gpu_device),
+    )
+    pose_chunk_size = int(chunk_plan.pose_chunk_size)
+    gains = np.empty((replica_count, action_count), dtype=np.float64)
+    programs = np.empty(
+        (replica_count, action_count, program_length),
+        dtype=np.int64,
+    )
+    kl_samples = np.empty(
+        (replica_count, action_count, int(sample_count)),
+        dtype=np.float64,
+    )
+    source_rows: list[list[str]] = [list() for _ in range(replica_count)]
+    combined_kl_rows: list[list[NDArray[np.float64]]] = [
+        [] for _ in range(replica_count)
+    ]
+    chunk_diagnostics: list[dict[str, object]] = []
+    response_wall_s = 0.0
+    search_wall_s = 0.0
+    weights = np.asarray(joint_particles.weights_n, dtype=np.float64)
+    oom_retry_events: list[dict[str, object]] = []
+    active_pose_chunk_size = int(pose_chunk_size)
+    action_start = 0
+    while action_start < action_count:
+        action_stop = min(action_start + active_pose_chunk_size, action_count)
+        chunk_detectors = detectors[action_start:action_stop]
+        response_scratch_budget = (
+            chunk_plan.response_scratch_budget_for_pose_count(
+                int(chunk_detectors.shape[0])
+            )
+        )
+        attempt_started = time.perf_counter()
+        components = None
+        local_batches: list[_ConditionalSearchBatch] = []
+        replica_diagnostics: list[dict[str, object]] = []
+        try:
+            response_started = time.perf_counter()
+            components = _full_spectrum_joint_program_components(
+                estimator=estimator,
+                detector_positions=chunk_detectors,
+                programs=_all_pair_component_programs(
+                    action_count=int(chunk_detectors.shape[0]),
+                    pair_count=pair_count,
+                ),
+                joint_particles=joint_particles,
+                live_time_s=float(config.live_time_s),
+                detector_aperture_samples=int(
+                    config.detector_aperture_samples
+                ),
+                device_resident=bool(estimator.pf_config.use_gpu),
+                working_memory_budget_bytes=int(response_scratch_budget),
+            )
+            response_wall_s += float(time.perf_counter() - response_started)
+            for replica_index, seed in enumerate(seeds):
+                search_started = time.perf_counter()
+                batch = _conditional_search_with_components(
+                    estimator=estimator,
+                    components=components,
+                    detector_positions_a3=chunk_detectors,
+                    particle_weights_n=weights,
+                    program_length=program_length,
+                    sample_count=int(sample_count),
+                    eig_call_seed=int(seed),
+                    stream_name=f"{stream_name}_replica_{replica_index}",
+                    enable_one_swap=bool(enable_one_swap),
+                    incumbent_subsets_ck=incumbent_subsets_ck,
+                    confirm_ambiguous=bool(confirm_ambiguous),
+                    confidence=float(config.proxy_boundary_confidence),
+                )
+                search_wall_s += float(time.perf_counter() - search_started)
+                local_batches.append(batch)
+                replica_diagnostics.append(dict(batch.diagnostics))
+        except Exception as error:
+            if not _is_dss_eig_memory_error(error):
+                raise
+            error.__traceback__ = None
+            components = None
+            local_batches.clear()
+            _release_dss_gpu_cache()
+            failed_chunk_size = int(chunk_detectors.shape[0])
+            if failed_chunk_size <= 1:
+                raise RuntimeError(
+                    "Conditional DSS exhausted memory for one full-fidelity "
+                    "pose after response/cache retry reduction."
+                ) from error
+            reduced_chunk_size = 2 if failed_chunk_size > 2 else 1
+            oom_retry_events.append(
+                {
+                    "action_start": int(action_start),
+                    "failed_pose_chunk_size": int(failed_chunk_size),
+                    "retry_pose_chunk_size": int(reduced_chunk_size),
+                    "response_scratch_budget_bytes": int(
+                        response_scratch_budget
+                    ),
+                    "failed_attempt_wall_s": float(
+                        time.perf_counter() - attempt_started
+                    ),
+                }
+            )
+            active_pose_chunk_size = int(reduced_chunk_size)
+            continue
+        for replica_index, batch in enumerate(local_batches):
+            gains[replica_index, action_start:action_stop] = (
+                batch.information_gains_a
+            )
+            programs[replica_index, action_start:action_stop] = (
+                batch.program_pair_ids_al
+            )
+            kl_samples[replica_index, action_start:action_stop] = (
+                batch.selected_base_kl_samples_aq
+            )
+            source_rows[replica_index].extend(batch.selection_sources_a)
+            combined_kl_rows[replica_index].extend(
+                batch.selected_combined_kl_samples_a
+            )
+        components = None
+        chunk_diagnostics.append(
+            {
+                "action_start": int(action_start),
+                "action_stop": int(action_stop),
+                "pose_chunk_size": int(chunk_detectors.shape[0]),
+                "response_scratch_budget_bytes": int(
+                    response_scratch_budget
+                ),
+                "replicas": replica_diagnostics,
+            }
+        )
+        action_start = action_stop
+    if (
+        np.any(~np.isfinite(gains))
+        or np.any(gains < 0.0)
+        or np.any(programs < 0)
+        or np.any(programs >= pair_count)
+        or np.any(~np.isfinite(kl_samples))
+    ):
+        raise RuntimeError("Conditional pose batching produced invalid results.")
+    if any(len(values) != action_count for values in source_rows) or any(
+        len(values) != action_count for values in combined_kl_rows
+    ):
+        raise RuntimeError("Conditional pose batching lost action diagnostics.")
+    combined_means = np.asarray(
+        [
+            [float(np.mean(values, dtype=np.float64)) for values in replica]
+            for replica in combined_kl_rows
+        ],
+        dtype=np.float64,
+    )
+    if not np.allclose(
+        combined_means,
+        gains,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    ):
+        raise RuntimeError("Conditional EIG means lost their paired MC samples.")
+    diagnostics: dict[str, object] = {
+        "pose_count": int(action_count),
+        "pose_chunk_size": int(pose_chunk_size),
+        "pose_chunk_count": int(len(chunk_diagnostics)),
+        "replica_count": int(replica_count),
+        "sample_count": int(sample_count),
+        "particle_count": int(weights.size),
+        "pair_count": int(pair_count),
+        "program_length": int(program_length),
+        "response_wall_s": float(response_wall_s),
+        "search_wall_s": float(search_wall_s),
+        "wall_s": float(response_wall_s + search_wall_s),
+        "memory_chunk_plan": chunk_plan.diagnostics(),
+        "oom_retry_count": int(len(oom_retry_events)),
+        "oom_retry_events": oom_retry_events,
+        "successful_pose_chunk_sizes": [
+            int(item["pose_chunk_size"]) for item in chunk_diagnostics
+        ],
+        "chunks": chunk_diagnostics,
+    }
+    return _ConditionalPoseEvaluation(
+        information_gains_ra=np.asarray(gains, dtype=np.float64),
+        program_pair_ids_ral=np.asarray(programs, dtype=np.int64),
+        selection_sources_r=tuple(tuple(values) for values in source_rows),
+        selected_base_kl_samples_raq=np.asarray(kl_samples, dtype=np.float64),
+        selected_combined_kl_samples_r=tuple(
+            tuple(np.asarray(values, dtype=np.float64) for values in replica)
+            for replica in combined_kl_rows
+        ),
+        diagnostics=diagnostics,
+    )
+
+
+def _evaluate_fixed_programs_in_pose_batches(
+    *,
+    estimator: RotatingShieldPFEstimator,
+    detector_positions_a3: NDArray[np.float64],
+    program_pair_ids_al: NDArray[np.int64],
+    joint_particles: JointPlanningParticles,
+    config: DSSPPConfig,
+    sample_count: int,
+    eig_call_seed: int,
+    stream_name: str,
+    working_memory_budget_bytes: int,
+) -> tuple[NDArray[np.float64], dict[str, object]]:
+    """Return fixed-program KL samples and memory scheduling diagnostics."""
+    import torch
+
+    detectors = np.asarray(detector_positions_a3, dtype=np.float64)
+    programs = np.asarray(program_pair_ids_al, dtype=np.int64)
+    if (
+        detectors.ndim != 2
+        or detectors.shape[1] != 3
+        or programs.shape
+        != (detectors.shape[0], int(config.program_length))
+        or detectors.shape[0] <= 0
+        or np.any(~np.isfinite(detectors))
+    ):
+        raise ValueError("Fixed-program confirmation inputs are inconsistent.")
+    output = np.empty(
+        (detectors.shape[0], int(sample_count)),
+        dtype=np.float64,
+    )
+    pair_count = int(estimator.num_orientations) ** 2
+    particle_weights = np.asarray(joint_particles.weights_n, dtype=np.float64)
+    source_slot_count = int(
+        sum(
+            np.asarray(values).shape[1]
+            for values in joint_particles.strengths_nk_by_isotope.values()
+        )
+    )
+    model = validate_full_spectrum_model(
+        estimator.full_spectrum_generative_model
+    )
+    minimum_response_scratch = _conditional_minimum_response_scratch_budget(
+        estimator,
+        detector_aperture_samples=int(config.detector_aperture_samples),
+        pair_count=int(pair_count),
+    )
+    chunk_plan = plan_conditional_pose_chunk(
+        model,
+        workload="exact",
+        requested_pose_count=int(detectors.shape[0]),
+        particle_count=int(particle_weights.size),
+        sample_count=int(sample_count),
+        source_slot_count=max(1, source_slot_count),
+        pair_count=int(pair_count),
+        program_length=int(config.program_length),
+        line_count=len(tuple(model.line_identity)),
+        feature_count=len(tuple(model.transport_feature_order)),
+        maximum_subset_candidate_count=1,
+        configured_total_budget_bytes=int(working_memory_budget_bytes),
+        minimum_response_scratch_budget_bytes=int(minimum_response_scratch),
+        use_gpu=bool(estimator.pf_config.use_gpu),
+        gpu_device=str(estimator.pf_config.gpu_device),
+    )
+    pose_chunk_size = int(chunk_plan.pose_chunk_size)
+    active_pose_chunk_size = int(pose_chunk_size)
+    action_start = 0
+    oom_retry_events: list[dict[str, int]] = []
+    successful_pose_chunk_sizes: list[int] = []
+    while action_start < int(detectors.shape[0]):
+        action_stop = min(
+            action_start + int(active_pose_chunk_size),
+            int(detectors.shape[0]),
+        )
+        chunk_detectors = detectors[action_start:action_stop]
+        components = None
+        prepared = None
+        subset_tensor = None
+        information_gain_tensor = None
+        kl_tensor = None
+        try:
+            components = _full_spectrum_joint_program_components(
+                estimator,
+                chunk_detectors,
+                _all_pair_component_programs(
+                    action_count=int(chunk_detectors.shape[0]),
+                    pair_count=pair_count,
+                ),
+                joint_particles,
+                live_time_s=float(config.live_time_s),
+                detector_aperture_samples=int(
+                    config.detector_aperture_samples
+                ),
+                device_resident=bool(estimator.pf_config.use_gpu),
+                working_memory_budget_bytes=(
+                    chunk_plan.response_scratch_budget_for_pose_count(
+                        int(chunk_detectors.shape[0])
+                    )
+                ),
+            )
+            prepared = prepare_conditional_observation_cache(
+                estimator,
+                components,
+                particle_weights,
+                chunk_detectors,
+                sample_count=int(sample_count),
+                eig_call_seed=int(eig_call_seed),
+                stream_name=str(stream_name),
+            )
+            subset_tensor = torch.as_tensor(
+                programs[action_start:action_stop, np.newaxis, :],
+                device=getattr(prepared.cache, "device"),
+                dtype=torch.long,
+            )
+            information_gain_tensor, kl_tensor = (
+                evaluate_subset_information_gain_torch(
+                    prepared.cache,
+                    subset_tensor,
+                    particle_weights,
+                )
+            )
+            output[action_start:action_stop] = np.asarray(
+                kl_tensor[:, 0].detach().cpu().numpy(),
+                dtype=np.float64,
+            )
+            del (
+                information_gain_tensor,
+                kl_tensor,
+                subset_tensor,
+                prepared,
+            )
+        except Exception as error:
+            if not _is_dss_eig_memory_error(error):
+                raise
+            error.__traceback__ = None
+            components = None
+            prepared = None
+            subset_tensor = None
+            information_gain_tensor = None
+            kl_tensor = None
+            _release_dss_gpu_cache()
+            failed_chunk_size = int(chunk_detectors.shape[0])
+            if failed_chunk_size <= 1:
+                raise RuntimeError(
+                    "Fixed-program confirmation exhausted memory for one "
+                    "full-fidelity pose."
+                ) from error
+            reduced_chunk_size = 2 if failed_chunk_size > 2 else 1
+            oom_retry_events.append(
+                {
+                    "action_start": int(action_start),
+                    "failed_pose_chunk_size": int(failed_chunk_size),
+                    "retry_pose_chunk_size": int(reduced_chunk_size),
+                }
+            )
+            active_pose_chunk_size = int(reduced_chunk_size)
+            continue
+        components = None
+        successful_pose_chunk_sizes.append(int(chunk_detectors.shape[0]))
+        action_start = action_stop
+    if np.any(~np.isfinite(output)) or np.any(output < 0.0):
+        raise RuntimeError("Fixed-program confirmation produced invalid KL samples.")
+    diagnostics = chunk_plan.diagnostics()
+    diagnostics.update(
+        {
+            "oom_retry_count": int(len(oom_retry_events)),
+            "oom_retry_events": oom_retry_events,
+            "successful_pose_chunk_sizes": successful_pose_chunk_sizes,
+        }
+    )
+    return output, diagnostics
+
+
+def _static_station_scores_batch(
+    *,
+    coverage_norm_p: NDArray[np.float64],
+    revisit_penalties_p: NDArray[np.float64],
+    bearing_gains_p: NDArray[np.float64],
+    frontier_gains_p: NDArray[np.float64],
+    turn_penalties_p: NDArray[np.float64],
+    local_orbit_gains_p: NDArray[np.float64],
+    elevation_condition_gains_p: NDArray[np.float64],
+    coverage_floor: float,
+    config: DSSPPConfig,
+) -> NDArray[np.float64]:
+    """Return vectorized spatial utility without EIG or physical motion."""
+    coverage = np.asarray(coverage_norm_p, dtype=np.float64).reshape(-1)
+    arrays = tuple(
+        np.asarray(values, dtype=np.float64).reshape(-1)
+        for values in (
+            revisit_penalties_p,
+            bearing_gains_p,
+            frontier_gains_p,
+            turn_penalties_p,
+            local_orbit_gains_p,
+            elevation_condition_gains_p,
+        )
+    )
+    if any(values.shape != coverage.shape for values in arrays) or any(
+        np.any(~np.isfinite(values)) for values in (coverage,) + arrays
+    ):
+        raise ValueError("Batched static pose-score components must align.")
+    revisit, bearing, frontier, turn, local_orbit, elevation = arrays
+    scores = (
+        float(config.lambda_coverage) * coverage
+        + float(config.lambda_bearing_diversity) * bearing
+        + float(config.lambda_frontier) * frontier
+        + float(config.lambda_local_orbit) * local_orbit
+        + float(config.lambda_elevation_condition)
+        * np.log1p(np.maximum(elevation, 0.0))
+        - float(config.eta_revisit) * revisit
+        - float(config.lambda_turn_smoothness) * turn
+        - float(config.coverage_floor_weight)
+        * np.square(np.maximum(0.0, float(coverage_floor) - coverage))
+    )
+    if np.any(~np.isfinite(scores)):
+        raise RuntimeError("Batched static pose scoring produced invalid values.")
+    return np.asarray(scores, dtype=np.float64)
+
+
+def _proxy_replica_scores_payload(
+    scores_rp: NDArray[np.float64],
+    *,
+    evaluated: bool,
+) -> list[list[float | None]]:
+    """Return JSON-safe proxy replicas with missing refinements as null."""
+    if not bool(evaluated):
+        return []
+    scores = np.asarray(scores_rp, dtype=np.float64)
+    if scores.ndim != 2 or np.any(np.isinf(scores)):
+        raise ValueError("Proxy replica diagnostics may contain finite values or NaN.")
+    return [
+        [None if not np.isfinite(value) else float(value) for value in replica]
+        for replica in scores
+    ]
+
+
+def _conditional_pose_ambiguity_mask(
+    score_samples_aq: NDArray[np.float64],
+    mean_scores_a: NDArray[np.float64],
+    *,
+    confidence: float,
+) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
+    """Return poses whose paired score gap from the leader is not established."""
+    samples = np.asarray(score_samples_aq, dtype=np.float64)
+    means = np.asarray(mean_scores_a, dtype=np.float64).reshape(-1)
+    if (
+        samples.ndim != 2
+        or samples.shape[0] != means.size
+        or samples.shape[1] < 2
+        or np.any(~np.isfinite(samples))
+        or np.any(~np.isfinite(means))
+    ):
+        raise ValueError("Pose ambiguity requires finite aligned MC scores.")
+    leader = int(_stable_descending_indices(means)[0])
+    leader_samples = np.broadcast_to(samples[leader], samples.shape)
+    _, _, lower = _paired_gap_lower_confidence(
+        leader_samples,
+        samples,
+        confidence=float(confidence),
+    )
+    lower[leader] = np.inf
+    ambiguous = lower <= 0.0
+    ambiguous[leader] = True
+    return np.asarray(ambiguous, dtype=np.bool_), np.asarray(lower, dtype=np.float64)
+
+
+def _build_conditional_nodes(
+    *,
+    estimator: RotatingShieldPFEstimator,
+    candidate_poses: NDArray[np.float64],
+    path_lengths: NDArray[np.float64],
+    coverage_norm: NDArray[np.float64],
+    coverage_raw: NDArray[np.float64],
+    revisit_penalties: NDArray[np.float64],
+    bearing_gains: NDArray[np.float64],
+    frontier_gains: NDArray[np.float64],
+    turn_penalties: NDArray[np.float64],
+    local_orbit_gains: NDArray[np.float64],
+    elevation_condition_gains: NDArray[np.float64],
+    coverage_floor: float,
+    coverage_support: str,
+    coverage_quadrature_diagnostics: dict[str, object] | None,
+    config: DSSPPConfig,
+    rng: np.random.Generator,
+    joint_particles: JointPlanningParticles,
+    legacy_guard_programs: Sequence[ShieldProgram],
+    motion_times: NDArray[np.float64] | None,
+    motion_time_components: tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]
+    | None,
+    path_length_support: str,
+) -> tuple[list[DSSPPNode], dict[str, object]]:
+    """Build standard DSS nodes with all-pair conditional program search."""
+    conditional_started = time.perf_counter()
+    poses = np.asarray(candidate_poses, dtype=np.float64)
+    paths = np.asarray(path_lengths, dtype=np.float64).reshape(-1)
+    valid_pose_indices = np.flatnonzero(np.isfinite(paths)).astype(
+        np.int64,
+        copy=False,
+    )
+    if valid_pose_indices.size == 0:
+        return [], {
+            "total_action_count": 0,
+            "proxy_action_count": 0,
+            "exact_action_count": 0,
+            "path_length_support": path_length_support,
+        }
+    static_scores = _static_station_scores_batch(
+        coverage_norm_p=coverage_norm,
+        revisit_penalties_p=revisit_penalties,
+        bearing_gains_p=bearing_gains,
+        frontier_gains_p=frontier_gains,
+        turn_penalties_p=turn_penalties,
+        local_orbit_gains_p=local_orbit_gains,
+        elevation_condition_gains_p=elevation_condition_gains,
+        coverage_floor=float(coverage_floor),
+        config=config,
+    )
+    exact_seed = int(
+        rng.integers(
+            0,
+            np.iinfo(np.int64).max,
+            endpoint=False,
+            dtype=np.int64,
+        )
+    )
+    available_pose_count = int(valid_pose_indices.size)
+    proxy_evaluation: _ConditionalPoseEvaluation | None = None
+    refinement_evaluation: _ConditionalPoseEvaluation | None = None
+    refinement_pose_count = 0
+    proxy_replica_scores = np.full(
+        (int(config.proxy_stability_replicates), available_pose_count),
+        np.nan,
+        dtype=np.float64,
+    )
+    if available_pose_count <= int(config.exact_eig_pose_min):
+        shortlisted_local_indices = np.arange(
+            available_pose_count,
+            dtype=np.int64,
+        )
+        shortlist_stop_reason = "all_poses_fit_minimum"
+        shortlist_boundaries: list[dict[str, object]] = []
+        coverage_reserve_pose = None
+    else:
+        proxy_particles = estimator.planning_joint_particles(
+            max_particles=int(config.proxy_planning_particles),
+            method="top_weight",
+        )
+        proxy_seed = int(
+            named_stream_seed(
+                exact_seed,
+                "dss_pp",
+                "conditional_all_pairs",
+                "proxy_base",
+            )
+            & ((1 << 63) - 1)
+        )
+        proxy_evaluation = _evaluate_conditional_pose_batches(
+            estimator=estimator,
+            detector_positions_a3=poses[valid_pose_indices],
+            joint_particles=proxy_particles,
+            config=config,
+            sample_count=int(config.proxy_eig_samples),
+            eig_call_seeds_r=np.asarray([proxy_seed], dtype=np.int64),
+            stream_name="proxy_all_poses",
+            workload="proxy",
+            working_memory_budget_bytes=int(config.proxy_memory_budget_bytes),
+            maximum_subset_candidate_count=(
+                int(estimator.num_orientations) ** 2
+            ),
+            enable_one_swap=False,
+            incumbent_subsets_ck=None,
+            confirm_ambiguous=False,
+        )
+        proxy_motion_times = (
+            None if motion_times is None else motion_times[valid_pose_indices]
+        )
+        proxy_motion_components = (
+            None
+            if motion_time_components is None
+            else tuple(values[valid_pose_indices] for values in motion_time_components)
+        )
+        base_proxy_scores, proxy_distance_weight = compose_pose_scores(
+            proxy_evaluation.information_gains_ra[0],
+            static_scores[valid_pose_indices],
+            paths[valid_pose_indices],
+            config=config,
+            program_length=int(config.program_length),
+            motion_times_p=proxy_motion_times,
+            motion_time_components_p=proxy_motion_components,
+        )
+        proxy_replica_scores[0] = base_proxy_scores
+        refinement_count = min(
+            int(config.proxy_stability_refinement_pool),
+            available_pose_count,
+        )
+        refinement_pose_count = int(refinement_count)
+        refinement_local_indices = _stable_descending_indices(
+            base_proxy_scores
+        )[:refinement_count]
+        extra_replica_count = int(config.proxy_stability_replicates) - 1
+        if extra_replica_count > 0:
+            refinement_seeds = np.asarray(
+                [
+                    named_stream_seed(
+                        exact_seed,
+                        "dss_pp",
+                        "conditional_all_pairs",
+                        "proxy_refinement",
+                        int(replica_index),
+                    )
+                    & ((1 << 63) - 1)
+                    for replica_index in range(extra_replica_count)
+                ],
+                dtype=np.int64,
+            )
+            refinement_evaluation = _evaluate_conditional_pose_batches(
+                estimator=estimator,
+                detector_positions_a3=poses[
+                    valid_pose_indices[refinement_local_indices]
+                ],
+                joint_particles=proxy_particles,
+                config=config,
+                sample_count=int(config.proxy_eig_samples),
+                eig_call_seeds_r=refinement_seeds,
+                stream_name="proxy_refinement_pool",
+                workload="proxy",
+                working_memory_budget_bytes=int(
+                    config.proxy_memory_budget_bytes
+                ),
+                maximum_subset_candidate_count=(
+                    int(estimator.num_orientations) ** 2
+                ),
+                enable_one_swap=False,
+                incumbent_subsets_ck=None,
+                confirm_ambiguous=False,
+            )
+            resolved_proxy_config = replace(
+                config,
+                lambda_distance=float(proxy_distance_weight),
+            )
+            for replica_index in range(extra_replica_count):
+                refined_scores, _ = compose_pose_scores(
+                    refinement_evaluation.information_gains_ra[replica_index],
+                    static_scores[
+                        valid_pose_indices[refinement_local_indices]
+                    ],
+                    paths[valid_pose_indices[refinement_local_indices]],
+                    config=resolved_proxy_config,
+                    program_length=int(config.program_length),
+                    motion_times_p=(
+                        None
+                        if motion_times is None
+                        else motion_times[
+                            valid_pose_indices[refinement_local_indices]
+                        ]
+                    ),
+                    motion_time_components_p=(
+                        None
+                        if motion_time_components is None
+                        else tuple(
+                            values[
+                                valid_pose_indices[refinement_local_indices]
+                            ]
+                            for values in motion_time_components
+                        )
+                    ),
+                )
+                proxy_replica_scores[
+                    replica_index + 1,
+                    refinement_local_indices,
+                ] = refined_scores
+        shortlist = select_adaptive_pose_shortlist(
+            proxy_replica_scores,
+            np.asarray(coverage_raw, dtype=np.float64)[valid_pose_indices],
+            minimum_pose_count=int(config.exact_eig_pose_min),
+            maximum_pose_count=int(config.exact_eig_pose_max),
+            pose_count_step=int(config.exact_eig_pose_step),
+            coverage_reserve_count=int(config.exact_eig_coverage_reserve),
+            boundary_confidence=float(config.proxy_boundary_confidence),
+            minimum_top_k_jaccard=float(config.proxy_top_k_jaccard_min),
+        )
+        shortlisted_local_indices = shortlist.pose_indices
+        shortlist_stop_reason = str(shortlist.stop_reason)
+        coverage_reserve_pose = (
+            None
+            if shortlist.coverage_reserve_pose is None
+            else int(valid_pose_indices[int(shortlist.coverage_reserve_pose)])
+        )
+        shortlist_boundaries = [
+            {
+                "pose_count": int(item.pose_count),
+                "boundary_included_pose": (
+                    None
+                    if item.boundary_included_pose is None
+                    else int(valid_pose_indices[item.boundary_included_pose])
+                ),
+                "boundary_excluded_pose": (
+                    None
+                    if item.boundary_excluded_pose is None
+                    else int(valid_pose_indices[item.boundary_excluded_pose])
+                ),
+                "paired_gap_mean": item.paired_gap_mean,
+                "paired_gap_standard_error": item.paired_gap_standard_error,
+                "paired_gap_lower_confidence": item.paired_gap_lower_confidence,
+                "mean_top_k_jaccard": float(item.mean_top_k_jaccard),
+                "stable": bool(item.stable),
+            }
+            for item in shortlist.boundary_diagnostics
+        ]
+
+    exact_pose_indices = valid_pose_indices[shortlisted_local_indices]
+    incumbent_matrix = None
+    if bool(config.legacy_program_guard_enabled):
+        from planning.legacy_program_guard import legacy_program_pair_matrix
+
+        incumbent_matrix = legacy_program_pair_matrix(legacy_guard_programs)
+        if incumbent_matrix.shape != (
+            len(legacy_guard_programs),
+            int(config.program_length),
+        ):
+            raise RuntimeError("Legacy program guard has an invalid pair matrix.")
+    conditional_pair_count = int(estimator.num_orientations) ** 2
+    conditional_swap_count = (
+        int(config.program_length)
+        * (conditional_pair_count - int(config.program_length))
+        if bool(config.conditional_greedy_one_swap)
+        else 0
+    )
+    exact_maximum_candidate_count = max(
+        conditional_pair_count,
+        conditional_swap_count,
+        0 if incumbent_matrix is None else int(incumbent_matrix.shape[0]),
+    )
+    exact_evaluation = _evaluate_conditional_pose_batches(
+        estimator=estimator,
+        detector_positions_a3=poses[exact_pose_indices],
+        joint_particles=joint_particles,
+        config=config,
+        sample_count=int(estimator.pf_config.planning_eig_samples),
+        eig_call_seeds_r=np.asarray([exact_seed], dtype=np.int64),
+        stream_name="exact_shortlist",
+        workload="exact",
+        working_memory_budget_bytes=int(config.exact_eig_memory_budget_bytes),
+        maximum_subset_candidate_count=int(exact_maximum_candidate_count),
+        enable_one_swap=bool(config.conditional_greedy_one_swap),
+        incumbent_subsets_ck=incumbent_matrix,
+        confirm_ambiguous=True,
+    )
+    exact_gains = exact_evaluation.information_gains_ra[0].copy()
+    exact_programs = exact_evaluation.program_pair_ids_ral[0].copy()
+    exact_sources = list(exact_evaluation.selection_sources_r[0])
+    final_eig_sample_counts = np.asarray(
+        [
+            int(values.size)
+            for values in exact_evaluation.selected_combined_kl_samples_r[0]
+        ],
+        dtype=np.int64,
+    )
+    exact_motion_times = (
+        None if motion_times is None else motion_times[exact_pose_indices]
+    )
+    exact_motion_components = (
+        None
+        if motion_time_components is None
+        else tuple(values[exact_pose_indices] for values in motion_time_components)
+    )
+    exact_scores, exact_distance_weight = compose_pose_scores(
+        exact_gains,
+        static_scores[exact_pose_indices],
+        paths[exact_pose_indices],
+        config=config,
+        program_length=int(config.program_length),
+        motion_times_p=exact_motion_times,
+        motion_time_components_p=exact_motion_components,
+    )
+
+    pose_confirmation_count = 0
+    pose_confirmation_wall_s = 0.0
+    pose_confirmation_memory_plan: dict[str, object] = {}
+    pose_gap_lower = np.full(exact_pose_indices.size, np.inf, dtype=np.float64)
+    if float(config.lambda_eig) > 0.0 and exact_pose_indices.size > 1:
+        base_kl_samples = exact_evaluation.selected_base_kl_samples_raq[0]
+        base_program_gains = np.mean(
+            base_kl_samples,
+            axis=1,
+            dtype=np.float64,
+        )
+        base_pose_scores, _base_distance_weight = compose_pose_scores(
+            base_program_gains,
+            static_scores[exact_pose_indices],
+            paths[exact_pose_indices],
+            config=config,
+            program_length=int(config.program_length),
+            motion_times_p=exact_motion_times,
+            motion_time_components_p=exact_motion_components,
+        )
+        deterministic_scores = (
+            base_pose_scores - float(config.lambda_eig) * base_program_gains
+        )
+        base_score_samples = (
+            deterministic_scores[:, np.newaxis]
+            + float(config.lambda_eig) * base_kl_samples
+        )
+        ambiguous_pose_mask, pose_gap_lower = _conditional_pose_ambiguity_mask(
+            base_score_samples,
+            base_pose_scores,
+            confidence=float(config.proxy_boundary_confidence),
+        )
+        if int(np.count_nonzero(ambiguous_pose_mask)) > 1:
+            pose_confirmation_started = time.perf_counter()
+            ambiguous_local_indices = np.flatnonzero(ambiguous_pose_mask).astype(
+                np.int64,
+                copy=False,
+            )
+            pose_confirmation_count = int(ambiguous_local_indices.size)
+            ambiguous_pose_indices = exact_pose_indices[ambiguous_local_indices]
+            confirmation_seed = int(
+                named_stream_seed(
+                    exact_seed,
+                    "dss_pp",
+                    "conditional_all_pairs",
+                    "ambiguous_pose_confirmation",
+                )
+                & ((1 << 63) - 1)
+            )
+            (
+                confirmation_kl,
+                pose_confirmation_memory_plan,
+            ) = _evaluate_fixed_programs_in_pose_batches(
+                estimator=estimator,
+                detector_positions_a3=poses[ambiguous_pose_indices],
+                program_pair_ids_al=exact_programs[ambiguous_local_indices],
+                joint_particles=joint_particles,
+                config=config,
+                sample_count=int(estimator.pf_config.planning_eig_samples),
+                eig_call_seed=confirmation_seed,
+                stream_name="ambiguous_pose_confirmation",
+                working_memory_budget_bytes=int(
+                    config.exact_eig_memory_budget_bytes
+                ),
+            )
+            confirmed_gains = np.asarray(
+                [
+                    np.mean(
+                        np.concatenate(
+                            (
+                                exact_evaluation.selected_combined_kl_samples_r[
+                                    0
+                                ][int(action_index)],
+                                confirmation_kl[local_index],
+                            )
+                        ),
+                        dtype=np.float64,
+                    )
+                    for local_index, action_index in enumerate(
+                        ambiguous_local_indices
+                    )
+                ],
+                dtype=np.float64,
+            )
+            exact_gains[ambiguous_local_indices] = confirmed_gains
+            final_eig_sample_counts[ambiguous_local_indices] += int(
+                estimator.pf_config.planning_eig_samples
+            )
+            exact_scores, exact_distance_weight = compose_pose_scores(
+                exact_gains,
+                static_scores[exact_pose_indices],
+                paths[exact_pose_indices],
+                config=config,
+                program_length=int(config.program_length),
+                motion_times_p=exact_motion_times,
+                motion_time_components_p=exact_motion_components,
+            )
+            pose_confirmation_wall_s = float(
+                time.perf_counter() - pose_confirmation_started
+            )
+
+    source_kind = {
+        "greedy": "conditional_greedy_all_pairs",
+        "one_swap": "conditional_greedy_one_swap",
+        "legacy48_guard": "legacy48_same_sample_eig_guard",
+    }
+    nodes = [
+        DSSPPNode(
+            pose_index=int(pose_index),
+            pose_xyz=poses[int(pose_index)].copy(),
+            program=ShieldProgram(
+                name=f"{exact_sources[row]}_pose_{int(pose_index):03d}",
+                pair_ids=tuple(int(value) for value in exact_programs[row]),
+                kind=source_kind[str(exact_sources[row])],
+            ),
+            score=float(exact_scores[row]),
+            static_score=float(
+                static_scores[int(pose_index)]
+                + float(config.lambda_eig) * exact_gains[row]
+            ),
+            distance_weight=float(exact_distance_weight),
+            information_gain=float(exact_gains[row]),
+            coverage_gain=float(coverage_raw[int(pose_index)]),
+            revisit_penalty=float(revisit_penalties[int(pose_index)]),
+            bearing_diversity_gain=float(bearing_gains[int(pose_index)]),
+            frontier_gain=float(frontier_gains[int(pose_index)]),
+            turn_penalty=float(turn_penalties[int(pose_index)]),
+            local_orbit_gain=float(local_orbit_gains[int(pose_index)]),
+            elevation_condition_gain=float(
+                elevation_condition_gains[int(pose_index)]
+            ),
+        )
+        for row, pose_index in enumerate(exact_pose_indices)
+    ]
+    nodes.sort(key=lambda node: (-float(node.score), int(node.pose_index)))
+    greedy_count = int(
+        int(config.program_length) * (int(estimator.num_orientations) ** 2)
+        - int(config.program_length) * (int(config.program_length) - 1) // 2
+    )
+    swap_count = int(
+        int(config.program_length)
+        * (int(estimator.num_orientations) ** 2 - int(config.program_length))
+        if bool(config.conditional_greedy_one_swap)
+        else 0
+    )
+    guard_count = int(0 if incumbent_matrix is None else incumbent_matrix.shape[0])
+    contender_count = 1 + int(swap_count > 0) + int(guard_count > 0)
+    program_confirmation_count = int(
+        sum(
+            int(replica["independently_confirmed_program_pose_count"])
+            for chunk in exact_evaluation.diagnostics["chunks"]
+            for replica in chunk["replicas"]
+        )
+    )
+    proxy_subset_evaluation_count = int(
+        (0 if proxy_evaluation is None else available_pose_count * greedy_count)
+        + (
+            0
+            if refinement_evaluation is None
+            else refinement_pose_count
+            * (int(config.proxy_stability_replicates) - 1)
+            * greedy_count
+        )
+    )
+    exact_subset_evaluation_count = int(
+        exact_pose_indices.size
+        * (greedy_count + swap_count + guard_count + contender_count)
+        + program_confirmation_count * contender_count
+        + pose_confirmation_count
+    )
+    diagnostics: dict[str, object] = {
+        "total_action_count": int(available_pose_count),
+        "path_length_support": str(path_length_support),
+        "proxy_action_count": int(proxy_subset_evaluation_count),
+        "proxy_subset_evaluation_count": int(proxy_subset_evaluation_count),
+        "proxy_particle_count": int(
+            0
+            if proxy_evaluation is None
+            else proxy_evaluation.diagnostics["particle_count"]
+        ),
+        "proxy_eig_samples": int(config.proxy_eig_samples),
+        "exact_action_count": int(exact_pose_indices.size),
+        "exact_subset_evaluation_count": int(exact_subset_evaluation_count),
+        "shortlisted_pose_count": int(exact_pose_indices.size),
+        "programs_per_shortlisted_pose": 1,
+        "full_program_sweep_per_shortlisted_pose": False,
+        "pose_shortlist_contract": (
+            "proxy_conditional_greedy_plus_spatial_minus_motion_with_"
+            "paired_mc_stability_adaptive_8_12_16"
+        ),
+        "program_search_contract": (
+            "all_pairs_conditional_greedy_then_one_swap_then_same_sample_"
+            "legacy48_eig_floor"
+            if incumbent_matrix is not None
+            else "all_pairs_conditional_greedy_then_one_swap_without_legacy_guard"
+        ),
+        "exact_eig_seed": int(exact_seed),
+        "adaptive_exact_eig_round_count": 1,
+        "adaptive_exact_eig_exhausted_all_actions": bool(
+            exact_pose_indices.size == available_pose_count
+        ),
+        "adaptive_shortlist_stop_reason": str(shortlist_stop_reason),
+        "adaptive_shortlist_boundaries": shortlist_boundaries,
+        "adaptive_shortlist_coverage_reserve_pose": coverage_reserve_pose,
+        "adaptive_shortlist_pose_indices": [
+            int(value) for value in exact_pose_indices
+        ],
+        "exact_pose_results": [
+            {
+                "pose_index": int(pose_index),
+                "pose_xyz": [float(value) for value in poses[int(pose_index)]],
+                "program_pair_ids": [
+                    int(value) for value in exact_programs[row]
+                ],
+                "selection_source": str(exact_sources[row]),
+                "information_gain": float(exact_gains[row]),
+                "information_gain_sample_count": int(
+                    final_eig_sample_counts[row]
+                ),
+                "pose_score": float(exact_scores[row]),
+            }
+            for row, pose_index in enumerate(exact_pose_indices)
+        ],
+        "proxy_replica_scores": _proxy_replica_scores_payload(
+            proxy_replica_scores,
+            evaluated=proxy_evaluation is not None,
+        ),
+        "proxy_eig_runtime": (
+            {} if proxy_evaluation is None else dict(proxy_evaluation.diagnostics)
+        ),
+        "proxy_refinement_eig_runtime": (
+            {}
+            if refinement_evaluation is None
+            else dict(refinement_evaluation.diagnostics)
+        ),
+        "exact_eig_runtime": dict(exact_evaluation.diagnostics),
+        "pose_gap_lower_confidence_initial": [
+            None if not np.isfinite(value) else float(value)
+            for value in pose_gap_lower
+        ],
+        "independently_confirmed_pose_count": int(pose_confirmation_count),
+        "pose_confirmation_wall_s": float(pose_confirmation_wall_s),
+        "pose_confirmation_memory_chunk_plan": dict(
+            pose_confirmation_memory_plan
+        ),
+        "conditional_greedy_candidate_count_per_pose": int(greedy_count),
+        "one_swap_candidate_count_per_pose": int(swap_count),
+        "legacy_guard_candidate_count_per_pose": int(guard_count),
+        "independently_confirmed_program_pose_count": int(
+            program_confirmation_count
+        ),
+        "coverage_support": str(coverage_support),
+        "coverage_quadrature": coverage_quadrature_diagnostics,
+        "eig_shortlist_wall_s": float(time.perf_counter() - conditional_started),
+    }
+    return nodes, diagnostics
+
+
 def _build_nodes(
     *,
     estimator: RotatingShieldPFEstimator,
@@ -1725,6 +3413,39 @@ def _build_nodes(
         modes_by_isotope,
         config=config,
     )
+    conditional_shadow_diagnostics: dict[str, object] | None = None
+    conditional_policy_active = (
+        config.forced_program_pair_ids is None
+        and config.shield_program_search_policy
+        in {"conditional_greedy_all_pairs", "conditional_greedy_shadow"}
+    )
+    if conditional_policy_active:
+        conditional_nodes, conditional_diagnostics = _build_conditional_nodes(
+            estimator=estimator,
+            candidate_poses=candidate_poses,
+            path_lengths=path_lengths,
+            coverage_norm=coverage_norm,
+            coverage_raw=coverage_raw,
+            revisit_penalties=revisit_penalties,
+            bearing_gains=bearing_gains,
+            frontier_gains=frontier_gains,
+            turn_penalties=turn_penalties,
+            local_orbit_gains=local_orbit_gains,
+            elevation_condition_gains=elevation_condition_gains,
+            coverage_floor=float(coverage_floor),
+            coverage_support=str(coverage_support),
+            coverage_quadrature_diagnostics=coverage_quadrature_diagnostics,
+            config=config,
+            rng=rng,
+            joint_particles=joint_particles,
+            legacy_guard_programs=programs,
+            motion_times=motion_times,
+            motion_time_components=motion_time_components,
+            path_length_support=str(path_length_support),
+        )
+        if config.shield_program_search_policy == "conditional_greedy_all_pairs":
+            return conditional_nodes, conditional_diagnostics
+        conditional_shadow_diagnostics = conditional_diagnostics
     evaluation_pose_indices = np.arange(candidate_poses.shape[0], dtype=np.int64)
     raw_nodes: list[DSSPPNode] = []
     pending: list[_PendingDSSPPNode] = []
@@ -2306,6 +4027,10 @@ def _build_nodes(
         ),
         "eig_shortlist_wall_s": float(proxy_wall_s + exact_wall_s),
     }
+    if conditional_shadow_diagnostics is not None:
+        diagnostics["conditional_greedy_shadow"] = dict(
+            conditional_shadow_diagnostics
+        )
     return raw_nodes, diagnostics
 
 
@@ -2505,13 +4230,33 @@ def select_dss_pp_next_station(
             "DSS-PP received no reachable candidate after the generic 3-D "
             "station-separation contract."
         )
-    if cfg.forced_program_pair_ids is None:
+    if (
+        cfg.forced_program_pair_ids is None
+        and cfg.shield_program_search_policy == "conditional_greedy_all_pairs"
+        and bool(cfg.legacy_program_guard_enabled)
+    ):
+        from planning.legacy_program_guard import legacy_program_guard_candidates
+
+        programs = list(
+            legacy_program_guard_candidates(
+                estimator.normals,
+                program_length=int(cfg.program_length),
+                max_programs=int(cfg.max_programs),
+            )
+        )
+    elif (
+        cfg.forced_program_pair_ids is None
+        and cfg.shield_program_search_policy
+        in {"predeclared_library", "conditional_greedy_shadow"}
+    ):
+        from planning.shield_programs import build_shield_program_library
+
         programs = build_shield_program_library(
             estimator.normals,
             program_length=int(cfg.program_length),
             max_programs=int(cfg.max_programs),
         )
-    else:
+    elif cfg.forced_program_pair_ids is not None:
         pair_count = int(estimator.num_orientations) ** 2
         if any(int(pair_id) >= pair_count for pair_id in cfg.forced_program_pair_ids):
             raise ValueError(
@@ -2525,6 +4270,8 @@ def select_dss_pp_next_station(
                 kind="forced_baseline",
             )
         ]
+    else:
+        programs = []
     candidate_pair_ids = [
         int(pair_id) for program in programs for pair_id in program.pair_ids
     ]
@@ -2586,8 +4333,17 @@ def select_dss_pp_next_station(
             atol=1.0e-12,
         )
     )
+    conditional_standard = bool(
+        cfg.forced_program_pair_ids is None
+        and cfg.shield_program_search_policy == "conditional_greedy_all_pairs"
+    )
     if float(cfg.lambda_eig) > 0.0:
-        if len(selected_pose_nodes) != len(programs):
+        if conditional_standard and len(selected_pose_nodes) != 1:
+            raise RuntimeError(
+                "Conditional DSS must retain exactly one EIG-maximized program "
+                "per exact pose."
+            )
+        if not conditional_standard and len(selected_pose_nodes) != len(programs):
             raise RuntimeError(
                 "The selected DSS pose was not exactly evaluated with every "
                 "predeclared shield program."
@@ -2631,13 +4387,33 @@ def select_dss_pp_next_station(
             ),
             "measurement": float(cfg.lambda_time),
         },
-        "program_count": int(len(programs)),
+        "program_count": int(
+            int(estimator.num_orientations) ** 2
+            if conditional_standard
+            else len(programs)
+        ),
+        "predeclared_program_count": int(len(programs)),
+        "legacy_guard_program_count": int(
+            len(programs)
+            if conditional_standard and cfg.legacy_program_guard_enabled
+            else 0
+        ),
+        "shield_pair_count": int(estimator.num_orientations) ** 2,
+        "shield_program_search_policy": str(cfg.shield_program_search_policy),
         "program_library_configured_capacity": int(cfg.max_programs),
         "program_library_realized_count": int(len(programs)),
         "program_library_policy": (
             "forced_predeclared_baseline"
             if cfg.forced_program_pair_ids is not None
-            else "balanced_multi_partition_predeclared_action_set"
+            else (
+                (
+                    "conditional_greedy_all_64_pairs_with_legacy48_guard"
+                    if cfg.legacy_program_guard_enabled
+                    else "conditional_greedy_all_64_pairs_without_legacy_guard"
+                )
+                if conditional_standard
+                else "balanced_multi_partition_predeclared_action_set"
+            )
         ),
         "program_library_global_optimality_claimed": False,
         "program_library_exact_eig_over_every_predeclared_action": bool(
@@ -2651,16 +4427,38 @@ def select_dss_pp_next_station(
             )
         ),
         "program_library_unique_pair_count": int(np.count_nonzero(pair_occurrences)),
-        "program_library_pair_occurrence_min": int(np.min(positive_occurrences)),
-        "program_library_pair_occurrence_max": int(np.max(positive_occurrences)),
+        "program_library_pair_occurrence_min": int(
+            1
+            if conditional_standard
+            else np.min(positive_occurrences)
+            if positive_occurrences.size
+            else 0
+        ),
+        "program_library_pair_occurrence_max": int(
+            1
+            if conditional_standard
+            else np.max(positive_occurrences)
+            if positive_occurrences.size
+            else 0
+        ),
+        "legacy_guard_pair_occurrence_min": int(
+            np.min(positive_occurrences) if positive_occurrences.size else 0
+        ),
+        "legacy_guard_pair_occurrence_max": int(
+            np.max(positive_occurrences) if positive_occurrences.size else 0
+        ),
         "program_library_companion_diversity_min": int(
-            min(
+            int(estimator.num_orientations) ** 2 - 1
+            if conditional_standard
+            else min(
                 (len(companions) for companions in companion_sets.values()),
                 default=0,
             )
         ),
         "program_library_companion_diversity_max": int(
-            max(
+            int(estimator.num_orientations) ** 2 - 1
+            if conditional_standard
+            else max(
                 (len(companions) for companions in companion_sets.values()),
                 default=0,
             )
@@ -2690,7 +4488,12 @@ def select_dss_pp_next_station(
             "best_exact_program_eig_plus_spatial_coverage_and_robot_motion_terms"
         ),
         "program_selection_objective": (
-            "maximum_exact_eig_within_predeclared_program_library"
+            "maximum_same_sample_eig_among_conditional_greedy_one_swap_and_"
+            "legacy48_guard"
+            if conditional_standard and cfg.legacy_program_guard_enabled
+            else "maximum_same_sample_eig_among_conditional_greedy_and_one_swap"
+            if conditional_standard
+            else "maximum_exact_eig_within_predeclared_program_library"
         ),
         "shield_rotation_cost_applied": False,
         "first_program_kind": first.program.kind,

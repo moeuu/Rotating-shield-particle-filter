@@ -2,19 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 from numpy.typing import NDArray
 
-
-@dataclass(frozen=True)
-class ShieldProgram:
-    """Represent a short sequence of Fe/Pb shield orientation pairs."""
-
-    name: str
-    pair_ids: tuple[int, ...]
-    kind: str
+from planning.program_types import ShieldProgram
 
 
 def build_shield_program_library(

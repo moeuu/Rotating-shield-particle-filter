@@ -9,7 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.detector_geometry import DEFAULT_PF_DETECTOR_APERTURE_SAMPLES
-from planning.shield_programs import ShieldProgram
+from planning.program_types import ShieldProgram
 
 
 DEFAULT_DSS_PP_LIVE_TIME_S = 30.0
@@ -111,6 +111,16 @@ class DSSPPConfig:
     proxy_memory_budget_bytes: int = 256 * 1024 * 1024
     proxy_planning_particles: int = 16
     proxy_eig_samples: int = 2
+    shield_program_search_policy: str = "predeclared_library"
+    legacy_program_guard_enabled: bool = True
+    conditional_greedy_one_swap: bool = True
+    exact_eig_pose_min: int = 8
+    exact_eig_pose_max: int = 16
+    exact_eig_pose_step: int = 4
+    proxy_stability_refinement_pool: int = 24
+    proxy_stability_replicates: int = 3
+    proxy_boundary_confidence: float = 0.95
+    proxy_top_k_jaccard_min: float = 0.75
 
     def __post_init__(self) -> None:
         """Validate every planner field before it can affect observations."""
@@ -175,6 +185,13 @@ class DSSPPConfig:
             "exact_eig_memory_budget_bytes": (self.exact_eig_memory_budget_bytes),
             "proxy_memory_budget_bytes": self.proxy_memory_budget_bytes,
             "proxy_eig_samples": self.proxy_eig_samples,
+            "exact_eig_pose_min": self.exact_eig_pose_min,
+            "exact_eig_pose_max": self.exact_eig_pose_max,
+            "exact_eig_pose_step": self.exact_eig_pose_step,
+            "proxy_stability_refinement_pool": (
+                self.proxy_stability_refinement_pool
+            ),
+            "proxy_stability_replicates": self.proxy_stability_replicates,
         }
         for name, value in positive_integer_fields.items():
             _integer(value, name, minimum=1)
@@ -202,8 +219,33 @@ class DSSPPConfig:
             raise ValueError(
                 "planning_method must be None, 'resample', or 'top_weight'."
             )
-        if not isinstance(self.augment_candidates, bool):
-            raise ValueError("augment_candidates must be a boolean.")
+        for name, value in {
+            "augment_candidates": self.augment_candidates,
+            "legacy_program_guard_enabled": self.legacy_program_guard_enabled,
+            "conditional_greedy_one_swap": self.conditional_greedy_one_swap,
+        }.items():
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean.")
+        if self.shield_program_search_policy not in {
+            "predeclared_library",
+            "conditional_greedy_shadow",
+            "conditional_greedy_all_pairs",
+        }:
+            raise ValueError(
+                "shield_program_search_policy must be predeclared_library, "
+                "conditional_greedy_shadow, or conditional_greedy_all_pairs."
+            )
+        conditional_search_enabled = self.shield_program_search_policy in {
+            "conditional_greedy_shadow",
+            "conditional_greedy_all_pairs",
+        }
+        predeclared_search_enabled = (
+            self.shield_program_search_policy == "predeclared_library"
+        )
+        legacy_execution_enabled = self.shield_program_search_policy in {
+            "predeclared_library",
+            "conditional_greedy_shadow",
+        }
 
         nonnegative_fields = {
             "lambda_eig": self.lambda_eig,
@@ -237,6 +279,15 @@ class DSSPPConfig:
             )
         for name, value in nonnegative_fields.items():
             _number(value, name, minimum=0.0)
+        if conditional_search_enabled and float(self.lambda_eig) <= 0.0:
+            raise ValueError(
+                "Conditional-greedy shield search requires lambda_eig > 0."
+            )
+        if conditional_search_enabled and int(self.proxy_eig_samples) < 2:
+            raise ValueError(
+                "Conditional-greedy shield search requires "
+                "proxy_eig_samples >= 2."
+            )
         if float(self.lambda_rotation) != 0.0:
             raise ValueError(
                 "lambda_rotation is retired: shield programs must be selected "
@@ -268,6 +319,20 @@ class DSSPPConfig:
             minimum=0.0,
             maximum=1.0,
         )
+        _number(
+            self.proxy_boundary_confidence,
+            "proxy_boundary_confidence",
+            minimum=0.0,
+            maximum=1.0,
+            strict_minimum=True,
+            strict_maximum=True,
+        )
+        _number(
+            self.proxy_top_k_jaccard_min,
+            "proxy_top_k_jaccard_min",
+            minimum=0.0,
+            maximum=1.0,
+        )
         if not self.ring_radii_m:
             raise ValueError("ring_radii_m must not be empty.")
         for index, radius in enumerate(self.ring_radii_m):
@@ -288,7 +353,9 @@ class DSSPPConfig:
                 )
             if len(set(pair_ids)) != len(pair_ids):
                 raise ValueError("forced_program_pair_ids must not contain duplicates.")
-        if int(self.exact_eig_coverage_reserve) > int(self.exact_eig_pose_limit):
+        if predeclared_search_enabled and int(
+            self.exact_eig_coverage_reserve
+        ) > int(self.exact_eig_pose_limit):
             raise ValueError(
                 "exact_eig_coverage_reserve must fit within "
                 "exact_eig_pose_limit."
@@ -298,10 +365,39 @@ class DSSPPConfig:
                 "exact_eig_program_diversity_reserve is retired because every "
                 "program is exactly evaluated at every shortlisted pose."
             )
-        if int(self.exact_eig_pose_limit) > int(self.exact_eig_action_limit):
+        if legacy_execution_enabled and int(self.exact_eig_pose_limit) > int(
+            self.exact_eig_action_limit
+        ):
             raise ValueError(
                 "exact_eig_action_limit must accommodate at least one program "
                 "for every shortlisted pose."
+            )
+        if int(self.exact_eig_pose_max) < int(self.exact_eig_pose_min):
+            raise ValueError(
+                "exact_eig_pose_max must be at least exact_eig_pose_min."
+            )
+        if int(self.exact_eig_pose_step) > int(self.exact_eig_pose_max):
+            raise ValueError(
+                "exact_eig_pose_step must not exceed exact_eig_pose_max."
+            )
+        if int(self.proxy_stability_replicates) < 2:
+            raise ValueError(
+                "proxy_stability_replicates must include an independent "
+                "boundary recheck."
+            )
+        if int(self.proxy_stability_refinement_pool) <= int(
+            self.exact_eig_pose_max
+        ):
+            raise ValueError(
+                "proxy_stability_refinement_pool must include the pose just "
+                "outside the maximum exact shortlist."
+            )
+        if conditional_search_enabled and int(
+            self.exact_eig_coverage_reserve
+        ) > int(self.exact_eig_pose_min):
+            raise ValueError(
+                "exact_eig_coverage_reserve must fit within the minimum "
+                "conditional-greedy pose shortlist."
             )
 
 

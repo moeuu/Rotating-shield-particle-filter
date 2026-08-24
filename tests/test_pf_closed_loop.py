@@ -25,10 +25,12 @@ from pf.closed_loop import (
     AdaptiveStopTracker,
     PFClosedLoopResult,
     PFControlBudget,
+    _bootstrap_program,
     _cui_truth_display_mode,
     run_pf_closed_loop,
 )
 from planning.configuration import dss_config_from_pf_settings
+from planning.dss_types import DSSPPConfig
 
 
 def _context_payload() -> dict[str, object]:
@@ -73,6 +75,36 @@ def test_estimator_owned_cui_rejects_truth_modes(mode: str) -> None:
         _cui_truth_display_mode({"cui_truth_display_mode": mode})
 
     assert _cui_truth_display_mode({}) == "hidden"
+
+
+def test_standard_bootstrap_does_not_depend_on_legacy_program_library(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard-free live bootstrap must remain usable after old48 removal."""
+    from planning import shield_programs
+
+    def _fail_legacy_builder(*args: object, **kwargs: object) -> object:
+        """Fail if the standard bootstrap reaches the legacy provider."""
+        del args, kwargs
+        raise AssertionError("legacy program library must not be used")
+
+    monkeypatch.setattr(
+        shield_programs,
+        "build_shield_program_library",
+        _fail_legacy_builder,
+    )
+    estimator = SimpleNamespace(normals=np.zeros((8, 3), dtype=np.float64))
+    planner = DSSPPConfig(
+        program_length=8,
+        shield_program_search_policy="conditional_greedy_all_pairs",
+        legacy_program_guard_enabled=False,
+        proxy_eig_samples=2,
+    )
+
+    program = _bootstrap_program(estimator, planner, None)
+
+    assert program.pair_ids == (0, 9, 18, 27, 36, 45, 54, 63)
+    assert program.kind == "prior_balanced_bootstrap"
 
 
 class _FakeRuntimeClient:

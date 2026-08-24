@@ -19,7 +19,7 @@ from planning.dss_types import (
     _DeviceJointProgramSpectrumComponents,
     _JointProgramSpectrumComponents,
 )
-from planning.shield_programs import ShieldProgram
+from planning.program_types import ShieldProgram
 
 
 def _program_pair_id_matrix(
@@ -265,6 +265,7 @@ def _selected_program_transport_components(
     sources: NDArray[np.float64],
     positive_line_indices: NDArray[np.int64],
     device_resident: bool = False,
+    working_memory_budget_bytes: int | None = None,
 ) -> dict[str, object]:
     """Evaluate each distinct detector/pair response exactly once in batches.
 
@@ -314,6 +315,99 @@ def _selected_program_transport_components(
         raise ValueError("positive_line_indices must be nonnegative integers.")
     if not isinstance(device_resident, bool):
         raise TypeError("device_resident must be a boolean.")
+    if working_memory_budget_bytes is not None and (
+        isinstance(working_memory_budget_bytes, bool)
+        or not isinstance(working_memory_budget_bytes, (int, np.integer))
+        or int(working_memory_budget_bytes) <= 0
+    ):
+        raise ValueError(
+            "working_memory_budget_bytes must be a positive integer."
+        )
+
+    output_shape = (
+        detectors.shape[0],
+        pair_ids.shape[1],
+        source_positions.shape[0],
+        line_indices.size,
+    )
+    dense_pair_order = np.arange(pair_count, dtype=np.int64)
+    direct_dense_request = bool(
+        pair_ids.shape[1] == pair_count
+        and np.array_equal(
+            pair_ids,
+            np.broadcast_to(dense_pair_order, pair_ids.shape),
+        )
+    )
+    if direct_dense_request:
+        if device_resident:
+            pair_program_kwargs: dict[str, object] = {
+                "isotope": isotope,
+                "detector_positions": detectors,
+                "sources": source_positions,
+                "fe_indices": pair_ids // orientation_count,
+                "pb_indices": pair_ids % orientation_count,
+                "positive_line_indices": line_indices,
+                "device_resident": True,
+            }
+            if working_memory_budget_bytes is not None:
+                pair_program_kwargs["working_memory_budget_bytes"] = int(
+                    working_memory_budget_bytes
+                )
+            components = (
+                kernel.line_transport_components_pair_program_for_detectors(
+                    **pair_program_kwargs,
+                )
+            )
+        else:
+            all_pair_kwargs: dict[str, object] = {
+                "isotope": isotope,
+                "detector_positions": detectors,
+                "sources": source_positions,
+                "positive_line_indices": line_indices,
+            }
+            if working_memory_budget_bytes is not None:
+                all_pair_kwargs["working_memory_budget_bytes"] = int(
+                    working_memory_budget_bytes
+                )
+            components = (
+                kernel.line_transport_components_all_pairs_for_detectors(
+                    **all_pair_kwargs,
+                )
+            )
+        field_names = (
+            "total_kernel",
+            "uncollided_kernel",
+            "tau_fe",
+            "tau_pb",
+            "tau_obstacle",
+            "distance_m",
+        )
+        outputs = {
+            field_name: getattr(components, field_name)
+            for field_name in field_names
+        }
+        if device_resident:
+            import torch
+
+            if any(
+                not torch.is_tensor(value)
+                or value.dtype != torch.float64
+                or tuple(value.shape) != output_shape
+                for value in outputs.values()
+            ):
+                raise RuntimeError(
+                    "Dense device pair transport returned invalid components."
+                )
+        elif any(
+            np.asarray(value).shape != output_shape
+            or np.any(~np.isfinite(value))
+            or np.any(np.asarray(value) < 0.0)
+            for value in outputs.values()
+        ):
+            raise RuntimeError(
+                "Dense host pair transport returned invalid components."
+            )
+        return outputs
 
     _, sorted_first_indices, sorted_inverse = np.unique(
         detectors,
@@ -336,12 +430,6 @@ def _selected_program_transport_components(
     )
     detector_pair_mask[action_detector_ids[:, None], pair_ids] = True
     union_sizes = np.sum(detector_pair_mask, axis=1, dtype=np.int64)
-    output_shape = (
-        detectors.shape[0],
-        pair_ids.shape[1],
-        source_positions.shape[0],
-        line_indices.size,
-    )
     field_names = (
         "total_kernel",
         "uncollided_kernel",
@@ -383,11 +471,20 @@ def _selected_program_transport_components(
             dtype=np.int64,
         )
         if union_size == pair_count and not device_resident:
-            components = kernel.line_transport_components_all_pairs_for_detectors(
-                isotope=isotope,
-                detector_positions=unique_detectors[detector_ids],
-                sources=source_positions,
-                positive_line_indices=line_indices,
+            all_pair_kwargs: dict[str, object] = {
+                "isotope": isotope,
+                "detector_positions": unique_detectors[detector_ids],
+                "sources": source_positions,
+                "positive_line_indices": line_indices,
+            }
+            if working_memory_budget_bytes is not None:
+                all_pair_kwargs["working_memory_budget_bytes"] = int(
+                    working_memory_budget_bytes
+                )
+            components = (
+                kernel.line_transport_components_all_pairs_for_detectors(
+                    **all_pair_kwargs,
+                )
             )
         else:
             pair_program_kwargs: dict[str, object] = {
@@ -400,6 +497,10 @@ def _selected_program_transport_components(
             }
             if device_resident:
                 pair_program_kwargs["device_resident"] = True
+            if working_memory_budget_bytes is not None:
+                pair_program_kwargs["working_memory_budget_bytes"] = int(
+                    working_memory_budget_bytes
+                )
             components = (
                 kernel.line_transport_components_pair_program_for_detectors(
                     **pair_program_kwargs,
@@ -1000,7 +1101,13 @@ def _is_dss_eig_memory_error(error: BaseException) -> bool:
         "torch"
     ):
         return True
-    return "out of memory" in str(error).lower()
+    message = str(error).lower()
+    if "out of memory" in message:
+        return True
+    return "defaultcpuallocator" in message and (
+        "can't allocate memory" in message
+        or "cannot allocate memory" in message
+    )
 
 
 def _release_dss_gpu_cache() -> None:

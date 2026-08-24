@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import planning.dss_pp as dss_pp
+
 from evaluation.source_normalization import Source as ExtractedSource
 from evaluation_metrics import Source as PublicSource
 from pf.estimator import (
@@ -44,11 +46,8 @@ from pf.particle_types import StructuralGeometryBatch, TorchLineTransportCompone
 from planning.dss_pp import (
     ShieldProgram as PublicShieldProgram,
 )
-from planning.dss_pp import (
-    build_shield_program_library as public_build_shield_program_library,
-)
 from planning.dss_pp import __all__ as dss_public_exports
-from planning.shield_programs import ShieldProgram, build_shield_program_library
+from planning.shield_programs import ShieldProgram
 from visualization.frame import PFFrame
 from visualization.realtime_viz import PFFrame as PublicPFFrame
 
@@ -66,15 +65,12 @@ def test_extracted_types_preserve_public_class_identity() -> None:
     assert PublicShieldProgram is ShieldProgram
 
 
-def test_shield_program_builder_preserves_public_function_identity() -> None:
-    """DSS-PP should directly re-export the extracted batched builder."""
-    assert public_build_shield_program_library is build_shield_program_library
-
-
 def test_dss_wildcard_exports_remain_public() -> None:
     """DSS wildcard imports must not expose compatibility-only helpers."""
     assert dss_public_exports
     assert all(not name.startswith("_") for name in dss_public_exports)
+    assert "build_shield_program_library" not in dss_public_exports
+    assert not hasattr(dss_pp, "build_shield_program_library")
 
 
 def test_particle_filter_helper_preserves_compatibility_identity() -> None:

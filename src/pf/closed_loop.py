@@ -58,13 +58,9 @@ from pf.runtime_defaults import (
 )
 from planning.audit import PlannerAuditWriter, build_planner_audit
 from planning.configuration import dss_config_from_pf_settings
-from planning.dss_pp import (
-    DSSPPConfig,
-    DSSPPResult,
-    ShieldProgram,
-    build_shield_program_library,
-    select_dss_pp_next_station,
-)
+from planning.bootstrap_program import build_balanced_bootstrap_program
+from planning.dss_pp import DSSPPConfig, DSSPPResult, select_dss_pp_next_station
+from planning.program_types import ShieldProgram
 from visualization.artifacts import publish_final_cui_split_views
 from visualization.realtime_viz import (
     AsyncCUISplitPFVisualizer,
@@ -571,14 +567,10 @@ def _bootstrap_program(
     )
     if baseline is not None:
         return baseline
-    programs = build_shield_program_library(
-        estimator.normals,
+    return build_balanced_bootstrap_program(
+        num_orientations=int(len(estimator.normals)),
         program_length=int(planner.program_length),
-        max_programs=int(planner.max_programs),
     )
-    if not programs:
-        raise RuntimeError("PF shield program library is empty.")
-    return programs[0]
 
 
 def _register_station_pose(

@@ -20,13 +20,14 @@ from pf.estimator import (
 )
 from measurement.surface_atlas import ContinuousSurfaceAtlas
 from pf.state import IsotopeState
+from pf.provenance import json_safe
 from planning.dss_pp import (
     DSSPPConfig,
     _continuous_kernel_for_estimator,
-    build_shield_program_library,
     estimate_lambda_cost,
     select_dss_pp_next_station,
 )
+from planning.shield_programs import build_shield_program_library
 from planning.candidate_generation import (
     expand_candidate_height_actions,
     generate_candidate_poses,
@@ -283,13 +284,17 @@ def test_dss_full_spectrum_components_remain_device_resident(
     if device_name == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     estimator = _build_full_spectrum_planning_estimator(
+        shield_normals=np.asarray(
+            [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
         use_gpu=True,
         gpu_device=device_name,
     )
     joint = estimator.planning_joint_particles()
     program = dss_pp.ShieldProgram(
-        name="one_view",
-        pair_ids=(0,),
+        name="all_pairs",
+        pair_ids=(0, 1, 2, 3),
         kind="test",
     )
     detectors = np.asarray(
@@ -822,6 +827,141 @@ def test_dss_selected_transport_retains_dense_all_pair_host_kernel() -> None:
     )
 
 
+def test_dss_dense_device_transport_reuses_runtime_component_storage() -> None:
+    """The all-pair planner path must not duplicate six response fields."""
+    torch = pytest.importorskip("torch")
+    shape = (2, 4, 1, 1)
+    values = {
+        field_name: torch.full(shape, float(index), dtype=torch.float64)
+        for index, field_name in enumerate(
+            (
+                "total_kernel",
+                "unattenuated_kernel",
+                "uncollided_kernel",
+                "tau_fe",
+                "tau_pb",
+                "tau_obstacle",
+                "tau_obstacle_compton",
+                "distance_m",
+            )
+        )
+    }
+    runtime_components = SimpleNamespace(**values)
+
+    class DenseDeviceKernel:
+        """Return one runtime-owned dense response tensor set."""
+
+        orientations = np.eye(2, 3, dtype=np.float64)
+
+        def line_transport_components_pair_program_for_detectors(
+            self,
+            **kwargs: object,
+        ) -> SimpleNamespace:
+            """Validate the canonical all-pair request and return its storage."""
+            np.testing.assert_array_equal(
+                kwargs["fe_indices"],
+                np.asarray([[0, 0, 1, 1], [0, 0, 1, 1]], dtype=np.int64),
+            )
+            np.testing.assert_array_equal(
+                kwargs["pb_indices"],
+                np.asarray([[0, 1, 0, 1], [0, 1, 0, 1]], dtype=np.int64),
+            )
+            assert kwargs["device_resident"] is True
+            return runtime_components
+
+    actual = dss_pp._selected_program_transport_components(
+        DenseDeviceKernel(),  # type: ignore[arg-type]
+        isotope="Cs-137",
+        detector_positions=np.asarray(
+            [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        pair_ids_av=np.broadcast_to(
+            np.arange(4, dtype=np.int64),
+            (2, 4),
+        ),
+        sources=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
+        positive_line_indices=np.asarray([0], dtype=np.int64),
+        device_resident=True,
+    )
+
+    for field_name in (
+        "total_kernel",
+        "uncollided_kernel",
+        "tau_fe",
+        "tau_pb",
+        "tau_obstacle",
+        "distance_m",
+    ):
+        assert actual[field_name].data_ptr() == values[field_name].data_ptr()
+
+
+def test_dss_dense_host_transport_reuses_runtime_component_storage() -> None:
+    """The host all-pair planner path must not retain a selected-output copy."""
+    shape = (2, 4, 1, 1)
+    values = {
+        field_name: np.full(shape, float(index), dtype=np.float64)
+        for index, field_name in enumerate(
+            (
+                "total_kernel",
+                "unattenuated_kernel",
+                "uncollided_kernel",
+                "tau_fe",
+                "tau_pb",
+                "tau_obstacle",
+                "tau_obstacle_compton",
+                "distance_m",
+            )
+        )
+    }
+    runtime_components = SimpleNamespace(**values)
+
+    class DenseHostKernel:
+        """Return one runtime-owned dense host response array set."""
+
+        orientations = np.eye(2, 3, dtype=np.float64)
+
+        def line_transport_components_all_pairs_for_detectors(
+            self,
+            **kwargs: object,
+        ) -> SimpleNamespace:
+            """Validate the canonical request and return runtime storage."""
+            assert "working_memory_budget_bytes" not in kwargs
+            return runtime_components
+
+        def line_transport_components_pair_program_for_detectors(
+            self,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            """Reject the selected-pair path for canonical all-pair input."""
+            raise AssertionError("dense host input must use the all-pair path")
+
+    actual = dss_pp._selected_program_transport_components(
+        DenseHostKernel(),  # type: ignore[arg-type]
+        isotope="Cs-137",
+        detector_positions=np.asarray(
+            [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        pair_ids_av=np.broadcast_to(
+            np.arange(4, dtype=np.int64),
+            (2, 4),
+        ),
+        sources=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
+        positive_line_indices=np.asarray([0], dtype=np.int64),
+    )
+
+    for field_name in (
+        "total_kernel",
+        "uncollided_kernel",
+        "tau_fe",
+        "tau_pb",
+        "tau_obstacle",
+        "distance_m",
+    ):
+        assert np.shares_memory(actual[field_name], values[field_name])
+
+
 def test_dss_selected_program_transport_matches_legacy_all_pair_physics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1240,7 +1380,10 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
         if action_count > 1 and not raised:
             raised = True
             failed_components = weakref.ref(components)
-            raise MemoryError("synthetic DSS action-batch OOM")
+            raise RuntimeError(
+                "DefaultCPUAllocator: can't allocate memory for synthetic "
+                "DSS action batch"
+            )
         return exact_information_gain(*args, **kwargs)
 
     def assert_failed_batch_released() -> None:
@@ -1293,12 +1436,261 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
     assert len(memory_contracts) == 1
     assert memory_contracts[0]["model_working_set_bytes"] > 0
     assert memory_contracts[0]["persistent_per_action_bytes"] > 0
+    resident_bytes = diagnostics["successful_response_resident_bytes"]
+    materialization_bytes = diagnostics[
+        "successful_response_materialization_peak_bytes"
+    ]
+    scratch_bytes = diagnostics["successful_response_scratch_budget_bytes"]
+    assert len(resident_bytes) == len(materialization_bytes) == len(scratch_bytes)
+    assert all(
+        int(peak) * 5 == int(resident) * 7
+        for resident, peak in zip(
+            resident_bytes,
+            materialization_bytes,
+            strict=True,
+        )
+    )
+    assert all(
+        int(scratch) == int(config.exact_eig_memory_budget_bytes) - int(resident)
+        for resident, scratch in zip(
+            resident_bytes,
+            scratch_bytes,
+            strict=True,
+        )
+    )
     np.testing.assert_allclose(
         np.concatenate(actual),
         np.concatenate(expected),
         rtol=0.0,
         atol=0.0,
     )
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "DefaultCPUAllocator: can't allocate memory: you tried to allocate 64 bytes",
+        "DefaultCPUAllocator: cannot allocate memory (error code 12)",
+    ),
+)
+def test_dss_memory_error_recognizes_torch_cpu_allocator(message: str) -> None:
+    """Torch CPU allocation failures must enter the bounded retry path."""
+    assert dss_pp._is_dss_eig_memory_error(RuntimeError(message))
+    assert not dss_pp._is_dss_eig_memory_error(
+        RuntimeError("another backend cannot allocate memory for this request")
+    )
+
+
+def test_conditional_pose_batch_retries_without_changing_eig(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A response OOM must reduce only scheduling, not conditional EIG."""
+    estimator = _build_full_spectrum_planning_estimator()
+    joint = estimator.planning_joint_particles()
+    detectors = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [1.2, 0.0, 0.0],
+            [1.4, 0.0, 0.0],
+            [1.6, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    config = DSSPPConfig(
+        max_programs=1,
+        program_length=1,
+        forced_program_pair_ids=(0,),
+        live_time_s=1.0,
+        detector_aperture_samples=1,
+    )
+    call_kwargs = {
+        "estimator": estimator,
+        "detector_positions_a3": detectors,
+        "joint_particles": joint,
+        "config": config,
+        "sample_count": 4,
+        "eig_call_seeds_r": np.asarray([123], dtype=np.int64),
+        "stream_name": "conditional_oom_equivalence",
+        "workload": "exact",
+        "working_memory_budget_bytes": config.exact_eig_memory_budget_bytes,
+        "maximum_subset_candidate_count": 1,
+        "enable_one_swap": False,
+        "incumbent_subsets_ck": None,
+        "confirm_ambiguous": False,
+    }
+    expected = dss_pp._evaluate_conditional_pose_batches(**call_kwargs)
+    exact_response = dss_pp._full_spectrum_joint_program_components
+    attempted_pose_counts: list[int] = []
+    raised = False
+
+    def _fail_first_four_pose_response(
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        """Raise one Torch-style CPU OOM, then delegate exact response work."""
+        nonlocal raised
+        detector_values = (
+            kwargs["detector_positions"]
+            if "detector_positions" in kwargs
+            else args[1]
+        )
+        pose_count = int(np.asarray(detector_values).shape[0])
+        attempted_pose_counts.append(pose_count)
+        if pose_count == 4 and not raised:
+            raised = True
+            raise RuntimeError(
+                "DefaultCPUAllocator: cannot allocate memory for synthetic "
+                "conditional response"
+            )
+        return exact_response(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dss_pp,
+        "_full_spectrum_joint_program_components",
+        _fail_first_four_pose_response,
+    )
+    actual = dss_pp._evaluate_conditional_pose_batches(**call_kwargs)
+
+    np.testing.assert_array_equal(
+        actual.information_gains_ra,
+        expected.information_gains_ra,
+    )
+    np.testing.assert_array_equal(
+        actual.program_pair_ids_ral,
+        expected.program_pair_ids_ral,
+    )
+    assert attempted_pose_counts == [4, 2, 2]
+    assert actual.diagnostics["oom_retry_count"] == 1
+    assert actual.diagnostics["successful_pose_chunk_sizes"] == [2, 2]
+
+
+def test_fixed_confirmation_releases_failed_cache_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed confirmation cache must die before the one-pose retry."""
+    torch = pytest.importorskip("torch")
+    estimator = _build_full_spectrum_planning_estimator()
+    joint = estimator.planning_joint_particles()
+    config = DSSPPConfig(
+        max_programs=1,
+        program_length=1,
+        forced_program_pair_ids=(0,),
+        detector_aperture_samples=1,
+    )
+    attempted_pose_counts: list[int] = []
+    failed_response: weakref.ReferenceType[object] | None = None
+    failed_cache: weakref.ReferenceType[object] | None = None
+    release_calls = 0
+    raised = False
+
+    class _Response:
+        """Weak-referenceable response sentinel."""
+
+    class _Cache:
+        """Weak-referenceable prepared-cache sentinel."""
+
+        device = torch.device("cpu")
+
+    class _Prepared:
+        """Store one opaque cache sentinel."""
+
+        def __init__(self) -> None:
+            """Allocate the cache whose lifetime the retry must bound."""
+            self.cache = _Cache()
+
+    def _response(*args: object, **kwargs: object) -> _Response:
+        """Return one response sentinel per attempted pose chunk."""
+        nonlocal failed_response
+        detector_values = (
+            kwargs["detector_positions"]
+            if "detector_positions" in kwargs
+            else args[1]
+        )
+        pose_count = int(np.asarray(detector_values).shape[0])
+        attempted_pose_counts.append(pose_count)
+        response = _Response()
+        if pose_count == 2 and failed_response is None:
+            failed_response = weakref.ref(response)
+        return response
+
+    def _prepare(*_args: object, **_kwargs: object) -> _Prepared:
+        """Return one opaque cache and retain only a weak failure reference."""
+        nonlocal failed_cache
+        prepared = _Prepared()
+        if failed_cache is None:
+            failed_cache = weakref.ref(prepared.cache)
+        return prepared
+
+    def _evaluate(
+        _cache: object,
+        subsets: object,
+        _weights: object,
+    ) -> tuple[object, object]:
+        """Fail after cache allocation once, then return deterministic KL."""
+        nonlocal raised
+        if not raised:
+            raised = True
+            raise RuntimeError(
+                "DefaultCPUAllocator: can't allocate memory for confirmation"
+            )
+        subset_tensor = torch.as_tensor(subsets)
+        action_count = int(subset_tensor.shape[0])
+        candidate_count = int(subset_tensor.shape[1])
+        return (
+            torch.zeros(
+                (action_count, candidate_count),
+                dtype=torch.float64,
+            ),
+            torch.zeros(
+                (action_count, candidate_count, 4),
+                dtype=torch.float64,
+            ),
+        )
+
+    def _assert_released() -> None:
+        """Check response and opaque cache references before allocator cleanup."""
+        nonlocal release_calls
+        release_calls += 1
+        assert failed_response is not None and failed_response() is None
+        assert failed_cache is not None and failed_cache() is None
+
+    monkeypatch.setattr(
+        dss_pp,
+        "_full_spectrum_joint_program_components",
+        _response,
+    )
+    monkeypatch.setattr(
+        dss_pp,
+        "prepare_conditional_observation_cache",
+        _prepare,
+    )
+    monkeypatch.setattr(
+        dss_pp,
+        "evaluate_subset_information_gain_torch",
+        _evaluate,
+    )
+    monkeypatch.setattr(dss_pp, "_release_dss_gpu_cache", _assert_released)
+
+    samples, diagnostics = dss_pp._evaluate_fixed_programs_in_pose_batches(
+        estimator=estimator,
+        detector_positions_a3=np.asarray(
+            [[1.0, 0.0, 0.0], [1.2, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        program_pair_ids_al=np.zeros((2, 1), dtype=np.int64),
+        joint_particles=joint,
+        config=config,
+        sample_count=4,
+        eig_call_seed=321,
+        stream_name="fixed_confirmation_oom_cleanup",
+        working_memory_budget_bytes=config.exact_eig_memory_budget_bytes,
+    )
+
+    np.testing.assert_array_equal(samples, np.zeros((2, 4), dtype=np.float64))
+    assert attempted_pose_counts == [2, 1, 1]
+    assert diagnostics["oom_retry_count"] == 1
+    assert diagnostics["successful_pose_chunk_sizes"] == [1, 1]
+    assert release_calls == 1
 
 
 def test_candidate_generation_adds_map_cells_when_random_sampling_is_sparse() -> None:
@@ -2621,6 +3013,27 @@ def test_planner_configuration_does_not_silently_expand_ring_angles() -> None:
         DSSPPConfig(ring_angles=3)
 
 
+def test_conditional_runtime_rejects_single_exact_eig_sample() -> None:
+    """Direct planner callers must preserve paired exact-MC uncertainty."""
+    estimator = _build_simple_estimator(canonical_octants=True)
+    estimator.pf_config.planning_eig_samples = 1
+
+    with pytest.raises(ValueError, match="planning_eig_samples >= 2"):
+        select_dss_pp_next_station(
+            estimator=estimator,
+            rng=np.random.default_rng(7),
+            candidate_poses_xyz=np.asarray(
+                [[1.0, 0.0, 0.0]],
+                dtype=np.float64,
+            ),
+            current_pose_xyz=np.zeros(3, dtype=np.float64),
+            config=DSSPPConfig(
+                shield_program_search_policy="conditional_greedy_all_pairs",
+                augment_candidates=False,
+            ),
+        )
+
+
 def test_forced_pair_support_comes_from_estimator_orientation_count() -> None:
     """A globally plausible pair ID must fail for a smaller shield state space."""
     estimator = _build_simple_estimator()
@@ -3132,6 +3545,88 @@ def test_dss_exactly_sweeps_every_program_at_shortlisted_poses(
     assert diagnostics["shortlisted_pose_count"] == 2
     assert diagnostics["exact_action_count"] == 96
     assert diagnostics["full_program_sweep_per_shortlisted_pose"] is True
+
+
+def test_dss_conditional_policy_searches_all_pairs_and_retains_eig_guard() -> None:
+    """The standard path must select eight unique pairs from all 64 views."""
+    estimator = _build_full_spectrum_planning_estimator(
+        shield_normals=np.asarray(generate_octant_orientations(), dtype=float),
+        use_gpu=False,
+    )
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(41),
+        candidate_poses_xyz=np.asarray(
+            [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        current_pose_xyz=np.zeros(3, dtype=np.float64),
+        config=DSSPPConfig(
+            max_programs=48,
+            program_length=8,
+            live_time_s=1.0,
+            lambda_eig=1.0,
+            lambda_distance=0.0,
+            lambda_time=0.0,
+            augment_candidates=False,
+            exact_eig_coverage_reserve=0,
+            detector_aperture_samples=1,
+            shield_program_search_policy="conditional_greedy_all_pairs",
+            exact_eig_pose_min=8,
+            exact_eig_pose_max=16,
+        ),
+    )
+
+    assert len(result.shield_program.pair_ids) == 8
+    assert len(set(result.shield_program.pair_ids)) == 8
+    assert all(0 <= pair_id < 64 for pair_id in result.shield_program.pair_ids)
+    assert result.shield_program.kind in {
+        "conditional_greedy_all_pairs",
+        "conditional_greedy_one_swap",
+        "legacy48_same_sample_eig_guard",
+    }
+    diagnostics = result.diagnostics["planning_eig_shortlist"]
+    assert diagnostics["conditional_greedy_candidate_count_per_pose"] == 484
+    assert diagnostics["one_swap_candidate_count_per_pose"] == 448
+    assert diagnostics["legacy_guard_candidate_count_per_pose"] == 48
+    assert diagnostics["programs_per_shortlisted_pose"] == 1
+    assert diagnostics["full_program_sweep_per_shortlisted_pose"] is False
+    assert result.diagnostics["selected_program_is_exact_eig_leader_at_selected_pose"]
+    assert isinstance(json_safe(result.diagnostics), dict)
+
+
+def test_dss_conditional_policy_has_a_legacy_free_execution_path() -> None:
+    """Disabling the guard must remove every old48 candidate from production."""
+    estimator = _build_full_spectrum_planning_estimator(
+        shield_normals=np.asarray(generate_octant_orientations(), dtype=float),
+        use_gpu=False,
+    )
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(42),
+        candidate_poses_xyz=np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
+        current_pose_xyz=np.zeros(3, dtype=np.float64),
+        config=DSSPPConfig(
+            max_programs=1,
+            program_length=8,
+            live_time_s=1.0,
+            lambda_eig=1.0,
+            lambda_distance=0.0,
+            lambda_time=0.0,
+            augment_candidates=False,
+            exact_eig_coverage_reserve=0,
+            detector_aperture_samples=1,
+            shield_program_search_policy="conditional_greedy_all_pairs",
+            legacy_program_guard_enabled=False,
+        ),
+    )
+
+    shortlist = result.diagnostics["planning_eig_shortlist"]
+    assert shortlist["legacy_guard_candidate_count_per_pose"] == 0
+    assert "without_legacy_guard" in shortlist["program_search_contract"]
+    assert result.diagnostics["predeclared_program_count"] == 0
+    assert result.diagnostics["legacy_guard_program_count"] == 0
+    assert result.shield_program.kind != "legacy48_same_sample_eig_guard"
 
 
 def test_dss_canonical_program_diagnostics_cover_all_pairs_at_horizon_one() -> None:

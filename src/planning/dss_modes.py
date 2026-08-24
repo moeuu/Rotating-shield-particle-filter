@@ -187,6 +187,20 @@ def _validate_eig_likelihood_contract(
     """Require the exact full-spectrum model used by the joint PF."""
     if float(config.lambda_eig) <= 0.0:
         return
+    if config.shield_program_search_policy in {
+        "conditional_greedy_shadow",
+        "conditional_greedy_all_pairs",
+    }:
+        exact_samples = getattr(estimator.pf_config, "planning_eig_samples", None)
+        if (
+            isinstance(exact_samples, bool)
+            or not isinstance(exact_samples, (int, np.integer))
+            or int(exact_samples) < 2
+        ):
+            raise ValueError(
+                "Conditional-greedy shield search requires "
+                "planning_eig_samples >= 2."
+            )
     model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
     if not callable(getattr(model, "cross_log_likelihood_numpy", None)):
         raise RuntimeError(

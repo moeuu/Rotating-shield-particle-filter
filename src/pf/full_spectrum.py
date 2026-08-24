@@ -212,6 +212,88 @@ class TorchPredictiveFullSpectrumModel(Protocol):
         """Draw exact integer spectra without leaving the Torch device."""
 
 
+@runtime_checkable
+class PreparedSubsetCrossLikelihood(Protocol):
+    """Define an opaque arbitrary-view likelihood cache owned by runtime."""
+
+    @property
+    def action_count(self) -> int:
+        """Return the number of aligned detector-pose actions."""
+
+    @property
+    def sample_count(self) -> int:
+        """Return the number of predictive observations per action."""
+
+    @property
+    def state_count(self) -> int:
+        """Return the number of PF states compared with each observation."""
+
+    @property
+    def view_count(self) -> int:
+        """Return the number of available shield-pair views."""
+
+    def evaluate(self, subset_pair_indices: object) -> object:
+        """Return action/candidate/sample/state likelihoods for subsets."""
+
+
+@runtime_checkable
+class SubsetCrossLikelihoodFullSpectrumModel(Protocol):
+    """Define runtime-owned exact likelihood preparation for arbitrary views."""
+
+    def prepare_subset_cross_likelihood_numpy(
+        self,
+        observed_spectra_aqvb: NDArray[np.float64],
+        total_line_contributions_anvsl: NDArray[np.float64],
+        uncollided_line_contributions_anvsl: NDArray[np.float64],
+        transport_features_anvslf: NDArray[np.float64],
+        live_times_s_v: NDArray[np.float64],
+        *,
+        action_chunk_size: int | None = None,
+        sample_chunk_size: int | None = None,
+        state_chunk_size: int | None = None,
+        view_chunk_size: int | None = None,
+    ) -> PreparedSubsetCrossLikelihood:
+        """Prepare an exact host cache for arbitrary view subsets."""
+
+    def prepare_subset_cross_likelihood_torch(
+        self,
+        observed_spectra_aqvb: object,
+        total_line_contributions_anvsl: object,
+        uncollided_line_contributions_anvsl: object,
+        transport_features_anvslf: object,
+        live_times_s_v: object,
+        *,
+        action_chunk_size: int | None = None,
+        sample_chunk_size: int | None = None,
+        state_chunk_size: int | None = None,
+        view_chunk_size: int | None = None,
+    ) -> PreparedSubsetCrossLikelihood:
+        """Prepare an exact device cache for arbitrary view subsets."""
+
+
+@runtime_checkable
+class SubsetCrossLikelihoodMemoryModel(Protocol):
+    """Define the runtime-owned arbitrary-subset memory estimate."""
+
+    def estimate_subset_cross_likelihood_working_set_bytes(
+        self,
+        *,
+        num_actions: int,
+        num_samples: int,
+        num_particles: int,
+        num_source_slots: int,
+        num_views: int,
+        num_candidates: int,
+        subset_size: int,
+        action_chunk_size: int | None = None,
+        sample_chunk_size: int | None = None,
+        state_chunk_size: int | None = None,
+        view_chunk_size: int | None = None,
+        dtype_bytes: int = 8,
+    ) -> int:
+        """Return resident-cache plus peak candidate workspace bytes."""
+
+
 def validate_full_spectrum_model(
     model: object,
 ) -> FullSpectrumGenerativeModel:
