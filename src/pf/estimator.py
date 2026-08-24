@@ -351,6 +351,7 @@ class RotatingShieldPFEstimator(
         self.last_joint_temper_steps: list[dict[str, float]] = []
         self.last_joint_rejuvenation_diagnostics: list[dict[str, float]] = []
         self.last_joint_smc_soft_budget_exceeded = False
+        self.last_joint_rejuvenation_mixing_incomplete = False
         self.last_joint_structural_mixing_incomplete = False
         self._joint_guided_initialization_applied = False
         self.last_joint_guided_initialization_ess: float | None = None

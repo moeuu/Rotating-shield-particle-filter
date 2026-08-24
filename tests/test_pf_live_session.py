@@ -130,6 +130,51 @@ def test_live_pf_config_loader_rejects_unknown_fields(tmp_path: Path) -> None:
         load_live_pf_config(config_path, profile="pf_strict")
 
 
+def test_live_pf_config_validates_nested_adaptive_stop_thresholds(
+    tmp_path: Path,
+) -> None:
+    """Adaptive-stop thresholds must be validated from their single block."""
+    config_path = tmp_path / "pf.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "pure_pf_schema_version": 1,
+                "estimator_profile": "pf_strict",
+                "adaptive_stop": {
+                    "enabled": True,
+                    "assessment_start_station": 10,
+                    "required_consecutive_stations": 3,
+                    "minimum_joint_map_cardinality_probability": 1.1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PFLiveSessionError, match="incompatible"):
+        load_live_pf_config(config_path, profile="pf_strict")
+
+
+def test_live_pf_config_rejects_top_level_adaptive_stop_threshold(
+    tmp_path: Path,
+) -> None:
+    """Estimator-facing stop settings must not duplicate the nested block."""
+    config_path = tmp_path / "pf.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "pure_pf_schema_version": 1,
+                "estimator_profile": "pf_strict",
+                "adaptive_stop_innovation_confidence": 0.99,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PFLiveSessionError, match="unknown fields"):
+        load_live_pf_config(config_path, profile="pf_strict")
+
+
 def test_live_record_forwards_only_raw_spectrum_and_action_geometry(
     tmp_path: Path,
 ) -> None:

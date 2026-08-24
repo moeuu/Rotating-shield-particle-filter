@@ -2037,6 +2037,7 @@ class JointRejuvenationMixin:
         soft_budget_s = float(self.pf_config.joint_smc_soft_wall_time_s)
         cumulative_k_transition_mass = 0.0
         cumulative_boundary_escape_mass = 0.0
+        self.last_joint_rejuvenation_mixing_incomplete = True
         self.last_joint_structural_mixing_incomplete = False
         for sweep_index in range(maximum_sweeps):
             diagnostics = self._joint_rejuvenate(
@@ -2090,7 +2091,7 @@ class JointRejuvenationMixin:
             boundary_requires_structure = bool(
                 self.pf_config.variable_cardinality
             ) and boundary_mass > float(
-                self.pf_config.converge_max_cardinality_boundary_mass
+                self.pf_config.joint_rejuvenation_boundary_mass_threshold
             )
             structural_movement_sufficient = not boundary_requires_structure or (
                 cumulative_k_transition_mass >= minimum_k_mass
@@ -2104,6 +2105,7 @@ class JointRejuvenationMixin:
                 structural_movement_sufficient
             )
             if continuous_movement_sufficient and structural_movement_sufficient:
+                self.last_joint_rejuvenation_mixing_incomplete = False
                 break
             station_elapsed = time.perf_counter() - station_start_s
             if station_elapsed >= soft_budget_s and not boundary_requires_structure:
@@ -2117,6 +2119,10 @@ class JointRejuvenationMixin:
                 )
                 break
             if sweep_index + 1 == maximum_sweeps:
+                self.last_joint_rejuvenation_mixing_incomplete = bool(
+                    not continuous_movement_sufficient
+                    or not structural_movement_sufficient
+                )
                 self.last_joint_structural_mixing_incomplete = bool(
                     boundary_requires_structure and not structural_movement_sufficient
                 )
@@ -2478,6 +2484,7 @@ class JointRejuvenationMixin:
             filt.reset_step_stats()
         self.last_joint_rejuvenation_diagnostics = []
         self.last_joint_smc_soft_budget_exceeded = False
+        self.last_joint_rejuvenation_mixing_incomplete = False
         self.last_joint_structural_mixing_incomplete = False
         station_start = time.perf_counter()
         self._apply_joint_guided_initialization(station)

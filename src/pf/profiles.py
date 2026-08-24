@@ -98,6 +98,7 @@ _PURE_PF_RUNTIME_KEYS = frozenset(
 )
 _PURE_PF_RUNTIME_MAPPING_KEYS = frozenset(
     {
+        "adaptive_stop",
         "dss_pp",
         "pf_buildup",
         "pf_obstacle_mu_by_isotope",
@@ -183,6 +184,17 @@ _DSS_PP_RUNTIME_KEYS = frozenset(
     }
 )
 _PURE_PF_NESTED_KEYS = {
+    "adaptive_stop": frozenset(
+        {
+            "assessment_start_station",
+            "enabled",
+            "innovation_confidence",
+            "maximum_surface_path_radius_95_m",
+            "maximum_upper_cardinality_mass",
+            "minimum_joint_map_cardinality_probability",
+            "required_consecutive_stations",
+        }
+    ),
     "dss_pp": _DSS_PP_RUNTIME_KEYS,
     "pf_buildup": frozenset({"fe_coeff", "pb_coeff", "obstacle_coeff"}),
 }
@@ -199,6 +211,7 @@ _RETIRED_RUNTIME_KEYS = frozenset(
         "adaptive_low_signal_projected_live_factor",
         "adaptive_low_signal_upper_sigma",
         "adaptive_ready_allow_informative_low",
+        "adaptive_mission_stop",
         "apply_incident_gamma_detector_response",
         "birth_enable",
         "birth_enabled",
@@ -210,7 +223,13 @@ _RETIRED_RUNTIME_KEYS = frozenset(
         "converge_min_steps",
         "converge_require_all",
         "converge_window",
+        "converge_cardinality_min_probability",
+        "converge_cardinality_var_max",
+        "converge_innovation_confidence",
+        "converge_max_cardinality_boundary_mass",
+        "converge_min_ess_ratio",
         "continuous_surface_chart_max_edge_m",
+        "credible_surface_radius_threshold_m",
         "coverage_grid_max_cells",
         "response_backscatter_fraction",
         "response_continuum_to_peak",

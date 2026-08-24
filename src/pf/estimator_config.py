@@ -90,11 +90,10 @@ class RotatingShieldPFConfig:
     structural_cardinality_prior_mean: float = 2.0
     structural_cardinality_tail_ratio: float = 0.05
     max_dwell_time_s: float = 5.0  # Max dwell time per pose.
-    credible_surface_radius_threshold_m: float = 0.5
-    converge_min_ess_ratio: float = 0.5
-    converge_cardinality_min_probability: float = 0.95
-    converge_max_cardinality_boundary_mass: float = 0.05
-    converge_innovation_confidence: float = 0.99
+    adaptive_stop_minimum_joint_map_cardinality_probability: float = 0.95
+    adaptive_stop_maximum_upper_cardinality_mass: float = 0.05
+    adaptive_stop_maximum_surface_path_radius_95_m: float = 0.5
+    adaptive_stop_innovation_confidence: float = 0.99
     target_ess_ratio: float = 0.5
     max_temper_steps: int = 256
     min_delta_beta: float = 1e-10
@@ -104,6 +103,7 @@ class RotatingShieldPFConfig:
     joint_rejuvenation_min_surface_esjd_m2: float = 1.0e-4
     joint_rejuvenation_min_log_strength_esjd: float = 1.0e-4
     joint_rejuvenation_min_k_transition_weight_mass: float = 1.0e-4
+    joint_rejuvenation_boundary_mass_threshold: float = 0.05
     joint_smc_soft_wall_time_s: float = 1800.0
     joint_guided_initialization: bool = True
     joint_guided_initialization_prior_row_probability: float = 0.5
@@ -133,7 +133,6 @@ class RotatingShieldPFConfig:
     gpu_device: str = "cuda"
     gpu_dtype: str = "float64"
     planning_eig_samples: int = 50
-    converge_cardinality_var_max: float = 0.05
 
     def __post_init__(self) -> None:
         """Validate and normalize estimator configuration values."""
@@ -255,20 +254,19 @@ class RotatingShieldPFConfig:
             "structural_cardinality_prior_mean",
             "structural_cardinality_tail_ratio",
             "max_dwell_time_s",
-            "credible_surface_radius_threshold_m",
-            "converge_min_ess_ratio",
-            "converge_cardinality_min_probability",
-            "converge_max_cardinality_boundary_mass",
-            "converge_innovation_confidence",
+            "adaptive_stop_minimum_joint_map_cardinality_probability",
+            "adaptive_stop_maximum_upper_cardinality_mass",
+            "adaptive_stop_maximum_surface_path_radius_95_m",
+            "adaptive_stop_innovation_confidence",
             "target_ess_ratio",
             "min_delta_beta",
             "joint_rejuvenation_min_state_change_weight_mass",
             "joint_rejuvenation_min_surface_esjd_m2",
             "joint_rejuvenation_min_log_strength_esjd",
             "joint_rejuvenation_min_k_transition_weight_mass",
+            "joint_rejuvenation_boundary_mass_threshold",
             "joint_smc_soft_wall_time_s",
             "joint_guided_initialization_prior_row_probability",
-            "converge_cardinality_var_max",
         )
         for name in numeric_fields:
             _strict_config_number(getattr(self, name), name=name)
@@ -348,11 +346,13 @@ class RotatingShieldPFConfig:
         ):
             raise ValueError("joint_smc_soft_wall_time_s must be positive.")
         innovation_confidence = _strict_config_number(
-            self.converge_innovation_confidence,
-            name="converge_innovation_confidence",
+            self.adaptive_stop_innovation_confidence,
+            name="adaptive_stop_innovation_confidence",
         )
         if not 0.0 < innovation_confidence < 1.0:
-            raise ValueError("converge_innovation_confidence must lie in (0, 1).")
+            raise ValueError(
+                "adaptive_stop_innovation_confidence must lie in (0, 1)."
+            )
         self.num_particles = int(self.num_particles)
         if self.num_particles < 1:
             raise ValueError("num_particles must be positive.")
@@ -625,21 +625,22 @@ class RotatingShieldPFConfig:
             0,
             int(self.surface_diagnostic_response_cache_max_entries),
         )
-        self.credible_surface_radius_threshold_m = float(
-            self.credible_surface_radius_threshold_m
+        self.adaptive_stop_maximum_surface_path_radius_95_m = float(
+            self.adaptive_stop_maximum_surface_path_radius_95_m
         )
         if (
-            not np.isfinite(self.credible_surface_radius_threshold_m)
-            or self.credible_surface_radius_threshold_m < 0.0
+            not np.isfinite(self.adaptive_stop_maximum_surface_path_radius_95_m)
+            or self.adaptive_stop_maximum_surface_path_radius_95_m < 0.0
         ):
             raise ValueError(
-                "credible_surface_radius_threshold_m must be finite and nonnegative."
+                "adaptive_stop_maximum_surface_path_radius_95_m must be finite "
+                "and nonnegative."
             )
         for probability_field, lower_inclusive in (
-            ("converge_min_ess_ratio", False),
-            ("converge_cardinality_min_probability", False),
-            ("converge_max_cardinality_boundary_mass", True),
-            ("converge_innovation_confidence", False),
+            ("adaptive_stop_minimum_joint_map_cardinality_probability", False),
+            ("adaptive_stop_maximum_upper_cardinality_mass", True),
+            ("adaptive_stop_innovation_confidence", False),
+            ("joint_rejuvenation_boundary_mass_threshold", True),
         ):
             probability = float(getattr(self, probability_field))
             lower_valid = probability >= 0.0 if lower_inclusive else probability > 0.0
@@ -647,14 +648,6 @@ class RotatingShieldPFConfig:
                 lower_symbol = "[" if lower_inclusive else "("
                 raise ValueError(f"{probability_field} must be in {lower_symbol}0, 1].")
             setattr(self, probability_field, probability)
-        self.converge_cardinality_var_max = float(self.converge_cardinality_var_max)
-        if (
-            not np.isfinite(self.converge_cardinality_var_max)
-            or self.converge_cardinality_var_max < 0.0
-        ):
-            raise ValueError(
-                "converge_cardinality_var_max must be finite and nonnegative."
-            )
         self.variable_cardinality = bool(self.variable_cardinality)
         if self.max_sources is None or int(self.max_sources) < 1:
             raise ValueError("Pure PF requires a finite positive max_sources.")

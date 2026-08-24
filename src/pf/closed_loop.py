@@ -89,8 +89,9 @@ class PFControlBudget:
     max_measurements: int
     views_per_station: int
     live_time_s: float
-    adaptive_stop: bool
-    minimum_stop_stations: int
+    adaptive_stop_enabled: bool
+    stop_assessment_start_station: int
+    stop_required_consecutive_stations: int
     runtime_refinement_top_k: int
     planner_audit_top_k: int
 
@@ -111,9 +112,30 @@ class PFControlBudget:
             raise ValueError(
                 "Runtime max_measurements must accommodate one complete station."
             )
-        adaptive_stop = settings.get("adaptive_mission_stop", False)
-        if not isinstance(adaptive_stop, bool):
-            raise TypeError("adaptive_mission_stop must be a boolean.")
+        adaptive_stop = settings.get("adaptive_stop", {})
+        if not isinstance(adaptive_stop, Mapping):
+            raise TypeError("adaptive_stop must be an object.")
+        adaptive_stop_enabled = adaptive_stop.get("enabled", False)
+        if not isinstance(adaptive_stop_enabled, bool):
+            raise TypeError("adaptive_stop.enabled must be a boolean.")
+        assessment_start = _exact_integer(
+            adaptive_stop.get("assessment_start_station", 10),
+            name="adaptive_stop.assessment_start_station",
+            minimum=1,
+        )
+        required_consecutive = _exact_integer(
+            adaptive_stop.get("required_consecutive_stations", 3),
+            name="adaptive_stop.required_consecutive_stations",
+            minimum=1,
+        )
+        earliest_stop_station = assessment_start + required_consecutive - 1
+        if adaptive_stop_enabled and earliest_stop_station > int(
+            acquisition_contract.max_stations
+        ):
+            raise ValueError(
+                "adaptive_stop cannot accumulate its required consecutive "
+                "stations before the runtime max_stations limit."
+            )
         refinement = _exact_integer(
             settings.get("runtime_candidate_refinement_top_k", 0),
             name="runtime_candidate_refinement_top_k",
@@ -132,15 +154,91 @@ class PFControlBudget:
             max_measurements=acquisition_contract.max_measurements,
             views_per_station=configured_views,
             live_time_s=acquisition_contract.live_time_s,
-            adaptive_stop=adaptive_stop,
-            minimum_stop_stations=_exact_integer(
-                settings.get("mission_stop_min_convergence_poses", 4),
-                name="mission_stop_min_convergence_poses",
-                minimum=1,
-            ),
+            adaptive_stop_enabled=adaptive_stop_enabled,
+            stop_assessment_start_station=assessment_start,
+            stop_required_consecutive_stations=required_consecutive,
             runtime_refinement_top_k=refinement,
             planner_audit_top_k=audit_top_k,
         )
+
+    @property
+    def earliest_adaptive_stop_station(self) -> int:
+        """Return the first station where a complete ready streak can stop."""
+        return (
+            self.stop_assessment_start_station
+            + self.stop_required_consecutive_stations
+            - 1
+        )
+
+
+@dataclass(slots=True)
+class AdaptiveStopTracker:
+    """Track consecutive model-native stop decisions across station updates."""
+
+    budget: PFControlBudget
+    consecutive_ready_stations: int = 0
+    last_station_count: int = 0
+
+    def assess(
+        self,
+        estimator: object,
+        *,
+        station_count: int,
+    ) -> dict[str, object]:
+        """Assess one new station and return a traceable stopping decision."""
+        count = _exact_integer(station_count, name="station_count", minimum=1)
+        if count != self.last_station_count + 1:
+            raise ValueError(
+                "Adaptive-stop stations must be assessed once in consecutive order."
+            )
+        self.last_station_count = count
+        enabled = bool(self.budget.adaptive_stop_enabled)
+        eligible = bool(
+            enabled and count >= self.budget.stop_assessment_start_station
+        )
+        diagnostics: dict[str, Any] | None = None
+        instantaneous_ready: bool | None = None
+        if eligible:
+            raw_diagnostics = estimator.posterior_convergence_diagnostics()
+            if not isinstance(raw_diagnostics, Mapping):
+                raise TypeError(
+                    "posterior_convergence_diagnostics must return a mapping."
+                )
+            diagnostics = dict(raw_diagnostics)
+            raw_ready = diagnostics.get("ready")
+            if not isinstance(raw_ready, bool):
+                raise TypeError(
+                    "posterior convergence ready must be a boolean."
+                )
+            instantaneous_ready = raw_ready
+            if instantaneous_ready:
+                self.consecutive_ready_stations += 1
+            else:
+                self.consecutive_ready_stations = 0
+        else:
+            self.consecutive_ready_stations = 0
+        stop_ready = bool(
+            eligible
+            and self.consecutive_ready_stations
+            >= self.budget.stop_required_consecutive_stations
+        )
+        return {
+            "enabled": enabled,
+            "assessed": eligible,
+            "assessment_start_station": (
+                self.budget.stop_assessment_start_station
+            ),
+            "required_consecutive_stations": (
+                self.budget.stop_required_consecutive_stations
+            ),
+            "earliest_stop_station": (
+                self.budget.earliest_adaptive_stop_station
+            ),
+            "instantaneous_ready": instantaneous_ready,
+            "consecutive_ready_stations": self.consecutive_ready_stations,
+            "stop_ready": stop_ready,
+            "posterior_convergence": diagnostics,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,6 +763,7 @@ def _write_final_outputs(
     log: object,
     result: PFClosedLoopResult,
     budget: PFControlBudget,
+    adaptive_stop_status: Mapping[str, object] | None,
 ) -> None:
     """Publish the final posterior and controller provenance atomically per file."""
     posterior = estimator.posterior_snapshot().to_dict()
@@ -676,6 +775,9 @@ def _write_final_outputs(
         "station_count": result.station_count,
         "stop_reason": result.stop_reason,
         "control_budget": asdict(budget),
+        "adaptive_stop_status": (
+            None if adaptive_stop_status is None else dict(adaptive_stop_status)
+        ),
         "posterior_convergence": estimator.posterior_convergence_diagnostics(),
         "posterior_predictive_check": estimator.posterior_predictive_check(),
         "structural_transition_provenance": (
@@ -764,6 +866,8 @@ def run_pf_closed_loop(
             planner,
             acquisition_contract,
         )
+        stop_tracker = AdaptiveStopTracker(budget)
+        latest_adaptive_stop_status: dict[str, object] | None = None
         detected_only_raw = settings.get(
             "pf_detected_isotopes_only",
             settings.get("detected_isotopes_only", False),
@@ -895,6 +999,10 @@ def run_pf_closed_loop(
                     station_id=prefix_station_id,
                     contract_hash=contract_hash,
                 )
+                latest_adaptive_stop_status = stop_tracker.assess(
+                    estimator,
+                    station_count=prefix_station_id + 1,
+                )
             if cui_split_viz is not None:
                 _publish_cui_frame(
                     cui_split_viz,
@@ -916,10 +1024,9 @@ def run_pf_closed_loop(
             elif station_id >= budget.max_stations:
                 stop_reason = "maximum_station_budget"
                 continue_acquisition = False
-            elif (
-                budget.adaptive_stop
-                and station_id >= budget.minimum_stop_stations
-                and estimator.posterior_convergence_diagnostics().get("ready", False)
+            elif bool(
+                latest_adaptive_stop_status
+                and latest_adaptive_stop_status["stop_ready"]
             ):
                 stop_reason = "intrinsic_surface_posterior_converged"
                 continue_acquisition = False
@@ -1088,6 +1195,11 @@ def run_pf_closed_loop(
                 dtype=np.float64,
             )
             visited.append(current_pose.copy())
+            completed_stations = station_id + 1
+            latest_adaptive_stop_status = stop_tracker.assess(
+                estimator,
+                station_count=completed_stations,
+            )
             posterior_snapshot = _live_posterior_summary(estimator)
             if cui_split_viz is not None:
                 _publish_cui_frame(
@@ -1110,23 +1222,16 @@ def run_pf_closed_loop(
                     "detected_isotope_gate": gate_diagnostics,
                     "particle_adequacy": _particle_diagnostics(estimator),
                     "posterior_snapshot": posterior_snapshot,
+                    "adaptive_stop": latest_adaptive_stop_status,
                 }
             )
-            completed_stations = station_id + 1
             if record_count >= budget.max_measurements:
                 stop_reason = "maximum_measurement_budget"
                 break
             if completed_stations >= budget.max_stations:
                 stop_reason = "maximum_station_budget"
                 break
-            if (
-                budget.adaptive_stop
-                and completed_stations >= budget.minimum_stop_stations
-                and estimator.posterior_convergence_diagnostics().get(
-                    "ready",
-                    False,
-                )
-            ):
+            if latest_adaptive_stop_status["stop_ready"]:
                 stop_reason = "intrinsic_surface_posterior_converged"
                 break
             station_planner_rng = _planner_rng(seed, completed_stations)
@@ -1202,6 +1307,7 @@ def run_pf_closed_loop(
             log=log,
             result=result,
             budget=budget,
+            adaptive_stop_status=latest_adaptive_stop_status,
         )
         completed_result = result
         return result

@@ -359,6 +359,18 @@ _PF_CONFIG_ALIASES = {
     "pf_strength_prior_gamma_shape": "strength_prior_gamma_shape",
     "pf_strength_prior_gamma_scale_cps_1m": "strength_prior_gamma_scale_cps_1m",
 }
+_ADAPTIVE_STOP_PF_CONFIG_FIELDS = {
+    "minimum_joint_map_cardinality_probability": (
+        "adaptive_stop_minimum_joint_map_cardinality_probability"
+    ),
+    "maximum_upper_cardinality_mass": (
+        "adaptive_stop_maximum_upper_cardinality_mass"
+    ),
+    "maximum_surface_path_radius_95_m": (
+        "adaptive_stop_maximum_surface_path_radius_95_m"
+    ),
+    "innovation_confidence": "adaptive_stop_innovation_confidence",
+}
 _PF_PHYSICAL_OVERRIDE_KEYS = frozenset(
     {
         "pf_buildup",
@@ -391,8 +403,10 @@ def validate_live_pf_config(
     allowed = {
         field.name for field in fields(RotatingShieldPFConfig)
     } | set(_PF_CONFIG_ALIASES) | {
+        "adaptive_stop",
         "pure_pf_schema_version",
     }
+    allowed.difference_update(_ADAPTIVE_STOP_PF_CONFIG_FIELDS.values())
     allowed.discard("position_max")
     unknown = sorted(set(config).difference(allowed))
     if unknown:
@@ -515,6 +529,12 @@ def _pf_config_values(
     """Select declared PF dataclass fields from resolved settings."""
     allowed = {field.name for field in fields(RotatingShieldPFConfig)}
     values = {key: value for key, value in config.items() if key in allowed}
+    adaptive_stop = config.get("adaptive_stop", {})
+    if not isinstance(adaptive_stop, Mapping):
+        raise PFLiveSessionError("adaptive_stop must be an object.")
+    for external_name, field_name in _ADAPTIVE_STOP_PF_CONFIG_FIELDS.items():
+        if external_name in adaptive_stop:
+            values[field_name] = adaptive_stop[external_name]
     values["estimator_profile"] = str(profile)
     values["position_max"] = tuple(float(value) for value in upper)
     return values
@@ -541,6 +561,16 @@ def _external_pf_config(
             raise PFLiveSessionError(
                 "External settings violate the pure-PF schema."
             ) from exc
+    top_level_stop_fields = sorted(
+        field_name
+        for field_name in _ADAPTIVE_STOP_PF_CONFIG_FIELDS.values()
+        if field_name in external_config
+    )
+    if top_level_stop_fields:
+        raise PFLiveSessionError(
+            "Adaptive-stop settings must be declared in the adaptive_stop object: "
+            + ", ".join(top_level_stop_fields)
+        )
     normalized = dict(external_config)
     for alias, canonical in _PF_CONFIG_ALIASES.items():
         if alias not in normalized:
@@ -554,7 +584,13 @@ def _external_pf_config(
     merged = {
         key: value
         for key, value in normalized.items()
-        if key in declared or key in {"pure_pf_schema_version", "estimator_profile"}
+        if key in declared
+        or key
+        in {
+            "adaptive_stop",
+            "pure_pf_schema_version",
+            "estimator_profile",
+        }
     }
     merged.setdefault("pure_pf_schema_version", 1)
     merged["position_max"] = tuple(float(value) for value in upper)

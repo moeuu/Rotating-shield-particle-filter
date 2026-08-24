@@ -960,10 +960,14 @@ def test_runtime_schema_rejects_malformed_cardinality_settings(
 @pytest.mark.parametrize(
     "retired_key",
     [
+        "adaptive_mission_stop",
         "birth_enable",
         "candidate_verification_queue_enable",
         "calibration_count_method",
         "continuous_surface_chart_max_edge_m",
+        "converge_min_ess_ratio",
+        "converge_cardinality_var_max",
+        "credible_surface_radius_threshold_m",
         "count_likelihood_model",
         "delayed_resample_update",
         "detector_height_sampling_mode",
@@ -1143,7 +1147,12 @@ def test_surface_credible_radius_does_not_collapse_on_a_broad_plane() -> None:
     diagnostics = estimator.posterior_convergence_diagnostics()
 
     assert radii["Cs-137"][0] >= 5.0
-    assert diagnostics["isotopes"]["Cs-137"]["gates"]["surface_radius"] is False
+    assert (
+        diagnostics["isotopes"]["Cs-137"]["gates"][
+            "surface_path_concentration"
+        ]
+        is False
+    )
     assert diagnostics["ready"] is False
 
 
@@ -1199,23 +1208,34 @@ def test_convergence_consumes_native_full_spectrum_innovation_schema(
     assert "0" in predictive["shield_pair_summary"]
     assert "Cs-137" in predictive["isotope_response_ablation_summary"]
     assert len(predictive["worst_standardized_bin_residuals"]) == 2
-    assert convergence["isotopes"]["Cs-137"]["innovation"] == innovation
+    assert convergence["innovation"] == innovation
 
 
-def test_convergence_uses_current_weight_ess_not_a_resample_snapshot() -> None:
-    """A stale resample-time ESS must not hide the current posterior collapse."""
+def test_convergence_reports_current_ess_without_using_it_as_a_stop_gate() -> None:
+    """Current ESS is particle adequacy, not physical posterior convergence."""
     estimator = _stable_fixed_k_estimator()
     particle_filter = estimator.filters["Cs-137"]
     particle_filter.continuous_particles[0].log_weight = float(np.log(0.999))
     particle_filter.continuous_particles[1].log_weight = float(np.log(0.001))
     particle_filter.last_ess_post = 2.0
-    estimator.pf_config.converge_min_ess_ratio = 0.8
 
     diagnostics = estimator.posterior_convergence_diagnostics()
     isotope = diagnostics["isotopes"]["Cs-137"]
 
     assert isotope["current_ess_ratio"] < 0.8
-    assert isotope["gates"]["current_ess"] is False
+    assert "current_ess" not in isotope["gates"]
+    assert diagnostics["ready"] is False
+
+
+def test_convergence_fails_closed_when_joint_rejuvenation_is_incomplete() -> None:
+    """An under-mixed exact-RJ generation must never authorize stopping."""
+    estimator = _stable_fixed_k_estimator()
+    estimator.last_joint_rejuvenation_mixing_incomplete = True
+
+    diagnostics = estimator.posterior_convergence_diagnostics()
+
+    assert diagnostics["sampler_health"]["rejuvenation_mixing_complete"] is False
+    assert diagnostics["joint_gates"]["rejuvenation_mixing_complete"] is False
     assert diagnostics["ready"] is False
 
 
@@ -1248,11 +1268,14 @@ def test_variable_cardinality_cannot_converge_at_the_truncation_boundary() -> No
         ("structural_rj_split_global_position_probability", 0.0),
         ("structural_rj_merge_uniform_pair_probability", 0.0),
         ("structural_rj_merge_distance_sigma_m", 0.0),
-        ("credible_surface_radius_threshold_m", -0.1),
-        ("converge_min_ess_ratio", 0.0),
-        ("converge_cardinality_min_probability", 1.1),
-        ("converge_max_cardinality_boundary_mass", -0.1),
-        ("converge_innovation_confidence", float("nan")),
+        ("adaptive_stop_maximum_surface_path_radius_95_m", -0.1),
+        (
+            "adaptive_stop_minimum_joint_map_cardinality_probability",
+            1.1,
+        ),
+        ("adaptive_stop_maximum_upper_cardinality_mass", -0.1),
+        ("adaptive_stop_innovation_confidence", float("nan")),
+        ("joint_rejuvenation_boundary_mass_threshold", -0.1),
     ],
 )
 def test_exact_rj_numeric_configuration_is_validated(
@@ -1569,7 +1592,15 @@ def test_strict_profile_keeps_pf_budget_and_retires_runtime_placeholders() -> No
     assert int(resolved["pf_hard_max_sources"]) == 8
     assert resolved["structural_cardinality_tail_ratio"] == pytest.approx(0.05)
     assert "adaptive_cardinality_dwell_enable" not in resolved
-    assert resolved["adaptive_mission_stop"] is False
+    assert resolved["adaptive_stop"] == {
+        "enabled": True,
+        "assessment_start_station": 10,
+        "required_consecutive_stations": 3,
+        "minimum_joint_map_cardinality_probability": 0.95,
+        "maximum_upper_cardinality_mass": 0.05,
+        "maximum_surface_path_radius_95_m": 0.5,
+        "innovation_confidence": 0.99,
+    }
     assert "measurement_budget_max_steps" not in resolved
     assert "mission_stop_max_poses" not in resolved
     assert "measurement_live_time_s" not in resolved
@@ -2280,12 +2311,10 @@ def test_pure_posterior_uses_joint_map_cardinality_vector() -> None:
     uncertainty = estimator.posterior_source_uncertainty()
 
     assert radii["Cs-137"] == []
-    assert diagnostics["isotopes"]["Co-60"][
-        "map_cardinality_probability"
-    ] == pytest.approx(0.45)
-    assert diagnostics["isotopes"]["Cs-137"][
-        "map_cardinality_probability"
-    ] == pytest.approx(0.45)
+    assert diagnostics["joint_cardinality"]["map_cardinalities"] == [1, 0]
+    assert diagnostics["joint_cardinality"]["map_probability"] == pytest.approx(
+        0.45
+    )
     assert diagnostics["isotopes"]["Cs-137"]["credible_surface_radii_95_m"] == []
     assert uncertainty["Co-60"][0]["posterior_reference_mass"] == (pytest.approx(0.45))
     assert uncertainty["Co-60"][0]["conditional_support_mass"] == (
@@ -3065,7 +3094,7 @@ def test_adaptive_rejuvenation_uses_movement_and_soft_budget(
         joint_rejuvenation_min_log_strength_esjd=1.0e-4,
         joint_rejuvenation_min_k_transition_weight_mass=1.0e-4,
         variable_cardinality=True,
-        converge_max_cardinality_boundary_mass=0.05,
+        joint_rejuvenation_boundary_mass_threshold=0.05,
         joint_smc_soft_wall_time_s=1800.0,
     )
     estimator.last_joint_rejuvenation_diagnostics = []
@@ -3123,7 +3152,7 @@ def test_adaptive_rejuvenation_does_not_accept_continuous_only_boundary_motion(
         joint_rejuvenation_min_k_transition_weight_mass=1.0e-4,
         joint_smc_soft_wall_time_s=1800.0,
         variable_cardinality=True,
-        converge_max_cardinality_boundary_mass=0.05,
+        joint_rejuvenation_boundary_mass_threshold=0.05,
     )
     estimator.last_joint_rejuvenation_diagnostics = []
     estimator.last_joint_smc_soft_budget_exceeded = False

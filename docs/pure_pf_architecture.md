@@ -173,10 +173,19 @@ posterior particle as the configuration representative, so reported sources
 coexisted and remain on their original continuous surfaces. It never averages
 positions into a solid or projects a synthetic mean back to a surface.
 
-Uncertainty and stopping diagnostics use intrinsic surface path radius or
-credible area, current ESS, cardinality-boundary mass, and model-native
-posterior-predictive innovation. A rank-deficient three-dimensional covariance
-determinant is not treated as surface convergence.
+Uncertainty and stopping diagnostics use the joint MAP cardinality-vector mass,
+ordinary-capacity boundary mass, connected 95% intrinsic surface-path radius,
+model-native full-spectrum posterior-predictive innovation, and the completion
+state of exact-RJ rejuvenation. Current ESS remains a particle-adequacy
+diagnostic, not evidence that the physical posterior has converged. A
+rank-deficient three-dimensional covariance determinant is not treated as
+surface convergence.
+
+The controller starts adaptive-stop assessment at the configured station and
+requires a configured number of consecutive ready posterior generations. The
+standard contract assesses stations 10 onward and requires three consecutive
+ready generations, so the earliest adaptive stop is station 12. The runtime
+acquisition contract remains the sole owner of the hard station limit.
 
 ## Planner
 

@@ -47,6 +47,7 @@
   "joint_rejuvenation_min_surface_esjd_m2": 0.0001,
   "joint_rejuvenation_min_log_strength_esjd": 0.0001,
   "joint_rejuvenation_min_k_transition_weight_mass": 0.0001,
+  "joint_rejuvenation_boundary_mass_threshold": 0.05,
   "joint_smc_soft_wall_time_s": 1800.0,
   "joint_guided_initialization": true,
   "joint_guided_initialization_prior_row_probability": 0.5,
@@ -58,7 +59,15 @@
   "use_gpu": true,
   "gpu_device": "cuda",
   "gpu_dtype": "float64",
-  "adaptive_mission_stop": false,
+  "adaptive_stop": {
+    "enabled": true,
+    "assessment_start_station": 10,
+    "required_consecutive_stations": 3,
+    "minimum_joint_map_cardinality_probability": 0.95,
+    "maximum_upper_cardinality_mass": 0.05,
+    "maximum_surface_path_radius_95_m": 0.5,
+    "innovation_confidence": 0.99
+  },
   "runtime_candidate_refinement_top_k": 0,
   "dss_pp": {
     "augment_candidates": false,

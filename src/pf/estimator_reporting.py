@@ -774,6 +774,9 @@ class EstimatorReportingMixin:
                 "joint_smc_soft_budget_exceeded": bool(
                     self.last_joint_smc_soft_budget_exceeded
                 ),
+                "joint_rejuvenation_mixing_incomplete": bool(
+                    self.last_joint_rejuvenation_mixing_incomplete
+                ),
                 "joint_structural_mixing_incomplete": bool(
                     self.last_joint_structural_mixing_incomplete
                 ),
@@ -937,7 +940,9 @@ class EstimatorReportingMixin:
                 "conditional_mark_degrees_of_freedom": 0,
                 "conditional_mark_tail_probability": None,
                 "conditional_mark_upper_tail_probability": None,
-                "confidence": float(self.pf_config.converge_innovation_confidence),
+                "confidence": float(
+                    self.pf_config.adaptive_stop_innovation_confidence
+                ),
             }
         station = self._joint_station_history[-1]
         weights = self._strict_joint_particle_weights()
@@ -953,7 +958,9 @@ class EstimatorReportingMixin:
                 components[2],
                 station.live_times_s,
                 weights,
-                confidence=float(self.pf_config.converge_innovation_confidence),
+                confidence=float(
+                    self.pf_config.adaptive_stop_innovation_confidence
+                ),
             )
         )
         required_raw = {
@@ -979,7 +986,7 @@ class EstimatorReportingMixin:
             not np.isfinite(confidence)
             or not np.isclose(
                 confidence,
-                float(self.pf_config.converge_innovation_confidence),
+                float(self.pf_config.adaptive_stop_innovation_confidence),
                 rtol=0.0,
                 atol=1.0e-15,
             )
@@ -1448,19 +1455,82 @@ class EstimatorReportingMixin:
             ),
         }
 
+    def _stopping_joint_cardinality_distribution(
+        self,
+    ) -> dict[tuple[int, ...], float]:
+        """Return aligned joint-cardinality mass for adaptive stopping."""
+        isotope_order = tuple(self.joint_isotope_order())
+        if not isotope_order:
+            return {}
+        weights = self._strict_joint_particle_weights()
+        cardinalities = np.column_stack(
+            [
+                np.fromiter(
+                    (
+                        int(particle.state.num_sources)
+                        for particle in self.filters[isotope].continuous_particles
+                    ),
+                    dtype=np.int64,
+                    count=weights.size,
+                )
+                for isotope in isotope_order
+            ]
+        )
+        expected_shape = (weights.size, len(isotope_order))
+        if cardinalities.shape != expected_shape or np.any(cardinalities < 0):
+            raise RuntimeError(
+                "Adaptive stopping requires valid aligned joint cardinalities."
+            )
+        vectors, inverse = np.unique(cardinalities, axis=0, return_inverse=True)
+        mass = validated_probability_distribution(
+            np.bincount(inverse, weights=weights, minlength=vectors.shape[0]),
+            name="adaptive-stop joint cardinality mass",
+        )
+        return {
+            tuple(int(value) for value in vector): float(probability)
+            for vector, probability in zip(vectors, mass, strict=True)
+        }
+
     def posterior_convergence_diagnostics(self) -> dict[str, Any]:
-        """Return fail-closed PF convergence gates without using simulation truth."""
+        """Return model-native adaptive-stop gates without simulation truth."""
         isotope_diagnostics: dict[str, dict[str, Any]] = {}
-        all_ready = True
         joint_innovation = self._latest_joint_station_innovation()
         point_estimates = self.posterior_point_estimate()
+        isotope_order = tuple(self.joint_isotope_order())
+        joint_distribution = self._stopping_joint_cardinality_distribution()
+        joint_map_vector = tuple(
+            int(point_estimates[isotope].map_cardinality)
+            for isotope in isotope_order
+            if isotope in point_estimates
+        )
+        joint_map_probability = float(joint_distribution.get(joint_map_vector, 0.0))
+        sampler_health = {
+            "smc_soft_budget_respected": bool(
+                not self.last_joint_smc_soft_budget_exceeded
+            ),
+            "rejuvenation_mixing_complete": bool(
+                not self.last_joint_rejuvenation_mixing_incomplete
+            ),
+            "structural_mixing_complete": bool(
+                not self.last_joint_structural_mixing_incomplete
+            ),
+        }
+        joint_gates = {
+            "joint_map_cardinality_probability": bool(
+                joint_map_probability
+                >= self.pf_config.adaptive_stop_minimum_joint_map_cardinality_probability
+            ),
+            "full_spectrum_innovation": bool(joint_innovation["passed"]),
+            **sampler_health,
+        }
+        all_isotopes_ready = True
         for isotope, filt in self.filters.items():
             if not filt.continuous_particles:
                 isotope_diagnostics[isotope] = {
                     "ready": False,
                     "reason": "missing_particles",
                 }
-                all_ready = False
+                all_isotopes_ready = False
                 continue
             weights = self._normalized_stopping_weights(filt)
             particle_count = int(weights.size)
@@ -1481,19 +1551,6 @@ class EstimatorReportingMixin:
                 int(cardinality): float(mass)
                 for cardinality, mass in point_estimate.cardinality_distribution.items()
             }
-            map_probability = float(point_estimate.selected_stratum_mass)
-            cardinality_mean = float(
-                sum(
-                    float(cardinality) * mass
-                    for cardinality, mass in distribution.items()
-                )
-            )
-            cardinality_variance = float(
-                sum(
-                    mass * (float(cardinality) - cardinality_mean) ** 2
-                    for cardinality, mass in distribution.items()
-                )
-            )
             ordinary_maximum = int(filt.config.max_sources or 0)
             boundary_mass = float(
                 sum(
@@ -1521,25 +1578,19 @@ class EstimatorReportingMixin:
                     default=0.0,
                 )
             )
+            minimum_connected_mass = min(connected_masses, default=1.0)
             gates = {
-                "current_ess": bool(ess_ratio >= self.pf_config.converge_min_ess_ratio),
-                "cardinality_confidence": bool(
-                    map_probability
-                    >= self.pf_config.converge_cardinality_min_probability
-                    and cardinality_variance
-                    <= self.pf_config.converge_cardinality_var_max
-                ),
                 "cardinality_not_at_upper_boundary": bool(
                     not filt.config.variable_cardinality
                     or boundary_mass
-                    <= self.pf_config.converge_max_cardinality_boundary_mass
+                    <= self.pf_config.adaptive_stop_maximum_upper_cardinality_mass
                 ),
-                "surface_radius": bool(
+                "surface_path_concentration": bool(
                     maximum_radius is not None
                     and maximum_radius
-                    <= self.pf_config.credible_surface_radius_threshold_m
+                    <= self.pf_config.adaptive_stop_maximum_surface_path_radius_95_m
+                    and minimum_connected_mass + 1.0e-15 >= 0.95
                 ),
-                "innovation": bool(joint_innovation["passed"]),
             }
             ready = bool(all(gates.values()))
             isotope_diagnostics[isotope] = {
@@ -1548,18 +1599,41 @@ class EstimatorReportingMixin:
                 "particle_count": particle_count,
                 "current_ess_ratio": ess_ratio,
                 "cardinality_distribution": distribution,
-                "map_cardinality_probability": map_probability,
-                "cardinality_variance": cardinality_variance,
+                "selected_joint_map_cardinality": int(
+                    point_estimate.map_cardinality
+                ),
+                "marginal_map_cardinality_probability": max(
+                    distribution.values(),
+                    default=0.0,
+                ),
                 "maximum_cardinality_boundary_mass": boundary_mass,
                 "credible_surface_radii_95_m": radii,
                 "surface_connected_masses": connected_masses,
+                "minimum_surface_connected_mass": minimum_connected_mass,
                 "maximum_credible_surface_radius_95_m": maximum_radius,
-                "innovation": dict(joint_innovation),
                 "gates": gates,
             }
-            all_ready &= ready
+            all_isotopes_ready &= ready
+        joint_ready = bool(joint_distribution) and all(joint_gates.values())
         return {
-            "ready": bool(isotope_diagnostics) and all_ready,
+            "ready": bool(isotope_diagnostics) and all_isotopes_ready and joint_ready,
             "metric": "surface_path_upper_bound_credible_distance",
+            "joint_cardinality": {
+                "isotope_order": list(isotope_order),
+                "map_cardinalities": list(joint_map_vector),
+                "map_probability": joint_map_probability,
+                "distribution": [
+                    {
+                        "cardinalities": list(cardinalities),
+                        "probability": float(probability),
+                    }
+                    for cardinalities, probability in sorted(
+                        joint_distribution.items()
+                    )
+                ],
+            },
+            "innovation": dict(joint_innovation),
+            "sampler_health": sampler_health,
+            "joint_gates": joint_gates,
             "isotopes": isotope_diagnostics,
         }

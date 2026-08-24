@@ -22,6 +22,7 @@ from runtime.adaptive_client import (
 from runtime.experiment_profiles import AcquisitionContract
 
 from pf.closed_loop import (
+    AdaptiveStopTracker,
     PFClosedLoopResult,
     PFControlBudget,
     _cui_truth_display_mode,
@@ -333,6 +334,97 @@ def test_pf_budget_requires_one_complete_estimator_station() -> None:
 
     with pytest.raises(ValueError, match="views_per_station"):
         PFControlBudget.from_runtime_contract(settings, planner, contract)
+
+
+def test_adaptive_stop_starts_at_ten_and_first_stops_at_twelve() -> None:
+    """Three ready assessments from station 10 must first stop at station 12."""
+    settings = {
+        "adaptive_stop": {
+            "enabled": True,
+            "assessment_start_station": 10,
+            "required_consecutive_stations": 3,
+        },
+        "dss_pp": {
+            "program_length": 8,
+            "planning_method": "resample",
+        },
+    }
+    planner = dss_config_from_pf_settings(settings)
+    contract = AcquisitionContract(
+        max_stations=16,
+        views_per_station=8,
+        live_time_s=20.0,
+        max_measurements=128,
+        min_station_separation_m=3.0,
+        coverage_radius_m=3.0,
+    )
+    budget = PFControlBudget.from_runtime_contract(settings, planner, contract)
+
+    class _ReadyEstimator:
+        """Return one ready posterior for every actual assessment."""
+
+        def __init__(self) -> None:
+            """Initialize an assessment call counter."""
+            self.calls = 0
+
+        def posterior_convergence_diagnostics(self) -> dict[str, bool]:
+            """Return a model-ready diagnostic payload."""
+            self.calls += 1
+            return {"ready": True}
+
+    estimator = _ReadyEstimator()
+    tracker = AdaptiveStopTracker(budget)
+    statuses = [
+        tracker.assess(estimator, station_count=station_count)
+        for station_count in range(1, 13)
+    ]
+
+    assert budget.earliest_adaptive_stop_station == 12
+    assert all(not status["assessed"] for status in statuses[:9])
+    assert [status["consecutive_ready_stations"] for status in statuses[9:]] == [
+        1,
+        2,
+        3,
+    ]
+    assert all(not status["stop_ready"] for status in statuses[:11])
+    assert statuses[11]["stop_ready"] is True
+    assert estimator.calls == 3
+
+
+def test_adaptive_stop_ready_streak_resets_after_one_failed_station() -> None:
+    """A failed posterior generation must require three new ready stations."""
+    settings = {
+        "adaptive_stop": {
+            "enabled": True,
+            "assessment_start_station": 10,
+            "required_consecutive_stations": 3,
+        },
+        "dss_pp": {"program_length": 8},
+    }
+    planner = dss_config_from_pf_settings(settings)
+    contract = AcquisitionContract(
+        max_stations=16,
+        views_per_station=8,
+        live_time_s=20.0,
+        max_measurements=128,
+        min_station_separation_m=3.0,
+        coverage_radius_m=3.0,
+    )
+    budget = PFControlBudget.from_runtime_contract(settings, planner, contract)
+    readiness = iter((True, False, True, True, True))
+    estimator = SimpleNamespace(
+        posterior_convergence_diagnostics=lambda: {"ready": next(readiness)}
+    )
+    tracker = AdaptiveStopTracker(budget)
+
+    statuses = [
+        tracker.assess(estimator, station_count=station_count)
+        for station_count in range(1, 15)
+    ]
+
+    assert statuses[10]["consecutive_ready_stations"] == 0
+    assert statuses[11]["consecutive_ready_stations"] == 1
+    assert statuses[13]["stop_ready"] is True
 
 
 def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
