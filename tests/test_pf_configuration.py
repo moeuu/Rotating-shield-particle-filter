@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -53,3 +54,23 @@ def test_load_pf_config_rejects_inheritance_cycles(tmp_path: Path) -> None:
 
     with pytest.raises(PFConfigError, match="Cyclic PF config inheritance"):
         load_pf_config(first)
+
+
+def test_diagnostic_profiles_inherit_production_particle_count() -> None:
+    """Diagnostic profiles must not duplicate the production particle count."""
+    root = Path(__file__).resolve().parents[1]
+    production_path = root / "configs" / "pf" / "pf_strict_3d.json"
+    production, _ = load_pf_config(production_path)
+    particle_count = production.get("num_particles")
+
+    assert isinstance(particle_count, int)
+    assert not isinstance(particle_count, bool)
+    assert particle_count > 0
+    for diagnostic_path in sorted(
+        (production_path.parent / "diagnostics").glob("*.json")
+    ):
+        leaf = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+        diagnostic, _ = load_pf_config(diagnostic_path)
+
+        assert "num_particles" not in leaf
+        assert diagnostic["num_particles"] == particle_count

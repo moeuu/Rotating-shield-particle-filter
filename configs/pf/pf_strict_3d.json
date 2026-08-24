@@ -1,7 +1,7 @@
 {
   "pure_pf_schema_version": 1,
   "estimator_profile": "pf_strict",
-  "num_particles": 2000,
+  "num_particles": 4096,
   "pf_detected_isotopes_only": false,
   "detected_isotope_false_activation_probability": 0.001,
   "variable_cardinality": true,

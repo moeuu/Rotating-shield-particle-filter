@@ -49,10 +49,13 @@ uv run rotating-shield-pf-live \
 
 Create and serve the private, action-free scenario from the shared runtime. The
 generic PF command accepts only its opaque Unix socket and never receives a private
-scenario path, scene seed, or source profile. The PF
-configuration owns its particle count, planner objective, station/view/measurement
-budgets, and stopping rule. An MLE session may use entirely different estimator
-settings while connecting to the same runtime protocol.
+scenario path, scene seed, or source profile. The PF configuration owns its particle
+count, planner objective, and statistical stopping rule; the shared runtime contract
+owns station, view, and measurement budgets. The production particle count is
+declared once as `num_particles` in `configs/pf/pf_strict_3d.json`. Diagnostic PF
+profiles inherit that value, so changing this one field updates live and RA-L PF
+runs without duplicating the setting. An MLE session may use entirely different
+estimator settings while connecting to the same runtime protocol.
 
 The runtime owns reachable candidate poses and their physical motion costs. PF owns
 candidate ranking and shield-program selection. Every selected station writes
