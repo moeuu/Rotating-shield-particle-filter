@@ -156,3 +156,52 @@ Diagnostics record proxy replicas, shortlist boundaries and Jaccard stability,
 exact pose programs/EIG/scores, greedy and swap candidate counts, legacy-floor
 use, independent-confirmation counts, selected source, timing, and all relevant
 seeds.
+
+## Fixed-eight shield-view shadow audit
+
+The production acquisition contract still executes exactly eight shield-pair
+views at every station. The strict PF profile additionally evaluates a
+non-controlling shadow policy over view counts `{2, 4, 8}`:
+
+- The depth-eight conditional-greedy order supplies nested prefixes
+  `G2 subset G4 subset G8`. Proxy EIG for every valid pose is already available
+  from the greedy stages, so the proxy audit adds no response or likelihood
+  approximation.
+- Exact K=2, K=4, and greedy-prefix K=8 are evaluated through one independent
+  holdout all-64-view cache after their ordered pairs have been fixed by the
+  selection cache. The three horizons therefore share holdout PF particles,
+  predictive samples, latent states, and station-shared nuisance draws without
+  reusing the samples that selected the prefix. This avoids an in-sample
+  winner's-curse interpretation of the paired interval. Physical response is
+  reused; only virtual observations and likelihood reductions are repeated.
+  The executed K=8 one-swap/legacy-guard result remains separate and unchanged.
+- The executed K=8 pose shortlist remains controlling. When it contains fewer
+  than the configured maximum of 16 poses, K-specific proxy leaders fill only
+  the unused audit capacity. These extra poses cannot affect the executed pose
+  or shield program.
+- For each exact pose and short view count `k`, the audit forms paired samples
+  `D_q(k) = KL_q(k) - 0.95 KL_q(8)`. It recommends two views when the one-sided
+  95% Student-t lower bound for `D(2)` is strictly positive, otherwise four
+  when the corresponding `D(4)` bound is positive, and otherwise eight. The
+  confidence is per comparison; no simultaneous or global 95% claim is made.
+- PF-owned truth-free health is joined only when writing `planner_audit.jsonl`.
+  Particle-diversity warnings, sampler failures, upper-cardinality-boundary
+  mass, latest full-spectrum innovation failure, newly activated isotopes, or
+  unavailable health force the hypothetical health-gated action to eight.
+- `measurement_time_weight` is recorded only as an uncalibrated counterfactual.
+  It does not enter the shadow decision, pose score used by that decision, the
+  returned `ShieldProgram`, runtime station completion, or measurement budget.
+  The audit saves live time, rotation-overhead-inclusive elapsed time, marginal
+  EIG per added second, and the action that the configured time weight alone
+  would have selected; this action is explicitly not calibrated for execution.
+
+The audit stores point-rule, paired-LCB, and health-gated hypothetical actions
+alongside the actually executed eight-view action. Enabling or disabling the
+shadow path must leave the controlling pose, ordered pair IDs, EIG, score, and
+planner RNG stream unchanged.
+
+The holdout adds one virtual-observation cache construction and three batched
+fixed-prefix likelihood reductions per exact pose chunk. It does not repeat
+the full-spectrum physical response. This audit overhead has not yet been
+measured in a completed full-simulation run and is not included in the older
+benchmark table above.

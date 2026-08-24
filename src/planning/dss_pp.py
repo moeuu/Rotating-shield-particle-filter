@@ -23,6 +23,7 @@ from pf.full_spectrum import (
     validate_full_spectrum_model,
 )
 from pf.randomness import named_random_generator, named_stream_seed
+
 # Private imports preserve direct legacy paths without joining wildcard exports.
 from planning.dss_candidates import (  # noqa: F401
     _free_space_mask_batch,
@@ -103,6 +104,7 @@ from planning.conditional_greedy import (
 from planning.conditional_memory import plan_conditional_pose_chunk
 from planning.pose_scoring import compose_pose_scores
 from planning.program_types import ShieldProgram
+from planning.shield_view_count_shadow import select_shield_view_count_shadow
 
 
 __all__ = [
@@ -212,9 +214,7 @@ def _full_spectrum_joint_program_components(
         or not isinstance(working_memory_budget_bytes, (int, np.integer))
         or int(working_memory_budget_bytes) <= 0
     ):
-        raise ValueError(
-            "working_memory_budget_bytes must be a positive integer."
-        )
+        raise ValueError("working_memory_budget_bytes must be a positive integer.")
     model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
     isotope_order = tuple(str(value) for value in joint_particles.isotope_order)
     if isotope_order != tuple(sorted(str(value) for value in estimator.isotopes)):
@@ -418,8 +418,7 @@ def _full_spectrum_joint_program_components(
                 )
                 if tuple(values.shape) != expected_program_shape:
                     raise RuntimeError(
-                        f"Full-spectrum component {field_name!r} has an "
-                        "invalid shape."
+                        f"Full-spectrum component {field_name!r} has an invalid shape."
                     )
             else:
                 values = np.asarray(
@@ -445,19 +444,15 @@ def _full_spectrum_joint_program_components(
         if device_resident:
             import torch
 
-            source_scale = (
-                torch.as_tensor(
-                    strengths[source_mask],
-                    device=total_components.device,
-                    dtype=total_components.dtype,
-                )
-                .reshape(1, 1, -1, 1)
-                * torch.as_tensor(
-                    branching_weights,
-                    device=total_components.device,
-                    dtype=total_components.dtype,
-                ).reshape(1, 1, 1, -1)
-            )
+            source_scale = torch.as_tensor(
+                strengths[source_mask],
+                device=total_components.device,
+                dtype=total_components.dtype,
+            ).reshape(1, 1, -1, 1) * torch.as_tensor(
+                branching_weights,
+                device=total_components.device,
+                dtype=total_components.dtype,
+            ).reshape(1, 1, 1, -1)
         else:
             source_scale = (
                 strengths[source_mask][None, None, :, None]
@@ -547,9 +542,7 @@ def _full_spectrum_joint_program_components(
                 torch.any(total_components < 0.0),
                 torch.any(uncollided_components < 0.0),
                 torch.any(feature_components < 0.0),
-                torch.any(
-                    uncollided_components > total_components + 1.0e-10
-                ),
+                torch.any(uncollided_components > total_components + 1.0e-10),
             )
         ).any()
         if bool(invalid.item()):
@@ -711,9 +704,7 @@ def _program_information_gains_for_poses(
         raise RuntimeError(
             "Torch DSS requires the shared device-resident predictive sampler."
         )
-    if use_gpu and not callable(
-        getattr(model, "cross_log_likelihood_torch", None)
-    ):
+    if use_gpu and not callable(getattr(model, "cross_log_likelihood_torch", None)):
         raise RuntimeError("Torch DSS requires the shared Torch cross likelihood.")
     accelerator_memory_before = _dss_accelerator_memory_snapshot(
         use_gpu=use_gpu,
@@ -912,9 +903,7 @@ def _program_information_gains_for_poses(
                     live_time_s=float(config.live_time_s),
                     detector_aperture_samples=int(config.detector_aperture_samples),
                     device_resident=use_gpu,
-                    working_memory_budget_bytes=int(
-                        response_scratch_budget_bytes
-                    ),
+                    working_memory_budget_bytes=int(response_scratch_budget_bytes),
                 )
                 batch_gains = _full_spectrum_information_gain(
                     estimator,
@@ -976,9 +965,7 @@ def _program_information_gains_for_poses(
             successful_likelihood_action_chunk_sizes.append(
                 int(likelihood_action_chunk_size)
             )
-            successful_response_resident_bytes.append(
-                int(response_resident_bytes)
-            )
+            successful_response_resident_bytes.append(int(response_resident_bytes))
             successful_response_materialization_peak_bytes.append(
                 int(response_materialization_peak_bytes)
             )
@@ -1385,9 +1372,7 @@ def _compose_transition_score(
             rtol=1.0e-12,
             atol=1.0e-12,
         ):
-            raise ValueError(
-                "Motion-time component overrides must sum to travel time."
-            )
+            raise ValueError("Motion-time component overrides must sum to travel time.")
         horizontal_weight = (
             float(config.lambda_time)
             if config.lambda_horizontal_time is None
@@ -1551,7 +1536,7 @@ def _exact_eig_shortlist(
             -float(pending_nodes[int(action_matrix[pose_row, 0])].coverage_gain),
             -float(pose_ranking_scores[pose_row]),
             int(pose_indices[pose_row]),
-        )
+        ),
     )
     coverage_limit = min(int(config.exact_eig_coverage_reserve), pose_limit)
     for pose_row in coverage_pose_rows[:coverage_limit]:
@@ -1598,6 +1583,15 @@ class _ConditionalSearchBatch:
     selection_sources_a: tuple[str, ...]
     selected_base_kl_samples_aq: NDArray[np.float64]
     selected_combined_kl_samples_a: tuple[NDArray[np.float64], ...]
+    shadow_prefix_pair_ids_by_view_count: dict[int, NDArray[np.int64]]
+    shadow_prefix_information_gains_by_view_count: dict[
+        int,
+        NDArray[np.float64],
+    ]
+    shadow_prefix_kl_samples_by_view_count: dict[
+        int,
+        NDArray[np.float64],
+    ]
     diagnostics: dict[str, object]
 
 
@@ -1612,6 +1606,18 @@ class _ConditionalPoseEvaluation:
     selected_combined_kl_samples_r: tuple[
         tuple[NDArray[np.float64], ...],
         ...,
+    ]
+    shadow_prefix_pair_ids_by_view_count: dict[
+        int,
+        NDArray[np.int64],
+    ]
+    shadow_prefix_information_gains_by_view_count: dict[
+        int,
+        NDArray[np.float64],
+    ]
+    shadow_prefix_kl_samples_by_view_count: dict[
+        int,
+        NDArray[np.float64],
     ]
     diagnostics: dict[str, object]
 
@@ -1669,8 +1675,7 @@ def _all_pair_component_programs(
 
 def _slice_joint_program_components(
     components: (
-        _JointProgramSpectrumComponents
-        | _DeviceJointProgramSpectrumComponents
+        _JointProgramSpectrumComponents | _DeviceJointProgramSpectrumComponents
     ),
     action_indices_a: NDArray[np.int64],
 ) -> _JointProgramSpectrumComponents | _DeviceJointProgramSpectrumComponents:
@@ -1700,9 +1705,7 @@ def _slice_joint_program_components(
             contract_hash_sha256=components.contract_hash_sha256,
         )
     host_selector: object = (
-        slice(int(indices[0]), int(indices[0]) + 1)
-        if indices.size == 1
-        else indices
+        slice(int(indices[0]), int(indices[0]) + 1) if indices.size == 1 else indices
     )
     return _JointProgramSpectrumComponents(
         total_pnvsl=components.total_pnvsl[host_selector],
@@ -1852,8 +1855,7 @@ def _conditional_search_with_components(
     *,
     estimator: RotatingShieldPFEstimator,
     components: (
-        _JointProgramSpectrumComponents
-        | _DeviceJointProgramSpectrumComponents
+        _JointProgramSpectrumComponents | _DeviceJointProgramSpectrumComponents
     ),
     detector_positions_a3: NDArray[np.float64],
     particle_weights_n: NDArray[np.float64],
@@ -1865,8 +1867,10 @@ def _conditional_search_with_components(
     incumbent_subsets_ck: NDArray[np.int64] | None,
     confirm_ambiguous: bool,
     confidence: float,
+    shadow_prefix_view_counts: tuple[int, ...] = (),
+    capture_shadow_kl_samples: bool = False,
 ) -> _ConditionalSearchBatch:
-    """Search all pair subsets, confirming only ambiguous final contenders."""
+    """Search all pairs and hold out MC samples for shadow inference."""
     import torch
 
     prepared = prepare_conditional_observation_cache(
@@ -1901,6 +1905,37 @@ def _conditional_search_with_components(
         initial_kl_tensor.detach().cpu().numpy(),
         dtype=np.float64,
     )
+    shadow_programs: dict[int, NDArray[np.int64]] = {}
+    shadow_gains: dict[int, NDArray[np.float64]] = {}
+    shadow_kl_samples: dict[int, NDArray[np.float64]] = {}
+    if bool(capture_shadow_kl_samples) and not shadow_prefix_view_counts:
+        raise ValueError("Shadow KL capture requires declared prefix view counts.")
+    if shadow_prefix_view_counts:
+        resolved_shadow_counts = tuple(
+            int(value) for value in shadow_prefix_view_counts
+        )
+        if (
+            tuple(sorted(set(resolved_shadow_counts))) != resolved_shadow_counts
+            or resolved_shadow_counts[-1] != int(program_length)
+            or resolved_shadow_counts[0] < 1
+        ):
+            raise ValueError(
+                "Shadow prefix view counts must be increasing and end at the "
+                "executed program length."
+            )
+        greedy_programs = np.asarray(
+            result.greedy_program_pair_ids_al,
+            dtype=np.int64,
+        )
+        for view_count in resolved_shadow_counts:
+            shadow_programs[view_count] = np.asarray(
+                greedy_programs[:, :view_count],
+                dtype=np.int64,
+            ).copy()
+            shadow_gains[view_count] = np.asarray(
+                result.stages[view_count - 1].selected_information_gain_a,
+                dtype=np.float64,
+            ).copy()
     (
         selected_programs,
         selected_gains,
@@ -1917,13 +1952,66 @@ def _conditional_search_with_components(
         selected_indices,
     ].copy()
     selected_combined_kl = [
-        np.asarray(values, dtype=np.float64).copy()
-        for values in base_selected_kl
+        np.asarray(values, dtype=np.float64).copy() for values in base_selected_kl
     ]
     # All tensors needed from the first seed are now on the host. Releasing
     # its opaque cache before an independent confirmation prevents two full
     # action caches from overlapping in device memory.
     del _initial_eig, initial_kl_tensor, contender_tensor, prepared
+    shadow_holdout_seed: int | None = None
+    shadow_holdout_stream_name: str | None = None
+    shadow_holdout_wall_s = 0.0
+    if bool(capture_shadow_kl_samples):
+        shadow_holdout_started = time.perf_counter()
+        _release_dss_gpu_cache()
+        shadow_holdout_seed = int(
+            named_stream_seed(
+                int(eig_call_seed),
+                "dss_pp",
+                "shield_view_count_shadow",
+                str(stream_name),
+                "independent_holdout",
+            )
+            & ((1 << 63) - 1)
+        )
+        shadow_holdout_stream_name = f"{stream_name}_shadow_independent_holdout"
+        shadow_holdout = prepare_conditional_observation_cache(
+            estimator,
+            components,
+            particle_weights_n,
+            detector_positions_a3,
+            sample_count=int(sample_count),
+            eig_call_seed=int(shadow_holdout_seed),
+            stream_name=shadow_holdout_stream_name,
+        )
+        # These three fixed horizons have different last dimensions. Each
+        # call remains batched over every pose and reuses the same holdout
+        # all-64-view cache, latent states, nuisance draws, and MC sample IDs.
+        for view_count in resolved_shadow_counts:
+            prefix_tensor = torch.as_tensor(
+                shadow_programs[view_count][:, np.newaxis, :],
+                device=getattr(shadow_holdout.cache, "device"),
+                dtype=torch.long,
+            )
+            _prefix_eig, prefix_kl_tensor = evaluate_subset_information_gain_torch(
+                shadow_holdout.cache,
+                prefix_tensor,
+                particle_weights_n,
+            )
+            prefix_kl = np.asarray(
+                prefix_kl_tensor[:, 0].detach().cpu().numpy(),
+                dtype=np.float64,
+            )
+            shadow_kl_samples[view_count] = prefix_kl
+            shadow_gains[view_count] = np.mean(
+                prefix_kl,
+                axis=1,
+                dtype=np.float64,
+            )
+            del _prefix_eig, prefix_kl_tensor, prefix_tensor
+        del shadow_holdout
+        _release_dss_gpu_cache()
+        shadow_holdout_wall_s = float(time.perf_counter() - shadow_holdout_started)
     confirmation_count = 0
     confirmation_batch_sizes: list[int] = []
     confirmation_component_strategy = "not_requested"
@@ -1954,8 +2042,7 @@ def _conditional_search_with_components(
             (ambiguous_indices,)
             if all_actions_ambiguous
             else tuple(
-                np.asarray([value], dtype=np.int64)
-                for value in ambiguous_indices
+                np.asarray([value], dtype=np.int64) for value in ambiguous_indices
             )
         )
         confirmation_component_strategy = (
@@ -1983,9 +2070,7 @@ def _conditional_search_with_components(
                 ],
                 sample_count=int(sample_count),
                 eig_call_seed=confirmation_seed,
-                stream_name=(
-                    f"{stream_name}_ambiguous_program_confirmation"
-                ),
+                stream_name=(f"{stream_name}_ambiguous_program_confirmation"),
             )
             confirmation_contenders = torch.as_tensor(
                 contenders[confirmation_indices],
@@ -1999,9 +2084,7 @@ def _conditional_search_with_components(
                     particle_weights_n,
                 )
             )
-            confirmation_stop = (
-                confirmation_offset + int(confirmation_indices.size)
-            )
+            confirmation_stop = confirmation_offset + int(confirmation_indices.size)
             confirmation_kl[confirmation_offset:confirmation_stop] = np.asarray(
                 confirmation_kl_tensor.detach().cpu().numpy(),
                 dtype=np.float64,
@@ -2043,9 +2126,7 @@ def _conditional_search_with_components(
                 combined_kl[local_index, confirmed_indices[local_index]],
                 dtype=np.float64,
             ).copy()
-    selected_sources = tuple(
-        contender_names[int(index)] for index in selected_indices
-    )
+    selected_sources = tuple(contender_names[int(index)] for index in selected_indices)
     diagnostics: dict[str, object] = {
         "greedy_candidate_count_per_pose": int(
             result.greedy_candidate_count_per_action
@@ -2061,9 +2142,7 @@ def _conditional_search_with_components(
         "ambiguous_program_pose_count": int(np.count_nonzero(ambiguous)),
         "independently_confirmed_program_pose_count": int(confirmation_count),
         "initial_cache_released_before_confirmation": True,
-        "confirmation_component_strategy": str(
-            confirmation_component_strategy
-        ),
+        "confirmation_component_strategy": str(confirmation_component_strategy),
         "confirmation_pose_batch_sizes": confirmation_batch_sizes,
         "confirmation_additional_component_pose_limit": int(
             0
@@ -2082,6 +2161,18 @@ def _conditional_search_with_components(
         "legacy_guard_applied_count": int(
             np.count_nonzero(result.incumbent_floor_applied_a)
         ),
+        "shadow_prefix_view_counts": [
+            int(value) for value in shadow_prefix_view_counts
+        ],
+        "shadow_prefix_kl_samples_captured": bool(
+            capture_shadow_kl_samples and shadow_prefix_view_counts
+        ),
+        "shadow_prefix_selection_and_evaluation_independent": bool(
+            capture_shadow_kl_samples and shadow_prefix_view_counts
+        ),
+        "shadow_holdout_seed": shadow_holdout_seed,
+        "shadow_holdout_stream_name": shadow_holdout_stream_name,
+        "shadow_holdout_wall_s": float(shadow_holdout_wall_s),
     }
     return _ConditionalSearchBatch(
         program_pair_ids_al=np.asarray(selected_programs, dtype=np.int64),
@@ -2089,6 +2180,9 @@ def _conditional_search_with_components(
         selection_sources_a=selected_sources,
         selected_base_kl_samples_aq=np.asarray(base_selected_kl, dtype=np.float64),
         selected_combined_kl_samples_a=tuple(selected_combined_kl),
+        shadow_prefix_pair_ids_by_view_count=shadow_programs,
+        shadow_prefix_information_gains_by_view_count=shadow_gains,
+        shadow_prefix_kl_samples_by_view_count=shadow_kl_samples,
         diagnostics=diagnostics,
     )
 
@@ -2136,9 +2230,7 @@ def _evaluate_conditional_pose_batches(
             for values in joint_particles.strengths_nk_by_isotope.values()
         )
     )
-    model = validate_full_spectrum_model(
-        estimator.full_spectrum_generative_model
-    )
+    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
     minimum_response_scratch = _conditional_minimum_response_scratch_budget(
         estimator,
         detector_aperture_samples=int(config.detector_aperture_samples),
@@ -2171,6 +2263,36 @@ def _evaluate_conditional_pose_batches(
         (replica_count, action_count, int(sample_count)),
         dtype=np.float64,
     )
+    shadow_view_counts = (
+        tuple(int(value) for value in config.shield_view_count_shadow_candidate_counts)
+        if bool(config.shield_view_count_shadow_enabled)
+        else ()
+    )
+    shadow_programs = {
+        view_count: np.empty(
+            (replica_count, action_count, view_count),
+            dtype=np.int64,
+        )
+        for view_count in shadow_view_counts
+    }
+    shadow_gains = {
+        view_count: np.empty(
+            (replica_count, action_count),
+            dtype=np.float64,
+        )
+        for view_count in shadow_view_counts
+    }
+    capture_shadow_samples = bool(
+        config.shield_view_count_shadow_enabled and str(workload) == "exact"
+    )
+    shadow_samples = {
+        view_count: np.empty(
+            (replica_count, action_count, int(sample_count)),
+            dtype=np.float64,
+        )
+        for view_count in shadow_view_counts
+        if capture_shadow_samples
+    }
     source_rows: list[list[str]] = [list() for _ in range(replica_count)]
     combined_kl_rows: list[list[NDArray[np.float64]]] = [
         [] for _ in range(replica_count)
@@ -2185,10 +2307,8 @@ def _evaluate_conditional_pose_batches(
     while action_start < action_count:
         action_stop = min(action_start + active_pose_chunk_size, action_count)
         chunk_detectors = detectors[action_start:action_stop]
-        response_scratch_budget = (
-            chunk_plan.response_scratch_budget_for_pose_count(
-                int(chunk_detectors.shape[0])
-            )
+        response_scratch_budget = chunk_plan.response_scratch_budget_for_pose_count(
+            int(chunk_detectors.shape[0])
         )
         attempt_started = time.perf_counter()
         components = None
@@ -2205,9 +2325,7 @@ def _evaluate_conditional_pose_batches(
                 ),
                 joint_particles=joint_particles,
                 live_time_s=float(config.live_time_s),
-                detector_aperture_samples=int(
-                    config.detector_aperture_samples
-                ),
+                detector_aperture_samples=int(config.detector_aperture_samples),
                 device_resident=bool(estimator.pf_config.use_gpu),
                 working_memory_budget_bytes=int(response_scratch_budget),
             )
@@ -2227,6 +2345,15 @@ def _evaluate_conditional_pose_batches(
                     incumbent_subsets_ck=incumbent_subsets_ck,
                     confirm_ambiguous=bool(confirm_ambiguous),
                     confidence=float(config.proxy_boundary_confidence),
+                    shadow_prefix_view_counts=(
+                        tuple(config.shield_view_count_shadow_candidate_counts)
+                        if bool(config.shield_view_count_shadow_enabled)
+                        else ()
+                    ),
+                    capture_shadow_kl_samples=bool(
+                        config.shield_view_count_shadow_enabled
+                        and str(workload) == "exact"
+                    ),
                 )
                 search_wall_s += float(time.perf_counter() - search_started)
                 local_batches.append(batch)
@@ -2250,9 +2377,7 @@ def _evaluate_conditional_pose_batches(
                     "action_start": int(action_start),
                     "failed_pose_chunk_size": int(failed_chunk_size),
                     "retry_pose_chunk_size": int(reduced_chunk_size),
-                    "response_scratch_budget_bytes": int(
-                        response_scratch_budget
-                    ),
+                    "response_scratch_budget_bytes": int(response_scratch_budget),
                     "failed_attempt_wall_s": float(
                         time.perf_counter() - attempt_started
                     ),
@@ -2261,9 +2386,7 @@ def _evaluate_conditional_pose_batches(
             active_pose_chunk_size = int(reduced_chunk_size)
             continue
         for replica_index, batch in enumerate(local_batches):
-            gains[replica_index, action_start:action_stop] = (
-                batch.information_gains_a
-            )
+            gains[replica_index, action_start:action_stop] = batch.information_gains_a
             programs[replica_index, action_start:action_stop] = (
                 batch.program_pair_ids_al
             )
@@ -2271,18 +2394,28 @@ def _evaluate_conditional_pose_batches(
                 batch.selected_base_kl_samples_aq
             )
             source_rows[replica_index].extend(batch.selection_sources_a)
-            combined_kl_rows[replica_index].extend(
-                batch.selected_combined_kl_samples_a
-            )
+            combined_kl_rows[replica_index].extend(batch.selected_combined_kl_samples_a)
+            for view_count in shadow_view_counts:
+                shadow_programs[view_count][
+                    replica_index,
+                    action_start:action_stop,
+                ] = batch.shadow_prefix_pair_ids_by_view_count[view_count]
+                shadow_gains[view_count][
+                    replica_index,
+                    action_start:action_stop,
+                ] = batch.shadow_prefix_information_gains_by_view_count[view_count]
+                if capture_shadow_samples:
+                    shadow_samples[view_count][
+                        replica_index,
+                        action_start:action_stop,
+                    ] = batch.shadow_prefix_kl_samples_by_view_count[view_count]
         components = None
         chunk_diagnostics.append(
             {
                 "action_start": int(action_start),
                 "action_stop": int(action_stop),
                 "pose_chunk_size": int(chunk_detectors.shape[0]),
-                "response_scratch_budget_bytes": int(
-                    response_scratch_budget
-                ),
+                "response_scratch_budget_bytes": int(response_scratch_budget),
                 "replicas": replica_diagnostics,
             }
         )
@@ -2299,6 +2432,37 @@ def _evaluate_conditional_pose_batches(
         len(values) != action_count for values in combined_kl_rows
     ):
         raise RuntimeError("Conditional pose batching lost action diagnostics.")
+    if shadow_view_counts:
+        invalid_shadow = any(
+            np.any(programs_by_count < 0)
+            or np.any(programs_by_count >= pair_count)
+            or np.any(~np.isfinite(shadow_gains[view_count]))
+            or np.any(shadow_gains[view_count] < 0.0)
+            for view_count, programs_by_count in shadow_programs.items()
+        )
+        if invalid_shadow:
+            raise RuntimeError("Shadow prefix pose batching produced invalid data.")
+        if capture_shadow_samples:
+            invalid_samples = any(
+                np.any(~np.isfinite(values)) or np.any(values < 0.0)
+                for values in shadow_samples.values()
+            )
+            if invalid_samples:
+                raise RuntimeError("Shadow prefix KL samples are invalid.")
+            for view_count in shadow_view_counts:
+                if not np.allclose(
+                    np.mean(
+                        shadow_samples[view_count],
+                        axis=2,
+                        dtype=np.float64,
+                    ),
+                    shadow_gains[view_count],
+                    rtol=1.0e-12,
+                    atol=1.0e-12,
+                ):
+                    raise RuntimeError(
+                        "Shadow prefix batch means lost their paired samples."
+                    )
     combined_means = np.asarray(
         [
             [float(np.mean(values, dtype=np.float64)) for values in replica]
@@ -2322,6 +2486,8 @@ def _evaluate_conditional_pose_batches(
         "particle_count": int(weights.size),
         "pair_count": int(pair_count),
         "program_length": int(program_length),
+        "shadow_prefix_view_counts": [int(value) for value in shadow_view_counts],
+        "shadow_prefix_kl_samples_captured": bool(capture_shadow_samples),
         "response_wall_s": float(response_wall_s),
         "search_wall_s": float(search_wall_s),
         "wall_s": float(response_wall_s + search_wall_s),
@@ -2342,6 +2508,18 @@ def _evaluate_conditional_pose_batches(
             tuple(np.asarray(values, dtype=np.float64) for values in replica)
             for replica in combined_kl_rows
         ),
+        shadow_prefix_pair_ids_by_view_count={
+            int(view_count): np.asarray(values, dtype=np.int64)
+            for view_count, values in shadow_programs.items()
+        },
+        shadow_prefix_information_gains_by_view_count={
+            int(view_count): np.asarray(values, dtype=np.float64)
+            for view_count, values in shadow_gains.items()
+        },
+        shadow_prefix_kl_samples_by_view_count={
+            int(view_count): np.asarray(values, dtype=np.float64)
+            for view_count, values in shadow_samples.items()
+        },
         diagnostics=diagnostics,
     )
 
@@ -2366,8 +2544,7 @@ def _evaluate_fixed_programs_in_pose_batches(
     if (
         detectors.ndim != 2
         or detectors.shape[1] != 3
-        or programs.shape
-        != (detectors.shape[0], int(config.program_length))
+        or programs.shape != (detectors.shape[0], int(config.program_length))
         or detectors.shape[0] <= 0
         or np.any(~np.isfinite(detectors))
     ):
@@ -2384,9 +2561,7 @@ def _evaluate_fixed_programs_in_pose_batches(
             for values in joint_particles.strengths_nk_by_isotope.values()
         )
     )
-    model = validate_full_spectrum_model(
-        estimator.full_spectrum_generative_model
-    )
+    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
     minimum_response_scratch = _conditional_minimum_response_scratch_budget(
         estimator,
         detector_aperture_samples=int(config.detector_aperture_samples),
@@ -2435,9 +2610,7 @@ def _evaluate_fixed_programs_in_pose_batches(
                 ),
                 joint_particles,
                 live_time_s=float(config.live_time_s),
-                detector_aperture_samples=int(
-                    config.detector_aperture_samples
-                ),
+                detector_aperture_samples=int(config.detector_aperture_samples),
                 device_resident=bool(estimator.pf_config.use_gpu),
                 working_memory_budget_bytes=(
                     chunk_plan.response_scratch_budget_for_pose_count(
@@ -2459,12 +2632,10 @@ def _evaluate_fixed_programs_in_pose_batches(
                 device=getattr(prepared.cache, "device"),
                 dtype=torch.long,
             )
-            information_gain_tensor, kl_tensor = (
-                evaluate_subset_information_gain_torch(
-                    prepared.cache,
-                    subset_tensor,
-                    particle_weights,
-                )
+            information_gain_tensor, kl_tensor = evaluate_subset_information_gain_torch(
+                prepared.cache,
+                subset_tensor,
+                particle_weights,
             )
             output[action_start:action_stop] = np.asarray(
                 kl_tensor[:, 0].detach().cpu().numpy(),
@@ -2582,6 +2753,499 @@ def _proxy_replica_scores_payload(
     ]
 
 
+def _shadow_measurement_penalty(
+    config: DSSPPConfig,
+    *,
+    view_count: int,
+) -> float:
+    """Return the uncalibrated measurement penalty for audit reporting only."""
+    return (
+        float(config.lambda_time)
+        * int(view_count)
+        * (float(config.rotation_overhead_s) + float(config.live_time_s))
+    )
+
+
+def _shadow_scores_without_measurement_penalty(
+    reference_scores_a: NDArray[np.float64],
+    reference_information_gains_a: NDArray[np.float64],
+    information_gains_la: NDArray[np.float64],
+    *,
+    config: DSSPPConfig,
+) -> NDArray[np.float64]:
+    """Compose K-specific counterfactual scores without a K time penalty."""
+    scores = np.asarray(reference_scores_a, dtype=np.float64).reshape(-1)
+    reference_gains = np.asarray(
+        reference_information_gains_a,
+        dtype=np.float64,
+    ).reshape(-1)
+    gains = np.asarray(information_gains_la, dtype=np.float64)
+    if (
+        gains.ndim != 2
+        or gains.shape[1] != scores.size
+        or reference_gains.shape != scores.shape
+        or np.any(~np.isfinite(gains))
+        or np.any(~np.isfinite(scores))
+        or np.any(~np.isfinite(reference_gains))
+    ):
+        raise ValueError("Shadow view-count scores require aligned finite inputs.")
+    deterministic = (
+        scores
+        - float(config.lambda_eig) * reference_gains
+        + _shadow_measurement_penalty(
+            config,
+            view_count=int(config.program_length),
+        )
+    )
+    output = deterministic[np.newaxis, :] + float(config.lambda_eig) * gains
+    if np.any(~np.isfinite(output)):
+        raise RuntimeError("Shadow view-count scores became nonfinite.")
+    return np.asarray(output, dtype=np.float64)
+
+
+def _shadow_union_pose_indices(
+    executed_shortlist_local_indices: NDArray[np.int64],
+    proxy_scores_la: NDArray[np.float64],
+    *,
+    maximum_pose_count: int,
+) -> NDArray[np.int64]:
+    """Add K-specific proxy leaders without changing the executed shortlist."""
+    executed = np.asarray(
+        executed_shortlist_local_indices,
+        dtype=np.int64,
+    ).reshape(-1)
+    scores = np.asarray(proxy_scores_la, dtype=np.float64)
+    if (
+        scores.ndim != 2
+        or scores.shape[1] < 1
+        or np.any(~np.isfinite(scores))
+        or np.any(executed < 0)
+        or np.any(executed >= scores.shape[1])
+    ):
+        raise ValueError("Shadow union shortlist inputs are invalid.")
+    limit = min(int(maximum_pose_count), int(scores.shape[1]))
+    if limit < executed.size:
+        raise ValueError("Shadow union limit cannot truncate the executed shortlist.")
+    ranked = np.stack(
+        [_stable_descending_indices(row) for row in scores],
+        axis=0,
+    )
+    # Rank-major flattening reserves leaders from every view count before
+    # taking deeper candidates. NumPy uniqueness retains the first occurrence.
+    interleaved = ranked.T.reshape(-1)
+    candidates = np.concatenate((executed, interleaved)).astype(
+        np.int64,
+        copy=False,
+    )
+    _, first_positions = np.unique(candidates, return_index=True)
+    ordered = candidates[np.sort(first_positions)]
+    return np.asarray(ordered[:limit], dtype=np.int64)
+
+
+def _shadow_holdout_seed_blocks(
+    evaluation: _ConditionalPoseEvaluation,
+    pose_indices_a: NDArray[np.int64],
+) -> list[dict[str, object]]:
+    """Return chunk-resolved independent holdout seed provenance."""
+    pose_indices = np.asarray(pose_indices_a, dtype=np.int64).reshape(-1)
+    chunks = evaluation.diagnostics.get("chunks")
+    if not isinstance(chunks, Sequence) or isinstance(chunks, (str, bytes)):
+        raise TypeError("Conditional evaluation chunks must be a sequence.")
+    blocks: list[dict[str, object]] = []
+    for raw_chunk in chunks:
+        if not isinstance(raw_chunk, Mapping):
+            raise TypeError("Conditional evaluation chunk must be a mapping.")
+        start = int(raw_chunk["action_start"])
+        stop = int(raw_chunk["action_stop"])
+        replicas = raw_chunk.get("replicas")
+        if not isinstance(replicas, Sequence) or len(replicas) != 1:
+            raise ValueError("Exact shadow chunks require one MC replica.")
+        replica = replicas[0]
+        if not isinstance(replica, Mapping):
+            raise TypeError("Exact shadow replica must be a mapping.")
+        holdout_seed = replica.get("shadow_holdout_seed")
+        holdout_stream = replica.get("shadow_holdout_stream_name")
+        if holdout_seed is None or holdout_stream is None:
+            raise RuntimeError("Exact shadow chunk lost its holdout provenance.")
+        blocks.append(
+            {
+                "seed": int(holdout_seed),
+                "stream_name": str(holdout_stream),
+                "pose_indices": [int(value) for value in pose_indices[start:stop]],
+                "samples_per_pose": int(evaluation.diagnostics["sample_count"]),
+            }
+        )
+    return blocks
+
+
+def _shadow_selected_action_payload(
+    *,
+    selected_view_counts_a: NDArray[np.int64],
+    scores_la: NDArray[np.float64],
+    information_gains_la: NDArray[np.float64],
+    programs_by_view_count: Mapping[int, NDArray[np.int64]],
+    candidate_view_counts: tuple[int, ...],
+    pose_indices_a: NDArray[np.int64],
+    poses_a3: NDArray[np.float64],
+) -> dict[str, object]:
+    """Return the highest-scoring exact shadow action for one selection rule."""
+    selected = np.asarray(selected_view_counts_a, dtype=np.int64).reshape(-1)
+    scores = np.asarray(scores_la, dtype=np.float64)
+    gains = np.asarray(information_gains_la, dtype=np.float64)
+    pose_indices = np.asarray(pose_indices_a, dtype=np.int64).reshape(-1)
+    poses = np.asarray(poses_a3, dtype=np.float64)
+    lengths = np.asarray(candidate_view_counts, dtype=np.int64)
+    if (
+        scores.shape != gains.shape
+        or scores.shape != (lengths.size, selected.size)
+        or pose_indices.shape != selected.shape
+        or poses.shape != (selected.size, 3)
+    ):
+        raise ValueError("Shadow action payload inputs must align by pose.")
+    length_matches = selected[np.newaxis, :] == lengths[:, np.newaxis]
+    if not np.all(np.sum(length_matches, axis=0) == 1):
+        raise ValueError("Selected shadow view counts lie outside the policy.")
+    selected_length_indices = np.argmax(length_matches, axis=0)
+    pose_offsets = np.arange(selected.size, dtype=np.int64)
+    selected_scores = scores[selected_length_indices, pose_offsets]
+    leader = int(_stable_descending_indices(selected_scores)[0])
+    view_count = int(selected[leader])
+    return {
+        "pose_index": int(pose_indices[leader]),
+        "pose_xyz": [float(value) for value in poses[leader]],
+        "selected_view_count": view_count,
+        "pair_ids": [
+            int(value) for value in programs_by_view_count[view_count][leader]
+        ],
+        "information_gain_mean_nat": float(
+            gains[selected_length_indices[leader], leader]
+        ),
+        "pose_score_without_measurement_time_penalty": float(selected_scores[leader]),
+    }
+
+
+def _shadow_configured_time_weight_action(
+    *,
+    scores_without_measurement_penalty_la: NDArray[np.float64],
+    information_gains_la: NDArray[np.float64],
+    programs_by_view_count: Mapping[int, NDArray[np.int64]],
+    candidate_view_counts: tuple[int, ...],
+    pose_indices_a: NDArray[np.int64],
+    poses_a3: NDArray[np.float64],
+    config: DSSPPConfig,
+) -> dict[str, object]:
+    """Return the explicitly uncalibrated configured-time counterfactual."""
+    scores = np.asarray(
+        scores_without_measurement_penalty_la,
+        dtype=np.float64,
+    )
+    counts = np.asarray(candidate_view_counts, dtype=np.int64)
+    penalties = np.asarray(
+        [
+            _shadow_measurement_penalty(config, view_count=int(view_count))
+            for view_count in counts
+        ],
+        dtype=np.float64,
+    )
+    if scores.ndim != 2 or scores.shape[0] != counts.size:
+        raise ValueError("Configured-time shadow scores must align by view count.")
+    adjusted_scores = scores - penalties[:, np.newaxis]
+    selected_indices = np.argmax(adjusted_scores, axis=0)
+    payload = _shadow_selected_action_payload(
+        selected_view_counts_a=np.asarray(
+            counts[selected_indices],
+            dtype=np.int64,
+        ),
+        scores_la=np.asarray(adjusted_scores, dtype=np.float64),
+        information_gains_la=information_gains_la,
+        programs_by_view_count=programs_by_view_count,
+        candidate_view_counts=candidate_view_counts,
+        pose_indices_a=pose_indices_a,
+        poses_a3=poses_a3,
+    )
+    adjusted_score = payload.pop("pose_score_without_measurement_time_penalty")
+    payload["pose_score_with_configured_measurement_time_weight"] = adjusted_score
+    payload["configured_measurement_time_weight"] = float(config.lambda_time)
+    payload["calibrated_for_dynamic_acquisition"] = False
+    return payload
+
+
+def _shadow_exact_diagnostics(
+    *,
+    pose_indices_a: NDArray[np.int64],
+    poses_a3: NDArray[np.float64],
+    programs_by_view_count: Mapping[int, NDArray[np.int64]],
+    kl_samples_by_view_count: Mapping[int, NDArray[np.float64]],
+    reference_scores_a: NDArray[np.float64],
+    reference_information_gains_a: NDArray[np.float64],
+    config: DSSPPConfig,
+) -> dict[str, object]:
+    """Build JSON-safe exact paired evidence and hypothetical actions."""
+    candidate_counts = tuple(
+        int(value) for value in config.shield_view_count_shadow_candidate_counts
+    )
+    samples = np.stack(
+        [
+            np.asarray(kl_samples_by_view_count[view_count], dtype=np.float64)
+            for view_count in candidate_counts
+        ],
+        axis=0,
+    )
+    decision = select_shield_view_count_shadow(
+        samples,
+        candidate_view_counts=candidate_counts,
+        retention_fraction=float(config.shield_view_count_shadow_retention_fraction),
+        per_comparison_confidence=float(
+            config.shield_view_count_shadow_per_comparison_confidence
+        ),
+    )
+    scores = _shadow_scores_without_measurement_penalty(
+        reference_scores_a,
+        reference_information_gains_a,
+        decision.information_gain_mean_la,
+        config=config,
+    )
+    critical = float(
+        student_t.ppf(
+            float(config.shield_view_count_shadow_per_comparison_confidence),
+            int(decision.sample_count - 1),
+        )
+    )
+    by_view_count: dict[str, object] = {}
+    previous_samples = np.zeros_like(samples[0])
+    previous_count = 0
+    for length_index, view_count in enumerate(candidate_counts):
+        current_samples = samples[length_index]
+        increment_samples = current_samples - previous_samples
+        increment_mean = np.mean(increment_samples, axis=1, dtype=np.float64)
+        increment_se = np.std(increment_samples, axis=1, ddof=1) / np.sqrt(
+            float(decision.sample_count)
+        )
+        increment_lcb = increment_mean - critical * increment_se
+        added_live_time = float(
+            (int(view_count) - int(previous_count)) * float(config.live_time_s)
+        )
+        added_elapsed_time = float(
+            (int(view_count) - int(previous_count))
+            * (float(config.live_time_s) + float(config.rotation_overhead_s))
+        )
+        retained = decision.retained_fraction_la[length_index]
+        payload: dict[str, object] = {
+            "pair_ids": np.asarray(
+                programs_by_view_count[view_count],
+                dtype=np.int64,
+            ).tolist(),
+            "program_semantics": "nested_conditional_greedy_prefix",
+            "information_gain_mean_nat": decision.information_gain_mean_la[
+                length_index
+            ].tolist(),
+            "information_gain_standard_error_nat": (
+                decision.information_gain_standard_error_la[length_index].tolist()
+            ),
+            "retained_fraction_of_reference": [
+                None if not np.isfinite(value) else float(value) for value in retained
+            ],
+            "measurement_live_time_s": float(
+                int(view_count) * float(config.live_time_s)
+            ),
+            "measurement_elapsed_time_s": float(
+                int(view_count)
+                * (float(config.live_time_s) + float(config.rotation_overhead_s))
+            ),
+            "pose_score_without_measurement_time_penalty": scores[
+                length_index
+            ].tolist(),
+            "pose_score_with_configured_measurement_time_weight": (
+                scores[length_index]
+                - _shadow_measurement_penalty(
+                    config,
+                    view_count=int(view_count),
+                )
+            ).tolist(),
+            "uncalibrated_time_utility_at_configured_weight": (
+                decision.information_gain_mean_la[length_index]
+                - _shadow_measurement_penalty(
+                    config,
+                    view_count=int(view_count),
+                )
+            ).tolist(),
+            "nested_prefix_increment": {
+                "previous_view_count": int(previous_count),
+                "added_view_count": int(view_count) - int(previous_count),
+                "mean_nat": increment_mean.tolist(),
+                "paired_standard_error_nat": increment_se.tolist(),
+                "one_sided_mc_lcb_nat": increment_lcb.tolist(),
+                "added_live_time_s": added_live_time,
+                "added_elapsed_time_s": added_elapsed_time,
+                "mean_nat_per_added_live_second": (
+                    increment_mean / added_live_time
+                ).tolist(),
+                "mean_nat_per_added_elapsed_second": (
+                    increment_mean / added_elapsed_time
+                ).tolist(),
+            },
+        }
+        if length_index < len(candidate_counts) - 1:
+            payload["retention_vs_reference"] = {
+                "reference_view_count": int(candidate_counts[-1]),
+                "threshold_fraction": float(decision.retention_fraction),
+                "paired_margin_mean_nat": decision.retention_margin_mean_sa[
+                    length_index
+                ].tolist(),
+                "paired_margin_standard_error_nat": (
+                    decision.retention_margin_standard_error_sa[length_index].tolist()
+                ),
+                "paired_margin_one_sided_mc_lcb_nat": (
+                    decision.retention_margin_lower_confidence_sa[length_index].tolist()
+                ),
+                "point_passed": decision.retention_point_passed_sa[
+                    length_index
+                ].tolist(),
+                "lcb_passed": decision.retention_lcb_passed_sa[length_index].tolist(),
+            }
+        else:
+            payload["retention_vs_reference"] = None
+        by_view_count[str(view_count)] = payload
+        previous_samples = current_samples
+        previous_count = int(view_count)
+
+    pose_indices = np.asarray(pose_indices_a, dtype=np.int64)
+    poses = np.asarray(poses_a3, dtype=np.float64)
+    return {
+        "particle_count": None,
+        "sample_count": int(decision.sample_count),
+        "pose_count": int(pose_indices.size),
+        "pose_indices": pose_indices.tolist(),
+        "pose_xyz": poses.tolist(),
+        "by_view_count": by_view_count,
+        "point_selected_view_count_by_pose": (
+            decision.point_selected_view_count_a.tolist()
+        ),
+        "paired_lcb_selected_view_count_by_pose": (
+            decision.lcb_selected_view_count_a.tolist()
+        ),
+        "monotonicity_warning_by_pose": (decision.monotonicity_warning_a.tolist()),
+        "point_rule_action": _shadow_selected_action_payload(
+            selected_view_counts_a=decision.point_selected_view_count_a,
+            scores_la=scores,
+            information_gains_la=decision.information_gain_mean_la,
+            programs_by_view_count=programs_by_view_count,
+            candidate_view_counts=candidate_counts,
+            pose_indices_a=pose_indices,
+            poses_a3=poses,
+        ),
+        "paired_lcb_rule_action": _shadow_selected_action_payload(
+            selected_view_counts_a=decision.lcb_selected_view_count_a,
+            scores_la=scores,
+            information_gains_la=decision.information_gain_mean_la,
+            programs_by_view_count=programs_by_view_count,
+            candidate_view_counts=candidate_counts,
+            pose_indices_a=pose_indices,
+            poses_a3=poses,
+        ),
+        "configured_time_weight_counterfactual_action": (
+            _shadow_configured_time_weight_action(
+                scores_without_measurement_penalty_la=scores,
+                information_gains_la=decision.information_gain_mean_la,
+                programs_by_view_count=programs_by_view_count,
+                candidate_view_counts=candidate_counts,
+                pose_indices_a=pose_indices,
+                poses_a3=poses,
+                config=config,
+            )
+        ),
+    }
+
+
+def _shadow_proxy_diagnostics(
+    *,
+    pose_indices_a: NDArray[np.int64],
+    poses_a3: NDArray[np.float64],
+    evaluation: _ConditionalPoseEvaluation,
+    reference_scores_a: NDArray[np.float64],
+    config: DSSPPConfig,
+    union_pose_indices_a: NDArray[np.int64],
+    executed_shortlist_pose_indices_a: NDArray[np.int64],
+) -> dict[str, object]:
+    """Build aligned all-pose proxy evidence for the shadow audit."""
+    candidate_counts = tuple(
+        int(value) for value in config.shield_view_count_shadow_candidate_counts
+    )
+    gains = np.stack(
+        [
+            evaluation.shadow_prefix_information_gains_by_view_count[view_count][0]
+            for view_count in candidate_counts
+        ],
+        axis=0,
+    )
+    programs = {
+        view_count: np.asarray(
+            evaluation.shadow_prefix_pair_ids_by_view_count[view_count][0],
+            dtype=np.int64,
+        )
+        for view_count in candidate_counts
+    }
+    scores = _shadow_scores_without_measurement_penalty(
+        reference_scores_a,
+        evaluation.information_gains_ra[0],
+        gains,
+        config=config,
+    )
+    reference = gains[-1]
+    passed = (
+        gains[:-1]
+        >= float(config.shield_view_count_shadow_retention_fraction)
+        * reference[np.newaxis, :]
+    )
+    any_passed = np.any(passed, axis=0)
+    first_passed = np.argmax(passed, axis=0)
+    selected_indices = np.where(
+        any_passed,
+        first_passed,
+        len(candidate_counts) - 1,
+    )
+    selected_counts = np.asarray(candidate_counts, dtype=np.int64)[selected_indices]
+    pose_indices = np.asarray(pose_indices_a, dtype=np.int64)
+    poses = np.asarray(poses_a3, dtype=np.float64)
+    return {
+        "particle_count": int(evaluation.diagnostics["particle_count"]),
+        "samples_per_seed": int(evaluation.diagnostics["sample_count"]),
+        "pose_count": int(pose_indices.size),
+        "stored_pose_scope": "all_valid_poses",
+        "pose_indices": pose_indices.tolist(),
+        "pose_xyz": poses.tolist(),
+        "by_view_count": {
+            str(view_count): {
+                "pair_ids": programs[view_count].tolist(),
+                "program_semantics": "nested_conditional_greedy_prefix",
+                "information_gain_mean_nat": gains[length_index].tolist(),
+                "pose_score_without_measurement_time_penalty": scores[
+                    length_index
+                ].tolist(),
+            }
+            for length_index, view_count in enumerate(candidate_counts)
+        },
+        "point_selected_view_count_by_pose": selected_counts.tolist(),
+        "point_rule_action": _shadow_selected_action_payload(
+            selected_view_counts_a=selected_counts,
+            scores_la=scores,
+            information_gains_la=gains,
+            programs_by_view_count=programs,
+            candidate_view_counts=candidate_counts,
+            pose_indices_a=pose_indices,
+            poses_a3=poses,
+        ),
+        "executed_fixed_8_shortlist_pose_indices": np.asarray(
+            executed_shortlist_pose_indices_a,
+            dtype=np.int64,
+        ).tolist(),
+        "view_count_union_exact_pose_indices": np.asarray(
+            union_pose_indices_a,
+            dtype=np.int64,
+        ).tolist(),
+    }
+
+
 def _conditional_pose_ambiguity_mask(
     score_samples_aq: NDArray[np.float64],
     mean_scores_a: NDArray[np.float64],
@@ -2676,6 +3340,7 @@ def _build_conditional_nodes(
         )
     )
     available_pose_count = int(valid_pose_indices.size)
+    proxy_seed: int | None = None
     proxy_evaluation: _ConditionalPoseEvaluation | None = None
     refinement_evaluation: _ConditionalPoseEvaluation | None = None
     refinement_pose_count = 0
@@ -2716,9 +3381,7 @@ def _build_conditional_nodes(
             stream_name="proxy_all_poses",
             workload="proxy",
             working_memory_budget_bytes=int(config.proxy_memory_budget_bytes),
-            maximum_subset_candidate_count=(
-                int(estimator.num_orientations) ** 2
-            ),
+            maximum_subset_candidate_count=(int(estimator.num_orientations) ** 2),
             enable_one_swap=False,
             incumbent_subsets_ck=None,
             confirm_ambiguous=False,
@@ -2746,9 +3409,9 @@ def _build_conditional_nodes(
             available_pose_count,
         )
         refinement_pose_count = int(refinement_count)
-        refinement_local_indices = _stable_descending_indices(
-            base_proxy_scores
-        )[:refinement_count]
+        refinement_local_indices = _stable_descending_indices(base_proxy_scores)[
+            :refinement_count
+        ]
         extra_replica_count = int(config.proxy_stability_replicates) - 1
         if extra_replica_count > 0:
             refinement_seeds = np.asarray(
@@ -2776,12 +3439,8 @@ def _build_conditional_nodes(
                 eig_call_seeds_r=refinement_seeds,
                 stream_name="proxy_refinement_pool",
                 workload="proxy",
-                working_memory_budget_bytes=int(
-                    config.proxy_memory_budget_bytes
-                ),
-                maximum_subset_candidate_count=(
-                    int(estimator.num_orientations) ** 2
-                ),
+                working_memory_budget_bytes=int(config.proxy_memory_budget_bytes),
+                maximum_subset_candidate_count=(int(estimator.num_orientations) ** 2),
                 enable_one_swap=False,
                 incumbent_subsets_ck=None,
                 confirm_ambiguous=False,
@@ -2793,26 +3452,20 @@ def _build_conditional_nodes(
             for replica_index in range(extra_replica_count):
                 refined_scores, _ = compose_pose_scores(
                     refinement_evaluation.information_gains_ra[replica_index],
-                    static_scores[
-                        valid_pose_indices[refinement_local_indices]
-                    ],
+                    static_scores[valid_pose_indices[refinement_local_indices]],
                     paths[valid_pose_indices[refinement_local_indices]],
                     config=resolved_proxy_config,
                     program_length=int(config.program_length),
                     motion_times_p=(
                         None
                         if motion_times is None
-                        else motion_times[
-                            valid_pose_indices[refinement_local_indices]
-                        ]
+                        else motion_times[valid_pose_indices[refinement_local_indices]]
                     ),
                     motion_time_components_p=(
                         None
                         if motion_time_components is None
                         else tuple(
-                            values[
-                                valid_pose_indices[refinement_local_indices]
-                            ]
+                            values[valid_pose_indices[refinement_local_indices]]
                             for values in motion_time_components
                         )
                     ),
@@ -2861,6 +3514,39 @@ def _build_conditional_nodes(
         ]
 
     exact_pose_indices = valid_pose_indices[shortlisted_local_indices]
+    shadow_union_local_indices = np.asarray(
+        shortlisted_local_indices,
+        dtype=np.int64,
+    )
+    if bool(config.shield_view_count_shadow_enabled) and proxy_evaluation is not None:
+        shadow_counts = tuple(
+            int(value) for value in config.shield_view_count_shadow_candidate_counts
+        )
+        shadow_proxy_gains = np.stack(
+            [
+                proxy_evaluation.shadow_prefix_information_gains_by_view_count[
+                    view_count
+                ][0]
+                for view_count in shadow_counts
+            ],
+            axis=0,
+        )
+        shadow_proxy_scores = _shadow_scores_without_measurement_penalty(
+            base_proxy_scores,
+            proxy_evaluation.information_gains_ra[0],
+            shadow_proxy_gains,
+            config=config,
+        )
+        shadow_union_local_indices = _shadow_union_pose_indices(
+            shortlisted_local_indices,
+            shadow_proxy_scores,
+            maximum_pose_count=int(config.exact_eig_pose_max),
+        )
+    shadow_union_pose_indices = valid_pose_indices[shadow_union_local_indices]
+    shadow_extra_local_indices = shadow_union_local_indices[
+        ~np.isin(shadow_union_local_indices, shortlisted_local_indices)
+    ]
+    shadow_extra_pose_indices = valid_pose_indices[shadow_extra_local_indices]
     incumbent_matrix = None
     if bool(config.legacy_program_guard_enabled):
         from planning.legacy_program_guard import legacy_program_pair_matrix
@@ -2987,26 +3673,22 @@ def _build_conditional_nodes(
                 sample_count=int(estimator.pf_config.planning_eig_samples),
                 eig_call_seed=confirmation_seed,
                 stream_name="ambiguous_pose_confirmation",
-                working_memory_budget_bytes=int(
-                    config.exact_eig_memory_budget_bytes
-                ),
+                working_memory_budget_bytes=int(config.exact_eig_memory_budget_bytes),
             )
             confirmed_gains = np.asarray(
                 [
                     np.mean(
                         np.concatenate(
                             (
-                                exact_evaluation.selected_combined_kl_samples_r[
-                                    0
-                                ][int(action_index)],
+                                exact_evaluation.selected_combined_kl_samples_r[0][
+                                    int(action_index)
+                                ],
                                 confirmation_kl[local_index],
                             )
                         ),
                         dtype=np.float64,
                     )
-                    for local_index, action_index in enumerate(
-                        ambiguous_local_indices
-                    )
+                    for local_index, action_index in enumerate(ambiguous_local_indices)
                 ],
                 dtype=np.float64,
             )
@@ -3026,6 +3708,250 @@ def _build_conditional_nodes(
             pose_confirmation_wall_s = float(
                 time.perf_counter() - pose_confirmation_started
             )
+
+    shadow_diagnostics: dict[str, object] | None = None
+    shadow_extra_evaluation: _ConditionalPoseEvaluation | None = None
+    if bool(config.shield_view_count_shadow_enabled):
+        shadow_extra_scores = np.empty(0, dtype=np.float64)
+        shadow_extra_gains = np.empty(0, dtype=np.float64)
+        shadow_extra_seed: int | None = None
+        if shadow_extra_pose_indices.size:
+            shadow_extra_seed = int(
+                named_stream_seed(
+                    exact_seed,
+                    "dss_pp",
+                    "shield_view_count_shadow",
+                    "exact_union_extra",
+                )
+                & ((1 << 63) - 1)
+            )
+            shadow_extra_evaluation = _evaluate_conditional_pose_batches(
+                estimator=estimator,
+                detector_positions_a3=poses[shadow_extra_pose_indices],
+                joint_particles=joint_particles,
+                config=config,
+                sample_count=int(estimator.pf_config.planning_eig_samples),
+                eig_call_seeds_r=np.asarray(
+                    [shadow_extra_seed],
+                    dtype=np.int64,
+                ),
+                stream_name="exact_shadow_union_extra",
+                workload="exact",
+                working_memory_budget_bytes=int(config.exact_eig_memory_budget_bytes),
+                maximum_subset_candidate_count=int(conditional_pair_count),
+                enable_one_swap=False,
+                incumbent_subsets_ck=None,
+                confirm_ambiguous=False,
+            )
+            shadow_extra_gains = shadow_extra_evaluation.information_gains_ra[0].copy()
+            shadow_extra_scores, _ = compose_pose_scores(
+                shadow_extra_gains,
+                static_scores[shadow_extra_pose_indices],
+                paths[shadow_extra_pose_indices],
+                config=replace(
+                    config,
+                    lambda_distance=float(exact_distance_weight),
+                ),
+                program_length=int(config.program_length),
+                motion_times_p=(
+                    None
+                    if motion_times is None
+                    else motion_times[shadow_extra_pose_indices]
+                ),
+                motion_time_components_p=(
+                    None
+                    if motion_time_components is None
+                    else tuple(
+                        values[shadow_extra_pose_indices]
+                        for values in motion_time_components
+                    )
+                ),
+            )
+
+        shadow_counts = tuple(
+            int(value) for value in config.shield_view_count_shadow_candidate_counts
+        )
+        shadow_exact_programs = {
+            view_count: np.concatenate(
+                (
+                    exact_evaluation.shadow_prefix_pair_ids_by_view_count[view_count][
+                        0
+                    ],
+                    (
+                        np.empty((0, view_count), dtype=np.int64)
+                        if shadow_extra_evaluation is None
+                        else shadow_extra_evaluation.shadow_prefix_pair_ids_by_view_count[
+                            view_count
+                        ][0]
+                    ),
+                ),
+                axis=0,
+            )
+            for view_count in shadow_counts
+        }
+        shadow_exact_samples = {
+            view_count: np.concatenate(
+                (
+                    exact_evaluation.shadow_prefix_kl_samples_by_view_count[view_count][
+                        0
+                    ],
+                    (
+                        np.empty(
+                            (
+                                0,
+                                int(estimator.pf_config.planning_eig_samples),
+                            ),
+                            dtype=np.float64,
+                        )
+                        if shadow_extra_evaluation is None
+                        else shadow_extra_evaluation.shadow_prefix_kl_samples_by_view_count[
+                            view_count
+                        ][0]
+                    ),
+                ),
+                axis=0,
+            )
+            for view_count in shadow_counts
+        }
+        shadow_exact = _shadow_exact_diagnostics(
+            pose_indices_a=shadow_union_pose_indices,
+            poses_a3=poses[shadow_union_pose_indices],
+            programs_by_view_count=shadow_exact_programs,
+            kl_samples_by_view_count=shadow_exact_samples,
+            reference_scores_a=np.concatenate(
+                (exact_scores, shadow_extra_scores),
+            ),
+            reference_information_gains_a=np.concatenate(
+                (exact_gains, shadow_extra_gains),
+            ),
+            config=config,
+        )
+        shadow_exact["particle_count"] = int(
+            exact_evaluation.diagnostics["particle_count"]
+        )
+        shadow_exact["prefix_selection_seed_blocks"] = [
+            {
+                "seed": int(exact_seed),
+                "stream_name": "exact_shortlist_replica_0",
+                "pose_indices": [int(value) for value in exact_pose_indices],
+                "samples_per_pose": int(estimator.pf_config.planning_eig_samples),
+            },
+            *(
+                []
+                if shadow_extra_seed is None
+                else [
+                    {
+                        "seed": int(shadow_extra_seed),
+                        "stream_name": "exact_shadow_union_extra_replica_0",
+                        "pose_indices": [
+                            int(value) for value in shadow_extra_pose_indices
+                        ],
+                        "samples_per_pose": int(
+                            estimator.pf_config.planning_eig_samples
+                        ),
+                    }
+                ]
+            ),
+        ]
+        shadow_exact["paired_evaluation_holdout_seed_blocks"] = [
+            *_shadow_holdout_seed_blocks(
+                exact_evaluation,
+                exact_pose_indices,
+            ),
+            *(
+                []
+                if shadow_extra_evaluation is None
+                else _shadow_holdout_seed_blocks(
+                    shadow_extra_evaluation,
+                    shadow_extra_pose_indices,
+                )
+            ),
+        ]
+        if proxy_evaluation is None:
+            shadow_proxy: dict[str, object] = {
+                "status": "skipped_all_valid_poses_exact",
+                "pose_count": int(available_pose_count),
+                "stored_pose_scope": "all_valid_poses_exact_instead",
+                "executed_fixed_8_shortlist_pose_indices": [
+                    int(value) for value in exact_pose_indices
+                ],
+                "view_count_union_exact_pose_indices": [
+                    int(value) for value in shadow_union_pose_indices
+                ],
+            }
+        else:
+            shadow_proxy = _shadow_proxy_diagnostics(
+                pose_indices_a=valid_pose_indices,
+                poses_a3=poses[valid_pose_indices],
+                evaluation=proxy_evaluation,
+                reference_scores_a=base_proxy_scores,
+                config=config,
+                union_pose_indices_a=shadow_union_pose_indices,
+                executed_shortlist_pose_indices_a=exact_pose_indices,
+            )
+            shadow_proxy["status"] = "evaluated"
+            if proxy_seed is None:
+                raise RuntimeError("Evaluated shadow proxy lost its MC seed.")
+            shadow_proxy["selection_seed_blocks"] = [
+                {
+                    "seed": int(proxy_seed),
+                    "stream_name": "proxy_all_poses_replica_0",
+                    "pose_indices": [int(value) for value in valid_pose_indices],
+                    "samples_per_pose": int(config.proxy_eig_samples),
+                }
+            ]
+        shadow_diagnostics = {
+            "schema_version": 1,
+            "status": "evaluated",
+            "mode": "audit_only_fixed_8_execution",
+            "truth_used": False,
+            "policy": {
+                "candidate_view_counts": [int(value) for value in shadow_counts],
+                "reference_view_count": int(shadow_counts[-1]),
+                "retention_fraction": float(
+                    config.shield_view_count_shadow_retention_fraction
+                ),
+                "per_comparison_one_sided_confidence": float(
+                    config.shield_view_count_shadow_per_comparison_confidence
+                ),
+                "global_coverage_claimed": False,
+                "selection_statistic": (
+                    "paired_lcb_of_information_gain_short_minus_retention_"
+                    "times_information_gain_reference"
+                ),
+                "lcb_pass_condition": "strictly_greater_than_zero",
+                "program_semantics": "nested_conditional_greedy_prefix",
+                "measurement_time_weight_affects_selection": False,
+                "configured_measurement_time_weight_audit_only": float(
+                    config.lambda_time
+                ),
+            },
+            "mc_contract": {
+                "status": "evaluated",
+                "paired_across_view_counts": True,
+                "paired_across_poses": False,
+                "paired_across_proxy_and_exact": False,
+                "prefix_selection_independent_of_exact_lcb_samples": True,
+                "selection_bias_control": (
+                    "conditional_greedy_prefixes_fixed_before_independent_"
+                    "holdout_evaluation"
+                ),
+                "predictive_pairing": (
+                    "same_all_64_view_draw_shared_latent_and_shared_nuisance"
+                ),
+            },
+            "proxy": shadow_proxy,
+            "exact": shadow_exact,
+            "executed_shortlist_pose_count": int(exact_pose_indices.size),
+            "view_count_union_exact_pose_count": int(shadow_union_pose_indices.size),
+            "view_count_union_extra_pose_count": int(shadow_extra_pose_indices.size),
+            "view_count_union_capacity": int(config.exact_eig_pose_max),
+            "shadow_extra_eig_runtime": (
+                {}
+                if shadow_extra_evaluation is None
+                else dict(shadow_extra_evaluation.diagnostics)
+            ),
+        }
 
     source_kind = {
         "greedy": "conditional_greedy_all_pairs",
@@ -3054,9 +3980,7 @@ def _build_conditional_nodes(
             frontier_gain=float(frontier_gains[int(pose_index)]),
             turn_penalty=float(turn_penalties[int(pose_index)]),
             local_orbit_gain=float(local_orbit_gains[int(pose_index)]),
-            elevation_condition_gain=float(
-                elevation_condition_gains[int(pose_index)]
-            ),
+            elevation_condition_gain=float(elevation_condition_gains[int(pose_index)]),
         )
         for row, pose_index in enumerate(exact_pose_indices)
     ]
@@ -3130,21 +4054,15 @@ def _build_conditional_nodes(
         "adaptive_shortlist_stop_reason": str(shortlist_stop_reason),
         "adaptive_shortlist_boundaries": shortlist_boundaries,
         "adaptive_shortlist_coverage_reserve_pose": coverage_reserve_pose,
-        "adaptive_shortlist_pose_indices": [
-            int(value) for value in exact_pose_indices
-        ],
+        "adaptive_shortlist_pose_indices": [int(value) for value in exact_pose_indices],
         "exact_pose_results": [
             {
                 "pose_index": int(pose_index),
                 "pose_xyz": [float(value) for value in poses[int(pose_index)]],
-                "program_pair_ids": [
-                    int(value) for value in exact_programs[row]
-                ],
+                "program_pair_ids": [int(value) for value in exact_programs[row]],
                 "selection_source": str(exact_sources[row]),
                 "information_gain": float(exact_gains[row]),
-                "information_gain_sample_count": int(
-                    final_eig_sample_counts[row]
-                ),
+                "information_gain_sample_count": int(final_eig_sample_counts[row]),
                 "pose_score": float(exact_scores[row]),
             }
             for row, pose_index in enumerate(exact_pose_indices)
@@ -3163,23 +4081,19 @@ def _build_conditional_nodes(
         ),
         "exact_eig_runtime": dict(exact_evaluation.diagnostics),
         "pose_gap_lower_confidence_initial": [
-            None if not np.isfinite(value) else float(value)
-            for value in pose_gap_lower
+            None if not np.isfinite(value) else float(value) for value in pose_gap_lower
         ],
         "independently_confirmed_pose_count": int(pose_confirmation_count),
         "pose_confirmation_wall_s": float(pose_confirmation_wall_s),
-        "pose_confirmation_memory_chunk_plan": dict(
-            pose_confirmation_memory_plan
-        ),
+        "pose_confirmation_memory_chunk_plan": dict(pose_confirmation_memory_plan),
         "conditional_greedy_candidate_count_per_pose": int(greedy_count),
         "one_swap_candidate_count_per_pose": int(swap_count),
         "legacy_guard_candidate_count_per_pose": int(guard_count),
-        "independently_confirmed_program_pose_count": int(
-            program_confirmation_count
-        ),
+        "independently_confirmed_program_pose_count": int(program_confirmation_count),
         "coverage_support": str(coverage_support),
         "coverage_quadrature": coverage_quadrature_diagnostics,
         "eig_shortlist_wall_s": float(time.perf_counter() - conditional_started),
+        "shield_view_count_shadow": shadow_diagnostics,
     }
     return nodes, diagnostics
 
@@ -3276,10 +4190,10 @@ def _build_nodes(
                 motion_time_components[2][int(pose_index)]
             ),
         }
+
     info_gains = np.zeros(candidate_poses.shape[0], dtype=float)
-    map_has_native_motion = (
-        map_api is None
-        or callable(getattr(map_api, "motion_path_lengths_batch", None))
+    map_has_native_motion = map_api is None or callable(
+        getattr(map_api, "motion_path_lengths_batch", None)
     )
     runtime_motion_time_only = motion_times is not None and not map_has_native_motion
     if runtime_motion_time_only:
@@ -3492,9 +4406,8 @@ def _build_nodes(
         int(available_pose_count),
     )
     required_exact_action_count = int(exact_pose_count * len(programs))
-    if (
-        float(config.lambda_eig) > 0.0
-        and required_exact_action_count > int(config.exact_eig_action_limit)
+    if float(config.lambda_eig) > 0.0 and required_exact_action_count > int(
+        config.exact_eig_action_limit
     ):
         raise ValueError(
             "exact_eig_action_limit cannot hold all programs for the "
@@ -3534,9 +4447,8 @@ def _build_nodes(
             dtype=np.int64,
         )
     )
-    if (
-        float(config.lambda_eig) > 0.0
-        and available_pose_count > int(config.exact_eig_pose_limit)
+    if float(config.lambda_eig) > 0.0 and available_pose_count > int(
+        config.exact_eig_pose_limit
     ):
         proxy_joint_particles = estimator.planning_joint_particles(
             max_particles=int(config.proxy_planning_particles),
@@ -3923,10 +4835,7 @@ def _build_nodes(
         int(evaluated_pending_indices.size) if float(config.lambda_eig) > 0.0 else 0
     )
     evaluated_pose_array = np.asarray(
-        [
-            int(pending[int(index)].pose_index)
-            for index in evaluated_pending_indices
-        ],
+        [int(pending[int(index)].pose_index) for index in evaluated_pending_indices],
         dtype=np.int64,
     )
     evaluated_pose_indices, evaluated_program_counts = np.unique(
@@ -4028,9 +4937,7 @@ def _build_nodes(
         "eig_shortlist_wall_s": float(proxy_wall_s + exact_wall_s),
     }
     if conditional_shadow_diagnostics is not None:
-        diagnostics["conditional_greedy_shadow"] = dict(
-            conditional_shadow_diagnostics
-        )
+        diagnostics["conditional_greedy_shadow"] = dict(conditional_shadow_diagnostics)
     return raw_nodes, diagnostics
 
 
@@ -4244,11 +5151,10 @@ def select_dss_pp_next_station(
                 max_programs=int(cfg.max_programs),
             )
         )
-    elif (
-        cfg.forced_program_pair_ids is None
-        and cfg.shield_program_search_policy
-        in {"predeclared_library", "conditional_greedy_shadow"}
-    ):
+    elif cfg.forced_program_pair_ids is None and cfg.shield_program_search_policy in {
+        "predeclared_library",
+        "conditional_greedy_shadow",
+    }:
         from planning.shield_programs import build_shield_program_library
 
         programs = build_shield_program_library(
@@ -4520,9 +5426,7 @@ def select_dss_pp_next_station(
         "planning_eig_shortlist": dict(shortlist_diagnostics),
         "first_information_gain": float(first.information_gain),
         "selected_pose_exact_program_count": int(len(selected_pose_nodes)),
-        "selected_pose_exact_information_gain_leader": float(
-            selected_pose_eig_leader
-        ),
+        "selected_pose_exact_information_gain_leader": float(selected_pose_eig_leader),
         "selected_program_is_exact_eig_leader_at_selected_pose": bool(
             selected_program_is_eig_leader
         ),

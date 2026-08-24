@@ -193,6 +193,10 @@ _DSS_PP_RUNTIME_KEYS = frozenset(
         "rotation_weight",
         "settling_time_weight",
         "shield_program_search_policy",
+        "shield_view_count_shadow_candidate_counts",
+        "shield_view_count_shadow_enabled",
+        "shield_view_count_shadow_per_comparison_confidence",
+        "shield_view_count_shadow_retention_fraction",
         "time_weight",
         "turn_smoothness_weight",
     }

@@ -194,6 +194,24 @@ def dss_config_from_pf_settings(
             "proxy_top_k_jaccard_min",
             0.75,
         ),
+        shield_view_count_shadow_enabled=raw.get(
+            "shield_view_count_shadow_enabled",
+            False,
+        ),
+        shield_view_count_shadow_candidate_counts=tuple(
+            raw.get(
+                "shield_view_count_shadow_candidate_counts",
+                (2, 4, 8),
+            )
+        ),
+        shield_view_count_shadow_retention_fraction=raw.get(
+            "shield_view_count_shadow_retention_fraction",
+            0.95,
+        ),
+        shield_view_count_shadow_per_comparison_confidence=raw.get(
+            "shield_view_count_shadow_per_comparison_confidence",
+            0.95,
+        ),
     )
     if config.shield_program_search_policy in {
         "conditional_greedy_shadow",

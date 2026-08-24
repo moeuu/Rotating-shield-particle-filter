@@ -121,6 +121,10 @@ class DSSPPConfig:
     proxy_stability_replicates: int = 3
     proxy_boundary_confidence: float = 0.95
     proxy_top_k_jaccard_min: float = 0.75
+    shield_view_count_shadow_enabled: bool = False
+    shield_view_count_shadow_candidate_counts: tuple[int, ...] = (2, 4, 8)
+    shield_view_count_shadow_retention_fraction: float = 0.95
+    shield_view_count_shadow_per_comparison_confidence: float = 0.95
 
     def __post_init__(self) -> None:
         """Validate every planner field before it can affect observations."""
@@ -188,9 +192,7 @@ class DSSPPConfig:
             "exact_eig_pose_min": self.exact_eig_pose_min,
             "exact_eig_pose_max": self.exact_eig_pose_max,
             "exact_eig_pose_step": self.exact_eig_pose_step,
-            "proxy_stability_refinement_pool": (
-                self.proxy_stability_refinement_pool
-            ),
+            "proxy_stability_refinement_pool": (self.proxy_stability_refinement_pool),
             "proxy_stability_replicates": self.proxy_stability_replicates,
         }
         for name, value in positive_integer_fields.items():
@@ -223,6 +225,7 @@ class DSSPPConfig:
             "augment_candidates": self.augment_candidates,
             "legacy_program_guard_enabled": self.legacy_program_guard_enabled,
             "conditional_greedy_one_swap": self.conditional_greedy_one_swap,
+            "shield_view_count_shadow_enabled": (self.shield_view_count_shadow_enabled),
         }.items():
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a boolean.")
@@ -266,17 +269,13 @@ class DSSPPConfig:
         if self.lambda_distance is not None:
             nonnegative_fields["lambda_distance"] = self.lambda_distance
         if self.lambda_horizontal_time is not None:
-            nonnegative_fields["lambda_horizontal_time"] = (
-                self.lambda_horizontal_time
-            )
+            nonnegative_fields["lambda_horizontal_time"] = self.lambda_horizontal_time
         if self.lambda_mast_vertical_time is not None:
             nonnegative_fields["lambda_mast_vertical_time"] = (
                 self.lambda_mast_vertical_time
             )
         if self.lambda_settling_time is not None:
-            nonnegative_fields["lambda_settling_time"] = (
-                self.lambda_settling_time
-            )
+            nonnegative_fields["lambda_settling_time"] = self.lambda_settling_time
         for name, value in nonnegative_fields.items():
             _number(value, name, minimum=0.0)
         if conditional_search_enabled and float(self.lambda_eig) <= 0.0:
@@ -285,8 +284,7 @@ class DSSPPConfig:
             )
         if conditional_search_enabled and int(self.proxy_eig_samples) < 2:
             raise ValueError(
-                "Conditional-greedy shield search requires "
-                "proxy_eig_samples >= 2."
+                "Conditional-greedy shield search requires proxy_eig_samples >= 2."
             )
         if float(self.lambda_rotation) != 0.0:
             raise ValueError(
@@ -333,6 +331,55 @@ class DSSPPConfig:
             minimum=0.0,
             maximum=1.0,
         )
+        _number(
+            self.shield_view_count_shadow_retention_fraction,
+            "shield_view_count_shadow_retention_fraction",
+            minimum=0.0,
+            maximum=1.0,
+            strict_minimum=True,
+        )
+        _number(
+            self.shield_view_count_shadow_per_comparison_confidence,
+            "shield_view_count_shadow_per_comparison_confidence",
+            minimum=0.0,
+            maximum=1.0,
+            strict_minimum=True,
+            strict_maximum=True,
+        )
+        shadow_counts = tuple(
+            _integer(
+                value,
+                "shield_view_count_shadow_candidate_counts",
+                minimum=1,
+            )
+            for value in self.shield_view_count_shadow_candidate_counts
+        )
+        if len(shadow_counts) < 2:
+            raise ValueError(
+                "shield_view_count_shadow_candidate_counts must contain at "
+                "least two values."
+            )
+        if tuple(sorted(set(shadow_counts))) != shadow_counts:
+            raise ValueError(
+                "shield_view_count_shadow_candidate_counts must be strictly "
+                "increasing and unique."
+            )
+        if self.shield_view_count_shadow_enabled:
+            if self.shield_program_search_policy != "conditional_greedy_all_pairs":
+                raise ValueError(
+                    "Shield view-count shadow audit requires "
+                    "conditional_greedy_all_pairs."
+                )
+            if shadow_counts != (2, 4, 8):
+                raise ValueError(
+                    "Enabled shield view-count shadow candidates must be "
+                    "exactly (2, 4, 8)."
+                )
+            if int(self.program_length) != int(shadow_counts[-1]):
+                raise ValueError(
+                    "Executed program_length must equal the shadow reference "
+                    "view count."
+                )
         if not self.ring_radii_m:
             raise ValueError("ring_radii_m must not be empty.")
         for index, radius in enumerate(self.ring_radii_m):
@@ -353,12 +400,11 @@ class DSSPPConfig:
                 )
             if len(set(pair_ids)) != len(pair_ids):
                 raise ValueError("forced_program_pair_ids must not contain duplicates.")
-        if predeclared_search_enabled and int(
-            self.exact_eig_coverage_reserve
-        ) > int(self.exact_eig_pose_limit):
+        if predeclared_search_enabled and int(self.exact_eig_coverage_reserve) > int(
+            self.exact_eig_pose_limit
+        ):
             raise ValueError(
-                "exact_eig_coverage_reserve must fit within "
-                "exact_eig_pose_limit."
+                "exact_eig_coverage_reserve must fit within exact_eig_pose_limit."
             )
         if int(self.exact_eig_program_diversity_reserve) != 0:
             raise ValueError(
@@ -373,28 +419,22 @@ class DSSPPConfig:
                 "for every shortlisted pose."
             )
         if int(self.exact_eig_pose_max) < int(self.exact_eig_pose_min):
-            raise ValueError(
-                "exact_eig_pose_max must be at least exact_eig_pose_min."
-            )
+            raise ValueError("exact_eig_pose_max must be at least exact_eig_pose_min.")
         if int(self.exact_eig_pose_step) > int(self.exact_eig_pose_max):
-            raise ValueError(
-                "exact_eig_pose_step must not exceed exact_eig_pose_max."
-            )
+            raise ValueError("exact_eig_pose_step must not exceed exact_eig_pose_max.")
         if int(self.proxy_stability_replicates) < 2:
             raise ValueError(
                 "proxy_stability_replicates must include an independent "
                 "boundary recheck."
             )
-        if int(self.proxy_stability_refinement_pool) <= int(
-            self.exact_eig_pose_max
-        ):
+        if int(self.proxy_stability_refinement_pool) <= int(self.exact_eig_pose_max):
             raise ValueError(
                 "proxy_stability_refinement_pool must include the pose just "
                 "outside the maximum exact shortlist."
             )
-        if conditional_search_enabled and int(
-            self.exact_eig_coverage_reserve
-        ) > int(self.exact_eig_pose_min):
+        if conditional_search_enabled and int(self.exact_eig_coverage_reserve) > int(
+            self.exact_eig_pose_min
+        ):
             raise ValueError(
                 "exact_eig_coverage_reserve must fit within the minimum "
                 "conditional-greedy pose shortlist."

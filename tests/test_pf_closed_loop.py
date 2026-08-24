@@ -27,6 +27,8 @@ from pf.closed_loop import (
     PFControlBudget,
     _bootstrap_program,
     _cui_truth_display_mode,
+    _particle_diagnostics,
+    _shield_view_count_shadow_health,
     run_pf_closed_loop,
 )
 from planning.configuration import dss_config_from_pf_settings
@@ -105,6 +107,108 @@ def test_standard_bootstrap_does_not_depend_on_legacy_program_library(
 
     assert program.pair_ids == (0, 9, 18, 27, 36, 45, 54, 63)
     assert program.kind == "prior_balanced_bootstrap"
+
+
+def test_shield_view_count_health_is_truth_free_and_fail_closed() -> None:
+    """Diversity, model mismatch, and cardinality caps must all force eight."""
+    health = _shield_view_count_shadow_health(
+        belief_after_station_id=7,
+        particle_adequacy={
+            "assessment": {
+                "diversity_warning": True,
+                "minimum_guided_initialization_ess_ratio": 0.5,
+                "minimum_cumulative_unique_ancestor_count": 1,
+            }
+        },
+        posterior_convergence={
+            "sampler_health": {
+                "smc_soft_budget_respected": True,
+                "rejuvenation_mixing_complete": False,
+                "structural_mixing_complete": True,
+            },
+            "innovation": {"available": True, "passed": False},
+            "isotopes": {
+                "Cs-137": {"gates": {"cardinality_not_at_upper_boundary": False}},
+                "Co-60": {"gates": {"cardinality_not_at_upper_boundary": True}},
+            },
+            "ready": False,
+        },
+        detected_isotope_gate={"newly_active_isotopes": ["Eu-154"]},
+    )
+
+    assert health["available"] is True
+    assert health["passed"] is False
+    assert health["truth_used"] is False
+    assert health["source_station_id"] == 7
+    assert health["hard_failure_reasons"] == [
+        "particle_diversity_warning",
+        "sampler_health:rejuvenation_mixing_complete",
+        "posterior_predictive_innovation_failed",
+        "cardinality_upper_boundary:Cs-137",
+        "newly_activated_isotope_posterior",
+    ]
+
+
+def test_shield_view_count_health_does_not_require_convergence_ready() -> None:
+    """Normal early posterior uncertainty alone must not be labelled unhealthy."""
+    health = _shield_view_count_shadow_health(
+        belief_after_station_id=1,
+        particle_adequacy={
+            "assessment": {
+                "diversity_warning": False,
+                "minimum_guided_initialization_ess_ratio": 0.8,
+                "minimum_cumulative_unique_ancestor_count": 100,
+            }
+        },
+        posterior_convergence={
+            "sampler_health": {
+                "smc_soft_budget_respected": True,
+                "rejuvenation_mixing_complete": True,
+                "structural_mixing_complete": True,
+            },
+            "innovation": {"available": True, "passed": True},
+            "isotopes": {
+                "Cs-137": {"gates": {"cardinality_not_at_upper_boundary": True}}
+            },
+            "ready": False,
+        },
+        detected_isotope_gate={"newly_active_isotopes": []},
+    )
+
+    assert health["passed"] is True
+    assert health["hard_failure_reasons"] == []
+
+
+def test_missing_particle_diversity_evidence_fails_closed() -> None:
+    """Absent ESS and ancestry evidence must never permit view shortening."""
+    estimator = SimpleNamespace(
+        pf_config=SimpleNamespace(num_particles=4096, target_ess_ratio=0.4),
+        step_diagnostics=lambda **_kwargs: {"Cs-137": {}},
+    )
+
+    diagnostics = _particle_diagnostics(estimator)
+    assessment = diagnostics["assessment"]
+    assert assessment["diversity_evidence_available"] is False
+    assert assessment["diversity_warning"] is True
+
+    health = _shield_view_count_shadow_health(
+        belief_after_station_id=1,
+        particle_adequacy=diagnostics,
+        posterior_convergence={
+            "sampler_health": {
+                "smc_soft_budget_respected": True,
+                "rejuvenation_mixing_complete": True,
+                "structural_mixing_complete": True,
+            },
+            "innovation": {"available": True, "passed": True},
+            "isotopes": {
+                "Cs-137": {"gates": {"cardinality_not_at_upper_boundary": True}}
+            },
+        },
+        detected_isotope_gate={"newly_active_isotopes": []},
+    )
+    assert health["passed"] is False
+    assert health["hard_failure_reasons"] == ["particle_diversity_evidence_unavailable"]
 
 
 class _FakeRuntimeClient:

@@ -21,6 +21,7 @@ from pf.estimator import (
 from measurement.surface_atlas import ContinuousSurfaceAtlas
 from pf.state import IsotopeState
 from pf.provenance import json_safe
+from planning.audit import build_planner_audit
 from planning.dss_pp import (
     DSSPPConfig,
     _continuous_kernel_for_estimator,
@@ -416,7 +417,9 @@ def test_dss_predictive_eig_stays_on_torch_device_until_final_scores(
     if device_name == "cuda":
         exact_cpu_transfer = torch.Tensor.cpu
 
-        def _record_cpu_transfer(tensor: object, *args: object, **kwargs: object) -> object:
+        def _record_cpu_transfer(
+            tensor: object, *args: object, **kwargs: object
+        ) -> object:
             """Record every explicit CUDA-to-host tensor transfer."""
             device_to_host_shapes.append(tuple(tensor.shape))
             return exact_cpu_transfer(tensor, *args, **kwargs)
@@ -690,9 +693,7 @@ def test_dss_transport_deduplicates_identical_pose_pair_views(
         estimator,
         detector_aperture_samples=121,
     )
-    evaluate_components = (
-        kernel.line_transport_components_pair_program_for_detectors
-    )
+    evaluate_components = kernel.line_transport_components_pair_program_for_detectors
     evaluated_program_shapes: list[tuple[int, int]] = []
 
     def _record_components(**kwargs: object) -> object:
@@ -1100,9 +1101,7 @@ def test_dss_transport_skips_inactive_padded_source_slots(
         estimator,
         detector_aperture_samples=121,
     )
-    evaluate_components = (
-        kernel.line_transport_components_pair_program_for_detectors
-    )
+    evaluate_components = kernel.line_transport_components_pair_program_for_detectors
     evaluated_source_counts: list[int] = []
 
     def _record_components(**kwargs: object) -> object:
@@ -1530,9 +1529,7 @@ def test_conditional_pose_batch_retries_without_changing_eig(
         """Raise one Torch-style CPU OOM, then delegate exact response work."""
         nonlocal raised
         detector_values = (
-            kwargs["detector_positions"]
-            if "detector_positions" in kwargs
-            else args[1]
+            kwargs["detector_positions"] if "detector_positions" in kwargs else args[1]
         )
         pose_count = int(np.asarray(detector_values).shape[0])
         attempted_pose_counts.append(pose_count)
@@ -1602,9 +1599,7 @@ def test_fixed_confirmation_releases_failed_cache_before_retry(
         """Return one response sentinel per attempted pose chunk."""
         nonlocal failed_response
         detector_values = (
-            kwargs["detector_positions"]
-            if "detector_positions" in kwargs
-            else args[1]
+            kwargs["detector_positions"] if "detector_positions" in kwargs else args[1]
         )
         pose_count = int(np.asarray(detector_values).shape[0])
         attempted_pose_counts.append(pose_count)
@@ -3538,9 +3533,10 @@ def test_dss_exactly_sweeps_every_program_at_shortlisted_poses(
     assert exact_batch_shapes == [(2, (48, 48))]
     assert result.next_pose[0] == pytest.approx(2.0)
     assert result.diagnostics["selected_pose_exact_program_count"] == 48
-    assert result.diagnostics[
-        "selected_program_is_exact_eig_leader_at_selected_pose"
-    ] is True
+    assert (
+        result.diagnostics["selected_program_is_exact_eig_leader_at_selected_pose"]
+        is True
+    )
     diagnostics = result.diagnostics["planning_eig_shortlist"]
     assert diagnostics["shortlisted_pose_count"] == 2
     assert diagnostics["exact_action_count"] == 96
@@ -3593,6 +3589,193 @@ def test_dss_conditional_policy_searches_all_pairs_and_retains_eig_guard() -> No
     assert diagnostics["full_program_sweep_per_shortlisted_pose"] is False
     assert result.diagnostics["selected_program_is_exact_eig_leader_at_selected_pose"]
     assert isinstance(json_safe(result.diagnostics), dict)
+
+
+def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> None:
+    """Audit-only prefixes must leave the fixed eight-view action identical."""
+    candidates = np.asarray(
+        [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+
+    def _run(
+        *,
+        enabled: bool,
+        measurement_weight: float,
+    ) -> tuple[dss_pp.DSSPPResult, float]:
+        """Run one isolated conditional planner with the requested audit mode."""
+        estimator = _build_full_spectrum_planning_estimator(
+            shield_normals=np.asarray(generate_octant_orientations(), dtype=float),
+            use_gpu=False,
+        )
+        planner_rng = np.random.default_rng(410)
+        result = select_dss_pp_next_station(
+            estimator=estimator,
+            rng=planner_rng,
+            candidate_poses_xyz=candidates,
+            current_pose_xyz=np.zeros(3, dtype=np.float64),
+            candidate_motion_times_s=np.zeros(candidates.shape[0]),
+            candidate_horizontal_travel_times_s=np.zeros(candidates.shape[0]),
+            candidate_mast_vertical_times_s=np.zeros(candidates.shape[0]),
+            candidate_settling_times_s=np.zeros(candidates.shape[0]),
+            config=DSSPPConfig(
+                max_programs=48,
+                program_length=8,
+                live_time_s=1.0,
+                lambda_eig=1.0,
+                lambda_distance=0.0,
+                lambda_time=measurement_weight,
+                augment_candidates=False,
+                exact_eig_coverage_reserve=0,
+                detector_aperture_samples=1,
+                shield_program_search_policy="conditional_greedy_all_pairs",
+                exact_eig_pose_min=8,
+                exact_eig_pose_max=16,
+                shield_view_count_shadow_enabled=enabled,
+            ),
+        )
+        return result, float(planner_rng.random())
+
+    baseline, baseline_next_random = _run(enabled=False, measurement_weight=0.0)
+    shadow, shadow_next_random = _run(enabled=True, measurement_weight=0.0)
+    weighted_shadow, _weighted_next_random = _run(
+        enabled=True,
+        measurement_weight=1000.0,
+    )
+
+    assert shadow.next_pose_index == baseline.next_pose_index
+    assert shadow.shield_program == baseline.shield_program
+    assert shadow.score == baseline.score
+    assert shadow.sequence[0].information_gain == baseline.sequence[0].information_gain
+    assert shadow_next_random == baseline_next_random
+    assert (
+        weighted_shadow.diagnostics["planning_eig_shortlist"][
+            "shield_view_count_shadow"
+        ]["exact"]["paired_lcb_rule_action"]
+        == shadow.diagnostics["planning_eig_shortlist"]["shield_view_count_shadow"][
+            "exact"
+        ]["paired_lcb_rule_action"]
+    )
+
+    audit = shadow.diagnostics["planning_eig_shortlist"]["shield_view_count_shadow"]
+    assert audit["mode"] == "audit_only_fixed_8_execution"
+    assert audit["policy"]["candidate_view_counts"] == [2, 4, 8]
+    assert audit["policy"]["measurement_time_weight_affects_selection"] is False
+    assert audit["mc_contract"]["paired_across_view_counts"] is True
+    assert (
+        audit["mc_contract"]["prefix_selection_independent_of_exact_lcb_samples"]
+        is True
+    )
+    assert audit["proxy"]["status"] == "skipped_all_valid_poses_exact"
+    assert audit["exact"]["pose_count"] == 2
+    assert audit["exact"]["sample_count"] >= 2
+    selection_seeds = {
+        block["seed"] for block in audit["exact"]["prefix_selection_seed_blocks"]
+    }
+    holdout_seeds = {
+        block["seed"]
+        for block in audit["exact"]["paired_evaluation_holdout_seed_blocks"]
+    }
+    assert selection_seeds.isdisjoint(holdout_seeds)
+    assert (
+        audit["exact"]["configured_time_weight_counterfactual_action"][
+            "calibrated_for_dynamic_acquisition"
+        ]
+        is False
+    )
+    by_count = audit["exact"]["by_view_count"]
+    for view_count in (2, 4, 8):
+        programs = by_count[str(view_count)]["pair_ids"]
+        assert all(len(program) == view_count for program in programs)
+        assert all(len(set(program)) == view_count for program in programs)
+        assert by_count[str(view_count)]["measurement_live_time_s"] == pytest.approx(
+            float(view_count)
+        )
+        assert by_count[str(view_count)]["measurement_elapsed_time_s"] == pytest.approx(
+            float(view_count) * 1.5
+        )
+    for pose_index in range(2):
+        pairs_2 = by_count["2"]["pair_ids"][pose_index]
+        pairs_4 = by_count["4"]["pair_ids"][pose_index]
+        pairs_8 = by_count["8"]["pair_ids"][pose_index]
+        assert pairs_4[:2] == pairs_2
+        assert pairs_8[:4] == pairs_4
+    assert isinstance(json_safe(audit), dict)
+    persisted = build_planner_audit(
+        station_id=1,
+        belief_after_station_id=0,
+        result=shadow,
+    )
+    assert (
+        persisted["shield_view_count_shadow"]["executed_action"]["selected_view_count"]
+        == 8
+    )
+    assert isinstance(json_safe(persisted), dict)
+
+
+def test_shield_view_count_shadow_logs_all_proxy_poses_and_exact_union() -> None:
+    """K-specific proxy leaders must expand only the audit exact-pose union."""
+    estimator = _build_full_spectrum_planning_estimator(
+        shield_normals=np.asarray(generate_octant_orientations(), dtype=float),
+        use_gpu=False,
+    )
+    candidates = np.column_stack(
+        (
+            np.linspace(0.5, 5.0, 10),
+            np.zeros(10),
+            np.zeros(10),
+        )
+    ).astype(np.float64)
+
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(411),
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.zeros(3, dtype=np.float64),
+        candidate_motion_times_s=np.zeros(candidates.shape[0]),
+        candidate_horizontal_travel_times_s=np.zeros(candidates.shape[0]),
+        candidate_mast_vertical_times_s=np.zeros(candidates.shape[0]),
+        candidate_settling_times_s=np.zeros(candidates.shape[0]),
+        config=DSSPPConfig(
+            max_programs=48,
+            program_length=8,
+            live_time_s=1.0,
+            lambda_eig=1.0,
+            lambda_distance=0.0,
+            lambda_time=0.0,
+            augment_candidates=False,
+            exact_eig_coverage_reserve=0,
+            detector_aperture_samples=1,
+            shield_program_search_policy="conditional_greedy_all_pairs",
+            exact_eig_pose_min=8,
+            exact_eig_pose_max=16,
+            proxy_stability_refinement_pool=24,
+            shield_view_count_shadow_enabled=True,
+        ),
+    )
+
+    shadow = result.diagnostics["planning_eig_shortlist"]["shield_view_count_shadow"]
+    proxy = shadow["proxy"]
+    exact = shadow["exact"]
+    assert proxy["status"] == "evaluated"
+    assert proxy["pose_count"] == 10
+    assert len(proxy["pose_indices"]) == 10
+    assert all(
+        len(proxy["by_view_count"][str(view_count)]["pair_ids"]) == 10
+        for view_count in (2, 4, 8)
+    )
+    assert set(proxy["executed_fixed_8_shortlist_pose_indices"]).issubset(
+        proxy["view_count_union_exact_pose_indices"]
+    )
+    assert shadow["view_count_union_exact_pose_count"] <= 16
+    assert exact["pose_indices"] == proxy["view_count_union_exact_pose_indices"]
+    assert result.next_pose_index in proxy["executed_fixed_8_shortlist_pose_indices"]
+    persisted = build_planner_audit(
+        station_id=1,
+        belief_after_station_id=0,
+        result=result,
+    )
+    assert persisted["shield_view_count_shadow"]["proxy"]["pose_count"] == 10
 
 
 def test_dss_conditional_policy_has_a_legacy_free_execution_path() -> None:

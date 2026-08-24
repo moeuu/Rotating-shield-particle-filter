@@ -1148,9 +1148,7 @@ def test_surface_credible_radius_does_not_collapse_on_a_broad_plane() -> None:
 
     assert radii["Cs-137"][0] >= 5.0
     assert (
-        diagnostics["isotopes"]["Cs-137"]["gates"][
-            "surface_path_concentration"
-        ]
+        diagnostics["isotopes"]["Cs-137"]["gates"]["surface_path_concentration"]
         is False
     )
     assert diagnostics["ready"] is False
@@ -1617,6 +1615,12 @@ def test_strict_profile_keeps_pf_budget_and_retires_runtime_placeholders() -> No
     # These inherited settings prove the nested section is fully specified,
     # not accidentally replaced by a three-key shallow override.
     assert "program_length" not in dss
+    assert dss["shield_view_count_shadow_enabled"] is True
+    assert dss["shield_view_count_shadow_candidate_counts"] == [2, 4, 8]
+    assert dss["shield_view_count_shadow_retention_fraction"] == pytest.approx(0.95)
+    assert dss["shield_view_count_shadow_per_comparison_confidence"] == pytest.approx(
+        0.95
+    )
     assert int(dss["max_programs"]) >= 1
     assert "min_station_separation_m" not in dss
     assert "coverage_radius_m" not in dss
@@ -2312,9 +2316,7 @@ def test_pure_posterior_uses_joint_map_cardinality_vector() -> None:
 
     assert radii["Cs-137"] == []
     assert diagnostics["joint_cardinality"]["map_cardinalities"] == [1, 0]
-    assert diagnostics["joint_cardinality"]["map_probability"] == pytest.approx(
-        0.45
-    )
+    assert diagnostics["joint_cardinality"]["map_probability"] == pytest.approx(0.45)
     assert diagnostics["isotopes"]["Cs-137"]["credible_surface_radii_95_m"] == []
     assert uncertainty["Co-60"][0]["posterior_reference_mass"] == (pytest.approx(0.45))
     assert uncertainty["Co-60"][0]["conditional_support_mass"] == (

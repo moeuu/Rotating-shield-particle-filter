@@ -106,6 +106,7 @@ def test_runtime_planner_parses_conditional_all_pair_search_controls() -> None:
         {
             "dss_pp": {
                 "shield_program_search_policy": "conditional_greedy_all_pairs",
+                "program_length": 8,
                 "legacy_program_guard_enabled": True,
                 "conditional_greedy_one_swap": True,
                 "exact_eig_pose_min": 8,
@@ -115,6 +116,10 @@ def test_runtime_planner_parses_conditional_all_pair_search_controls() -> None:
                 "proxy_stability_replicates": 3,
                 "proxy_boundary_confidence": 0.95,
                 "proxy_top_k_jaccard_min": 0.75,
+                "shield_view_count_shadow_enabled": True,
+                "shield_view_count_shadow_candidate_counts": [2, 4, 8],
+                "shield_view_count_shadow_retention_fraction": 0.95,
+                "shield_view_count_shadow_per_comparison_confidence": 0.95,
             }
         },
     )
@@ -129,6 +134,36 @@ def test_runtime_planner_parses_conditional_all_pair_search_controls() -> None:
     assert config.proxy_stability_replicates == 3
     assert config.proxy_boundary_confidence == pytest.approx(0.95)
     assert config.proxy_top_k_jaccard_min == pytest.approx(0.75)
+    assert config.shield_view_count_shadow_enabled is True
+    assert config.shield_view_count_shadow_candidate_counts == (2, 4, 8)
+    assert config.shield_view_count_shadow_retention_fraction == pytest.approx(0.95)
+    assert config.shield_view_count_shadow_per_comparison_confidence == pytest.approx(
+        0.95
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"shield_program_search_policy": "predeclared_library"},
+        {"program_length": 4},
+        {"shield_view_count_shadow_candidate_counts": [2, 3, 8]},
+    ),
+)
+def test_view_count_shadow_requires_the_fixed_eight_all_pair_contract(
+    overrides: dict[str, object],
+) -> None:
+    """Shadow settings must not silently alter legacy or runtime acquisition."""
+    values: dict[str, object] = {
+        "shield_program_search_policy": "conditional_greedy_all_pairs",
+        "shield_view_count_shadow_enabled": True,
+        "shield_view_count_shadow_candidate_counts": [2, 4, 8],
+        "program_length": 8,
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValueError, match="shadow|Shadow|program_length"):
+        dss_config_from_pf_settings({"dss_pp": values})
 
 
 @pytest.mark.parametrize(

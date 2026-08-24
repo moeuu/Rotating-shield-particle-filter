@@ -56,7 +56,12 @@ from pf.runtime_defaults import (
     DEFAULT_CUI_SPLIT_VIEW_HOST,
     DEFAULT_CUI_SPLIT_VIEW_PORT,
 )
-from planning.audit import PlannerAuditWriter, build_planner_audit
+from planning.audit import (
+    PlannerAuditWriter,
+    SHIELD_VIEW_COUNT_SHADOW_HEALTH_GATES,
+    build_bootstrap_planner_audit,
+    build_planner_audit,
+)
 from planning.configuration import dss_config_from_pf_settings
 from planning.bootstrap_program import build_balanced_bootstrap_program
 from planning.dss_pp import DSSPPConfig, DSSPPResult, select_dss_pp_next_station
@@ -189,9 +194,7 @@ class AdaptiveStopTracker:
             )
         self.last_station_count = count
         enabled = bool(self.budget.adaptive_stop_enabled)
-        eligible = bool(
-            enabled and count >= self.budget.stop_assessment_start_station
-        )
+        eligible = bool(enabled and count >= self.budget.stop_assessment_start_station)
         diagnostics: dict[str, Any] | None = None
         instantaneous_ready: bool | None = None
         if eligible:
@@ -203,9 +206,7 @@ class AdaptiveStopTracker:
             diagnostics = dict(raw_diagnostics)
             raw_ready = diagnostics.get("ready")
             if not isinstance(raw_ready, bool):
-                raise TypeError(
-                    "posterior convergence ready must be a boolean."
-                )
+                raise TypeError("posterior convergence ready must be a boolean.")
             instantaneous_ready = raw_ready
             if instantaneous_ready:
                 self.consecutive_ready_stations += 1
@@ -221,15 +222,11 @@ class AdaptiveStopTracker:
         return {
             "enabled": enabled,
             "assessed": eligible,
-            "assessment_start_station": (
-                self.budget.stop_assessment_start_station
-            ),
+            "assessment_start_station": (self.budget.stop_assessment_start_station),
             "required_consecutive_stations": (
                 self.budget.stop_required_consecutive_stations
             ),
-            "earliest_stop_station": (
-                self.budget.earliest_adaptive_stop_station
-            ),
+            "earliest_stop_station": (self.budget.earliest_adaptive_stop_station),
             "instantaneous_ready": instantaneous_ready,
             "consecutive_ready_stations": self.consecutive_ready_stations,
             "stop_ready": stop_ready,
@@ -509,8 +506,10 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         "minimum_cumulative_unique_ancestor_count": (
             None if not ancestry_counts else int(min(ancestry_counts))
         ),
+        "diversity_evidence_available": bool(guided_ratios or ancestry_counts),
         "diversity_warning": bool(
-            (guided_ratios and min(guided_ratios) < target_ratio)
+            (not guided_ratios and not ancestry_counts)
+            or (guided_ratios and min(guided_ratios) < target_ratio)
             or (ancestry_counts and min(ancestry_counts) <= 1)
         ),
         "interpretation": (
@@ -520,6 +519,131 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         ),
     }
     return {"assessment": evidence, "isotopes": isotopes}
+
+
+def _shield_view_count_shadow_health(
+    *,
+    belief_after_station_id: int,
+    particle_adequacy: Mapping[str, object],
+    posterior_convergence: Mapping[str, object],
+    detected_isotope_gate: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Return truth-free hard gates for audit-only view-count shortening."""
+    if (
+        isinstance(belief_after_station_id, bool)
+        or not isinstance(belief_after_station_id, int)
+        or belief_after_station_id < 0
+    ):
+        raise ValueError("belief_after_station_id must be nonnegative.")
+    assessment = particle_adequacy.get("assessment")
+    if not isinstance(assessment, Mapping):
+        raise TypeError("particle_adequacy.assessment must be a mapping.")
+    sampler_health = posterior_convergence.get("sampler_health")
+    innovation = posterior_convergence.get("innovation")
+    isotope_rows = posterior_convergence.get("isotopes")
+    if not isinstance(sampler_health, Mapping):
+        raise TypeError("posterior sampler_health must be a mapping.")
+    if not isinstance(innovation, Mapping):
+        raise TypeError("posterior innovation must be a mapping.")
+    if not isinstance(isotope_rows, Mapping):
+        raise TypeError("posterior isotope health must be a mapping.")
+
+    reasons: list[str] = []
+    diversity_evidence_available = bool(
+        assessment.get("diversity_evidence_available", False)
+        or assessment.get("minimum_guided_initialization_ess_ratio") is not None
+        or assessment.get("minimum_cumulative_unique_ancestor_count") is not None
+    )
+    if not diversity_evidence_available:
+        reasons.append("particle_diversity_evidence_unavailable")
+    elif bool(assessment.get("diversity_warning", True)):
+        reasons.append("particle_diversity_warning")
+    for name in (
+        "smc_soft_budget_respected",
+        "rejuvenation_mixing_complete",
+        "structural_mixing_complete",
+    ):
+        if sampler_health.get(name) is not True:
+            reasons.append(f"sampler_health:{name}")
+    innovation_available = innovation.get("available") is True
+    innovation_passed = innovation.get("passed") is True
+    if not innovation_available:
+        reasons.append("posterior_predictive_innovation_unavailable")
+    elif not innovation_passed:
+        reasons.append("posterior_predictive_innovation_failed")
+    boundary_isotopes: list[str] = []
+    for isotope, raw_row in sorted(isotope_rows.items(), key=lambda item: str(item[0])):
+        if not isinstance(raw_row, Mapping):
+            raise TypeError("posterior isotope health rows must be mappings.")
+        gates = raw_row.get("gates")
+        if not isinstance(gates, Mapping):
+            reasons.append(f"cardinality_boundary_health_unavailable:{isotope}")
+            continue
+        if gates.get("cardinality_not_at_upper_boundary") is not True:
+            boundary_isotopes.append(str(isotope))
+            reasons.append(f"cardinality_upper_boundary:{isotope}")
+    newly_active: list[str] = []
+    if detected_isotope_gate is not None:
+        raw_new = detected_isotope_gate.get("newly_active_isotopes", [])
+        if not isinstance(raw_new, Sequence) or isinstance(raw_new, (str, bytes)):
+            raise TypeError("newly_active_isotopes must be a sequence.")
+        newly_active = sorted(str(value) for value in raw_new)
+        if newly_active:
+            reasons.append("newly_activated_isotope_posterior")
+    return {
+        "policy_schema_version": 1,
+        "hard_gate_contract": list(SHIELD_VIEW_COUNT_SHADOW_HEALTH_GATES),
+        "available": True,
+        "passed": not reasons,
+        "source_station_id": int(belief_after_station_id),
+        "hard_failure_reasons": reasons,
+        "truth_used": False,
+        "particle_adequacy": {
+            "diversity_evidence_available": bool(diversity_evidence_available),
+            "diversity_warning": bool(assessment.get("diversity_warning", True)),
+            "minimum_guided_initialization_ess_ratio": assessment.get(
+                "minimum_guided_initialization_ess_ratio"
+            ),
+            "minimum_cumulative_unique_ancestor_count": assessment.get(
+                "minimum_cumulative_unique_ancestor_count"
+            ),
+        },
+        "sampler_health": dict(sampler_health),
+        "posterior_predictive_innovation_available": bool(innovation_available),
+        "posterior_predictive_innovation_passed": bool(innovation_passed),
+        "cardinality_upper_boundary_isotopes": boundary_isotopes,
+        "newly_active_isotopes": newly_active,
+    }
+
+
+def _current_shadow_health(
+    estimator: object,
+    *,
+    planner: DSSPPConfig,
+    belief_after_station_id: int,
+    particle_adequacy: Mapping[str, object],
+    adaptive_stop_status: Mapping[str, object] | None,
+    detected_isotope_gate: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    """Evaluate view-count health only when the shadow policy is enabled."""
+    if not bool(planner.shield_view_count_shadow_enabled):
+        return None
+    convergence: Mapping[str, object] | None = None
+    if adaptive_stop_status is not None:
+        raw = adaptive_stop_status.get("posterior_convergence")
+        if isinstance(raw, Mapping):
+            convergence = raw
+    if convergence is None:
+        raw = estimator.posterior_convergence_diagnostics()
+        if not isinstance(raw, Mapping):
+            raise TypeError("posterior_convergence_diagnostics must be a mapping.")
+        convergence = raw
+    return _shield_view_count_shadow_health(
+        belief_after_station_id=int(belief_after_station_id),
+        particle_adequacy=particle_adequacy,
+        posterior_convergence=convergence,
+        detected_isotope_gate=detected_isotope_gate,
+    )
 
 
 def _live_posterior_summary(estimator: object) -> dict[str, object]:
@@ -951,42 +1075,25 @@ def run_pf_closed_loop(
             station_id = 0
             station_history = []
             planner_writer.append(
-                {
-                    "schema_version": 1,
-                    "station_id": 0,
-                    "selection_mode": (
-                        "external_control_bootstrap"
-                        if current_program.kind == "external_control"
-                        else "pf_prior_balanced_bootstrap"
+                build_bootstrap_planner_audit(
+                    station_id=0,
+                    pose_index=int(bootstrap.candidate_index),
+                    pose_xyz=current_pose,
+                    program=current_program,
+                    shadow_enabled=bool(
+                        planner.shield_view_count_shadow_enabled
+                        and current_program.kind != "external_control"
                     ),
-                    "selected_pose_xyz": current_pose.tolist(),
-                    "selected_program": {
-                        "name": current_program.name,
-                        "kind": current_program.kind,
-                        "pair_ids": list(current_program.pair_ids),
-                    },
-                    "selected_score": None,
-                    "selected_information_gain": None,
-                    "best_exact_information_gain": None,
-                    "total_action_count": 0,
-                    "selected_proxy_rank": 0,
-                    "exact_action_count": 0,
-                    "proxy_action_count": 0,
-                    "planning_particle_count": 0,
-                    "score_leader": None,
-                    "information_gain_leader": None,
-                    "top_ranked_actions": [],
-                    "shortlist_certificate": {
-                        "available": False,
-                        "winner_exceeds_excluded_bound": False,
-                        "evaluated_objective_lower_bound": None,
-                        "excluded_objective_upper_bound": None,
-                    },
-                    "exact_eig_seed": None,
-                    "mc_seed_rank_stability": {
-                        "status": "not_applicable_before_first_observation"
-                    },
-                }
+                    candidate_view_counts=tuple(
+                        planner.shield_view_count_shadow_candidate_counts
+                    ),
+                    retention_fraction=float(
+                        planner.shield_view_count_shadow_retention_fraction
+                    ),
+                    per_comparison_confidence=float(
+                        planner.shield_view_count_shadow_per_comparison_confidence
+                    ),
+                )
             )
         else:
             prefix = ready.resume
@@ -1041,6 +1148,15 @@ def run_pf_closed_loop(
                 stop_reason = "intrinsic_surface_posterior_converged"
                 continue_acquisition = False
             if continue_acquisition:
+                resume_particle_adequacy = _particle_diagnostics(estimator)
+                resume_shadow_health = _current_shadow_health(
+                    estimator,
+                    planner=planner,
+                    belief_after_station_id=int(station_id - 1),
+                    particle_adequacy=resume_particle_adequacy,
+                    adaptive_stop_status=latest_adaptive_stop_status,
+                    detected_isotope_gate=gate_diagnostics,
+                )
                 resume_rng = _planner_rng(seed, station_id)
                 planned = _plan(
                     estimator,
@@ -1078,6 +1194,8 @@ def run_pf_closed_loop(
                         station_id=station_id,
                         result=planned,
                         top_k=budget.planner_audit_top_k,
+                        belief_after_station_id=int(station_id - 1),
+                        posterior_health=resume_shadow_health,
                     )
                 )
                 current_pose = np.asarray(planned.next_pose, dtype=np.float64)
@@ -1210,6 +1328,15 @@ def run_pf_closed_loop(
                 estimator,
                 station_count=completed_stations,
             )
+            particle_adequacy = _particle_diagnostics(estimator)
+            shadow_health = _current_shadow_health(
+                estimator,
+                planner=planner,
+                belief_after_station_id=int(station_id),
+                particle_adequacy=particle_adequacy,
+                adaptive_stop_status=latest_adaptive_stop_status,
+                detected_isotope_gate=gate_diagnostics,
+            )
             posterior_snapshot = _live_posterior_summary(estimator)
             if cui_split_viz is not None:
                 _publish_cui_frame(
@@ -1230,7 +1357,8 @@ def run_pf_closed_loop(
                     "pair_ids": [int(value) for value in current_program.pair_ids],
                     "pf_update_elapsed_s": float(assimilation_elapsed_s),
                     "detected_isotope_gate": gate_diagnostics,
-                    "particle_adequacy": _particle_diagnostics(estimator),
+                    "particle_adequacy": particle_adequacy,
+                    "shield_view_count_shadow_health": shadow_health,
                     "posterior_snapshot": posterior_snapshot,
                     "adaptive_stop": latest_adaptive_stop_status,
                 }
@@ -1282,6 +1410,8 @@ def run_pf_closed_loop(
                     station_id=station_id,
                     result=planned,
                     top_k=budget.planner_audit_top_k,
+                    belief_after_station_id=int(station_id - 1),
+                    posterior_health=shadow_health,
                 )
             )
             current_pose = np.asarray(planned.next_pose, dtype=np.float64)
