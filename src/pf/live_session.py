@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
+import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from io import BytesIO
 from numbers import Real
@@ -19,10 +19,16 @@ from measurement.shielding import generate_octant_orientations
 from measurement.surface_atlas import ContinuousSurfaceAtlas
 from measurement.surface_charts import build_surface_chart_geometry
 from numpy.typing import NDArray
+from runtime.adaptive_client import (
+    AdaptiveCandidateSnapshot,
+    AdaptiveStepRequest,
+)
 from runtime.contracts import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
 from runtime.artifacts import (
+    AtomicBundlePublisher,
     atomic_write_bytes,
     build_artifact_inventory,
+    publish_artifact_manifest,
 )
 from runtime.forward_context import ResolvedForwardContext
 from runtime.measurement_log import (
@@ -37,18 +43,76 @@ from runtime.records import RunContext
 from scipy.spatial import cKDTree
 
 from pf.estimator_types import JointPlanningParticles
+from pf.control_policy import PFControlPolicyProvenance
 from pf.gpu_utils import preflight_compute_backend
-from pf.configuration import load_pf_config
-from pf.profiles import apply_profile_to_config, enforce_pure_runtime_settings
-from pf.provenance import canonical_json_bytes, sha256_json
+from pf.configuration import PFConfigDocument, load_pf_config
+from pf.profiles import (
+    apply_profile_to_config,
+    enforce_pure_runtime_settings,
+    production_pf_config_values,
+)
+from pf.provenance import (
+    strict_canonical_json_bytes,
+    strict_json_loads,
+    strict_sha256_json,
+)
 from pf.pure_estimator import PurePFEstimator, RotatingShieldPFConfig
-from planning.dss_pp import DSSPPConfig, select_dss_pp_next_station
-
-PFPlanningConfig = DSSPPConfig
 
 
 class PFLiveSessionError(RuntimeError):
     """Report an incompatible live context, setting, or observation."""
+
+
+def _exact_nonempty_string(value: object, *, location: str) -> str:
+    """Return one nonempty string without trimming or stringification."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{location} must be an exact nonempty string.")
+    return value
+
+
+def _exact_isotope_order(
+    value: object,
+    *,
+    location: str,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    """Return one exact unique tuple of canonical isotope strings."""
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{location} must be a sequence of isotope strings.")
+    isotopes = tuple(
+        _exact_nonempty_string(item, location=f"{location} item") for item in value
+    )
+    if (not allow_empty and not isotopes) or len(set(isotopes)) != len(isotopes):
+        raise ValueError(f"{location} must contain unique nonempty strings.")
+    return isotopes
+
+
+def _strict_live_artifact_json_bytes(
+    value: object,
+    *,
+    artifact_name: str,
+) -> bytes:
+    """Serialize one live artifact without any implicit value coercion."""
+    try:
+        return strict_canonical_json_bytes(value)
+    except (TypeError, ValueError) as exc:
+        raise PFLiveSessionError(
+            f"{artifact_name} must contain only strict finite JSON values."
+        ) from exc
+
+
+def _strict_live_artifact_sha256(
+    value: object,
+    *,
+    artifact_name: str,
+) -> str:
+    """Hash one live artifact without any implicit value coercion."""
+    try:
+        return strict_sha256_json(value)
+    except (TypeError, ValueError) as exc:
+        raise PFLiveSessionError(
+            f"{artifact_name} must contain only strict finite JSON values."
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +136,7 @@ class PFLiveParticleSnapshot:
 
     def posterior_summary(self) -> dict[str, object]:
         """Return a detached JSON-compatible copy of the live PF summary."""
-        payload = json.loads(self.posterior_summary_json)
+        payload = strict_json_loads(self.posterior_summary_json)
         if not isinstance(payload, dict):
             raise PFLiveSessionError("PF live posterior summary must be an object.")
         return payload
@@ -95,9 +159,10 @@ class PFExternalSurfaceGuidance:
 
     def __post_init__(self) -> None:
         """Validate lineage and freeze the estimator-neutral surface arrays."""
-        run_id = str(self.source_run_id).strip()
-        if not run_id:
-            raise ValueError("source_run_id must be non-empty.")
+        run_id = _exact_nonempty_string(
+            self.source_run_id,
+            location="source_run_id",
+        )
         record_count = _json_integer(
             self.record_count,
             location="record_count",
@@ -115,13 +180,10 @@ class PFExternalSurfaceGuidance:
         )
         if not isinstance(self.covered_records_digest, DigestIdentity):
             raise TypeError("covered_records_digest must be a DigestIdentity.")
-        isotope_order = tuple(str(value).strip() for value in self.isotope_order)
-        if (
-            not isotope_order
-            or any(not value for value in isotope_order)
-            or len(set(isotope_order)) != len(isotope_order)
-        ):
-            raise ValueError("isotope_order must contain unique non-empty names.")
+        isotope_order = _exact_isotope_order(
+            self.isotope_order,
+            location="isotope_order",
+        )
         centroids = np.asarray(self.patch_centroids_xyz, dtype=np.float64)
         density = np.asarray(self.density_by_isotope, dtype=np.float64)
         if (
@@ -223,9 +285,10 @@ class PFExternalSurfaceGuidanceReceipt:
             self.guidance_sha256,
             location="guidance_sha256",
         )
-        source_run_id = str(self.source_run_id).strip()
-        if not source_run_id:
-            raise ValueError("source_run_id must be non-empty.")
+        source_run_id = _exact_nonempty_string(
+            self.source_run_id,
+            location="source_run_id",
+        )
         record_count = _json_integer(
             self.record_count,
             location="record_count",
@@ -249,13 +312,17 @@ class PFExternalSurfaceGuidanceReceipt:
             raise ValueError("proposal_mass must lie in (0, 1].")
         if bandwidth_m <= 0.0:
             raise ValueError("bandwidth_m must be positive.")
-        informative = tuple(str(value).strip() for value in self.informative_isotopes)
-        evaluated = tuple(str(value).strip() for value in self.evaluated_isotopes)
+        informative = _exact_isotope_order(
+            self.informative_isotopes,
+            location="informative_isotopes",
+            allow_empty=True,
+        )
+        evaluated = _exact_isotope_order(
+            self.evaluated_isotopes,
+            location="evaluated_isotopes",
+        )
         if (
-            any(not value for value in (*informative, *evaluated))
-            or len(set(informative)) != len(informative)
-            or len(set(evaluated)) != len(evaluated)
-            or not set(informative).issubset(evaluated)
+            not set(informative).issubset(evaluated)
         ):
             raise ValueError("Receipt isotope lists must be unique and consistent.")
         mapped_chart_count = _json_integer(
@@ -278,57 +345,6 @@ class PFExternalSurfaceGuidanceReceipt:
 
 
 @dataclass(frozen=True, slots=True)
-class PFNextAction:
-    """Describe one PF-selected runtime pose and shield program."""
-
-    candidate_index: int
-    detector_pose_xyz: tuple[float, float, float]
-    shield_pair_ids: tuple[int, ...]
-    shield_program_name: str
-    shield_program_kind: str
-    score: float
-    diagnostics_json: bytes
-
-    def diagnostics(self) -> dict[str, object]:
-        """Return a detached JSON-compatible copy of planner diagnostics."""
-        payload = json.loads(self.diagnostics_json)
-        if not isinstance(payload, dict):
-            raise PFLiveSessionError("PF planning diagnostics must be an object.")
-        return payload
-
-
-def _compact_next_action_diagnostics(result: object) -> dict[str, object]:
-    """Return only non-duplicated scalar evidence for one runtime action."""
-    raw = getattr(result, "diagnostics", None)
-    if not isinstance(raw, Mapping):
-        raise PFLiveSessionError("PF planner diagnostics must be an object.")
-    compact: dict[str, object] = {"schema_version": 1}
-    selection_mode = raw.get("selection_mode")
-    if selection_mode is not None:
-        compact["selection_mode"] = str(selection_mode)
-    selected_information_gain = raw.get("selected_information_gain")
-    if selected_information_gain is None:
-        sequence = getattr(result, "sequence", ())
-        if isinstance(sequence, Sequence) and sequence:
-            selected_information_gain = getattr(
-                sequence[0],
-                "information_gain",
-                None,
-            )
-    if selected_information_gain is not None:
-        information_gain = _finite_real(
-            selected_information_gain,
-            location="PF selected information gain",
-        )
-        if information_gain < 0.0:
-            raise PFLiveSessionError(
-                "PF selected information gain must be nonnegative."
-            )
-        compact["selected_information_gain"] = information_gain
-    return compact
-
-
-@dataclass(frozen=True, slots=True)
 class PFCompletedLiveState:
     """Seal a completed live posterior before MeasurementLog publication."""
 
@@ -339,6 +355,7 @@ class PFCompletedLiveState:
     station_count: int
     covered_step_ids: tuple[int, ...]
     covered_records_digest: DigestIdentity
+    control_policy_provenance: PFControlPolicyProvenance
     checkpoint_state: bytes
     checkpoint_sha256: str
     diagnostics_json: bytes
@@ -382,97 +399,88 @@ class PFPublishedLiveResult:
 
 _SHA256_PATTERN = frozenset("0123456789abcdef")
 _DEFAULT_SURFACE_DIAGNOSTIC_POINT_COUNT = 1024
-_PF_CONFIG_ALIASES = {
-    "pf_detected_isotopes_only": "detected_isotopes_only",
-    "pf_max_sources": "max_sources",
-    "pf_hard_max_sources": "hard_max_sources",
-    "pf_strength_prior_min_cps_1m": "strength_prior_min_cps_1m",
-    "pf_strength_prior_max_cps_1m": "strength_prior_max_cps_1m",
-    "pf_strength_prior_family": "strength_prior_family",
-    "pf_strength_prior_gamma_shape": "strength_prior_gamma_shape",
-    "pf_strength_prior_gamma_scale_cps_1m": "strength_prior_gamma_scale_cps_1m",
-}
-_ADAPTIVE_STOP_PF_CONFIG_FIELDS = {
-    "minimum_joint_map_cardinality_probability": (
-        "adaptive_stop_minimum_joint_map_cardinality_probability"
-    ),
-    "maximum_upper_cardinality_mass": (
-        "adaptive_stop_maximum_upper_cardinality_mass"
-    ),
-    "maximum_surface_path_radius_95_m": (
-        "adaptive_stop_maximum_surface_path_radius_95_m"
-    ),
-    "innovation_confidence": "adaptive_stop_innovation_confidence",
-}
-_PF_PHYSICAL_OVERRIDE_KEYS = frozenset(
-    {
-        "pf_buildup",
-        "pf_detector_aperture_radius_m",
-        "pf_detector_aperture_samples",
-        "pf_detector_aperture_sampling",
-        "pf_detector_count_radius_m",
-        "pf_line_resolved_shield_attenuation",
-        "pf_obstacle_attenuation",
-        "pf_obstacle_material",
-        "pf_obstacle_mu_by_isotope",
-        "pf_obstacle_source_extent_radius_m",
-        "pf_obstacle_source_extent_samples",
-        "pf_source_extent_radius_m",
-        "pf_source_extent_samples",
-    }
-)
+_PRODUCTION_CONFIG_VALIDATION_TOKEN = object()
+_DETECTOR_QUATERNION_ABSOLUTE_TOLERANCE = 1.0e-10
 
 
-def validate_live_pf_config(
+def validate_production_live_pf_config(
     config: Mapping[str, Any],
     *,
     profile: str,
 ) -> dict[str, Any]:
-    """Validate a lossless external live-PF estimator configuration."""
+    """Validate the complete production-live schema without filling defaults."""
     if not isinstance(config, Mapping) or any(
         not isinstance(key, str) for key in config
     ):
         raise PFLiveSessionError("Live PF configuration must be a string-keyed object.")
-    allowed = {
-        field.name for field in fields(RotatingShieldPFConfig)
-    } | set(_PF_CONFIG_ALIASES) | {
-        "adaptive_stop",
-        "pure_pf_schema_version",
-    }
-    allowed.difference_update(_ADAPTIVE_STOP_PF_CONFIG_FIELDS.values())
-    allowed.discard("position_max")
-    unknown = sorted(set(config).difference(allowed))
-    if unknown:
-        raise PFLiveSessionError(
-            "Live PF configuration contains unknown fields: "
-            + ", ".join(unknown)
-        )
-    normalized = _external_pf_config(config, upper=np.ones(3, dtype=np.float64))
     try:
-        validated = enforce_pure_runtime_settings(normalized, profile=profile)
-        RotatingShieldPFConfig(
-            **_pf_config_values(
-                validated,
-                profile=profile,
-                upper=np.ones(3, dtype=np.float64),
-            )
-        )
+        validated = enforce_pure_runtime_settings(config, profile=profile)
     except (TypeError, ValueError) as exc:
-        raise PFLiveSessionError("Live PF configuration is incompatible.") from exc
-    return dict(config)
+        raise PFLiveSessionError(
+            f"Production live PF configuration is incompatible: {exc}"
+        ) from exc
+    return validated
 
 
-def load_live_pf_config(
+@dataclass(frozen=True, slots=True)
+class ValidatedProductionPFConfig:
+    """Bind validated production settings to the exact loaded source bytes."""
+
+    document: PFConfigDocument
+    profile: str
+    _validation_token: object = field(repr=False, compare=False)
+    _settings_json: bytes = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Validate the document and freeze its resolved production settings."""
+        if self._validation_token is not _PRODUCTION_CONFIG_VALIDATION_TOKEN:
+            raise PFLiveSessionError(
+                "ValidatedProductionPFConfig values may only be created by "
+                "load_production_live_pf_config()."
+            )
+        if not isinstance(self.document, PFConfigDocument):
+            raise TypeError("document must be a PFConfigDocument.")
+        validated = validate_production_live_pf_config(
+            self.document.config(),
+            profile=self.profile,
+        )
+        object.__setattr__(
+            self,
+            "_settings_json",
+            _strict_live_artifact_json_bytes(
+                validated,
+                artifact_name="Production live PF configuration",
+            ),
+        )
+
+    @property
+    def source_sha256(self) -> str:
+        """Return the digest of the exact input file bytes."""
+        return self.document.source_sha256
+
+    def settings(self) -> dict[str, Any]:
+        """Return a detached copy of the validated production settings."""
+        payload = strict_json_loads(self._settings_json)
+        if not isinstance(payload, dict):  # pragma: no cover - constructor invariant.
+            raise PFLiveSessionError("Validated PF settings are not an object.")
+        return payload
+
+
+def load_production_live_pf_config(
     path: str | Path,
     *,
     profile: str,
-) -> tuple[dict[str, Any], str]:
-    """Load and strictly validate one package-owned live PF config file."""
+) -> ValidatedProductionPFConfig:
+    """Load and validate one complete production-live schema-v2 file."""
     try:
-        payload, source_sha256 = load_pf_config(path)
+        document = load_pf_config(path)
     except (OSError, TypeError, ValueError, RuntimeError) as exc:
         raise PFLiveSessionError(f"Cannot load live PF configuration: {exc}") from exc
-    return validate_live_pf_config(payload, profile=profile), source_sha256
+    return ValidatedProductionPFConfig(
+        document=document,
+        profile=profile,
+        _validation_token=_PRODUCTION_CONFIG_VALIDATION_TOKEN,
+    )
 
 
 def _sha256_string(value: object, *, location: str) -> str:
@@ -512,6 +520,54 @@ def _finite_real(value: object, *, location: str) -> float:
     return parsed
 
 
+def _integer_keyed_cardinality_distribution(
+    value: object,
+    *,
+    location: str,
+) -> dict[str, float]:
+    """Encode one scientific integer-keyed cardinality law as strict JSON."""
+    if not isinstance(value, Mapping) or not value:
+        raise PFLiveSessionError(f"{location} must be a nonempty object.")
+    normalized: dict[str, float] = {}
+    for raw_cardinality, raw_probability in value.items():
+        cardinality = _json_integer(
+            raw_cardinality,
+            location=f"{location} cardinality",
+            minimum=0,
+        )
+        normalized[str(cardinality)] = _finite_real(
+            raw_probability,
+            location=f"{location} probability {cardinality}",
+        )
+    return normalized
+
+
+def _json_cardinality_distribution(
+    value: object,
+    *,
+    location: str,
+) -> dict[str, float]:
+    """Validate one already JSON-keyed cardinality law without coercion."""
+    if not isinstance(value, Mapping) or not value:
+        raise PFLiveSessionError(f"{location} must be a nonempty object.")
+    normalized: dict[str, float] = {}
+    for cardinality, raw_probability in value.items():
+        if (
+            not isinstance(cardinality, str)
+            or not cardinality.isascii()
+            or not cardinality.isdigit()
+            or cardinality != str(int(cardinality))
+        ):
+            raise PFLiveSessionError(
+                f"{location} keys must be canonical nonnegative integer strings."
+            )
+        normalized[cardinality] = _finite_real(
+            raw_probability,
+            location=f"{location} probability {cardinality}",
+        )
+    return normalized
+
+
 def _compact_pf_diagnostics(estimator: object) -> dict[str, object]:
     """Build compact final diagnostics without duplicating posterior provenance."""
     convergence_method = getattr(
@@ -532,13 +588,60 @@ def _compact_pf_diagnostics(estimator: object) -> dict[str, object]:
     ):
         raise PFLiveSessionError("PF final diagnostics must serialize objects.")
     convergence = dict(raw_convergence)
-    sampler_health = convergence.pop("sampler_health", {})
+    if "sampler_health" not in convergence:
+        raise PFLiveSessionError("PF convergence omits sampler_health.")
+    sampler_health = convergence.pop("sampler_health")
     if not isinstance(sampler_health, Mapping):
         raise PFLiveSessionError("PF sampler health must be an object.")
+    expected_sampler_health = {
+        "smc_rejuvenation_wall_time_respected",
+        "rejuvenation_mixing_complete",
+        "structural_mixing_complete",
+    }
+    if set(sampler_health) != expected_sampler_health or any(
+        type(sampler_health[name]) is not bool for name in expected_sampler_health
+    ):
+        raise PFLiveSessionError(
+            "PF sampler health must contain exactly the three Boolean gates."
+        )
+    failed_sampler_gates = sorted(
+        name for name in expected_sampler_health if sampler_health[name] is not True
+    )
+    if failed_sampler_gates:
+        raise PFLiveSessionError(
+            "PF live state cannot be sealed with failed sampler-health gates: "
+            f"{failed_sampler_gates}."
+        )
+    isotope_rows = convergence.get("isotopes")
+    if not isinstance(isotope_rows, Mapping) or not isotope_rows:
+        raise PFLiveSessionError("PF convergence requires nonempty isotope rows.")
+    normalized_isotope_rows: dict[str, object] = {}
+    for isotope, raw_row in isotope_rows.items():
+        if not isinstance(isotope, str) or not isotope:
+            raise PFLiveSessionError(
+                "PF convergence isotope keys must be nonempty strings."
+            )
+        if not isinstance(raw_row, Mapping):
+            raise PFLiveSessionError(
+                f"PF convergence isotope row {isotope} must be an object."
+            )
+        row = dict(raw_row)
+        row["cardinality_distribution"] = (
+            _integer_keyed_cardinality_distribution(
+                row.get("cardinality_distribution"),
+                location=f"PF convergence {isotope} cardinality distribution",
+            )
+        )
+        normalized_isotope_rows[isotope] = row
+    convergence["isotopes"] = normalized_isotope_rows
     joint_gates = convergence.get("joint_gates")
     if isinstance(joint_gates, Mapping):
+        if any(not isinstance(name, str) for name in joint_gates):
+            raise PFLiveSessionError(
+                "PF convergence joint-gate keys must be strings."
+            )
         convergence["joint_gates"] = {
-            str(name): value
+            name: value
             for name, value in joint_gates.items()
             if name not in sampler_health
         }
@@ -592,99 +695,76 @@ def _surface_atlas_diagnostic_points(
     return np.ascontiguousarray(atlas.positions_xyz(chart_ids, uv))
 
 
-def _pf_config_values(
-    config: Mapping[str, Any],
+def _live_session_hash_payload(
     *,
-    profile: str,
-    upper: NDArray[np.float64],
-) -> dict[str, Any]:
-    """Select declared PF dataclass fields from resolved settings."""
-    allowed = {field.name for field in fields(RotatingShieldPFConfig)}
-    values = {key: value for key, value in config.items() if key in allowed}
-    adaptive_stop = config.get("adaptive_stop", {})
-    if not isinstance(adaptive_stop, Mapping):
-        raise PFLiveSessionError("adaptive_stop must be an object.")
-    for external_name, field_name in _ADAPTIVE_STOP_PF_CONFIG_FIELDS.items():
-        if external_name in adaptive_stop:
-            values[field_name] = adaptive_stop[external_name]
-    values["estimator_profile"] = str(profile)
-    values["position_max"] = tuple(float(value) for value in upper)
-    return values
-
-
-def _external_pf_config(
-    external_config: Mapping[str, Any],
-    *,
-    upper: NDArray[np.float64],
-) -> dict[str, Any]:
-    """Resolve PF settings without overriding runtime-owned physics."""
-    forbidden_physics = sorted(
-        key for key in external_config if key in _PF_PHYSICAL_OVERRIDE_KEYS
-    )
-    if forbidden_physics:
+    runtime_config_sha256: str,
+    measurement_log_sha256: str,
+    actual_pf: Mapping[str, object],
+    random_seed: int,
+    control_policy_provenance: PFControlPolicyProvenance,
+) -> dict[str, object]:
+    """Return the single canonical resolved-session hash input contract."""
+    if not isinstance(control_policy_provenance, PFControlPolicyProvenance):
         raise PFLiveSessionError(
-            "External PF settings cannot override runtime physics: "
-            + ", ".join(forbidden_physics)
+            "Live PF construction requires sealed control-policy provenance."
         )
-    if external_config:
-        try:
-            enforce_pure_runtime_settings(external_config)
-        except ValueError as exc:
-            raise PFLiveSessionError(
-                "External settings violate the pure-PF schema."
-            ) from exc
-    top_level_stop_fields = sorted(
-        field_name
-        for field_name in _ADAPTIVE_STOP_PF_CONFIG_FIELDS.values()
-        if field_name in external_config
-    )
-    if top_level_stop_fields:
-        raise PFLiveSessionError(
-            "Adaptive-stop settings must be declared in the adaptive_stop object: "
-            + ", ".join(top_level_stop_fields)
-        )
-    normalized = dict(external_config)
-    for alias, canonical in _PF_CONFIG_ALIASES.items():
-        if alias not in normalized:
-            continue
-        if canonical in normalized and normalized[canonical] != normalized[alias]:
-            raise PFLiveSessionError(
-                f"Conflicting PF settings {alias!r} and {canonical!r}."
-            )
-        normalized[canonical] = normalized[alias]
-    declared = {field.name for field in fields(RotatingShieldPFConfig)}
-    merged = {
-        key: value
-        for key, value in normalized.items()
-        if key in declared
-        or key
-        in {
-            "adaptive_stop",
-            "pure_pf_schema_version",
-            "estimator_profile",
-        }
+    return {
+        "measurement_runtime_config_sha256": runtime_config_sha256,
+        "measurement_log_sha256": measurement_log_sha256,
+        "pf_config": dict(actual_pf),
+        "pf_random_seed": random_seed,
+        "control_policy": control_policy_provenance.to_dict(),
     }
-    merged.setdefault("pure_pf_schema_version", 1)
-    merged["position_max"] = tuple(float(value) for value in upper)
-    return merged
+
+
+def _sealed_live_checkpoint_state(
+    estimator: object,
+    control_policy_provenance: PFControlPolicyProvenance,
+) -> bytes:
+    """Bind immutable control provenance into one serialized PF state."""
+    raw_checkpoint = estimator.serialized_state()
+    if not isinstance(raw_checkpoint, (bytes, bytearray, memoryview)):
+        raise PFLiveSessionError("PF serialized_state() must return bytes.")
+    try:
+        payload = strict_json_loads(bytes(raw_checkpoint))
+    except (TypeError, ValueError) as exc:
+        raise PFLiveSessionError("PF serialized state must be strict JSON.") from exc
+    if not isinstance(payload, dict):
+        raise PFLiveSessionError("PF serialized state must be a JSON object.")
+    estimator_schema_version = payload.get("schema_version")
+    if type(estimator_schema_version) is not int or estimator_schema_version != 1:
+        raise PFLiveSessionError(
+            "PF estimator state must use exact internal schema version 1."
+        )
+    if "control_policy" in payload:
+        raise PFLiveSessionError(
+            "PF serialized state cannot replace session control provenance."
+        )
+    payload["schema_version"] = 2
+    payload["estimator_state_schema_version"] = estimator_schema_version
+    payload["control_policy"] = control_policy_provenance.to_dict()
+    return _strict_live_artifact_json_bytes(
+        payload,
+        artifact_name="PF sealed checkpoint state",
+    )
 
 
 def _build_live_estimator_from_forward_context(
     forward: ResolvedForwardContext,
-    config: Mapping[str, Any],
+    config: ValidatedProductionPFConfig,
     *,
     profile: str,
     seed: int,
     measurement_log_schema_version: int,
     measurement_runtime_config_sha256: str,
-    config_hash: str | None = None,
-    inference_isotopes: Sequence[str] | None = None,
+    control_policy_provenance: PFControlPolicyProvenance,
 ) -> PurePFEstimator:
     """Build one live PF from an authenticated shared physical context."""
-    if not isinstance(config, Mapping):
-        raise PFLiveSessionError("PF configuration must be an object.")
-    if any(not isinstance(key, str) for key in config):
-        raise PFLiveSessionError("PF configuration keys must be JSON strings.")
+    if not isinstance(config, ValidatedProductionPFConfig):
+        raise PFLiveSessionError(
+            "Live estimator construction requires a validated config document."
+        )
+    settings = config.settings()
     if not isinstance(profile, str):
         raise PFLiveSessionError("PF profile must be a JSON string.")
     session_seed = _json_integer(seed, location="seed", minimum=0)
@@ -699,29 +779,18 @@ def _build_live_estimator_from_forward_context(
     )
     pending_log_digest = "unavailable"
     isotopes = tuple(forward.isotopes)
-    active_isotopes = (
-        isotopes
-        if inference_isotopes is None
-        else tuple(str(value) for value in inference_isotopes)
-    )
-    if (
-        not active_isotopes
-        or len(set(active_isotopes)) != len(active_isotopes)
-        or not set(active_isotopes).issubset(isotopes)
-    ):
+    if not isotopes or len(set(isotopes)) != len(isotopes):
         raise PFLiveSessionError(
-            "Inference isotopes must be a unique nonempty subset of the runtime "
-            "candidate isotopes."
+            "Runtime candidate isotopes must be unique and nonempty."
         )
-    active_isotopes = tuple(
-        isotope for isotope in isotopes if isotope in set(active_isotopes)
-    )
     _, upper = forward.bounds_xyz
-    session_config = _external_pf_config(config, upper=upper)
     try:
-        pure_config = enforce_pure_runtime_settings(session_config, profile=profile)
+        pure_config = validate_production_live_pf_config(settings, profile=profile)
         pf_config = RotatingShieldPFConfig(
-            **_pf_config_values(pure_config, profile=profile, upper=upper)
+            **production_pf_config_values(
+                pure_config,
+                position_max=tuple(float(value) for value in upper),
+            )
         )
         apply_profile_to_config(pf_config)
         preflight_compute_backend(
@@ -745,27 +814,24 @@ def _build_live_estimator_from_forward_context(
         obstacle_grid=pf_obstacle_grid,
         obstacle_height_m=observation_model.obstacle_height_m,
     )
-    actual_pf = {
-        field.name: getattr(pf_config, field.name)
-        for field in fields(RotatingShieldPFConfig)
-    }
-    session_hash_payload: dict[str, object] = {
-        "measurement_runtime_config_sha256": runtime_config_sha256,
-        "measurement_log_sha256": pending_log_digest,
-        "pf_config": actual_pf,
-        "pf_random_seed": session_seed,
-    }
-    if active_isotopes != isotopes:
-        session_hash_payload["active_isotopes"] = list(active_isotopes)
-    resolved_session_config_sha256 = sha256_json(session_hash_payload)
-    input_config_sha256 = (
-        sha256_json(dict(config))
-        if config_hash is None
-        else _sha256_string(config_hash, location="config_hash")
+    actual_pf = asdict(pf_config)
+    session_hash_payload = _live_session_hash_payload(
+        runtime_config_sha256=runtime_config_sha256,
+        measurement_log_sha256=pending_log_digest,
+        actual_pf=actual_pf,
+        random_seed=session_seed,
+        control_policy_provenance=control_policy_provenance,
+    )
+    resolved_session_config_sha256 = _strict_live_artifact_sha256(
+        session_hash_payload,
+        artifact_name="PF resolved session identity",
+    )
+    input_config_sha256 = _sha256_string(
+        config.source_sha256,
+        location="config.source_sha256",
     )
     estimator = PurePFEstimator(
-        isotopes=active_isotopes,
-        candidate_isotopes=isotopes,
+        isotopes=isotopes,
         surface_diagnostic_points=surface_diagnostic_points,
         shield_normals=generate_octant_orientations(),
         mu_by_isotope=observation_model.mu_by_isotope,
@@ -805,13 +871,12 @@ def _build_live_estimator_from_forward_context(
 
 def build_live_estimator(
     context: RunContext,
-    config: Mapping[str, Any],
+    config: ValidatedProductionPFConfig,
     *,
     profile: str,
     seed: int,
     runtime_root: str | Path,
-    config_hash: str | None = None,
-    inference_isotopes: Sequence[str] | None = None,
+    control_policy_provenance: PFControlPolicyProvenance,
 ) -> PurePFEstimator:
     """Construct a PF from a truth-free live runtime handshake."""
     root = Path(runtime_root).expanduser().resolve()
@@ -828,8 +893,7 @@ def build_live_estimator(
         seed=seed,
         measurement_log_schema_version=context.schema_version,
         measurement_runtime_config_sha256=context.runtime_config_sha256,
-        config_hash=config_hash,
-        inference_isotopes=inference_isotopes,
+        control_policy_provenance=control_policy_provenance,
     )
 
 
@@ -843,27 +907,20 @@ def _validate_published_forward_context(log: MeasurementLog) -> None:
         ) from exc
 
 
-def bind_published_measurement_log(
+def _bind_estimator_to_published_log(
     estimator: PurePFEstimator,
     log: MeasurementLog,
     *,
     live_records: Sequence[MeasurementLogRecord],
+    control_policy_provenance: PFControlPolicyProvenance,
 ) -> None:
-    """Bind a live PF to the immutable log produced by its own session."""
+    """Bind a live PF to the immutable log after session identity checks."""
     logged_isotopes = tuple(log.run_manifest["isotopes"])
-    candidate_isotopes = tuple(
-        getattr(estimator, "candidate_isotopes", estimator.joint_isotope_order())
-    )
-    if candidate_isotopes != logged_isotopes:
+    active_isotopes = tuple(estimator.joint_isotope_order())
+    if active_isotopes != logged_isotopes:
         raise PFLiveSessionError(
-            "Published MeasurementLog isotopes disagree with live PF candidates."
+            "Published MeasurementLog isotope order differs from the live PF."
         )
-    active_isotope_set = set(estimator.joint_isotope_order())
-    if not active_isotope_set.issubset(logged_isotopes):
-        raise PFLiveSessionError("Live PF active isotopes are not runtime candidates.")
-    active_isotopes = tuple(
-        isotope for isotope in logged_isotopes if isotope in active_isotope_set
-    )
     if len(estimator.measurements) != len(log.records):
         raise PFLiveSessionError(
             "Published MeasurementLog record count disagrees with the live PF."
@@ -884,21 +941,234 @@ def bind_published_measurement_log(
             "Published MeasurementLog records differ from the ordered live records."
         )
     _validate_published_forward_context(log)
-    actual_pf = {
-        field.name: getattr(estimator.pf_config, field.name)
-        for field in fields(RotatingShieldPFConfig)
-    }
+    actual_pf = asdict(estimator.pf_config)
     digest = log.log_sha256
     estimator.measurement_log_sha256 = digest
-    session_hash_payload: dict[str, object] = {
-        "measurement_runtime_config_sha256": log.resolved_config_sha256,
-        "measurement_log_sha256": digest,
-        "pf_config": actual_pf,
-        "pf_random_seed": int(estimator.random_seed),
+    session_hash_payload = _live_session_hash_payload(
+        runtime_config_sha256=log.resolved_config_sha256,
+        measurement_log_sha256=digest,
+        actual_pf=actual_pf,
+        random_seed=int(estimator.random_seed),
+        control_policy_provenance=control_policy_provenance,
+    )
+    estimator.resolved_config_hash = _strict_live_artifact_sha256(
+        session_hash_payload,
+        artifact_name="PF resolved session identity",
+    )
+
+
+def _context_energy_bin_edges(context: RunContext) -> NDArray[np.float64]:
+    """Return the exact full-spectrum bin edges declared by one handshake."""
+    contract = context.runtime_config.get("full_spectrum_generative_model")
+    if not isinstance(contract, Mapping):
+        raise PFLiveSessionError(
+            "Live runtime context lacks full_spectrum_generative_model."
+        )
+    bin_count = _json_integer(
+        contract.get("energy_bin_count"),
+        location="context full-spectrum energy_bin_count",
+        minimum=1,
+    )
+    energy_min = _finite_real(
+        contract.get("energy_min_keV"),
+        location="context full-spectrum energy_min_keV",
+    )
+    energy_max = _finite_real(
+        contract.get("energy_max_keV"),
+        location="context full-spectrum energy_max_keV",
+    )
+    bin_width = _finite_real(
+        contract.get("bin_width_keV"),
+        location="context full-spectrum bin_width_keV",
+    )
+    if bin_width <= 0.0:
+        raise PFLiveSessionError(
+            "Context full-spectrum bin_width_keV must be positive."
+        )
+    axis = energy_min + np.arange(bin_count, dtype=np.float64) * bin_width
+    if axis[-1] != energy_max:
+        raise PFLiveSessionError(
+            "Context full-spectrum energy dimensions are inconsistent."
+        )
+    edges = np.concatenate(
+        (axis, np.asarray([axis[-1] + bin_width], dtype=np.float64))
+    )
+    edges.setflags(write=False)
+    return edges
+
+
+def _yaw_from_detector_quaternion_wxyz(
+    quaternion_wxyz: Sequence[float],
+) -> float:
+    """Return Z-axis yaw from one finite nonzero WXYZ quaternion."""
+    quaternion = np.asarray(quaternion_wxyz, dtype=np.float64)
+    if quaternion.shape != (4,) or np.any(~np.isfinite(quaternion)):
+        raise PFLiveSessionError(
+            "Prior detector quaternion must be one finite WXYZ vector."
+        )
+    norm = float(np.linalg.norm(quaternion))
+    if norm <= 0.0 or not math.isfinite(norm):
+        raise PFLiveSessionError("Prior detector quaternion must have positive norm.")
+    w, x, y, z = quaternion / norm
+    return float(
+        math.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+    )
+
+
+def _expected_detector_quaternion_wxyz(
+    request_candidates: AdaptiveCandidateSnapshot,
+    *,
+    candidate_index: int,
+    previous_record: MeasurementLogRecord | None,
+) -> NDArray[np.float64]:
+    """Derive the runtime-commanded yaw quaternion for one exact request."""
+    current = np.asarray(request_candidates.current_pose_xyz, dtype=np.float64)
+    target = np.asarray(
+        request_candidates.candidate_poses_xyz[candidate_index],
+        dtype=np.float64,
+    )
+    if (
+        current.shape != (3,)
+        or target.shape != (3,)
+        or np.any(~np.isfinite(current))
+        or np.any(~np.isfinite(target))
+    ):
+        raise PFLiveSessionError(
+            "Detector yaw binding requires finite current and target XYZ poses."
+        )
+    delta_x = float(target[0] - current[0])
+    delta_y = float(target[1] - current[1])
+    if delta_x == 0.0 and delta_y == 0.0:
+        yaw = (
+            0.0
+            if previous_record is None
+            else _yaw_from_detector_quaternion_wxyz(
+                previous_record.detector_quat_wxyz
+            )
+        )
+    else:
+        yaw = math.atan2(delta_y, delta_x)
+    half_yaw = 0.5 * yaw
+    expected = np.asarray(
+        [math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)],
+        dtype=np.float64,
+    )
+    expected.setflags(write=False)
+    return expected
+
+
+def _detector_quaternion_matches_command(
+    quaternion_wxyz: Sequence[float],
+    expected_wxyz: NDArray[np.float64],
+) -> bool:
+    """Return whether one WXYZ quaternion matches the commanded yaw up to sign."""
+    observed = np.asarray(quaternion_wxyz, dtype=np.float64)
+    if observed.shape != (4,) or np.any(~np.isfinite(observed)):
+        return False
+    if not np.isclose(
+        float(np.linalg.norm(observed)),
+        1.0,
+        rtol=0.0,
+        atol=_DETECTOR_QUATERNION_ABSOLUTE_TOLERANCE,
+    ):
+        return False
+    return bool(
+        np.allclose(
+            observed,
+            expected_wxyz,
+            rtol=0.0,
+            atol=_DETECTOR_QUATERNION_ABSOLUTE_TOLERANCE,
+        )
+        or np.allclose(
+            observed,
+            -expected_wxyz,
+            rtol=0.0,
+            atol=_DETECTOR_QUATERNION_ABSOLUTE_TOLERANCE,
+        )
+    )
+
+
+def _initial_candidate_motion_contract(
+    context: RunContext,
+) -> tuple[tuple[float, float, float], float]:
+    """Return the exact initial pose and shield speed from the live context."""
+    environment = context.environment
+    initial_pose = environment.get("detector_position")
+    if not isinstance(initial_pose, (list, tuple)) or len(initial_pose) != 3:
+        raise PFLiveSessionError(
+            "Runtime context detector_position must be one three-number array."
+        )
+    if any(type(value) not in (int, float) for value in initial_pose):
+        raise PFLiveSessionError(
+            "Runtime context detector_position must contain exact JSON numbers."
+        )
+    pose = tuple(float(value) for value in initial_pose)
+    if any(not math.isfinite(value) for value in pose):
+        raise PFLiveSessionError("Runtime context detector_position must be finite.")
+    adaptive = environment.get("adaptive_measurement")
+    if not isinstance(adaptive, Mapping):
+        raise PFLiveSessionError(
+            "Runtime context must contain adaptive_measurement."
+        )
+    raw_speed = adaptive.get("shield_angular_speed_rad_s")
+    if type(raw_speed) not in (int, float):
+        raise PFLiveSessionError(
+            "Runtime shield angular speed must be an exact JSON number."
+        )
+    speed = float(raw_speed)
+    if not math.isfinite(speed) or speed <= 0.0:
+        raise PFLiveSessionError(
+            "Runtime shield angular speed must be finite and positive."
+        )
+    return pose, speed
+
+
+def _require_refined_candidate_extension(
+    previous: AdaptiveCandidateSnapshot,
+    refined: AdaptiveCandidateSnapshot,
+) -> None:
+    """Require refinement to preserve physical state and every prior quote."""
+    if not isinstance(previous, AdaptiveCandidateSnapshot) or not isinstance(
+        refined,
+        AdaptiveCandidateSnapshot,
+    ):
+        raise TypeError("Candidate refinement requires typed runtime snapshots.")
+    if refined.current_pose_xyz != previous.current_pose_xyz:
+        raise RuntimeError("Refined candidates changed the current detector pose.")
+    if refined.current_pair_id != previous.current_pair_id:
+        raise RuntimeError("Refined candidates changed the current shield state.")
+    if refined.allowed_pair_ids != previous.allowed_pair_ids:
+        raise RuntimeError("Refined candidates changed the allowed shield pairs.")
+    if (
+        refined.shield_angular_speed_rad_s
+        != previous.shield_angular_speed_rad_s
+    ):
+        raise RuntimeError("Refined candidates changed the shield angular speed.")
+    if len(refined.candidate_poses_xyz) <= len(previous.candidate_poses_xyz):
+        raise RuntimeError("Candidate refinement did not add a new reachable pose.")
+    refined_index = {
+        pose: index for index, pose in enumerate(refined.candidate_poses_xyz)
     }
-    if active_isotopes != logged_isotopes:
-        session_hash_payload["active_isotopes"] = list(active_isotopes)
-    estimator.resolved_config_hash = sha256_json(session_hash_payload)
+    for previous_index, pose in enumerate(previous.candidate_poses_xyz):
+        if pose not in refined_index:
+            raise RuntimeError("Candidate refinement removed a prior reachable pose.")
+        new_index = refined_index[pose]
+        for field_name in (
+            "travel_costs",
+            "horizontal_travel_times_s",
+            "mast_vertical_times_s",
+            "settling_times_s",
+        ):
+            old_values = getattr(previous, field_name)
+            new_values = getattr(refined, field_name)
+            if new_values[new_index] != old_values[previous_index]:
+                raise RuntimeError(
+                    "Candidate refinement changed a prior runtime motion quote: "
+                    f"{field_name}."
+                )
 
 
 def measurement_record_to_station_input(
@@ -1170,16 +1440,10 @@ def _compact_live_point_estimate(
         )
     return {
         "map_cardinality": map_cardinality,
-        "cardinality_distribution": {
-            str(cardinality): _finite_real(
-                probability,
-                location=(
-                    f"live posterior {isotope} cardinality probability "
-                    f"{cardinality}"
-                ),
-            )
-            for cardinality, probability in distribution.items()
-        },
+        "cardinality_distribution": _json_cardinality_distribution(
+            distribution,
+            location=f"live posterior {isotope} cardinality distribution",
+        ),
         "selected_stratum_mass": selected_stratum_mass,
         "modes": modes,
     }
@@ -1197,6 +1461,10 @@ def live_posterior_summary(estimator: object) -> dict[str, object]:
         raise PFLiveSessionError("PF live point estimates must be an isotope mapping.")
     isotopes: dict[str, object] = {}
     for isotope, estimate in raw.items():
+        if not isinstance(isotope, str) or not isotope:
+            raise PFLiveSessionError(
+                "PF live point-estimate isotope keys must be nonempty strings."
+            )
         to_dict = getattr(estimate, "to_dict", None)
         if not callable(to_dict):
             raise PFLiveSessionError(
@@ -1207,10 +1475,9 @@ def live_posterior_summary(estimator: object) -> dict[str, object]:
             raise PFLiveSessionError(
                 "Every PF live point estimate must serialize an object."
             )
-        isotope_name = str(isotope)
-        isotopes[isotope_name] = _compact_live_point_estimate(
+        isotopes[isotope] = _compact_live_point_estimate(
             payload,
-            isotope=isotope_name,
+            isotope=isotope,
         )
     return {
         "schema_version": 2,
@@ -1396,17 +1663,47 @@ class PFLiveSession:
     def __init__(
         self,
         context: RunContext,
-        config: Mapping[str, Any],
+        config: ValidatedProductionPFConfig,
         *,
+        initial_candidates: AdaptiveCandidateSnapshot,
         profile: str,
         seed: int,
         runtime_root: str | Path,
-        config_hash: str | None = None,
-        inference_isotopes: Sequence[str] | None = None,
+        control_policy_provenance: PFControlPolicyProvenance,
     ) -> None:
         """Authenticate the runtime context and construct one live PF."""
         if not isinstance(context, RunContext):
             raise PFLiveSessionError("context must be a runtime RunContext.")
+        if not isinstance(control_policy_provenance, PFControlPolicyProvenance):
+            raise PFLiveSessionError(
+                "Live PF session requires sealed control-policy provenance."
+            )
+        if not isinstance(initial_candidates, AdaptiveCandidateSnapshot):
+            raise PFLiveSessionError(
+                "Live PF session requires the exact handshake candidate snapshot."
+            )
+        initial_pose, shield_angular_speed_rad_s = (
+            _initial_candidate_motion_contract(context)
+        )
+        if initial_pose != initial_candidates.current_pose_xyz:
+            raise PFLiveSessionError(
+                "Handshake candidates are not anchored to the runtime initial pose."
+            )
+        if initial_candidates.current_pair_id != 0:
+            raise PFLiveSessionError(
+                "Fresh handshake candidates must start at shield pair 0."
+            )
+        if initial_candidates.allowed_pair_ids != tuple(range(64)):
+            raise PFLiveSessionError(
+                "Fresh handshake candidates must expose all 64 shield pairs."
+            )
+        if (
+            initial_candidates.shield_angular_speed_rad_s
+            != shield_angular_speed_rad_s
+        ):
+            raise PFLiveSessionError(
+                "Handshake candidate shield speed differs from the runtime context."
+            )
         contract_hash = _sha256_string(
             context.runtime_config.get(FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY),
             location=(
@@ -1420,8 +1717,7 @@ class PFLiveSession:
             profile=profile,
             seed=seed,
             runtime_root=runtime_root,
-            config_hash=config_hash,
-            inference_isotopes=inference_isotopes,
+            control_policy_provenance=control_policy_provenance,
         )
         estimator_contract = getattr(
             getattr(estimator, "full_spectrum_generative_model", None),
@@ -1435,10 +1731,13 @@ class PFLiveSession:
         self._context = context
         self._estimator = estimator
         self._runtime_root = Path(runtime_root).expanduser().resolve()
-        self._input_config = MappingProxyType(dict(config))
+        self._input_config = MappingProxyType(config.settings())
         self._profile = profile
         self._seed = seed
+        self._control_policy_provenance = control_policy_provenance
+        self._expected_candidates = initial_candidates
         self._generative_contract_hash_sha256 = contract_hash
+        self._expected_energy_bin_edges_keV = _context_energy_bin_edges(context)
         self._records: list[MeasurementLogRecord] = []
         self._station_count = 0
         self._phase = "receiving"
@@ -1453,6 +1752,11 @@ class PFLiveSession:
     def context(self) -> RunContext:
         """Return the immutable truth-free runtime handshake."""
         return self._context
+
+    @property
+    def estimator(self) -> PurePFEstimator:
+        """Return the estimator owned by this session for live diagnostics."""
+        return self._estimator
 
     @property
     def records(self) -> tuple[MeasurementLogRecord, ...]:
@@ -1488,6 +1792,22 @@ class PFLiveSession:
                 f"PF live session cannot receive records while {self._phase}."
             )
 
+    def receive_refined_candidates(
+        self,
+        refined: AdaptiveCandidateSnapshot,
+    ) -> None:
+        """Advance the owned candidate chain through one exact refinement event."""
+        self._ensure_receiving()
+        try:
+            _require_refined_candidate_extension(
+                self._expected_candidates,
+                refined,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            self._phase = "failed"
+            raise
+        self._expected_candidates = refined
+
     def _validated_view(
         self,
         records: Sequence[MeasurementLogRecord],
@@ -1501,6 +1821,14 @@ class PFLiveSession:
                 f"Persisted PF records violate the runtime contract: {exc}"
             ) from exc
         for index, record in enumerate(view.records):
+            if not np.array_equal(
+                np.asarray(record.energy_bin_edges_keV, dtype=np.float64),
+                self._expected_energy_bin_edges_keV,
+            ):
+                raise PFLiveSessionError(
+                    "Persisted PF record energy axis differs from the runtime "
+                    f"handshake at row {index}."
+                )
             if (
                 record.metadata.get(FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY)
                 != self._generative_contract_hash_sha256
@@ -1510,6 +1838,149 @@ class PFLiveSession:
                     f"runtime handshake at row {index}."
                 )
         return view
+
+    def receive_acquired(
+        self,
+        record: MeasurementLogRecord,
+        *,
+        request: AdaptiveStepRequest,
+        request_candidates: AdaptiveCandidateSnapshot,
+        next_candidates: AdaptiveCandidateSnapshot,
+    ) -> bool:
+        """Validate one complete action transaction before PF assimilation."""
+        self._ensure_receiving()
+        if not isinstance(record, MeasurementLogRecord):
+            self._phase = "failed"
+            raise PFLiveSessionError(
+                "receive_acquired requires a MeasurementLogRecord."
+            )
+        if not isinstance(request, AdaptiveStepRequest):
+            self._phase = "failed"
+            raise PFLiveSessionError(
+                "receive_acquired requires an AdaptiveStepRequest."
+            )
+        if not isinstance(request_candidates, AdaptiveCandidateSnapshot):
+            self._phase = "failed"
+            raise PFLiveSessionError(
+                "receive_acquired requires the exact pre-action candidate snapshot."
+            )
+        if request_candidates != self._expected_candidates:
+            self._phase = "failed"
+            raise PFLiveSessionError(
+                "request_candidates differs from the session-owned runtime "
+                "candidate chain."
+            )
+        if not isinstance(next_candidates, AdaptiveCandidateSnapshot):
+            self._phase = "failed"
+            raise PFLiveSessionError(
+                "receive_acquired requires an AdaptiveCandidateSnapshot."
+            )
+        candidate_index = request.candidate_index
+        if candidate_index >= len(request_candidates.candidate_poses_xyz):
+            self._phase = "failed"
+            raise PFLiveSessionError(
+                "Adaptive request.candidate_index lies outside its exact "
+                "pre-action snapshot."
+            )
+        requested_pose = np.asarray(
+            request_candidates.candidate_poses_xyz[candidate_index],
+            dtype=np.float64,
+        )
+        if (
+            requested_pose.dtype != np.dtype(np.float64)
+            or requested_pose.shape != (3,)
+            or np.any(~np.isfinite(requested_pose))
+        ):
+            self._phase = "failed"
+            raise PFLiveSessionError(
+                "Requested candidate pose must be one exact finite float64 XYZ."
+            )
+        try:
+            expected_detector_quaternion = _expected_detector_quaternion_wxyz(
+                request_candidates,
+                candidate_index=candidate_index,
+                previous_record=(self._records[-1] if self._records else None),
+            )
+        except (TypeError, ValueError, PFLiveSessionError):
+            self._phase = "failed"
+            raise
+        expected_record_id = len(self._records)
+        mismatches: list[str] = []
+        if request.action_id != expected_record_id:
+            mismatches.append("request.action_id")
+        if record.step_id != request.action_id:
+            mismatches.append("step_id")
+        if record.action_id != request.action_id:
+            mismatches.append("action_id")
+        if record.station_id != request.station_id:
+            mismatches.append("station_id")
+        if tuple(record.detector_pose_xyz) != tuple(requested_pose.tolist()):
+            mismatches.append("detector_pose_xyz")
+        if not _detector_quaternion_matches_command(
+            record.detector_quat_wxyz,
+            expected_detector_quaternion,
+        ):
+            mismatches.append("detector_quat_wxyz")
+        if record.fe_orientation_index != request.fe_orientation_index:
+            mismatches.append("fe_orientation_index")
+        if record.pb_orientation_index != request.pb_orientation_index:
+            mismatches.append("pb_orientation_index")
+        if record.live_time_s != request.dwell_time_s:
+            mismatches.append("live_time_s")
+        if (
+            record.travel_time_s
+            != request_candidates.travel_costs[candidate_index]
+        ):
+            mismatches.append("travel_time_s")
+        requested_pair_id = (
+            request.fe_orientation_index * 8 + request.pb_orientation_index
+        )
+        expected_shield_actuation_time_s = (
+            request_candidates.quote_shield_program_time_s((requested_pair_id,))
+        )
+        if (
+            record.shield_actuation_time_s
+            != expected_shield_actuation_time_s
+        ):
+            mismatches.append("shield_actuation_time_s")
+        station_complete = record.metadata.get("station_complete") is True
+        if station_complete is not request.station_complete:
+            mismatches.append("station_complete")
+        if not np.array_equal(
+            np.asarray(record.energy_bin_edges_keV, dtype=np.float64),
+            self._expected_energy_bin_edges_keV,
+        ):
+            mismatches.append("energy_bin_edges_keV")
+        if (
+            record.metadata.get(FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY)
+            != self._generative_contract_hash_sha256
+        ):
+            mismatches.append(FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY)
+        if next_candidates.current_pair_id != requested_pair_id:
+            mismatches.append("candidates.current_pair_id")
+        if tuple(next_candidates.current_pose_xyz) != tuple(requested_pose.tolist()):
+            mismatches.append("candidates.current_pose")
+        if next_candidates.allowed_pair_ids != request_candidates.allowed_pair_ids:
+            mismatches.append("candidates.allowed_pair_ids")
+        if (
+            next_candidates.shield_angular_speed_rad_s
+            != request_candidates.shield_angular_speed_rad_s
+        ):
+            mismatches.append("candidates.shield_angular_speed_rad_s")
+        if mismatches:
+            self._phase = "failed"
+            raise PFLiveSessionError(
+                "Adaptive acquisition response differs from its exact request: "
+                + ", ".join(mismatches)
+                + "."
+            )
+        try:
+            completed = self.receive_persisted(record)
+        except BaseException:
+            self._phase = "failed"
+            raise
+        self._expected_candidates = next_candidates
+        return completed
 
     def stage_external_surface_guidance(
         self,
@@ -1658,8 +2129,9 @@ class PFLiveSession:
             method=method,
             rng=rng,
         )
-        summary_json = canonical_json_bytes(
-            live_posterior_summary(self._estimator)
+        summary_json = _strict_live_artifact_json_bytes(
+            live_posterior_summary(self._estimator),
+            artifact_name="PF live posterior summary",
         )
         return _immutable_particle_snapshot(
             particles,
@@ -1670,155 +2142,17 @@ class PFLiveSession:
             posterior_summary_json=summary_json,
         )
 
-    def plan_next_action(
+    def complete_live_state(
         self,
-        candidate_poses_xyz: object,
         *,
-        candidate_motion_times_s: object,
-        config: DSSPPConfig | Mapping[str, Any],
-        candidate_horizontal_travel_times_s: object | None = None,
-        candidate_mast_vertical_times_s: object | None = None,
-        candidate_settling_times_s: object | None = None,
-        current_pose_xyz: object | None = None,
-        current_pair_id: int | None = None,
-        visited_poses_xyz: object | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> PFNextAction:
-        """Select the next runtime-authored pose and executable shield program."""
-        if self._phase != "receiving":
-            raise PFLiveSessionError(
-                f"PF live session cannot plan while {self._phase}."
-            )
-        if not self._records or (
-            self._records[-1].metadata.get("station_complete") is not True
-        ):
-            raise PFLiveSessionError(
-                "PF action planning requires the latest durable station boundary."
-            )
-        if isinstance(config, DSSPPConfig):
-            planner_config = config
-        elif isinstance(config, Mapping):
-            try:
-                planner_config = DSSPPConfig(**dict(config))
-            except (TypeError, ValueError) as exc:
-                raise PFLiveSessionError(
-                    "PF action-planning configuration is incompatible."
-                ) from exc
-        else:
-            raise PFLiveSessionError(
-                "PF action-planning configuration must be DSSPPConfig or a mapping."
-            )
-        if planner_config.augment_candidates:
-            raise PFLiveSessionError(
-                "Live PF planning requires runtime-owned candidates and forbids "
-                "estimator-side candidate augmentation."
-            )
-        candidates = np.asarray(candidate_poses_xyz, dtype=np.float64)
-        motion_times = np.asarray(candidate_motion_times_s, dtype=np.float64)
-        raw_motion_components = (
-            candidate_horizontal_travel_times_s,
-            candidate_mast_vertical_times_s,
-            candidate_settling_times_s,
-        )
-        motion_components = None
-        if any(values is not None for values in raw_motion_components):
-            if not all(values is not None for values in raw_motion_components):
-                raise PFLiveSessionError(
-                    "PF action planning requires all three motion-time components."
-                )
-            motion_components = tuple(
-                np.asarray(values, dtype=np.float64)
-                for values in raw_motion_components
-            )
-        if current_pose_xyz is None:
-            current_pose = np.asarray(
-                self._records[-1].detector_pose_xyz,
-                dtype=np.float64,
-            )
-        else:
-            current_pose = np.asarray(current_pose_xyz, dtype=np.float64)
-        if current_pair_id is None:
-            latest = self._records[-1]
-            resolved_pair_id = (
-                int(latest.fe_orientation_index) * 8
-                + int(latest.pb_orientation_index)
-            )
-        else:
-            resolved_pair_id = current_pair_id
-        if visited_poses_xyz is None:
-            visited = np.asarray(
-                [
-                    record.detector_pose_xyz
-                    for record in self._records
-                    if record.metadata.get("station_complete") is True
-                ],
-                dtype=np.float64,
-            ).reshape((-1, 3))
-        else:
-            visited = np.asarray(visited_poses_xyz, dtype=np.float64)
-        planning_rng = rng
-        if planning_rng is None:
-            planning_rng = np.random.default_rng(
-                np.random.SeedSequence(
-                    [int(self._seed), 0xD55A11, int(self._station_count)]
-                )
-            )
-        try:
-            forward = ResolvedForwardContext.from_run_context(
-                self._context,
-                run_root=self._runtime_root,
-            )
-            lower, upper = forward.bounds_xyz
-            result = select_dss_pp_next_station(
-                self._estimator,
-                candidates,
-                current_pose,
-                current_pair_id=resolved_pair_id,
-                visited_poses_xyz=visited,
-                map_api=forward.obstacle_grid,
-                bounds_xyz=(lower, upper),
-                continuous_height_bounds_m=(float(lower[2]), float(upper[2])),
-                config=planner_config,
-                rng=planning_rng,
-                candidate_motion_times_s=motion_times,
-                candidate_horizontal_travel_times_s=(
-                    None if motion_components is None else motion_components[0]
-                ),
-                candidate_mast_vertical_times_s=(
-                    None if motion_components is None else motion_components[1]
-                ),
-                candidate_settling_times_s=(
-                    None if motion_components is None else motion_components[2]
-                ),
-            )
-        except (TypeError, ValueError, RuntimeError) as exc:
-            raise PFLiveSessionError(f"PF action planning failed: {exc}") from exc
-        diagnostics = _compact_next_action_diagnostics(result)
-        selected_pose = np.asarray(result.next_pose, dtype=np.float64).reshape(3)
-        matching_candidates = np.flatnonzero(
-            np.all(candidates == selected_pose[None, :], axis=1)
-        )
-        if matching_candidates.size != 1:
-            raise PFLiveSessionError(
-                "PF-selected pose must identify exactly one runtime candidate."
-            )
-        return PFNextAction(
-            candidate_index=int(matching_candidates[0]),
-            detector_pose_xyz=tuple(
-                float(value) for value in selected_pose
-            ),
-            shield_pair_ids=tuple(
-                int(value) for value in result.shield_program.pair_ids
-            ),
-            shield_program_name=str(result.shield_program.name),
-            shield_program_kind=str(result.shield_program.kind),
-            score=float(result.score),
-            diagnostics_json=canonical_json_bytes(diagnostics),
-        )
-
-    def complete_live_state(self) -> PFCompletedLiveState:
+        diagnostics_extensions: Mapping[str, object] | None = None,
+    ) -> PFCompletedLiveState:
         """Seal the already-assimilated live state before log publication."""
         if self._phase in {"completed", "bound"}:
+            if diagnostics_extensions is not None:
+                raise PFLiveSessionError(
+                    "Completed PF diagnostics cannot be changed after sealing."
+                )
             assert self._completed_state is not None
             return self._completed_state
         self._ensure_receiving()
@@ -1838,17 +2172,42 @@ class PFLiveSession:
             raise PFLiveSessionError(
                 "PF live completion differs from its assimilated station history."
             )
-        final_particles = self.planning_particle_snapshot(
-            max_particles=0,
-            method="top_weight",
+        final_particles = self.planning_particle_snapshot()
+        try:
+            diagnostics = _compact_pf_diagnostics(self._estimator)
+        except BaseException:
+            self._phase = "failed"
+            raise
+        if diagnostics_extensions is not None:
+            if not isinstance(diagnostics_extensions, Mapping):
+                raise PFLiveSessionError(
+                    "PF diagnostics extensions must be a mapping."
+                )
+            conflicts = sorted(set(diagnostics).intersection(diagnostics_extensions))
+            if conflicts:
+                raise PFLiveSessionError(
+                    "PF diagnostics extensions cannot replace canonical fields: "
+                    f"{conflicts}."
+                )
+            normalized_extensions = strict_json_loads(
+                _strict_live_artifact_json_bytes(
+                    dict(diagnostics_extensions),
+                    artifact_name="PF diagnostics extensions",
+                )
+            )
+            if not isinstance(normalized_extensions, dict):
+                raise PFLiveSessionError(
+                    "PF diagnostics extensions must serialize as an object."
+                )
+            diagnostics.update(normalized_extensions)
+        diagnostics_json = _strict_live_artifact_json_bytes(
+            diagnostics,
+            artifact_name="PF diagnostics",
         )
-        diagnostics_json = canonical_json_bytes(
-            _compact_pf_diagnostics(self._estimator)
+        checkpoint = _sealed_live_checkpoint_state(
+            self._estimator,
+            self._control_policy_provenance,
         )
-        raw_checkpoint = self._estimator.serialized_state()
-        if not isinstance(raw_checkpoint, (bytes, bytearray, memoryview)):
-            raise PFLiveSessionError("PF serialized_state() must return bytes.")
-        checkpoint = bytes(raw_checkpoint)
         digest = measurement_records_digest(self._records)
         completed = PFCompletedLiveState(
             source_run_id=self._context.run_id,
@@ -1860,6 +2219,7 @@ class PFLiveSession:
             station_count=self._station_count,
             covered_step_ids=tuple(record.step_id for record in self._records),
             covered_records_digest=digest,
+            control_policy_provenance=self._control_policy_provenance,
             checkpoint_state=checkpoint,
             checkpoint_sha256=sha256(checkpoint).hexdigest(),
             diagnostics_json=diagnostics_json,
@@ -1900,16 +2260,18 @@ class PFLiveSession:
                 "Published MeasurementLog records differ from the completed PF state."
             )
         before_bind = self._completed_state.checkpoint_state
-        bind_published_measurement_log(
+        _bind_estimator_to_published_log(
             self._estimator,
             log,
             live_records=self._records,
+            control_policy_provenance=(
+                self._completed_state.control_policy_provenance
+            ),
         )
-        raw_after_bind = self._estimator.serialized_state()
-        if not isinstance(raw_after_bind, (bytes, bytearray, memoryview)):
-            self._phase = "failed"
-            raise PFLiveSessionError("PF serialized_state() must return bytes.")
-        after_bind = bytes(raw_after_bind)
+        after_bind = _sealed_live_checkpoint_state(
+            self._estimator,
+            self._completed_state.control_policy_provenance,
+        )
         if after_bind != before_bind:
             self._phase = "failed"
             raise PFLiveSessionError(
@@ -1932,7 +2294,17 @@ class PFLiveSession:
             raise PFLiveSessionError(
                 "Bound PF posterior identity differs from the published log."
             )
-        posterior_json = canonical_json_bytes(dict(payload))
+        posterior_payload = dict(payload)
+        posterior_provenance = dict(provenance)
+        policy_provenance = (
+            self._completed_state.control_policy_provenance.to_dict()
+        )
+        posterior_provenance["control_policy"] = policy_provenance
+        posterior_payload["provenance"] = posterior_provenance
+        posterior_json = _strict_live_artifact_json_bytes(
+            posterior_payload,
+            artifact_name="PF posterior",
+        )
         bound = PFBoundLiveState(
             completed=self._completed_state,
             measurement_log_sha256=log_digest,
@@ -1951,25 +2323,54 @@ class PFLiveSession:
             )
         return self._bound_state
 
-    def publish_bound_result(
+    def _publish_bound_result_into_staging(
         self,
         output_dir: str | Path,
     ) -> PFPublishedLiveResult:
-        """Publish the package-owned PF result without any estimator update."""
+        """Write canonical PF artifacts into one outer atomic staging root."""
         bound = self.publication_input()
         target = Path(output_dir).expanduser().resolve()
         if target.exists():
-            raise FileExistsError(f"Refusing to replace PF result directory: {target}")
-        target.mkdir(parents=True)
-        posterior = json.loads(bound.posterior_json)
+            if not target.is_dir() or target.is_symlink():
+                raise FileExistsError(
+                    f"PF result target is not a regular directory: {target}"
+                )
+        else:
+            target.mkdir(parents=True)
+        owned_names = {
+            "pf_posterior.json",
+            "pf_diagnostics.json",
+            "pf_state.json",
+            "pf_particles.npz",
+            "pf_checkpoint.json",
+            "pf_artifact_inventory.json",
+        }
+        conflicts = sorted(name for name in owned_names if (target / name).exists())
+        if conflicts:
+            raise FileExistsError(
+                "Refusing to replace package-owned PF artifacts: "
+                f"{conflicts}."
+            )
+        posterior = strict_json_loads(bound.posterior_json)
         if not isinstance(posterior, dict):
             raise PFLiveSessionError("Bound PF posterior must be a JSON object.")
         provenance = posterior.get("provenance")
         if not isinstance(provenance, Mapping):
             raise PFLiveSessionError("Bound PF posterior lacks provenance.")
-        checkpoint_payload = json.loads(bound.checkpoint_state)
+        expected_policy_provenance = (
+            bound.completed.control_policy_provenance.to_dict()
+        )
+        if provenance.get("control_policy") != expected_policy_provenance:
+            raise PFLiveSessionError(
+                "Bound PF posterior control policy differs from the sealed session."
+            )
+        checkpoint_payload = strict_json_loads(bound.checkpoint_state)
         if not isinstance(checkpoint_payload, dict):
             raise PFLiveSessionError("PF checkpoint state must be a JSON object.")
+        if checkpoint_payload.get("control_policy") != expected_policy_provenance:
+            raise PFLiveSessionError(
+                "PF checkpoint state control policy differs from the sealed session."
+            )
         rng_states = checkpoint_payload.get("rng_states")
         if not isinstance(rng_states, Mapping):
             raise PFLiveSessionError("PF checkpoint state lacks RNG provenance.")
@@ -2035,7 +2436,7 @@ class PFLiveSession:
         ):
             raise PFLiveSessionError("Bound PF provenance is incomplete.")
         checkpoint_manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "checkpoint_family": "pure_pf_causal_state",
             "checkpoint_id": f"pf-live-{bound.checkpoint_sha256[:24]}",
             "source_run_id": bound.completed.source_run_id,
@@ -2049,12 +2450,17 @@ class PFLiveSession:
             "prefix_measurement_log_sha256": bound.measurement_log_sha256,
             "pf_repository_commit": estimator_commit,
             "resolved_config_sha256": resolved_config_sha256,
+            "control_policy": (
+                bound.completed.control_policy_provenance.to_dict()
+            ),
             "random_seed": random_seed,
             "state_artifact": checkpoint_state_path.name,
+            "state_schema_version": 2,
             "state_artifact_sha256": bound.checkpoint_sha256,
-            "rng_state_sha256": sha256(
-                canonical_json_bytes(dict(rng_states))
-            ).hexdigest(),
+            "rng_state_sha256": _strict_live_artifact_sha256(
+                dict(rng_states),
+                artifact_name="PF checkpoint RNG state",
+            ),
             "safety": {
                 "prefix_causal": True,
                 "truth_read": False,
@@ -2063,7 +2469,20 @@ class PFLiveSession:
         }
         checkpoint_path = atomic_write_bytes(
             target / "pf_checkpoint.json",
-            canonical_json_bytes(checkpoint_manifest),
+            _strict_live_artifact_json_bytes(
+                checkpoint_manifest,
+                artifact_name="PF checkpoint manifest",
+            ),
+        )
+        payload_inventory = build_artifact_inventory(target)
+        publish_artifact_manifest(
+            target / "pf_artifact_inventory.json",
+            payload_inventory,
+            metadata={
+                "artifact_family": "pure_pf_live_result",
+                "source_run_id": bound.completed.source_run_id,
+                "measurement_log_sha256": bound.measurement_log_sha256,
+            },
         )
         inventory = build_artifact_inventory(target)
         return PFPublishedLiveResult(
@@ -2074,9 +2493,33 @@ class PFLiveSession:
             checkpoint_state_path=checkpoint_state_path,
             particle_snapshot_path=particle_snapshot_path,
             posterior_sha256=bound.posterior_sha256,
-            checkpoint_sha256=sha256(
-                canonical_json_bytes(checkpoint_manifest)
-            ).hexdigest(),
+            checkpoint_sha256=_strict_live_artifact_sha256(
+                checkpoint_manifest,
+                artifact_name="PF checkpoint manifest",
+            ),
+            result_sha256=inventory.sha256,
+        )
+
+    def publish_bound_result(
+        self,
+        output_dir: str | Path,
+    ) -> PFPublishedLiveResult:
+        """Publish one new directory-atomic package-owned PF result."""
+        target = Path(output_dir).expanduser().resolve()
+        with AtomicBundlePublisher(target, policy="create") as publisher:
+            staged = self._publish_bound_result_into_staging(
+                publisher.staging_path
+            )
+            inventory = publisher.publish()
+        return PFPublishedLiveResult(
+            root=target,
+            posterior_path=target / staged.posterior_path.name,
+            diagnostics_path=target / staged.diagnostics_path.name,
+            checkpoint_path=target / staged.checkpoint_path.name,
+            checkpoint_state_path=target / staged.checkpoint_state_path.name,
+            particle_snapshot_path=target / staged.particle_snapshot_path.name,
+            posterior_sha256=staged.posterior_sha256,
+            checkpoint_sha256=staged.checkpoint_sha256,
             result_sha256=inventory.sha256,
         )
 
@@ -2084,18 +2527,16 @@ class PFLiveSession:
 __all__ = [
     "PFBoundLiveState",
     "PFCompletedLiveState",
-    "PFNextAction",
-    "PFPlanningConfig",
     "PFPublishedLiveResult",
     "PFLiveSessionError",
     "PFLiveParticleSnapshot",
     "PFLiveSession",
+    "ValidatedProductionPFConfig",
     "assimilate_persisted_station",
-    "bind_published_measurement_log",
     "build_live_estimator",
     "live_posterior_summary",
-    "load_live_pf_config",
+    "load_production_live_pf_config",
     "measurement_record_to_station_input",
     "register_persisted_station_pose",
-    "validate_live_pf_config",
+    "validate_production_live_pf_config",
 ]

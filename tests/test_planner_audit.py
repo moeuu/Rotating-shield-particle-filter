@@ -56,6 +56,7 @@ def _result() -> DSSPPResult:
         sequence=(node,),
         diagnostics={
             "planning_eig_shortlist": {
+                "candidate_pose_count": 8,
                 "total_action_count": 128,
                 "proxy_action_count": 128,
                 "exact_action_count": 32,
@@ -74,11 +75,29 @@ def _result() -> DSSPPResult:
             "selected_pose_exact_information_gain_leader": 2.5,
             "selected_program_is_exact_eig_leader_at_selected_pose": True,
             "selected_pose_exact_program_count": 16,
+            "planning_particle_count": 512,
             "component_leaders": {
                 "score": leader,
                 "information_gain": leader,
             },
             "ranked_nodes": [leader],
+        },
+    )
+
+
+def _external_control_result() -> DSSPPResult:
+    """Return one exact fixed-path decision without DSS-PP diagnostics."""
+    program = ShieldProgram("fixed_shield_0", (0, 0), "external_control")
+    return DSSPPResult(
+        next_pose=np.asarray([1.0, 2.0, 3.0]),
+        next_pose_index=2,
+        shield_program=program,
+        score=-0.25,
+        sequence=(),
+        diagnostics={
+            "selection_mode": "external_control_path",
+            "external_path_policy": "passive_serpentine",
+            "external_shield_program_name": program.name,
         },
     )
 
@@ -133,6 +152,54 @@ def test_planner_audit_captures_compact_pose_and_eig_evidence() -> None:
     assert removed.isdisjoint(audit)
 
 
+def test_external_control_audit_has_its_own_exact_discriminant() -> None:
+    """A fixed-path decision must not claim DSS-PP or EIG evidence."""
+    audit = build_planner_audit(
+        station_id=2,
+        belief_after_station_id=1,
+        result=_external_control_result(),
+    )
+
+    assert audit == {
+        "schema_version": 3,
+        "station_id": 2,
+        "belief_after_station_id": 1,
+        "selection_mode": "external_control_path",
+        "external_control_execution": {
+            "path_policy_name": "passive_serpentine",
+            "shield_program_name": "fixed_shield_0",
+        },
+        "selected_pose_index": 2,
+        "selected_pose_xyz": [1.0, 2.0, 3.0],
+        "selected_program": {
+            "name": "fixed_shield_0",
+            "kind": "external_control",
+            "pair_ids": [0, 0],
+        },
+        "selected_path_policy_score": -0.25,
+    }
+
+
+def test_external_control_audit_rejects_fake_dss_evidence_or_shadow_health() -> None:
+    """External decisions must use only their dedicated exact audit contract."""
+    result = _external_control_result()
+    result.diagnostics["planning_eig_shortlist"] = {}
+
+    with pytest.raises(ValueError, match="exact contract"):
+        build_planner_audit(
+            station_id=2,
+            belief_after_station_id=1,
+            result=result,
+        )
+    with pytest.raises(ValueError, match="cannot carry DSS-PP shadow health"):
+        build_planner_audit(
+            station_id=2,
+            belief_after_station_id=1,
+            result=_external_control_result(),
+            posterior_health={},
+        )
+
+
 def test_planner_audit_health_gates_an_evaluated_shadow_action() -> None:
     """Information-only choices must remain visible under an eight-view fallback."""
     result = _result()
@@ -180,7 +247,7 @@ def test_planner_audit_health_gates_an_evaluated_shadow_action() -> None:
                     "selected_view_count": 2,
                     "pair_ids": [1, 2],
                     "information_gain_mean_nat": 1.0,
-                    "pose_score_without_measurement_time_penalty": 1.1,
+                    "pose_score": 1.1,
                 },
                 "paired_lcb_rule_action": {
                     "pose_index": 1,
@@ -188,7 +255,7 @@ def test_planner_audit_health_gates_an_evaluated_shadow_action() -> None:
                     "selected_view_count": 4,
                     "pair_ids": [1, 2, 3, 4],
                     "information_gain_mean_nat": 1.5,
-                    "pose_score_without_measurement_time_penalty": 1.6,
+                    "pose_score": 1.6,
                 },
             "configured_time_weight_counterfactual_action": {
                 "pose_index": 1,
@@ -234,7 +301,6 @@ def test_planner_audit_health_gates_an_evaluated_shadow_action() -> None:
                             "paired_margin_one_sided_mc_lcb_nat": [-1.1, -1.0],
                         },
                         "measurement_live_time_s": 40.0,
-                        "measurement_elapsed_time_s": 42.0,
                     },
                     "4": {
                         "pair_ids": [[1, 2, 3, 4], [0, 1, 2, 3]],
@@ -252,7 +318,6 @@ def test_planner_audit_health_gates_an_evaluated_shadow_action() -> None:
                             "paired_margin_one_sided_mc_lcb_nat": [-0.6, -0.5],
                         },
                         "measurement_live_time_s": 80.0,
-                        "measurement_elapsed_time_s": 84.0,
                     },
                 "8": {
                     "pair_ids": [
@@ -269,7 +334,6 @@ def test_planner_audit_health_gates_an_evaluated_shadow_action() -> None:
                         },
                         "retention_vs_reference": None,
                         "measurement_live_time_s": 160.0,
-                        "measurement_elapsed_time_s": 168.0,
                 },
             },
         },
@@ -436,7 +500,7 @@ def test_shadow_action_rejects_invalid_pose_or_pair_domain(
     with pytest.raises(ValueError):
         _shadow_action(
             raw,
-            score_field="pose_score_without_measurement_time_penalty",
+            score_field="pose_score",
         )
 
 

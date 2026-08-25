@@ -15,12 +15,11 @@ from planning.program_types import ShieldProgram
 
 SHIELD_VIEW_COUNT_SHADOW_HEALTH_GATES = (
     "particle_diversity_evidence_available_and_warning_absent",
-    "smc_soft_budget_respected",
+    "smc_rejuvenation_wall_time_respected",
     "rejuvenation_mixing_complete",
     "structural_mixing_complete",
     "posterior_predictive_innovation_available_and_passed",
     "cardinality_not_at_upper_boundary_for_every_isotope",
-    "no_newly_activated_isotope",
 )
 
 
@@ -537,16 +536,126 @@ def _compact_exact_shadow(
     return compact
 
 
-def _candidate_pose_count(shortlist: Mapping[str, object]) -> int:
-    """Convert legacy pose-program action counts to physical pose counts."""
-    action_count = int(shortlist.get("total_action_count", 0))
-    programs_per_pose = max(
-        int(shortlist.get("programs_per_shortlisted_pose", 1)),
-        1,
-    )
-    if action_count < 0 or action_count % programs_per_pose != 0:
-        raise ValueError("Planner action count cannot be converted to pose units.")
-    return int(action_count // programs_per_pose)
+def _required_nonnegative_integer(
+    values: Mapping[str, object],
+    key: str,
+    *,
+    name: str,
+) -> int:
+    """Return one required exact nonnegative integer audit field."""
+    value = values.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name}.{key} must be an integer.")
+    resolved = int(value)
+    if resolved < 0:
+        raise ValueError(f"{name}.{key} must be nonnegative.")
+    return resolved
+
+
+def _build_external_control_planner_audit(
+    *,
+    station_id: int,
+    belief_after_station_id: int | None,
+    result: DSSPPResult,
+    diagnostics: Mapping[str, object],
+) -> dict[str, object]:
+    """Build one exact audit record for a non-DSS external path decision."""
+    expected_diagnostics = {
+        "selection_mode",
+        "external_path_policy",
+        "external_shield_program_name",
+    }
+    actual_diagnostics = set(diagnostics)
+    if actual_diagnostics != expected_diagnostics:
+        raise ValueError(
+            "External-control planner diagnostics differ from the exact contract: "
+            f"missing={sorted(expected_diagnostics - actual_diagnostics)}, "
+            f"unknown={sorted(actual_diagnostics - expected_diagnostics)}."
+        )
+    if diagnostics["selection_mode"] != "external_control_path":
+        raise ValueError(
+            "External-control planner audit requires "
+            "selection_mode='external_control_path'."
+        )
+    path_policy = diagnostics["external_path_policy"]
+    if (
+        not isinstance(path_policy, str)
+        or not path_policy
+        or path_policy != path_policy.strip()
+    ):
+        raise ValueError("External path policy must be a canonical nonempty string.")
+    shield_program_name = diagnostics["external_shield_program_name"]
+    if shield_program_name != result.shield_program.name:
+        raise ValueError(
+            "External shield-program provenance differs from the selected program."
+        )
+    if (
+        not isinstance(shield_program_name, str)
+        or not shield_program_name
+        or shield_program_name != shield_program_name.strip()
+    ):
+        raise ValueError(
+            "External shield-program name must be a canonical nonempty string."
+        )
+    if result.shield_program.kind != "external_control":
+        raise ValueError(
+            "An external path decision requires an external-control shield program."
+        )
+    if result.sequence:
+        raise ValueError(
+            "An external path decision must not carry a synthetic DSS-PP sequence."
+        )
+    pose_index = result.next_pose_index
+    if isinstance(pose_index, bool) or not isinstance(
+        pose_index,
+        (int, np.integer),
+    ):
+        raise TypeError("External selected pose index must be an integer.")
+    if int(pose_index) < 0:
+        raise ValueError("External selected pose index must be nonnegative.")
+    pose = np.asarray(result.next_pose, dtype=np.float64)
+    if pose.shape != (3,) or np.any(~np.isfinite(pose)):
+        raise ValueError("External selected pose must be one finite 3-D point.")
+    score = result.score
+    if isinstance(score, (bool, np.bool_)) or not isinstance(
+        score,
+        (int, float, np.integer, np.floating),
+    ):
+        raise TypeError("External path-policy score must be a real number.")
+    path_score = float(score)
+    if not math.isfinite(path_score):
+        raise ValueError("External path-policy score must be finite.")
+    pair_ids = tuple(result.shield_program.pair_ids)
+    if (
+        not pair_ids
+        or any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            for value in pair_ids
+        )
+        or any(value < 0 or value >= 64 for value in pair_ids)
+    ):
+        raise ValueError(
+            "External shield-program pair IDs must be nonempty integers in [0, 63]."
+        )
+    return {
+        "schema_version": 3,
+        "station_id": int(station_id),
+        "belief_after_station_id": belief_after_station_id,
+        "selection_mode": "external_control_path",
+        "external_control_execution": {
+            "path_policy_name": path_policy,
+            "shield_program_name": shield_program_name,
+        },
+        "selected_pose_index": int(pose_index),
+        "selected_pose_xyz": [float(value) for value in pose],
+        "selected_program": {
+            "name": shield_program_name,
+            "kind": "external_control",
+            "pair_ids": [int(value) for value in pair_ids],
+        },
+        "selected_path_policy_score": path_score,
+    }
 
 
 def build_planner_audit(
@@ -576,6 +685,21 @@ def build_planner_audit(
             "A planned station must be audited against the immediately "
             "preceding PF belief station."
         )
+    diagnostics = _mapping(result.diagnostics, name="planner diagnostics")
+    selection_mode = diagnostics.get("selection_mode")
+    if selection_mode == "external_control_path":
+        if posterior_health is not None:
+            raise ValueError(
+                "External-control planning cannot carry DSS-PP shadow health."
+            )
+        return _build_external_control_planner_audit(
+            station_id=station_id,
+            belief_after_station_id=belief_after_station_id,
+            result=result,
+            diagnostics=diagnostics,
+        )
+    if selection_mode is not None:
+        raise ValueError(f"Unsupported planner selection_mode {selection_mode!r}.")
     validated_health = (
         None
         if posterior_health is None
@@ -584,7 +708,6 @@ def build_planner_audit(
             belief_after_station_id=belief_after_station_id,
         )
     )
-    diagnostics = _mapping(result.diagnostics, name="planner diagnostics")
     shortlist = _mapping(
         diagnostics.get("planning_eig_shortlist", {}),
         name="planning_eig_shortlist",
@@ -619,7 +742,7 @@ def build_planner_audit(
         "station_id": int(station_id),
         "belief_after_station_id": belief_after_station_id,
         "selected_pose_index": int(result.next_pose_index),
-        "selection_mode": str(diagnostics.get("selection_mode", "pf_dss_pp")),
+        "selection_mode": "pf_dss_pp",
         "selected_pose_xyz": [float(value) for value in result.next_pose],
         "selected_program": {
             "name": str(result.shield_program.name),
@@ -627,26 +750,31 @@ def build_planner_audit(
             "pair_ids": [int(value) for value in result.shield_program.pair_ids],
         },
         "selected_score": float(result.score),
-        "candidate_pose_count": _candidate_pose_count(shortlist),
-        "exact_pose_count": int(
-            shortlist.get(
-                "shortlisted_pose_count",
-                shortlist.get("exact_action_count", 0),
-            )
+        "candidate_pose_count": _required_nonnegative_integer(
+            shortlist,
+            "candidate_pose_count",
+            name="planning_eig_shortlist",
         ),
-        "proxy_subset_evaluation_count": int(
-            shortlist.get(
-                "proxy_subset_evaluation_count",
-                shortlist.get("proxy_action_count", 0),
-            )
+        "exact_pose_count": _required_nonnegative_integer(
+            shortlist,
+            "shortlisted_pose_count",
+            name="planning_eig_shortlist",
         ),
-        "exact_subset_evaluation_count": int(
-            shortlist.get(
-                "exact_subset_evaluation_count",
-                shortlist.get("exact_action_count", 0),
-            )
+        "proxy_subset_evaluation_count": _required_nonnegative_integer(
+            shortlist,
+            "proxy_subset_evaluation_count",
+            name="planning_eig_shortlist",
         ),
-        "planning_particle_count": int(diagnostics.get("planning_particle_count", 0)),
+        "exact_subset_evaluation_count": _required_nonnegative_integer(
+            shortlist,
+            "exact_subset_evaluation_count",
+            name="planning_eig_shortlist",
+        ),
+        "planning_particle_count": _required_nonnegative_integer(
+            diagnostics,
+            "planning_particle_count",
+            name="planner diagnostics",
+        ),
     }
     if selected_eig is not None:
         audit["selected_information_gain"] = selected_eig
@@ -654,9 +782,11 @@ def build_planner_audit(
         audit["information_gain_leader"] = information_leader
     if compact_ranked:
         audit["top_ranked_actions"] = compact_ranked
-    exact_eig_seed = shortlist.get("exact_eig_seed")
-    if exact_eig_seed is not None:
-        audit["exact_eig_seed"] = exact_eig_seed
+    audit["exact_eig_seed"] = _required_nonnegative_integer(
+        shortlist,
+        "exact_eig_seed",
+        name="planning_eig_shortlist",
+    )
     if shadow is not None:
         audit["shield_view_count_shadow"] = shadow
     return audit
@@ -774,16 +904,9 @@ def _resolved_shield_view_count_shadow(
     if raw is None:
         if posterior_health is None:
             return None
-        return {
-            "schema_version": 2,
-            "status": "not_evaluated",
-            "truth_used": False,
-            "actual_execution": {
-                "view_count": int(len(result.shield_program.pair_ids)),
-                "fixed_to_reference_view_count": None,
-            },
-            "health": health,
-        }
+        raise ValueError(
+            "Enabled shield view-count shadow omitted its planner diagnostics."
+        )
     payload = dict(_mapping(raw, name="shield_view_count_shadow"))
     if payload.get("status") != "evaluated":
         raise ValueError("A present shield view-count shadow must be evaluated.")
@@ -845,11 +968,11 @@ def _resolved_shield_view_count_shadow(
     )
     point_action = _shadow_action(
         raw_point_action,
-        score_field="pose_score_without_measurement_time_penalty",
+        score_field="pose_score",
     )
     lcb_action = _shadow_action(
         raw_lcb_action,
-        score_field="pose_score_without_measurement_time_penalty",
+        score_field="pose_score",
     )
     health_passed = bool(health.get("available")) and bool(health.get("passed"))
     health_action = lcb_action if health_passed else executed

@@ -77,7 +77,7 @@
   `mix9_multi_isotope_cardinality`:
   `proposed`, `baseline_passive_equal_time_no_shield`, `round_robin_shield`,
   and `eig_only_path`. The task uses `4 Cs-137 + 3 Co-60 + 2 Eu-154` sources.
-  Every variant uses `pure_pf_schema_version: 1`, the `pf_strict` profile, and
+  Every variant uses `pure_pf_schema_version: 2`, the `pf_strict` profile, and
   the same exact reversible-jump PF; variants change only shield and planning
   policy.
 - Generate a fresh environment/truth seed for every new RA-L comparison batch

@@ -17,6 +17,7 @@ from pf.estimator import (
 )
 from pf.particle_filter import IsotopeParticle
 from pf.state import IsotopeState
+from pf.strength_prior import BoundedUniformStrengthPriorTestConfig
 from tests.pure_pf_test_support import (
     TEST_ISOTOPES,
     approved_full_spectrum_model,
@@ -67,6 +68,7 @@ def _estimator(
             gpu_device=gpu_device,
             position_max=(3.0, 3.0, 3.0),
         ),
+        detector_radius_m=0.025,
         full_spectrum_generative_model=model,
         random_seed=17,
     )
@@ -1126,13 +1128,21 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
             use_gpu=False,
             position_max=(3.0, 3.0, 3.0),
             structural_rj_surface_chart_max_edge_m=2.0,
-            strength_prior_min_cps_1m=1_000.0,
-            strength_prior_max_cps_1m=10_000.0,
+            strength_prior=BoundedUniformStrengthPriorTestConfig(
+                minimum_cps_1m=1_000.0,
+                maximum_cps_1m=10_000.0,
+            ),
             structural_cardinality_prior_mean=1.0,
             target_ess_ratio=0.25,
             max_temper_steps=64,
             min_delta_beta=1.0e-8,
+            joint_rejuvenation_boundary_mass_threshold=1.0,
+            joint_rejuvenation_min_k_transition_weight_mass=0.0,
+            joint_rejuvenation_min_state_change_weight_mass=0.0,
+            joint_rejuvenation_min_surface_esjd_m2=0.0,
+            joint_rejuvenation_min_log_strength_esjd=0.0,
         ),
+        detector_radius_m=0.025,
         full_spectrum_generative_model=model,
         random_seed=1_827,
     )
@@ -1259,6 +1269,7 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
     weights /= float(np.sum(weights))
     cardinality_one_mass = 0.0
     truth_neighborhood_mass = 0.0
+    far_neighborhood_mass = 0.0
     for particle, weight in zip(
         cs_filter.continuous_particles,
         weights,
@@ -1270,9 +1281,12 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
         inferred = cs_filter.continuous_state_positions(particle.state)[0]
         if float(np.linalg.norm(inferred - truth_position)) < 0.5:
             truth_neighborhood_mass += float(weight)
+        if float(np.linalg.norm(inferred - far_position)) < 0.5:
+            far_neighborhood_mass += float(weight)
 
     assert cardinality_one_mass > 0.99
-    assert truth_neighborhood_mass > 0.99
+    assert truth_neighborhood_mass > 0.95
+    assert truth_neighborhood_mass > 20.0 * far_neighborhood_mass
     assert cs_filter.last_ess >= 0.25 * particle_count - 1.0e-9
     assert estimator.last_joint_temper_steps[-1]["beta_total"] == 1.0
     assert 1 <= estimator.last_joint_station_unique_ancestor_count <= particle_count

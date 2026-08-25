@@ -31,6 +31,7 @@ uv run rotating-shield-pf-live \
   --session-socket /run/user/1000/rotating-shield/run-001.sock \
   --runtime-root ../Rotating-shield-simulation-runtime \
   --config configs/pf/pf_strict_3d.json \
+  --seed 1 \
   --output-dir results/pf-live-run-001
 ```
 

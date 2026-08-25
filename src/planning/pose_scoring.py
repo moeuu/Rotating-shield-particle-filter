@@ -14,7 +14,6 @@ def compose_pose_scores(
     path_lengths_p: NDArray[np.float64],
     *,
     config: DSSPPConfig,
-    program_length: int,
     motion_times_p: NDArray[np.float64] | None = None,
     motion_time_components_p: tuple[
         NDArray[np.float64],
@@ -37,13 +36,6 @@ def compose_pose_scores(
         or np.any(paths < 0.0)
     ):
         raise ValueError("Pose score inputs contain invalid values.")
-    if (
-        isinstance(program_length, bool)
-        or not isinstance(program_length, (int, np.integer))
-        or int(program_length) <= 0
-    ):
-        raise ValueError("program_length must be a positive integer.")
-
     finite = np.isfinite(paths)
     if config.lambda_distance is None:
         distance_weight = estimate_lambda_cost(
@@ -55,8 +47,24 @@ def compose_pose_scores(
         distance_weight = float(config.lambda_distance)
 
     finite_paths = np.where(finite, paths, 0.0)
+    component_weights = np.asarray(
+        (
+            config.lambda_horizontal_time,
+            config.lambda_mast_vertical_time,
+            config.lambda_settling_time,
+        ),
+        dtype=np.float64,
+    )
+    if (motion_times_p is None) is not (motion_time_components_p is None):
+        raise ValueError(
+            "Motion totals and all three components must be supplied together."
+        )
     if motion_times_p is None:
-        motion_times = finite_paths / float(config.robot_speed_m_s)
+        if np.any(component_weights != 0.0):
+            raise ValueError(
+                "Nonzero motion weights require runtime-authored motion components."
+            )
+        motion_penalty = np.zeros_like(gains)
     else:
         motion_times = np.asarray(motion_times_p, dtype=np.float64).reshape(-1)
         if (
@@ -65,10 +73,7 @@ def compose_pose_scores(
             or np.any(motion_times < 0.0)
         ):
             raise ValueError("motion_times_p must be finite and align with poses.")
-
-    if motion_time_components_p is None:
-        motion_penalty = float(config.lambda_time) * motion_times
-    else:
+        assert motion_time_components_p is not None
         if len(motion_time_components_p) != 3:
             raise ValueError("Motion scoring requires exactly three components.")
         components = tuple(
@@ -84,40 +89,22 @@ def compose_pose_scores(
             raise ValueError(
                 "Motion-time components must be finite and align with poses."
             )
-        if not np.allclose(
+        if not np.array_equal(
             np.sum(np.vstack(components), axis=0),
             motion_times,
-            rtol=1.0e-12,
-            atol=1.0e-12,
         ):
             raise ValueError("Motion-time components must sum to motion times.")
-        weights = (
-            float(config.lambda_time)
-            if config.lambda_horizontal_time is None
-            else float(config.lambda_horizontal_time),
-            float(config.lambda_time)
-            if config.lambda_mast_vertical_time is None
-            else float(config.lambda_mast_vertical_time),
-            float(config.lambda_time)
-            if config.lambda_settling_time is None
-            else float(config.lambda_settling_time),
-        )
         motion_penalty = np.einsum(
             "cp,c->p",
             np.vstack(components),
-            np.asarray(weights, dtype=np.float64),
+            component_weights,
             optimize=True,
         )
-
-    measurement_penalty = float(config.lambda_time) * int(program_length) * (
-        float(config.rotation_overhead_s) + float(config.live_time_s)
-    )
     scores = (
         static
         + float(config.lambda_eig) * gains
         - float(distance_weight) * finite_paths
         - motion_penalty
-        - measurement_penalty
     )
     scores = np.where(finite, scores, -np.inf)
     if np.any(np.isnan(scores)) or np.any(np.isposinf(scores)):

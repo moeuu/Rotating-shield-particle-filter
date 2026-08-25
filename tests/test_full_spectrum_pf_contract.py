@@ -11,6 +11,7 @@ from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.full_spectrum import (
     validate_full_spectrum_model,
     validate_observed_spectrum,
+    validate_training_full_spectrum_model,
 )
 from pure_pf_test_support import approved_full_spectrum_model
 from spectrum.transport_spectral import GeometryConditionedSpectralModel
@@ -123,15 +124,46 @@ def test_observed_full_spectrum_accepts_unit_weight_integer_counts() -> None:
     assert validated.flags.c_contiguous
 
 
-def test_model_validator_accepts_training_ready_pre_holdout_model() -> None:
-    """The PF runtime gate must not require independent holdout approval."""
+def test_production_model_validator_rejects_pre_holdout_model() -> None:
+    """Production PF must reject a merely training-ready model."""
     candidate = _runtime_ready_candidate()
 
-    validated = validate_full_spectrum_model(candidate)
+    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+        validate_full_spectrum_model(candidate)
+
+    assert candidate.runtime_ready is True
+    assert candidate.production_ready is False
+
+
+def test_training_model_validator_is_explicitly_nonproduction() -> None:
+    """Training and holdout tools may use their separate validation API."""
+    candidate = _runtime_ready_candidate()
+
+    validated = validate_training_full_spectrum_model(candidate)
 
     assert validated is candidate
     assert candidate.runtime_ready is True
     assert candidate.production_ready is False
+
+
+def test_production_model_validator_rejects_truthy_production_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production approval must be the literal boolean value ``True``."""
+    model = approved_full_spectrum_model()
+    monkeypatch.setattr(
+        type(model),
+        "production_ready",
+        property(lambda _self: "true"),
+    )
+    monkeypatch.setattr(
+        type(model),
+        "require_production_ready",
+        lambda _self: None,
+    )
+
+    with pytest.raises(RuntimeError, match="production_ready=False"):
+        validate_full_spectrum_model(model)
 
 
 def test_model_validator_rejects_truthy_string_runtime_flag(

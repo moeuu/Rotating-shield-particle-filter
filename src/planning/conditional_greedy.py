@@ -2,8 +2,8 @@
 
 The shared runtime owns full-spectrum physics, predictive observations, and
 nuisance integration.  This module owns only information-theoretic subset
-search.  It therefore consumes an opaque prepared likelihood cache and never
-imports the legacy shield-program library or runtime implementation classes.
+search. It therefore consumes an opaque prepared likelihood cache and never
+imports predeclared shield-program libraries or runtime implementation classes.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class ConditionalGreedyStage:
 
 @dataclass(frozen=True)
 class ConditionalGreedyResult:
-    """Store greedy, one-swap, and optional incumbent-floor results."""
+    """Store greedy and one-swap shield-program search results."""
 
     pair_count: int
     program_length: int
@@ -67,11 +67,6 @@ class ConditionalGreedyResult:
     one_swap_added_pair_id_a: NDArray[np.int64]
     one_swap_best_program_pair_ids_al: NDArray[np.int64]
     one_swap_best_information_gain_a: NDArray[np.float64]
-    incumbent_candidate_count_per_action: int
-    incumbent_floor_applied_a: NDArray[np.bool_]
-    incumbent_best_index_a: NDArray[np.int64]
-    incumbent_best_program_pair_ids_al: NDArray[np.int64]
-    incumbent_best_information_gain_a: NDArray[np.float64]
 
 
 def conditional_greedy_candidate_count(
@@ -235,22 +230,15 @@ def select_conditional_greedy_programs(
     num_orientations: int,
     program_length: int,
     enable_one_swap: bool = True,
-    incumbent_subsets: object | None = None,
 ) -> ConditionalGreedyResult:
     """Select an EIG-only shield program independently for every pose.
 
     The only Python loop is the mathematically sequential greedy depth, whose
     full-simulation bound is the runtime ``program_length`` (normally eight).
     At each depth all remaining pair candidates for all poses are evaluated in
-    one GPU call.  The optional one-swap neighborhood and optional incumbent
-    floor are each evaluated in one additional GPU call.  No spatial, travel,
-    robot-turn, or shield-rotation score can enter this function.
-
-    ``incumbent_subsets`` is deliberately generic and optional.  Passing the
-    old 48-program library supplies a non-regression floor under the exact same
-    prepared Monte Carlo observations, while omitting it leaves a complete
-    legacy-free implementation.  Removing that compatibility policy therefore
-    requires no change to this module.
+    one GPU call.  The optional one-swap neighborhood is evaluated in one
+    additional GPU call.  No spatial, travel, robot-turn, shield-rotation, or
+    retired program-library score can enter this function.
     """
     import torch
 
@@ -417,59 +405,6 @@ def select_conditional_greedy_programs(
     elif not enable_one_swap:
         swap_candidate_count = 0
 
-    incumbent_candidate_count = 0
-    incumbent_floor_applied = torch.zeros_like(swap_applied)
-    incumbent_best_index = torch.full_like(swap_removed_position, -1)
-    incumbent_best_information_gain = torch.full_like(
-        current_information_gain,
-        torch.nan,
-    )
-    incumbent_best_program = torch.full_like(current_program, -1)
-    if incumbent_subsets is not None:
-        incumbents = _validated_incumbent_subsets(
-            incumbent_subsets,
-            action_count=action_count,
-            pair_count=pair_count,
-            program_length=length,
-            device=device,
-        )
-        incumbent_candidate_count = int(incumbents.shape[1])
-        incumbent_gains = _evaluate_subset_information_gain(
-            cache,
-            incumbents,
-            weights_n,
-        )
-        best_incumbent_index = torch.argmax(incumbent_gains, dim=1)
-        incumbent_best_information_gain = torch.gather(
-            incumbent_gains,
-            1,
-            best_incumbent_index[:, None],
-        )[:, 0]
-        incumbent_best_program = torch.gather(
-            incumbents,
-            1,
-            best_incumbent_index[:, None, None].expand(-1, 1, length),
-        )[:, 0]
-        incumbent_floor_applied = (
-            incumbent_best_information_gain > current_information_gain
-        )
-        current_program = torch.where(
-            incumbent_floor_applied[:, None],
-            incumbent_best_program,
-            current_program,
-        )
-        current_information_gain = torch.where(
-            incumbent_floor_applied,
-            incumbent_best_information_gain,
-            current_information_gain,
-        )
-        incumbent_best_index = best_incumbent_index
-        selection_code = torch.where(
-            incumbent_floor_applied,
-            torch.full_like(selection_code, 2),
-            selection_code,
-        )
-
     stage_pairs = torch.stack(selected_pair_stages, dim=0).detach().cpu().numpy()
     stage_gains = torch.stack(selected_gain_stages, dim=0).detach().cpu().numpy()
     stage_runners = torch.stack(runner_up_stages, dim=0).detach().cpu().numpy()
@@ -494,7 +429,7 @@ def select_conditional_greedy_programs(
         )
         for index in range(length)
     )
-    source_names = ("greedy", "one_swap", "incumbent")
+    source_names = ("greedy", "one_swap")
     source_indices = np.asarray(
         selection_code.detach().cpu().numpy(),
         dtype=np.int64,
@@ -519,15 +454,6 @@ def select_conditional_greedy_programs(
         one_swap_best_program_pair_ids_al=_numpy_int64(swap_best_program),
         one_swap_best_information_gain_a=_numpy_float64(
             swap_best_information_gain
-        ),
-        incumbent_candidate_count_per_action=incumbent_candidate_count,
-        incumbent_floor_applied_a=_numpy_bool(incumbent_floor_applied),
-        incumbent_best_index_a=_numpy_int64(incumbent_best_index),
-        incumbent_best_program_pair_ids_al=_numpy_int64(
-            incumbent_best_program
-        ),
-        incumbent_best_information_gain_a=_numpy_float64(
-            incumbent_best_information_gain
         ),
     )
 
@@ -606,56 +532,6 @@ def _one_swap_candidate_subsets(
     return flattened_candidates, flattened_additions
 
 
-def _validated_incumbent_subsets(
-    incumbent_subsets: object,
-    *,
-    action_count: int,
-    pair_count: int,
-    program_length: int,
-    device: object,
-) -> object:
-    """Return validated shared or per-action incumbent subsets on device."""
-    import torch
-
-    subsets = torch.as_tensor(incumbent_subsets, device=device)
-    integer_dtypes = {
-        torch.uint8,
-        torch.int8,
-        torch.int16,
-        torch.int32,
-        torch.int64,
-    }
-    if subsets.dtype not in integer_dtypes:
-        raise ValueError("incumbent_subsets must contain integer pair IDs.")
-    if subsets.ndim == 2:
-        if tuple(subsets.shape[1:]) != (program_length,):
-            raise ValueError(
-                "Shared incumbent subsets must be shaped (candidate, view)."
-            )
-        subsets = subsets[None, :, :].expand(action_count, -1, -1)
-    elif subsets.ndim == 3:
-        if tuple(subsets.shape[:1] + subsets.shape[2:]) != (
-            action_count,
-            program_length,
-        ):
-            raise ValueError(
-                "Per-action incumbent subsets must be shaped (A, C, K)."
-            )
-    else:
-        raise ValueError("incumbent_subsets must be shaped (C, K) or (A, C, K).")
-    if int(subsets.shape[1]) <= 0:
-        raise ValueError("incumbent_subsets must contain at least one candidate.")
-    subsets = subsets.to(dtype=torch.long).contiguous()
-    invalid_range = torch.any((subsets < 0) | (subsets >= int(pair_count)))
-    sorted_subsets = torch.sort(subsets, dim=2).values
-    duplicate = torch.any(sorted_subsets[:, :, 1:] == sorted_subsets[:, :, :-1])
-    if bool((invalid_range | duplicate).item()):
-        raise ValueError(
-            "Every incumbent subset must contain unique in-range pair IDs."
-        )
-    return subsets
-
-
 def _normalised_weights_torch(
     weights_n: NDArray[np.float64] | Sequence[float],
     *,
@@ -686,11 +562,8 @@ def _cache_action_count(cache: PreparedSubsetLikelihoodCache) -> int:
 
 
 def _cache_pair_count(cache: PreparedSubsetLikelihoodCache) -> int:
-    """Return the validated runtime view count with a compatibility alias."""
-    raw_count = getattr(cache, "view_count", None)
-    if raw_count is None:
-        raw_count = getattr(cache, "pair_count", None)
-    return _positive_integer(raw_count, name="view_count")
+    """Return the validated runtime view count."""
+    return _positive_integer(getattr(cache, "view_count"), name="view_count")
 
 
 def _positive_integer(value: object, *, name: str) -> int:

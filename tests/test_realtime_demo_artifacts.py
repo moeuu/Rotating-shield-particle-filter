@@ -5,63 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 
-import numpy as np
 import pytest
 
-from visualization.artifacts import (
-    prepare_final_visualization_frame,
-    publish_final_cui_split_views,
-)
-from visualization.realtime_viz import PFFrame
-
-
-def test_prepare_final_visualization_frame_preserves_travel_segment() -> None:
-    """Final posterior projection must not connect station poses directly."""
-    saved_segment = np.asarray(
-        [
-            [1.0, 1.0, 0.5],
-            [1.0, 2.0, 0.5],
-            [2.0, 2.0, 0.5],
-        ],
-        dtype=float,
-    )
-    frame = PFFrame(
-        step_index=0,
-        time=30.0,
-        robot_position=np.asarray([2.0, 2.0, 0.5], dtype=float),
-        robot_orientation=None,
-        RFe=np.asarray([1.0, 0.0, 0.0], dtype=float),
-        RPb=np.asarray([0.0, 1.0, 0.0], dtype=float),
-        duration=30.0,
-        particle_positions={"Cs-137": np.zeros((0, 3), dtype=float)},
-        particle_weights={"Cs-137": np.zeros(0, dtype=float)},
-        estimated_sources={"Cs-137": np.zeros((0, 3), dtype=float)},
-        estimated_strengths={"Cs-137": np.zeros(0, dtype=float)},
-        path_waypoints_xyz=saved_segment.copy(),
-    )
-
-    final_frame = prepare_final_visualization_frame(
-        frame,
-        step_index=7,
-        elapsed_s=240.0,
-        final_estimates={
-            "Cs-137": (
-                np.asarray([[4.0, 5.0, 0.5]], dtype=float),
-                np.asarray([600_000.0], dtype=float),
-            )
-        },
-    )
-
-    assert final_frame is not frame
-    np.testing.assert_array_equal(final_frame.path_waypoints_xyz, saved_segment)
-    np.testing.assert_array_equal(
-        final_frame.estimated_sources["Cs-137"],
-        np.asarray([[4.0, 5.0, 0.5]], dtype=float),
-    )
-    assert final_frame.step_index == 7
-    assert final_frame.time == 240.0
-    assert frame.step_index == 0
-    assert frame.time == 30.0
+from visualization.artifacts import publish_final_cui_split_views
 
 
 def test_publish_final_cui_split_views_copies_all_images(
@@ -105,32 +51,6 @@ def test_publish_final_cui_split_views_copies_all_images(
     assert final_spectrum.read_bytes() == b"spectrum-png"
 
 
-def test_publish_final_cui_split_views_keeps_three_view_compatibility(
-    tmp_path: Path,
-) -> None:
-    """Legacy callers may continue publishing the original three views."""
-    sources = tuple(tmp_path / "cui" / f"source-{index}.png" for index in range(3))
-    targets = tuple(tmp_path / "results" / f"target-{index}.png" for index in range(3))
-    for index, source in enumerate(sources):
-        source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_bytes(f"source-{index}".encode())
-
-    publish_final_cui_split_views(
-        source_robot_path=sources[0],
-        source_pf_path=sources[1],
-        source_pf_labeled_path=sources[2],
-        final_robot_path=targets[0],
-        final_pf_path=targets[1],
-        final_pf_labeled_path=targets[2],
-    )
-
-    assert [target.read_bytes() for target in targets] == [
-        b"source-0",
-        b"source-1",
-        b"source-2",
-    ]
-
-
 def test_publish_final_cui_split_views_rejects_missing_source(
     tmp_path: Path,
 ) -> None:
@@ -140,12 +60,16 @@ def test_publish_final_cui_split_views_rejects_missing_source(
 
     with pytest.raises(RuntimeError, match="latest_pf_3d.png"):
         publish_final_cui_split_views(
+            source_overview_path=tmp_path / "latest_experiment_overview.png",
             source_robot_path=latest_robot,
             source_pf_path=tmp_path / "latest_pf_3d.png",
             source_pf_labeled_path=tmp_path / "latest_pf_3d_labeled.png",
+            source_spectrum_path=tmp_path / "latest_spectrum.png",
+            final_overview_path=tmp_path / "result_overview.png",
             final_robot_path=tmp_path / "result_robot_2d.png",
             final_pf_path=tmp_path / "result_pf_3d.png",
             final_pf_labeled_path=tmp_path / "result_pf_3d_labeled.png",
+            final_spectrum_path=tmp_path / "result_spectrum.png",
         )
 
     assert not (tmp_path / "result_robot_2d.png").exists()
@@ -158,8 +82,8 @@ def test_publish_final_cui_split_views_stages_every_copy_before_replacing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A copy failure must preserve every previously published final image."""
-    sources = tuple(tmp_path / "cui" / f"source-{index}.png" for index in range(3))
-    targets = tuple(tmp_path / "results" / f"target-{index}.png" for index in range(3))
+    sources = tuple(tmp_path / "cui" / f"source-{index}.png" for index in range(5))
+    targets = tuple(tmp_path / "results" / f"target-{index}.png" for index in range(5))
     for index, path in enumerate(sources):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(f"new-{index}".encode())
@@ -182,17 +106,23 @@ def test_publish_final_cui_split_views_stages_every_copy_before_replacing(
 
     with pytest.raises(OSError, match="synthetic copy failure"):
         publish_final_cui_split_views(
-            source_robot_path=sources[0],
-            source_pf_path=sources[1],
-            source_pf_labeled_path=sources[2],
-            final_robot_path=targets[0],
-            final_pf_path=targets[1],
-            final_pf_labeled_path=targets[2],
+            source_overview_path=sources[0],
+            source_robot_path=sources[1],
+            source_pf_path=sources[2],
+            source_pf_labeled_path=sources[3],
+            source_spectrum_path=sources[4],
+            final_overview_path=targets[0],
+            final_robot_path=targets[1],
+            final_pf_path=targets[2],
+            final_pf_labeled_path=targets[3],
+            final_spectrum_path=targets[4],
         )
 
     assert [path.read_bytes() for path in targets] == [
         b"old-0",
         b"old-1",
         b"old-2",
+        b"old-3",
+        b"old-4",
     ]
     assert not tuple((tmp_path / "results").glob(".*.tmp-*"))

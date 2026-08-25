@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 from scipy.integrate import quad
 
-from pf.strength_prior import StrengthPrior
+from pf.strength_prior import (
+    STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY,
+    BoundedUniformStrengthPriorTestConfig,
+    ShiftedGammaStrengthPriorConfig,
+    StrengthPrior,
+    resolve_strength_prior_config,
+)
 
 
 def test_strength_prior_log_prob_is_normalized() -> None:
@@ -51,13 +57,11 @@ def test_strength_prior_sampling_matches_uniform_mean() -> None:
 
 def test_shifted_gamma_strength_prior_is_normalized_and_unbounded() -> None:
     """The proper upper-unbounded prior must integrate to one."""
-    prior = StrengthPrior(
-        minimum=2.0,
-        maximum=8.0,
-        family="shifted_gamma",
-        gamma_shape=2.0,
-        gamma_scale=3.0,
-    )
+    prior = ShiftedGammaStrengthPriorConfig(
+        minimum_cps_1m=2.0,
+        shape=2.0,
+        scale_cps_1m=3.0,
+    ).build()
     integral, error = quad(
         lambda value: float(np.exp(prior.log_prob(value))),
         prior.minimum,
@@ -71,23 +75,62 @@ def test_shifted_gamma_strength_prior_is_normalized_and_unbounded() -> None:
     assert prior.support_maximum == np.inf
     assert prior.in_support(80.0)
     assert np.isfinite(prior.log_prob(80.0))
-    assert prior.finite_upper_quantile() > prior.maximum
+    assert prior.finite_upper_quantile() == pytest.approx(prior.maximum)
 
 
 def test_shifted_gamma_strength_prior_sampling_matches_mean() -> None:
     """Batched shifted-gamma draws should preserve their analytic mean."""
-    prior = StrengthPrior(
-        minimum=2.0,
-        maximum=8.0,
-        family="shifted_gamma",
-        gamma_shape=2.0,
-        gamma_scale=3.0,
-    )
+    prior = ShiftedGammaStrengthPriorConfig(
+        minimum_cps_1m=2.0,
+        shape=2.0,
+        scale_cps_1m=3.0,
+    ).build()
     samples = prior.sample(100_000, rng=np.random.default_rng(412))
 
     assert np.all(samples >= prior.minimum)
     assert np.any(samples > prior.maximum)
     assert float(np.mean(samples)) == pytest.approx(prior.mean, abs=0.04)
+
+
+def test_shifted_gamma_config_has_no_maximum_and_fixes_proposal_quantile() -> None:
+    """Production prior input must not carry an ignored finite maximum."""
+    config = ShiftedGammaStrengthPriorConfig(
+        minimum_cps_1m=2.0,
+        shape=2.0,
+        scale_cps_1m=3.0,
+    )
+    prior = config.build()
+
+    assert not hasattr(config, "maximum_cps_1m")
+    assert prior.support_maximum == np.inf
+    assert prior.maximum == pytest.approx(
+        prior.finite_upper_quantile(
+            STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY
+        )
+    )
+    with pytest.raises(ValueError, match="unknown=.*maximum_cps_1m"):
+        resolve_strength_prior_config(
+            {
+                "kind": "shifted_gamma",
+                "minimum_cps_1m": 2.0,
+                "shape": 2.0,
+                "scale_cps_1m": 3.0,
+                "maximum_cps_1m": 8.0,
+            }
+        )
+
+
+def test_bounded_uniform_prior_requires_explicit_test_only_config() -> None:
+    """Finite support must be selected through the named test-only type."""
+    config = BoundedUniformStrengthPriorTestConfig(
+        minimum_cps_1m=2.0,
+        maximum_cps_1m=8.0,
+    )
+    prior = config.build()
+
+    assert config.kind == "bounded_uniform_test_only"
+    assert prior.family == "bounded_uniform"
+    assert prior.support_maximum == 8.0
 
 
 def test_strength_prior_sampling_is_seed_reproducible() -> None:

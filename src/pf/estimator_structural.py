@@ -9,18 +9,33 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-from pf.estimator_compat import runtime_estimator_export
 from pf.estimator_types import JointStationObservation
 from pf.particle_filter import IsotopeParticleFilter, StructuralGeometryBatch
-from pf.strength_prior import StrengthPrior
+from pf.strength_prior import STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY
 
 if TYPE_CHECKING:
     import torch
 
 
-def _runtime_facade_constants(*names: str) -> tuple[object, ...]:
-    """Resolve compatibility constants from the public estimator facade."""
-    return tuple(runtime_estimator_export(name) for name in names)
+JOINT_STRENGTH_GRID_AUTOTUNE_MAX_BATCH_SIZE = 1024
+JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES = 2_147_483_648
+JOINT_STRUCTURAL_UNIT_CACHE_ACTIVE_STATE_MULTIPLIER = 2
+JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE = np.dtype(
+    [
+        ("chart", "<i8"),
+        ("x", "<f8"),
+        ("y", "<f8"),
+        ("z", "<f8"),
+    ]
+)
+JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES = (
+    "total_kernel",
+    "uncollided_kernel",
+    "tau_fe",
+    "tau_pb",
+    "tau_obstacle",
+    "distance_m",
+)
 
 
 class EstimatorStructuralProposalMixin:
@@ -415,14 +430,10 @@ class EstimatorStructuralProposalMixin:
         self,
     ) -> tuple[NDArray[np.float64], float]:
         """Return a finite design grid without truncating prior support."""
-        prior = StrengthPrior(
-            minimum=float(self.pf_config.strength_prior_min_cps_1m),
-            maximum=float(self.pf_config.strength_prior_max_cps_1m),
-            family=str(self.pf_config.strength_prior_family),
-            gamma_shape=float(self.pf_config.strength_prior_gamma_shape),
-            gamma_scale=float(self.pf_config.strength_prior_gamma_scale_cps_1m),
+        prior = self.pf_config.build_strength_prior()
+        upper = prior.finite_upper_quantile(
+            STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY
         )
-        upper = prior.finite_upper_quantile(0.995)
         grid = np.linspace(
             prior.minimum,
             upper,
@@ -430,52 +441,6 @@ class EstimatorStructuralProposalMixin:
             dtype=np.float64,
         )
         return grid, float(prior.mean)
-
-    def full_spectrum_isotope_detection_score_grids(
-        self,
-        records: Sequence[Sequence[object]],
-        *,
-        pose_idx: int,
-        generative_contract_hash_sha256: str,
-    ) -> dict[str, NDArray[np.float64]]:
-        """Return truth-free chart-by-strength detection scores for one station."""
-        if not records:
-            raise ValueError(
-                "An isotope-detection station must contain at least one view."
-            )
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        self._assert_joint_particle_alignment()
-        station = self._joint_station_from_spectrum_records(
-            records,
-            pose_idx=pose_idx,
-            station_sequence_id=0,
-            generative_contract_hash_sha256=(generative_contract_hash_sha256),
-        )
-        strength_grid, _ = self._strength_birth_proposal_grid()
-        result: dict[str, NDArray[np.float64]] = {}
-        for isotope in self.joint_isotope_order():
-            filt = self.filters[isotope]
-            atlas = filt._structural_rj_surface_atlas
-            if atlas is None:
-                raise RuntimeError(
-                    "Full-spectrum isotope detection requires a surface atlas."
-                )
-            centers = np.asarray(
-                atlas.geometry.centers_xyz,
-                dtype=np.float64,
-            )
-            result[isotope] = np.asarray(
-                self._joint_station_birth_proposal_score_grid(
-                    filt=filt,
-                    station=station,
-                    chart_centers_xyz=centers,
-                    strength_grid=strength_grid,
-                    reference_mean_vb=None,
-                ),
-                dtype=np.float64,
-            ).copy()
-        return result
 
     def _joint_structural_proposal_evaluator(
         self,
@@ -717,17 +682,6 @@ class EstimatorStructuralProposalMixin:
         Missing positions are evaluated together by the batched CPU/GPU
         transport kernel, or consumed from an exact multi-station prefetch.
         """
-        (
-            JOINT_STRUCTURAL_UNIT_CACHE_ACTIVE_STATE_MULTIPLIER,
-            JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE,
-            JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES,
-            JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES,
-        ) = _runtime_facade_constants(
-            "JOINT_STRUCTURAL_UNIT_CACHE_ACTIVE_STATE_MULTIPLIER",
-            "JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE",
-            "JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES",
-            "JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES",
-        )
         positions = np.asarray(positions_s3, dtype=np.float64).reshape(-1, 3)
         raw_chart_ids = np.asarray(chart_ids_s)
         line_indices = np.asarray(
@@ -1000,9 +954,6 @@ class EstimatorStructuralProposalMixin:
         protected_signature: str,
     ) -> None:
         """Bound all station shards for one isotope with shard-level LRU."""
-        (JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES,) = _runtime_facade_constants(
-            "JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES",
-        )
         isotope_cache = self._joint_structural_unit_transport_cache[str(isotope)]
         total_bytes = sum(
             self._joint_structural_unit_cache_shard_bytes(cache)
@@ -1068,13 +1019,6 @@ class EstimatorStructuralProposalMixin:
         positive_line_indices: NDArray[np.int64],
     ) -> tuple[NDArray[np.float64], ...]:
         """Return exact transport with one fused call for station-cache misses."""
-        (
-            JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE,
-            JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES,
-        ) = _runtime_facade_constants(
-            "JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE",
-            "JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES",
-        )
         positions = np.asarray(positions_s3, dtype=np.float64).reshape(-1, 3)
         raw_chart_ids = np.asarray(chart_ids_s)
         chart_ids = np.asarray(raw_chart_ids, dtype=np.int64).reshape(-1)
@@ -2067,11 +2011,6 @@ class EstimatorStructuralProposalMixin:
         transport once, broadcasts it over the strength-grid axis, and scores
         the resulting exact joint targets in bounded CPU/GPU batches.
         """
-        (JOINT_STRENGTH_GRID_AUTOTUNE_MAX_BATCH_SIZE,) = (
-            _runtime_facade_constants(
-                "JOINT_STRENGTH_GRID_AUTOTUNE_MAX_BATCH_SIZE",
-            )
-        )
         stations = self._active_joint_station_history
         cache = self._joint_structural_transport_cache
         if stations is None or cache is None:

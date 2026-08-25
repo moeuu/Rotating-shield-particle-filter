@@ -1112,10 +1112,8 @@ def _is_dss_eig_memory_error(error: BaseException) -> bool:
 
 def _release_dss_gpu_cache() -> None:
     """Release unused Torch cache blocks after a recoverable DSS OOM."""
-    try:
-        import torch
-    except ImportError:
-        return
+    import torch
+
     if bool(torch.cuda.is_available()):
         torch.cuda.empty_cache()
 
@@ -1131,12 +1129,8 @@ def _dss_accelerator_memory_snapshot(
             "enabled": False,
             "device": "cpu",
         }
-    try:
-        import torch
-    except ImportError as error:
-        raise RuntimeError(
-            "GPU DSS EIG was requested but Torch is unavailable."
-        ) from error
+    import torch
+
     device = torch.device(str(gpu_device))
     if device.type != "cuda":
         return {

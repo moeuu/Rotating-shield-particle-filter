@@ -20,43 +20,38 @@ from runtime.adaptive_client import (
     AdaptiveStepRequest,
     candidate_index_for_pose,
 )
-from runtime.cui import CUIRoute, CUI_URL_MESSAGE_PREFIX, cui_route_from_records
-from runtime.cui_components import CUITruthDisplayMode
-from runtime.artifacts import DurableJSONLWriter
+from runtime.cui import (
+    CUIRoute,
+    CUIServerHandle,
+    CUI_URL_MESSAGE_PREFIX,
+    cui_route_from_records,
+)
+from runtime.artifacts import (
+    AtomicBundlePublisher,
+    DurableJSONLWriter,
+    atomic_write_bytes,
+)
 from runtime.experiment_profiles import (
     AcquisitionContract,
     acquisition_contract_from_environment,
 )
 from runtime.measurement_log import (
     MeasurementLogRecord,
-    MeasurementLogView,
     load_measurement_log,
 )
-from runtime.provenance import canonical_json_bytes
-
-from pf.atomic_io import atomic_write_bytes
-from pf.control_policy import PFControlPolicy, validate_control_policy
+from pf.control_policy import validate_control_policy
 from pf.cui_runtime import (
-    ensure_cui_view_server,
     resolve_cui_split_view_enabled,
+    start_cui_view_server,
 )
-from pf.configuration import load_pf_config
-from pf.isotope_gate import FullSpectrumIsotopeGate
 from pf.live_session import (
-    _compact_pf_diagnostics,
-    assimilate_persisted_station,
-    bind_published_measurement_log,
-    build_live_estimator,
+    PFLiveSession,
+    _strict_live_artifact_json_bytes,
     live_posterior_summary,
-    measurement_record_to_station_input,
-    register_persisted_station_pose,
+    load_production_live_pf_config,
 )
-from pf.live_resume import reconstruct_live_resume_state
-from pf.runtime_defaults import (
-    DEFAULT_CUI_SPLIT_VIEW_DIR,
-    DEFAULT_CUI_SPLIT_VIEW_HOST,
-    DEFAULT_CUI_SPLIT_VIEW_PORT,
-)
+from pf.gpu_utils import preflight_compute_backend
+from pf.profiles import production_compute_backend_values
 from planning.audit import (
     PlannerAuditWriter,
     SHIELD_VIEW_COUNT_SHADOW_HEALTH_GATES,
@@ -73,9 +68,6 @@ from visualization.realtime_viz import (
     build_frame_from_pf,
 )
 
-ROOT = Path(__file__).resolve().parents[2]
-
-
 def _exact_integer(value: object, *, name: str, minimum: int) -> int:
     """Return one exact integer satisfying an inclusive lower bound."""
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -91,7 +83,6 @@ class PFControlBudget:
     max_measurements: int
     views_per_station: int
     live_time_s: float
-    adaptive_stop_enabled: bool
     stop_assessment_start_station: int
     stop_required_consecutive_stations: int
     runtime_refinement_top_k: int
@@ -101,53 +92,44 @@ class PFControlBudget:
     def from_runtime_contract(
         cls,
         settings: Mapping[str, Any],
-        planner: DSSPPConfig,
         acquisition_contract: AcquisitionContract,
     ) -> "PFControlBudget":
         """Resolve runtime limits without accepting estimator-side overrides."""
         configured_views = int(acquisition_contract.views_per_station)
-        if configured_views != int(planner.program_length):
-            raise ValueError(
-                "Runtime views_per_station and planner program_length must agree."
-            )
         if acquisition_contract.max_measurements < configured_views:
             raise ValueError(
                 "Runtime max_measurements must accommodate one complete station."
             )
-        adaptive_stop = settings.get("adaptive_stop", {})
+        adaptive_stop = settings["adaptive_stop"]
         if not isinstance(adaptive_stop, Mapping):
             raise TypeError("adaptive_stop must be an object.")
-        adaptive_stop_enabled = adaptive_stop.get("enabled", False)
-        if not isinstance(adaptive_stop_enabled, bool):
-            raise TypeError("adaptive_stop.enabled must be a boolean.")
         assessment_start = _exact_integer(
-            adaptive_stop.get("assessment_start_station", 10),
+            adaptive_stop["assessment_start_station"],
             name="adaptive_stop.assessment_start_station",
             minimum=1,
         )
         required_consecutive = _exact_integer(
-            adaptive_stop.get("required_consecutive_stations", 3),
+            adaptive_stop["required_consecutive_stations"],
             name="adaptive_stop.required_consecutive_stations",
             minimum=1,
         )
         earliest_stop_station = assessment_start + required_consecutive - 1
-        if adaptive_stop_enabled and earliest_stop_station > int(
-            acquisition_contract.max_stations
-        ):
+        reachable_station_count = min(
+            int(acquisition_contract.max_stations),
+            int(acquisition_contract.max_measurements) // configured_views,
+        )
+        if earliest_stop_station > reachable_station_count:
             raise ValueError(
                 "adaptive_stop cannot accumulate its required consecutive "
-                "stations before the runtime max_stations limit."
+                "stations before the runtime station/measurement budgets."
             )
         refinement = _exact_integer(
-            settings.get("runtime_candidate_refinement_top_k", 0),
+            settings["runtime_candidate_refinement_top_k"],
             name="runtime_candidate_refinement_top_k",
             minimum=0,
         )
         audit_top_k = _exact_integer(
-            settings.get(
-                "planner_audit_top_k",
-                max(10, int(planner.diagnostic_ranked_node_limit)),
-            ),
+            settings["planner_audit_top_k"],
             name="planner_audit_top_k",
             minimum=0,
         )
@@ -156,7 +138,6 @@ class PFControlBudget:
             max_measurements=acquisition_contract.max_measurements,
             views_per_station=configured_views,
             live_time_s=acquisition_contract.live_time_s,
-            adaptive_stop_enabled=adaptive_stop_enabled,
             stop_assessment_start_station=assessment_start,
             stop_required_consecutive_stations=required_consecutive,
             runtime_refinement_top_k=refinement,
@@ -171,6 +152,27 @@ class PFControlBudget:
             + self.stop_required_consecutive_stations
             - 1
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PFExternalFixedPathPlanner:
+    """Carry only the runtime view count needed by an external fixed path."""
+
+    program_length: int
+    shield_view_count_shadow_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        """Reject anything other than an explicit planner-disabled contract."""
+        _exact_integer(
+            self.program_length,
+            name="PFExternalFixedPathPlanner.program_length",
+            minimum=1,
+        )
+        if self.shield_view_count_shadow_enabled is not False:
+            raise ValueError("External fixed-path shadow planning must be disabled.")
+
+
+PFPlannerConfig = DSSPPConfig | PFExternalFixedPathPlanner
 
 
 @dataclass(slots=True)
@@ -194,8 +196,7 @@ class AdaptiveStopTracker:
                 "Adaptive-stop stations must be assessed once in consecutive order."
             )
         self.last_station_count = count
-        enabled = bool(self.budget.adaptive_stop_enabled)
-        eligible = bool(enabled and count >= self.budget.stop_assessment_start_station)
+        eligible = bool(count >= self.budget.stop_assessment_start_station)
         diagnostics: dict[str, Any] | None = None
         instantaneous_ready: bool | None = None
         if eligible:
@@ -221,7 +222,6 @@ class AdaptiveStopTracker:
             >= self.budget.stop_required_consecutive_stations
         )
         return {
-            "enabled": enabled,
             "assessed": eligible,
             "assessment_start_station": (self.budget.stop_assessment_start_station),
             "required_consecutive_stations": (
@@ -304,27 +304,23 @@ def _bounds(context: object) -> tuple[np.ndarray, np.ndarray]:
     return np.zeros(3, dtype=np.float64), upper
 
 
-def _height_bounds(context: object) -> tuple[float, float] | None:
-    """Return runtime-owned detector height limits when declared."""
-    environment = getattr(context, "environment")
-    raw = environment.get("adaptive_measurement", {})
-    if not isinstance(raw, Mapping):
-        raise TypeError("environment.adaptive_measurement must be a mapping.")
-    if "detector_height_min_m" not in raw or "detector_height_max_m" not in raw:
-        return None
-    return (
-        float(raw["detector_height_min_m"]),
-        float(raw["detector_height_max_m"]),
-    )
+def _require_candidate_anchor(
+    candidates: AdaptiveCandidateSnapshot,
+    current_pose: np.ndarray,
+) -> None:
+    """Require runtime motion costs to be anchored to the controller pose."""
+    pose = np.asarray(current_pose, dtype=np.float64)
+    if pose.shape != (3,) or np.any(~np.isfinite(pose)):
+        raise ValueError("Controller current pose must be one finite XYZ row.")
+    if tuple(candidates.current_pose_xyz) != tuple(pose.tolist()):
+        raise RuntimeError(
+            "Runtime candidate motion costs are anchored to another current pose."
+        )
 
 
-def _strict_cui_bool(
-    settings: Mapping[str, object],
-    key: str,
-    default: bool,
-) -> bool:
+def _strict_cui_bool(settings: Mapping[str, object], key: str) -> bool:
     """Return one boolean CUI setting without accepting truthy substitutes."""
-    value = settings.get(key, default)
+    value = settings[key]
     if not isinstance(value, bool):
         raise TypeError(f"{key} must be a boolean.")
     return value
@@ -332,7 +328,7 @@ def _strict_cui_bool(
 
 def _strict_cui_host(settings: Mapping[str, object]) -> str:
     """Return the configured network bind host for the CUI server."""
-    value = settings.get("cui_split_view_host", DEFAULT_CUI_SPLIT_VIEW_HOST)
+    value = settings["cui_split_view_host"]
     if not isinstance(value, str) or not value.strip():
         raise TypeError("cui_split_view_host must be a nonempty string.")
     return value
@@ -340,7 +336,7 @@ def _strict_cui_host(settings: Mapping[str, object]) -> str:
 
 def _strict_cui_port(settings: Mapping[str, object]) -> int:
     """Return a valid TCP port for the CUI server."""
-    value = settings.get("cui_split_view_port", DEFAULT_CUI_SPLIT_VIEW_PORT)
+    value = settings["cui_split_view_port"]
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("cui_split_view_port must be an integer.")
     if value < 1 or value > 65535:
@@ -348,91 +344,120 @@ def _strict_cui_port(settings: Mapping[str, object]) -> int:
     return int(value)
 
 
-def _cui_truth_display_mode(settings: Mapping[str, object]) -> str:
-    """Require a truth-free CUI inside the estimator-owned controller."""
-    value = settings.get("cui_truth_display_mode", "hidden")
-    if not isinstance(value, str):
-        raise TypeError("cui_truth_display_mode must be a string.")
-    try:
-        mode = CUITruthDisplayMode(value.strip())
-    except ValueError as exc:
-        raise ValueError(
-            "cui_truth_display_mode must be hidden, evaluation_live, or post_run."
-        ) from exc
-    if mode is not CUITruthDisplayMode.HIDDEN:
-        raise ValueError(
-            "PF closed-loop CUI must keep truth hidden; truth overlays belong to "
-            "a separate post-estimation evaluator."
+def _strict_cui_public_host(settings: Mapping[str, object]) -> str:
+    """Return the explicit browser-facing host for the CUI server."""
+    value = settings["cui_split_view_public_host"]
+    if not isinstance(value, str) or not value or value == "auto":
+        raise TypeError(
+            "cui_split_view_public_host must be an explicit host string."
         )
-    return mode.value
+    return value
 
 
-def _cui_output_dir(settings: Mapping[str, object]) -> Path:
-    """Resolve the shared browser-served CUI output directory."""
-    raw = settings.get("cui_split_view_dir", DEFAULT_CUI_SPLIT_VIEW_DIR)
-    output_dir = Path(str(raw)).expanduser()
-    if not output_dir.is_absolute():
-        output_dir = ROOT / output_dir
-    return output_dir.resolve()
+def _bind_cui_view_server(
+    settings: Mapping[str, object],
+    *,
+    output_dir: Path,
+) -> CUIServerHandle | None:
+    """Bind the configured CUI port before any runtime session is opened."""
+    enabled = resolve_cui_split_view_enabled(settings)
+    serve = _strict_cui_bool(settings, "cui_split_view_serve")
+    if serve and not enabled:
+        raise ValueError("cui_split_view_serve requires cui_split_view=true.")
+    if not serve:
+        network_fields = (
+            "cui_split_view_host",
+            "cui_split_view_port",
+            "cui_split_view_public_host",
+        )
+        non_inert = [name for name in network_fields if settings[name] is not None]
+        if non_inert:
+            raise ValueError(
+                "Non-serving CUI requires null network fields: "
+                f"{non_inert}."
+            )
+        if not enabled and (
+            _strict_cui_bool(settings, "cui_split_view_save_step_history")
+            or settings["cui_split_view_max_particles_per_isotope"] is not None
+        ):
+            raise ValueError(
+                "Disabled CUI requires inert renderer-only settings."
+            )
+        return None
+    return start_cui_view_server(
+        output_dir,
+        host=_strict_cui_host(settings),
+        port=_strict_cui_port(settings),
+        public_host=_strict_cui_public_host(settings),
+    )
 
 
 def _start_cui_split_view(
     settings: Mapping[str, object],
     *,
+    output_dir: Path,
     isotopes: Sequence[str],
     room_bounds: tuple[np.ndarray, np.ndarray],
     obstacle_grid: ObstacleGrid | None,
+    server_handle: CUIServerHandle | None,
     output_hook: Any,
 ) -> AsyncCUISplitPFVisualizer | None:
-    """Start the truth-free asynchronous CUI renderer for one PF run."""
-    if not resolve_cui_split_view_enabled(settings, save_outputs=True):
+    """Start the renderer after context resolution and a successful server bind."""
+    if not resolve_cui_split_view_enabled(settings):
+        if server_handle is not None:
+            raise RuntimeError("Disabled CUI unexpectedly owns a server handle.")
         return None
     lower, upper = room_bounds
-    output_dir = _cui_output_dir(settings)
-    visualizer = AsyncCUISplitPFVisualizer(
-        isotopes=[str(isotope) for isotope in isotopes],
-        output_dir=output_dir,
-        world_bounds=(
-            float(lower[0]),
-            float(upper[0]),
-            float(lower[1]),
-            float(upper[1]),
-            float(lower[2]),
-            float(upper[2]),
-        ),
-        obstacle_grid=obstacle_grid,
-        max_particles_per_isotope=settings.get(
-            "cui_split_view_max_particles_per_isotope"
-        ),
-        save_step_history=_strict_cui_bool(
-            settings,
-            "cui_split_view_save_step_history",
-            False,
-        ),
-    )
-    output_hook(
-        "CUI split visualization enabled: "
-        f"{visualizer.index_path.as_posix()} "
-        "(latest_experiment_overview.png, latest_robot_2d.png, "
-        "latest_pf_3d.png, latest_pf_3d_labeled.png, latest_spectrum.png)"
-    )
-    output_hook("CUI split visualization rendering: async process")
-    if _strict_cui_bool(settings, "cui_split_view_serve", True):
-        public_host_raw = settings.get("cui_split_view_public_host")
-        if public_host_raw is not None and (
-            not isinstance(public_host_raw, str) or not public_host_raw.strip()
-        ):
-            raise TypeError(
-                "cui_split_view_public_host must be a nonempty string when set."
+    serve = _strict_cui_bool(settings, "cui_split_view_serve")
+    if serve:
+        if server_handle is None or not isinstance(server_handle.url, str):
+            raise RuntimeError(
+                "Enabled CUI serving requires its pre-bound owning handle."
             )
-        split_url = ensure_cui_view_server(
-            output_dir,
-            host=_strict_cui_host(settings),
-            port=_strict_cui_port(settings),
-            public_host=(None if public_host_raw is None else str(public_host_raw)),
+    elif server_handle is not None:
+        raise RuntimeError("Non-serving CUI unexpectedly owns a server handle.")
+    visualizer: AsyncCUISplitPFVisualizer | None = None
+    try:
+        visualizer = AsyncCUISplitPFVisualizer(
+            isotopes=[str(isotope) for isotope in isotopes],
+            output_dir=output_dir,
+            world_bounds=(
+                float(lower[0]),
+                float(upper[0]),
+                float(lower[1]),
+                float(upper[1]),
+                float(lower[2]),
+                float(upper[2]),
+            ),
+            obstacle_grid=obstacle_grid,
+            max_particles_per_isotope=settings[
+                "cui_split_view_max_particles_per_isotope"
+            ],
+            save_step_history=_strict_cui_bool(
+                settings,
+                "cui_split_view_save_step_history",
+            ),
         )
-        output_hook(f"{CUI_URL_MESSAGE_PREFIX} {split_url}")
-    return visualizer
+        output_hook(
+            "CUI split visualization enabled: "
+            f"{visualizer.index_path.as_posix()} "
+            "(latest_experiment_overview.png, latest_robot_2d.png, "
+            "latest_pf_3d.png, latest_pf_3d_labeled.png, latest_spectrum.png)"
+        )
+        output_hook("CUI split visualization rendering: async process")
+        if server_handle is not None:
+            output_hook(f"{CUI_URL_MESSAGE_PREFIX} {server_handle.url}")
+        return visualizer
+    except BaseException as exc:
+        if visualizer is not None:
+            try:
+                visualizer.close()
+            except BaseException as close_exc:
+                exc.add_note(
+                    "Secondary CUI renderer cleanup failure: "
+                    f"{type(close_exc).__name__}: {close_exc}"
+                )
+        raise
 
 
 def _publish_cui_frame(
@@ -458,39 +483,32 @@ def _publish_cui_frame(
     spectrum_counts = np.asarray(record.spectrum_counts, dtype=np.int64)
     if energy_edges.ndim != 1 or energy_edges.size != spectrum_counts.size + 1:
         raise ValueError("Adaptive record has incompatible spectrum bin edges.")
-    normals = np.asarray(estimator.normals, dtype=np.float64)
-    fe_index = int(record.fe_orientation_index)
-    pb_index = int(record.pb_orientation_index)
-    if (
-        normals.ndim != 2
-        or normals.shape[1] != 3
-        or fe_index < 0
-        or pb_index < 0
-        or fe_index >= normals.shape[0]
-        or pb_index >= normals.shape[0]
-    ):
-        raise ValueError("Adaptive record shield orientation is out of range.")
     frame = build_frame_from_pf(
         estimator,
         int(record.step_id),
         float(elapsed_time_s),
         detector_position=np.asarray(record.detector_pose_xyz, dtype=np.float64),
-        live_time_s=float(record.live_time_s),
-        RFe=normals[fe_index],
-        RPb=normals[pb_index],
         spectrum_energy_keV=0.5 * (energy_edges[:-1] + energy_edges[1:]),
         spectrum_counts=spectrum_counts,
     )
     if route.travel_path_segments_xyz:
         frame.path_waypoints_xyz = route.travel_path_segments_xyz[-1].copy()
     frame.cui_route = route
-    frame.record_measurement = bool(record_measurement)
     visualizer.update(frame)
 
 
 def _particle_diagnostics(estimator: object) -> dict[str, object]:
     """Extract particle-adequacy evidence without simulation truth."""
     raw = estimator.step_diagnostics(top_k=0, include_estimates=False)
+    if not isinstance(raw, Mapping) or not raw:
+        raise TypeError("PF step diagnostics must contain isotope mappings.")
+    expected_isotopes = tuple(str(value) for value in estimator.isotopes)
+    if tuple(str(value) for value in raw) != expected_isotopes:
+        raise ValueError(
+            "PF step diagnostics isotope order differs from the estimator."
+        )
+    if any(not isinstance(values, Mapping) for values in raw.values()):
+        raise TypeError("Every PF isotope diagnostic row must be a mapping.")
     keep = (
         "particle_count",
         "current_ess",
@@ -502,7 +520,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         "cumulative_unique_ancestor_count",
         "r_probability_by_count",
         "transition_weight_mass",
-        "joint_smc_soft_budget_exceeded",
+        "joint_smc_wall_time_limit_exceeded",
         "joint_rejuvenation_mixing_incomplete",
         "joint_structural_mixing_incomplete",
     )
@@ -510,6 +528,16 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         str(isotope): {key: values.get(key) for key in keep}
         for isotope, values in raw.items()
     }
+    sampler_fields = (
+        "joint_smc_wall_time_limit_exceeded",
+        "joint_rejuvenation_mixing_incomplete",
+        "joint_structural_mixing_incomplete",
+    )
+    for isotope, values in retained.items():
+        if any(type(values[name]) is not bool for name in sampler_fields):
+            raise TypeError(
+                f"PF isotope {isotope} omits Boolean sampler-health evidence."
+            )
     isotopes = {}
     for isotope, values in retained.items():
         transition_mass = values["transition_weight_mass"]
@@ -585,8 +613,8 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         key: value for key, value in evidence.items() if value is not None
     }
     sampler_health = {
-        "smc_soft_budget_respected": all(
-            values.get("joint_smc_soft_budget_exceeded") is False
+        "smc_rejuvenation_wall_time_respected": all(
+            values.get("joint_smc_wall_time_limit_exceeded") is False
             for values in retained.values()
         ),
         "rejuvenation_mixing_complete": all(
@@ -605,12 +633,35 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
     }
 
 
+def _require_plannable_sampler_health(
+    particle_adequacy: Mapping[str, object],
+) -> None:
+    """Abort before planning when the latest PF transition is incomplete."""
+    raw_health = particle_adequacy.get("sampler_health")
+    expected = {
+        "smc_rejuvenation_wall_time_respected",
+        "rejuvenation_mixing_complete",
+        "structural_mixing_complete",
+    }
+    if not isinstance(raw_health, Mapping) or set(raw_health) != expected:
+        raise TypeError(
+            "PF particle diagnostics must contain the exact sampler-health gates."
+        )
+    if any(type(raw_health[name]) is not bool for name in expected):
+        raise TypeError("PF sampler-health gates must be booleans.")
+    failed = sorted(name for name in expected if raw_health[name] is not True)
+    if failed:
+        raise RuntimeError(
+            "PF sampler health forbids further live planning: "
+            f"{failed}."
+        )
+
+
 def _shield_view_count_shadow_health(
     *,
     belief_after_station_id: int,
     particle_adequacy: Mapping[str, object],
     posterior_convergence: Mapping[str, object],
-    detected_isotope_gate: Mapping[str, object] | None,
 ) -> dict[str, object]:
     """Return truth-free hard gates for audit-only view-count shortening."""
     if (
@@ -631,6 +682,32 @@ def _shield_view_count_shadow_health(
         raise TypeError("posterior innovation must be a mapping.")
     if not isinstance(isotope_rows, Mapping):
         raise TypeError("posterior isotope health must be a mapping.")
+    expected_sampler_keys = {
+        "smc_rejuvenation_wall_time_respected",
+        "rejuvenation_mixing_complete",
+        "structural_mixing_complete",
+    }
+    if set(sampler_health) != expected_sampler_keys or any(
+        type(sampler_health[name]) is not bool for name in expected_sampler_keys
+    ):
+        raise TypeError(
+            "posterior sampler_health must contain exactly three Boolean gates."
+        )
+    if set(innovation) != {"available", "passed"} or any(
+        type(innovation[name]) is not bool for name in ("available", "passed")
+    ):
+        raise TypeError(
+            "posterior innovation must contain exactly available/passed booleans."
+        )
+    particle_isotopes = particle_adequacy.get("isotopes")
+    if not isinstance(particle_isotopes, Mapping) or not particle_isotopes:
+        raise TypeError("particle adequacy requires nonempty isotope rows.")
+    if tuple(str(key) for key in isotope_rows) != tuple(
+        str(key) for key in particle_isotopes
+    ):
+        raise ValueError(
+            "posterior and particle-adequacy isotope rows must match exactly."
+        )
 
     reasons: list[str] = []
     diversity_evidence_available = bool(
@@ -643,7 +720,7 @@ def _shield_view_count_shadow_health(
     elif bool(assessment.get("diversity_warning", True)):
         reasons.append("particle_diversity_warning")
     for name in (
-        "smc_soft_budget_respected",
+        "smc_rejuvenation_wall_time_respected",
         "rejuvenation_mixing_complete",
         "structural_mixing_complete",
     ):
@@ -661,19 +738,21 @@ def _shield_view_count_shadow_health(
             raise TypeError("posterior isotope health rows must be mappings.")
         gates = raw_row.get("gates")
         if not isinstance(gates, Mapping):
-            reasons.append(f"cardinality_boundary_health_unavailable:{isotope}")
-            continue
-        if gates.get("cardinality_not_at_upper_boundary") is not True:
+            raise TypeError("posterior isotope gates must be mappings.")
+        expected_isotope_gates = {
+            "cardinality_not_at_upper_boundary",
+            "surface_path_concentration",
+        }
+        if set(gates) != expected_isotope_gates or any(
+            type(gates[name]) is not bool for name in expected_isotope_gates
+        ):
+            raise TypeError(
+                "posterior isotope health must contain the exact Boolean "
+                "cardinality boundary gate."
+            )
+        if gates["cardinality_not_at_upper_boundary"] is not True:
             boundary_isotopes.append(str(isotope))
             reasons.append(f"cardinality_upper_boundary:{isotope}")
-    newly_active: list[str] = []
-    if detected_isotope_gate is not None:
-        raw_new = detected_isotope_gate.get("newly_active_isotopes", [])
-        if not isinstance(raw_new, Sequence) or isinstance(raw_new, (str, bytes)):
-            raise TypeError("newly_active_isotopes must be a sequence.")
-        newly_active = sorted(str(value) for value in raw_new)
-        if newly_active:
-            reasons.append("newly_activated_isotope_posterior")
     return {
         "policy_schema_version": 1,
         "hard_gate_contract": list(SHIELD_VIEW_COUNT_SHADOW_HEALTH_GATES),
@@ -696,18 +775,16 @@ def _shield_view_count_shadow_health(
         "posterior_predictive_innovation_available": bool(innovation_available),
         "posterior_predictive_innovation_passed": bool(innovation_passed),
         "cardinality_upper_boundary_isotopes": boundary_isotopes,
-        "newly_active_isotopes": newly_active,
     }
 
 
 def _current_shadow_health(
     estimator: object,
     *,
-    planner: DSSPPConfig,
+    planner: PFPlannerConfig,
     belief_after_station_id: int,
     particle_adequacy: Mapping[str, object],
     adaptive_stop_status: Mapping[str, object] | None,
-    detected_isotope_gate: Mapping[str, object] | None,
 ) -> dict[str, object] | None:
     """Evaluate view-count health only when the shadow policy is enabled."""
     if not bool(planner.shield_view_count_shadow_enabled):
@@ -726,7 +803,6 @@ def _current_shadow_health(
         belief_after_station_id=int(belief_after_station_id),
         particle_adequacy=particle_adequacy,
         posterior_convergence=convergence,
-        detected_isotope_gate=detected_isotope_gate,
     )
 
 
@@ -743,8 +819,8 @@ def _live_posterior_summary(estimator: object) -> dict[str, object]:
 
 def _external_shield_program(
     estimator: object,
-    planner: DSSPPConfig,
-    control_policy: PFControlPolicy | None,
+    planner: PFPlannerConfig,
+    control_policy: object | None,
     *,
     pose_index: int,
     current_pair_id: int | None,
@@ -762,8 +838,8 @@ def _external_shield_program(
 
 def _bootstrap_program(
     estimator: object,
-    planner: DSSPPConfig,
-    control_policy: PFControlPolicy | None,
+    planner: PFPlannerConfig,
+    control_policy: object | None,
 ) -> ShieldProgram:
     """Choose an injected or balanced first-station shield program."""
     baseline = _external_shield_program(
@@ -781,36 +857,6 @@ def _bootstrap_program(
     )
 
 
-def _register_station_pose(
-    estimator: object,
-    records: Sequence[object],
-    *,
-    station_id: int,
-) -> int:
-    """Register one single-pose station and return its estimator pose index."""
-    return register_persisted_station_pose(
-        estimator,
-        records,
-        station_id=station_id,
-    )
-
-
-def _assimilate_station(
-    estimator: object,
-    records: Sequence[object],
-    *,
-    station_id: int,
-    contract_hash: str,
-) -> None:
-    """Assimilate one durably staged, single-pose station block."""
-    assimilate_persisted_station(
-        estimator,
-        records,
-        station_id=station_id,
-        generative_contract_hash_sha256=contract_hash,
-    )
-
-
 def _plan(
     estimator: object,
     candidates: AdaptiveCandidateSnapshot,
@@ -819,12 +865,10 @@ def _plan(
     visited_poses: Sequence[np.ndarray],
     obstacle_grid: ObstacleGrid | None,
     room_bounds: tuple[np.ndarray, np.ndarray],
-    height_bounds: tuple[float, float] | None,
-    planner: DSSPPConfig,
+    planner: PFPlannerConfig,
     rng: np.random.Generator,
-    settings: Mapping[str, Any],
     station_index: int,
-    control_policy: PFControlPolicy | None,
+    control_policy: object | None,
 ) -> DSSPPResult:
     """Rank runtime actions under the standard or injected control policy."""
     candidate_poses = np.asarray(
@@ -865,11 +909,12 @@ def _plan(
             diagnostics={
                 "selection_mode": "external_control_path",
                 "external_path_policy": baseline_path.policy_name,
-                "planning_particle_count": 0,
-                "ranked_nodes": [],
-                "component_leaders": {},
-                "planning_eig_shortlist": {},
+                "external_shield_program_name": baseline_program.name,
             },
+        )
+    if isinstance(planner, PFExternalFixedPathPlanner):
+        raise RuntimeError(
+            "External fixed-path planner contract did not select an external path."
         )
     active_planner = planner
     if baseline_program is not None:
@@ -881,11 +926,9 @@ def _plan(
         estimator,
         candidate_poses,
         current_pose,
-        current_pair_id=candidates.current_pair_id,
         visited_poses_xyz=np.asarray(visited_poses, dtype=np.float64),
         map_api=obstacle_grid,
         bounds_xyz=room_bounds,
-        continuous_height_bounds_m=height_bounds,
         config=active_planner,
         rng=rng,
         candidate_motion_times_s=np.asarray(
@@ -895,33 +938,90 @@ def _plan(
         candidate_horizontal_travel_times_s=np.asarray(
             candidates.horizontal_travel_times_s,
             dtype=np.float64,
-        )
-        if candidates.has_motion_time_components
-        else None,
+        ),
         candidate_mast_vertical_times_s=np.asarray(
             candidates.mast_vertical_times_s,
             dtype=np.float64,
-        )
-        if candidates.has_motion_time_components
-        else None,
+        ),
         candidate_settling_times_s=np.asarray(
             candidates.settling_times_s,
             dtype=np.float64,
-        )
-        if candidates.has_motion_time_components
-        else None,
+        ),
     )
 
 
 def _planner_rng(seed: int, station_index: int) -> np.random.Generator:
-    """Return a station-addressed planner stream that supports exact resume."""
+    """Return the deterministic planner stream for one fresh-run station."""
     return np.random.default_rng(
         np.random.SeedSequence([int(seed), 0xD55A11, int(station_index)])
     )
 
 
+def _require_refinement_seed_capacity(
+    settings: Mapping[str, object],
+    candidates: AdaptiveCandidateSnapshot,
+) -> None:
+    """Reject a live refinement request that the handshake cannot satisfy."""
+    top_k = _exact_integer(
+        settings["runtime_candidate_refinement_top_k"],
+        name="runtime_candidate_refinement_top_k",
+        minimum=0,
+    )
+    candidate_count = len(candidates.candidate_poses_xyz)
+    if top_k > candidate_count:
+        raise ValueError(
+            "runtime_candidate_refinement_top_k exceeds the authenticated "
+            f"candidate count ({top_k} > {candidate_count})."
+        )
+
+
+def _require_native_planner_settings(settings: Mapping[str, object]) -> None:
+    """Reject fixed-path sentinels when native DSS-PP must execute."""
+    if not isinstance(settings.get("dss_pp"), Mapping):
+        raise ValueError(
+            "Native DSS-PP control requires a complete dss_pp configuration."
+        )
+    planning_samples = settings.get("planning_eig_samples")
+    if (
+        isinstance(planning_samples, bool)
+        or not isinstance(planning_samples, int)
+        or planning_samples < 2
+    ):
+        raise ValueError(
+            "Native DSS-PP control requires planning_eig_samples>=2."
+        )
+
+
+def _planner_audit_for_mode(
+    *,
+    station_id: int,
+    result: DSSPPResult,
+    planner: PFPlannerConfig,
+    top_k: int,
+    belief_after_station_id: int,
+    posterior_health: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Keep inactive DSS-only audit inputs out of external fixed-path records."""
+    if isinstance(planner, PFExternalFixedPathPlanner):
+        if posterior_health is not None:
+            raise ValueError("External fixed-path audit cannot carry shadow health.")
+        return build_planner_audit(
+            station_id=station_id,
+            result=result,
+            belief_after_station_id=belief_after_station_id,
+        )
+    return build_planner_audit(
+        station_id=station_id,
+        result=result,
+        top_k=top_k,
+        belief_after_station_id=belief_after_station_id,
+        posterior_health=posterior_health,
+    )
+
+
 def _refine_and_replan(
     client: AdaptiveRuntimeClient,
+    live_session: PFLiveSession,
     estimator: object,
     candidates: AdaptiveCandidateSnapshot,
     initial: DSSPPResult,
@@ -931,32 +1031,48 @@ def _refine_and_replan(
     visited_poses: Sequence[np.ndarray],
     obstacle_grid: ObstacleGrid | None,
     room_bounds: tuple[np.ndarray, np.ndarray],
-    height_bounds: tuple[float, float] | None,
-    planner: DSSPPConfig,
+    planner: PFPlannerConfig,
     rng: np.random.Generator,
-    settings: Mapping[str, Any],
     station_index: int,
-    control_policy: PFControlPolicy | None,
+    control_policy: object | None,
 ) -> tuple[AdaptiveCandidateSnapshot, DSSPPResult]:
     """Optionally request runtime-owned local poses and rerank them exactly."""
     if refinement_top_k <= 0 or (
         control_policy is not None and control_policy.has_fixed_path
     ):
         return candidates, initial
-    ranked = initial.diagnostics.get("ranked_nodes", [])
+    if not isinstance(initial.diagnostics, Mapping):
+        raise TypeError("Candidate refinement requires planner diagnostics.")
+    if "ranked_nodes" not in initial.diagnostics:
+        raise ValueError(
+            "Candidate refinement requires canonical ranked_nodes diagnostics."
+        )
+    ranked = initial.diagnostics["ranked_nodes"]
+    if not isinstance(ranked, Sequence) or isinstance(ranked, (str, bytes)):
+        raise TypeError("Candidate refinement ranked_nodes must be a sequence.")
+    if not ranked:
+        raise ValueError(
+            "Candidate refinement is enabled but ranked_nodes is empty."
+        )
     seed_indices: list[int] = []
     for node in ranked:
         if not isinstance(node, Mapping):
-            continue
+            raise TypeError("Every candidate-refinement ranked node must be a mapping.")
+        if "pose_xyz" not in node:
+            raise ValueError("Candidate-refinement ranked node omits pose_xyz.")
         index = candidate_index_for_pose(candidates, node["pose_xyz"])
         if index not in seed_indices:
             seed_indices.append(index)
         if len(seed_indices) >= refinement_top_k:
             break
-    if not seed_indices:
-        return candidates, initial
+    if len(seed_indices) != refinement_top_k:
+        raise ValueError(
+            "Candidate refinement could not resolve exactly the requested "
+            f"{refinement_top_k} distinct runtime-authored seed poses."
+        )
     event = client.refine_candidates(AdaptiveRefineRequest.from_indices(seed_indices))
     refined = event.candidates
+    live_session.receive_refined_candidates(refined)
     result = _plan(
         estimator,
         refined,
@@ -964,52 +1080,29 @@ def _refine_and_replan(
         visited_poses=visited_poses,
         obstacle_grid=obstacle_grid,
         room_bounds=room_bounds,
-        height_bounds=height_bounds,
         planner=planner,
         rng=rng,
-        settings=settings,
         station_index=station_index,
         control_policy=control_policy,
     )
     return refined, result
 
 
-def _write_final_outputs(
-    output_dir: Path,
+def _completion_diagnostics_extensions(
     *,
-    estimator: object,
-    result: PFClosedLoopResult,
+    stop_reason: str,
     budget: PFControlBudget,
     adaptive_stop_status: Mapping[str, object] | None,
-) -> None:
-    """Publish the final posterior and controller provenance atomically per file."""
-    posterior = estimator.posterior_snapshot().to_dict()
-    diagnostics = _compact_pf_diagnostics(estimator)
-    stop: dict[str, object] = {"reason": result.stop_reason}
+) -> dict[str, object]:
+    """Return controller diagnostics sealed with the canonical PF state."""
+    stop: dict[str, object] = {"reason": stop_reason}
     compact_stop = _compact_adaptive_stop_status(adaptive_stop_status)
     if compact_stop is not None:
         stop["adaptive"] = compact_stop
-    diagnostics["stop"] = stop
-    diagnostics["control_budget"] = asdict(budget)
-    detected_isotope_gate = getattr(
-        estimator,
-        "detected_isotope_gate_diagnostics",
-        None,
-    )
-    if detected_isotope_gate is not None:
-        diagnostics["detected_isotope_gate"] = detected_isotope_gate
-    atomic_write_bytes(
-        output_dir / "pf_posterior.json",
-        canonical_json_bytes(posterior),
-    )
-    atomic_write_bytes(
-        output_dir / "pf_diagnostics.json",
-        canonical_json_bytes(diagnostics),
-    )
-    atomic_write_bytes(
-        output_dir / "closed_loop_result.json",
-        canonical_json_bytes(result.to_dict()),
-    )
+    return {
+        "stop": stop,
+        "control_budget": asdict(budget),
+    }
 
 
 def run_pf_closed_loop(
@@ -1018,30 +1111,58 @@ def run_pf_closed_loop(
     runtime_root: str | Path,
     pf_config_path: str | Path,
     output_dir: str | Path,
+    seed: int,
     profile: str = "pf_strict",
-    seed: int = 0,
-    control_policy: PFControlPolicy | None = None,
+    control_policy: object | None = None,
     output_hook: Any = print,
 ) -> PFClosedLoopResult:
     """Run a PF closed loop over an opaque truth-free runtime session socket."""
-    validate_control_policy(control_policy)
-    settings, config_hash = load_pf_config(pf_config_path)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("Production PF seed must be a nonnegative integer.")
+    if seed < 0:
+        raise ValueError("Production PF seed must be a nonnegative integer.")
+    control_policy_provenance = validate_control_policy(control_policy)
+    validated_config = load_production_live_pf_config(
+        pf_config_path,
+        profile=profile,
+    )
+    settings = validated_config.settings()
+    if control_policy is not None:
+        control_policy.validate_pf_settings(settings)
+    else:
+        _require_native_planner_settings(settings)
+    compute_backend = production_compute_backend_values(settings)
+    preflight_compute_backend(
+        use_gpu=compute_backend["use_gpu"],
+        gpu_device=compute_backend["gpu_device"],
+        gpu_dtype="float64",
+    )
     target = Path(output_dir).expanduser().resolve()
     if target.exists():
         raise FileExistsError(f"Refusing to replace PF output {target}.")
-    target.mkdir(parents=True)
+    bundle_publisher = AtomicBundlePublisher(target, policy="create")
+    staging_dir: Path | None = bundle_publisher.staging_path.resolve()
     resources = ExitStack()
     client: AdaptiveRuntimeClient | None = None
-    estimator = None
+    live_session: PFLiveSession | None = None
+    estimator: object | None = None
+    cui_server_handle: CUIServerHandle | None = None
     cui_split_viz: AsyncCUISplitPFVisualizer | None = None
-    completed_result: PFClosedLoopResult | None = None
-    cui_frame_rendered = False
+    cui_frame_enqueued = False
     cui_route_records: list[MeasurementLogRecord] = []
+    stage_suffix = staging_dir.name.rsplit(".bundle-", maxsplit=1)[-1]
+    failure_receipt_path = target.with_name(
+        f".{target.name}.failure-{stage_suffix}.json"
+    )
     try:
-        planner_writer = PlannerAuditWriter(target / "planner_audit.jsonl")
+        cui_server_handle = _bind_cui_view_server(
+            settings,
+            output_dir=staging_dir / "cui_live",
+        )
+        planner_writer = PlannerAuditWriter(staging_dir / "planner_audit.jsonl")
         resources.callback(planner_writer.close)
         controller_writer = DurableJSONLWriter(
-            target / "pf_station_trace.jsonl",
+            staging_dir / "pf_station_trace.jsonl",
             mode=0o644,
         )
         resources.callback(controller_writer.close)
@@ -1055,70 +1176,46 @@ def run_pf_closed_loop(
         context = ready.context
         candidates = ready.candidates
         bootstrap = ready.bootstrap
+        _require_refinement_seed_capacity(settings, candidates)
         acquisition_contract = acquisition_contract_from_environment(
             context.environment
         )
-        planner = dss_config_from_pf_settings(
-            settings,
-            acquisition_contract=acquisition_contract,
+        live_session = PFLiveSession(
+            context,
+            validated_config,
+            initial_candidates=candidates,
+            profile=profile,
+            seed=seed,
+            runtime_root=runtime_root,
+            control_policy_provenance=control_policy_provenance,
         )
+        estimator = live_session.estimator
+        if control_policy is not None and control_policy.has_fixed_path:
+            planner: PFPlannerConfig = PFExternalFixedPathPlanner(
+                program_length=int(acquisition_contract.views_per_station),
+            )
+        else:
+            planner = dss_config_from_pf_settings(
+                settings,
+                acquisition_contract=acquisition_contract,
+                detector_aperture_samples=int(estimator.detector_aperture_samples),
+            )
         budget = PFControlBudget.from_runtime_contract(
             settings,
-            planner,
             acquisition_contract,
         )
         stop_tracker = AdaptiveStopTracker(budget)
         latest_adaptive_stop_status: dict[str, object] | None = None
-        detected_only_raw = settings.get(
-            "pf_detected_isotopes_only",
-            settings.get("detected_isotopes_only", False),
-        )
-        if not isinstance(detected_only_raw, bool):
-            raise TypeError("pf_detected_isotopes_only must be a boolean.")
-        if schema_version == 2 and detected_only_raw:
-            raise ValueError(
-                "Adaptive resume currently requires pf_detected_isotopes_only=false."
-            )
-        initial_estimator_settings = dict(settings)
-        if detected_only_raw:
-            initial_estimator_settings["num_particles"] = 1
-            initial_estimator_settings["variable_cardinality"] = False
-            initial_estimator_settings["init_num_sources"] = (0, 0)
-        estimator = build_live_estimator(
-            context,
-            initial_estimator_settings,
-            profile=profile,
-            seed=seed,
-            runtime_root=runtime_root,
-            config_hash=config_hash,
-        )
-        isotope_gate = (
-            FullSpectrumIsotopeGate(
-                candidate_isotopes=tuple(context.isotopes),
-                false_activation_probability=float(
-                    settings.get(
-                        "detected_isotope_false_activation_probability",
-                        1.0e-3,
-                    )
-                ),
-            )
-            if detected_only_raw
-            else None
-        )
-        detection_estimator = estimator if isotope_gate is not None else None
         obstacle_grid = _obstacle_grid(context)
         room_bounds = _bounds(context)
-        height_bounds = _height_bounds(context)
-        _cui_truth_display_mode(settings)
         cui_split_viz = _start_cui_split_view(
             settings,
+            output_dir=staging_dir / "cui_live",
             isotopes=getattr(context, "isotopes"),
             room_bounds=room_bounds,
             obstacle_grid=obstacle_grid,
+            server_handle=cui_server_handle,
             output_hook=output_hook,
-        )
-        contract_hash = str(
-            context.runtime_config["full_spectrum_contract_hash_sha256"]
         )
         current_program = _bootstrap_program(
             estimator,
@@ -1126,8 +1223,6 @@ def run_pf_closed_loop(
             control_policy,
         )
         visited: list[np.ndarray]
-        station_history: list[tuple[MeasurementLogRecord, ...]]
-        gate_diagnostics: dict[str, object] | None = None
         stop_reason = "maximum_station_budget"
         continue_acquisition = True
         if schema_version == 1:
@@ -1136,13 +1231,21 @@ def run_pf_closed_loop(
                 candidates.candidate_poses_xyz[bootstrap.candidate_index],
                 dtype=np.float64,
             )
+            _require_candidate_anchor(candidates, current_pose)
             visited = []
-            record_count = 0
+            record_count = live_session.record_count
             cui_elapsed_time_s = 0.0
             station_id = 0
-            station_history = []
-            planner_writer.append(
-                build_bootstrap_planner_audit(
+            if isinstance(planner, PFExternalFixedPathPlanner):
+                bootstrap_audit = build_bootstrap_planner_audit(
+                    station_id=0,
+                    pose_index=int(bootstrap.candidate_index),
+                    pose_xyz=current_pose,
+                    program=current_program,
+                    shadow_enabled=False,
+                )
+            else:
+                bootstrap_audit = build_bootstrap_planner_audit(
                     station_id=0,
                     pose_index=int(bootstrap.candidate_index),
                     pose_xyz=current_pose,
@@ -1161,142 +1264,48 @@ def run_pf_closed_loop(
                         planner.shield_view_count_shadow_per_comparison_confidence
                     ),
                 )
-            )
+            planner_writer.append(bootstrap_audit)
         else:
-            prefix = ready.resume
-            assert prefix is not None
-            resume_station_view = MeasurementLogView.from_records(
-                context,
-                prefix.records,
-            ).station_view()
-            cui_route_records.extend(resume_station_view.records)
-            resume_state = reconstruct_live_resume_state(
-                resume_station_view,
-                next_station_id=prefix.next_station_id,
-                expected_views_per_station=budget.views_per_station,
-            )
-            station_history = [tuple(station) for station in resume_state.stations]
-            for prefix_station_id, prefix_station in enumerate(station_history):
-                _assimilate_station(
-                    estimator,
-                    prefix_station,
-                    station_id=prefix_station_id,
-                    contract_hash=contract_hash,
-                )
-                latest_adaptive_stop_status = stop_tracker.assess(
-                    estimator,
-                    station_count=prefix_station_id + 1,
-                )
-            if cui_split_viz is not None:
-                _publish_cui_frame(
-                    cui_split_viz,
-                    estimator,
-                    resume_station_view.records[-1],
-                    cui_route_records,
-                    elapsed_time_s=resume_state.elapsed_time_s,
-                    record_measurement=False,
-                )
-                cui_frame_rendered = True
-            current_pose = resume_state.current_pose.copy()
-            visited = [pose.copy() for pose in resume_state.visited_poses]
-            record_count = resume_state.record_count
-            cui_elapsed_time_s = resume_state.elapsed_time_s
-            station_id = resume_state.next_station_id
-            if record_count >= budget.max_measurements:
-                stop_reason = "maximum_measurement_budget"
-                continue_acquisition = False
-            elif station_id >= budget.max_stations:
-                stop_reason = "maximum_station_budget"
-                continue_acquisition = False
-            elif bool(
-                latest_adaptive_stop_status
-                and latest_adaptive_stop_status["stop_ready"]
-            ):
-                stop_reason = "intrinsic_surface_posterior_converged"
-                continue_acquisition = False
-            if continue_acquisition:
-                resume_particle_adequacy = _particle_diagnostics(estimator)
-                resume_shadow_health = _current_shadow_health(
-                    estimator,
-                    planner=planner,
-                    belief_after_station_id=int(station_id - 1),
-                    particle_adequacy=resume_particle_adequacy,
-                    adaptive_stop_status=latest_adaptive_stop_status,
-                    detected_isotope_gate=gate_diagnostics,
-                )
-                resume_rng = _planner_rng(seed, station_id)
-                planned = _plan(
-                    estimator,
-                    candidates,
-                    current_pose=current_pose,
-                    visited_poses=visited,
-                    obstacle_grid=obstacle_grid,
-                    room_bounds=room_bounds,
-                    height_bounds=height_bounds,
-                    planner=planner,
-                    rng=resume_rng,
-                    settings=settings,
-                    station_index=station_id,
-                    control_policy=control_policy,
-                )
-                candidates, planned = _refine_and_replan(
-                    client,
-                    estimator,
-                    candidates,
-                    planned,
-                    refinement_top_k=budget.runtime_refinement_top_k,
-                    current_pose=current_pose,
-                    visited_poses=visited,
-                    obstacle_grid=obstacle_grid,
-                    room_bounds=room_bounds,
-                    height_bounds=height_bounds,
-                    planner=planner,
-                    rng=resume_rng,
-                    settings=settings,
-                    station_index=station_id,
-                    control_policy=control_policy,
-                )
-                planner_writer.append(
-                    build_planner_audit(
-                        station_id=station_id,
-                        result=planned,
-                        top_k=budget.planner_audit_top_k,
-                        belief_after_station_id=int(station_id - 1),
-                        posterior_health=resume_shadow_health,
-                    )
-                )
-                current_pose = np.asarray(planned.next_pose, dtype=np.float64)
-                current_program = planned.shield_program
-            output_hook(
-                "Resumed PF from "
-                f"{record_count} truth-free records at station {station_id}."
+            raise RuntimeError(
+                "PF live acquisition requires fresh protocol schema 1."
             )
         while continue_acquisition and station_id < budget.max_stations:
             if record_count + len(current_program.pair_ids) > budget.max_measurements:
                 stop_reason = "maximum_measurement_budget"
                 break
-            station_records = []
+            station_records: list[MeasurementLogRecord] = []
+            assimilation_start_s: float | None = None
             for view_index, pair_id in enumerate(current_program.pair_ids):
                 candidate_index = candidate_index_for_pose(candidates, current_pose)
                 fe_index, pb_index = divmod(int(pair_id), 8)
-                event = client.acquire(
-                    AdaptiveStepRequest(
-                        candidate_index=candidate_index,
-                        fe_orientation_index=fe_index,
-                        pb_orientation_index=pb_index,
-                        dwell_time_s=budget.live_time_s,
-                        station_id=station_id,
-                        station_complete=(
-                            view_index == len(current_program.pair_ids) - 1
-                        ),
-                    )
+                request = AdaptiveStepRequest(
+                    action_id=record_count,
+                    candidate_index=candidate_index,
+                    fe_orientation_index=fe_index,
+                    pb_orientation_index=pb_index,
+                    dwell_time_s=budget.live_time_s,
+                    station_id=station_id,
+                    station_complete=(
+                        view_index == len(current_program.pair_ids) - 1
+                    ),
                 )
+                event = client.acquire(request)
                 record = event.record
-                if int(record.station_id) != station_id:
-                    raise ValueError("Runtime record station_id changed unexpectedly.")
+                if request.station_complete:
+                    assimilation_start_s = time.perf_counter()
+                completed_station = live_session.receive_acquired(
+                    record,
+                    request=request,
+                    request_candidates=candidates,
+                    next_candidates=event.candidates,
+                )
+                if completed_station is not request.station_complete:
+                    raise RuntimeError(
+                        "PF station completion disagrees with the exact request."
+                    )
                 station_records.append(record)
                 candidates = event.candidates
-                record_count += 1
+                record_count = live_session.record_count
                 cui_elapsed_time_s += (
                     float(record.live_time_s)
                     + float(record.travel_time_s)
@@ -1311,79 +1320,9 @@ def run_pf_closed_loop(
                         elapsed_time_s=cui_elapsed_time_s,
                         record_measurement=True,
                     )
-                    cui_frame_rendered = True
-            if station_records[-1].metadata.get("station_complete") is not True:
-                raise ValueError("Runtime omitted the final station marker.")
-            station_history.append(tuple(station_records))
-            assimilation_start_s = time.perf_counter()
-            if isotope_gate is None:
-                _assimilate_station(
-                    estimator,
-                    station_records,
-                    station_id=station_id,
-                    contract_hash=contract_hash,
-                )
-            else:
-                assert detection_estimator is not None
-                detection_pose_index = _register_station_pose(
-                    detection_estimator,
-                    station_records,
-                    station_id=station_id,
-                )
-                score_grids = (
-                    detection_estimator.full_spectrum_isotope_detection_score_grids(
-                        tuple(
-                            measurement_record_to_station_input(record)
-                            for record in station_records
-                        ),
-                        pose_idx=detection_pose_index,
-                        generative_contract_hash_sha256=contract_hash,
-                    )
-                )
-                gate_diagnostics = isotope_gate.update(score_grids)
-                detection_estimator.detected_isotope_gate_diagnostics = gate_diagnostics
-                active_isotopes = tuple(
-                    isotope
-                    for isotope in context.isotopes
-                    if isotope in isotope_gate.active_isotopes
-                )
-                if gate_diagnostics["newly_active_isotopes"]:
-                    estimator = build_live_estimator(
-                        context,
-                        settings,
-                        profile=profile,
-                        seed=seed,
-                        runtime_root=runtime_root,
-                        config_hash=config_hash,
-                        inference_isotopes=active_isotopes,
-                    )
-                    for prior_station_id, prior_station in enumerate(station_history):
-                        _assimilate_station(
-                            estimator,
-                            prior_station,
-                            station_id=prior_station_id,
-                            contract_hash=contract_hash,
-                        )
-                    estimator.detected_isotope_gate_diagnostics = gate_diagnostics
-                    output_hook(
-                        "Spectrum-detected isotope PF set active: "
-                        f"{list(active_isotopes)}; rebuilt from "
-                        f"{len(station_history)} truth-free station(s)."
-                    )
-                elif active_isotopes:
-                    _assimilate_station(
-                        estimator,
-                        station_records,
-                        station_id=station_id,
-                        contract_hash=contract_hash,
-                    )
-                else:
-                    output_hook(
-                        "No isotope has crossed the truth-free full-spectrum "
-                        "activation threshold; PF assimilation remains deferred."
-                    )
-                if active_isotopes:
-                    estimator.detected_isotope_gate_diagnostics = gate_diagnostics
+                    cui_frame_enqueued = True
+            if assimilation_start_s is None:
+                raise RuntimeError("PF station completed without an assimilation start.")
             assimilation_elapsed_s = time.perf_counter() - assimilation_start_s
             current_pose = np.asarray(
                 station_records[-1].detector_pose_xyz,
@@ -1396,13 +1335,13 @@ def run_pf_closed_loop(
                 station_count=completed_stations,
             )
             particle_adequacy = _particle_diagnostics(estimator)
+            _require_plannable_sampler_health(particle_adequacy)
             shadow_health = _current_shadow_health(
                 estimator,
                 planner=planner,
                 belief_after_station_id=int(station_id),
                 particle_adequacy=particle_adequacy,
                 adaptive_stop_status=latest_adaptive_stop_status,
-                detected_isotope_gate=gate_diagnostics,
             )
             posterior_snapshot = _live_posterior_summary(estimator)
             if cui_split_viz is not None:
@@ -1414,7 +1353,7 @@ def run_pf_closed_loop(
                     elapsed_time_s=cui_elapsed_time_s,
                     record_measurement=False,
                 )
-                cui_frame_rendered = True
+                cui_frame_enqueued = True
             station_trace = {
                 "schema_version": 2,
                 "station_id": station_id,
@@ -1427,8 +1366,6 @@ def run_pf_closed_loop(
             )
             if compact_stop is not None:
                 station_trace["adaptive_stop"] = compact_stop
-            if gate_diagnostics is not None:
-                station_trace["detected_isotope_gate"] = gate_diagnostics
             controller_writer.append(station_trace)
             if record_count >= budget.max_measurements:
                 stop_reason = "maximum_measurement_budget"
@@ -1447,15 +1384,14 @@ def run_pf_closed_loop(
                 visited_poses=visited,
                 obstacle_grid=obstacle_grid,
                 room_bounds=room_bounds,
-                height_bounds=height_bounds,
                 planner=planner,
                 rng=station_planner_rng,
-                settings=settings,
                 station_index=completed_stations,
                 control_policy=control_policy,
             )
             candidates, planned = _refine_and_replan(
                 client,
+                live_session,
                 estimator,
                 candidates,
                 planned,
@@ -1464,18 +1400,17 @@ def run_pf_closed_loop(
                 visited_poses=visited,
                 obstacle_grid=obstacle_grid,
                 room_bounds=room_bounds,
-                height_bounds=height_bounds,
                 planner=planner,
                 rng=station_planner_rng,
-                settings=settings,
                 station_index=completed_stations,
                 control_policy=control_policy,
             )
             station_id += 1
             planner_writer.append(
-                build_planner_audit(
+                _planner_audit_for_mode(
                     station_id=station_id,
                     result=planned,
+                    planner=planner,
                     top_k=budget.planner_audit_top_k,
                     belief_after_station_id=int(station_id - 1),
                     posterior_health=shadow_health,
@@ -1483,23 +1418,18 @@ def run_pf_closed_loop(
             )
             current_pose = np.asarray(planned.next_pose, dtype=np.float64)
             current_program = planned.shield_program
+        live_session.complete_live_state(
+            diagnostics_extensions=_completion_diagnostics_extensions(
+                stop_reason=stop_reason,
+                budget=budget,
+                adaptive_stop_status=latest_adaptive_stop_status,
+            )
+        )
         published = client.finalize_log()
         log = load_measurement_log(published.path)
         if published.record_count != len(log.records):
             raise RuntimeError("Published MeasurementLog record count is inconsistent.")
-        if isotope_gate is not None and not isotope_gate.active_isotopes:
-            raise RuntimeError(
-                "No candidate isotope crossed the truth-free full-spectrum "
-                "activation threshold before the acquisition budget ended."
-            )
-        live_records = tuple(
-            record for station_records in station_history for record in station_records
-        )
-        bind_published_measurement_log(
-            estimator,
-            log,
-            live_records=live_records,
-        )
+        live_session.bind_published_log(log)
         result = PFClosedLoopResult(
             measurement_log_path=log.path.resolve(),
             pf_output_dir=target,
@@ -1508,49 +1438,157 @@ def run_pf_closed_loop(
             station_count=log.station_view().station_count,
             stop_reason=stop_reason,
         )
-        _write_final_outputs(
-            target,
-            estimator=estimator,
-            result=result,
-            budget=budget,
-            adaptive_stop_status=latest_adaptive_stop_status,
+        resources.close()
+        if cui_split_viz is not None:
+            visualizer = cui_split_viz
+            if not cui_frame_enqueued:
+                raise RuntimeError(
+                    "Enabled CUI renderer received no frame for this PF run."
+                )
+            visualizer.close()
+            cui_split_viz = None
+            artifact_paths = (
+                getattr(visualizer, "latest_overview_path", None),
+                getattr(visualizer, "latest_robot_path", None),
+                getattr(visualizer, "latest_pf_path", None),
+                getattr(visualizer, "latest_pf_labeled_path", None),
+                getattr(visualizer, "latest_spectrum_path", None),
+            )
+            if not all(isinstance(path, Path) for path in artifact_paths):
+                raise RuntimeError("CUI renderer omitted canonical artifact paths.")
+            missing_artifacts = [
+                path.as_posix() for path in artifact_paths if not path.is_file()
+            ]
+            if missing_artifacts:
+                raise RuntimeError(
+                    "CUI renderer acknowledged its final frame without artifacts: "
+                    f"{missing_artifacts}."
+                )
+            publish_final_cui_split_views(
+                source_overview_path=artifact_paths[0],
+                source_robot_path=artifact_paths[1],
+                source_pf_path=artifact_paths[2],
+                source_pf_labeled_path=artifact_paths[3],
+                source_spectrum_path=artifact_paths[4],
+                final_overview_path=(
+                    staging_dir / "final_experiment_overview.png"
+                ),
+                final_robot_path=staging_dir / "final_robot_2d.png",
+                final_pf_path=staging_dir / "final_pf_3d.png",
+                final_pf_labeled_path=(
+                    staging_dir / "final_pf_3d_labeled.png"
+                ),
+                final_spectrum_path=staging_dir / "final_spectrum.png",
+            )
+        if cui_server_handle is not None:
+            server_handle = cui_server_handle
+            server_handle.close()
+            cui_server_handle = None
+        atomic_write_bytes(
+            staging_dir / "closed_loop_result.json",
+            _strict_live_artifact_json_bytes(
+                result.to_dict(),
+                artifact_name="PF closed-loop result",
+            ),
         )
-        completed_result = result
+        live_session._publish_bound_result_into_staging(staging_dir)
+        bundle_publisher.publish()
+        staging_dir = None
         return result
-    except BaseException:
+    except BaseException as exc:
+        secondary_failures: list[dict[str, str]] = []
         if client is not None:
-            client.abort()
+            try:
+                client.abort()
+            except BaseException as abort_exc:
+                secondary_failures.append(
+                    {
+                        "operation": "runtime_abort",
+                        "error_type": type(abort_exc).__name__,
+                        "message": str(abort_exc),
+                    }
+                )
+        try:
+            resources.close()
+        except BaseException as close_exc:
+            secondary_failures.append(
+                {
+                    "operation": "resource_close",
+                    "error_type": type(close_exc).__name__,
+                    "message": str(close_exc),
+                }
+            )
+        if cui_split_viz is not None:
+            visualizer = cui_split_viz
+            try:
+                visualizer.close()
+            except BaseException as cui_exc:
+                secondary_failures.append(
+                    {
+                        "operation": "cui_close",
+                        "error_type": type(cui_exc).__name__,
+                        "message": str(cui_exc),
+                    }
+                )
+            else:
+                cui_split_viz = None
+        if cui_server_handle is not None:
+            server_handle = cui_server_handle
+            try:
+                server_handle.close()
+            except BaseException as server_exc:
+                secondary_failures.append(
+                    {
+                        "operation": "cui_server_close",
+                        "error_type": type(server_exc).__name__,
+                        "message": str(server_exc),
+                    }
+                )
+            else:
+                cui_server_handle = None
+        try:
+            atomic_write_bytes(
+                failure_receipt_path,
+                _strict_live_artifact_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "status": "failed",
+                        "output_bundle_published": target.exists(),
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                        "secondary_failures": secondary_failures,
+                    },
+                    artifact_name="PF closed-loop failure receipt",
+                ),
+            )
+        except BaseException as marker_exc:
+            secondary_failures.append(
+                {
+                    "operation": "failure_receipt_write",
+                    "error_type": type(marker_exc).__name__,
+                    "message": str(marker_exc),
+                }
+            )
+        for failure in secondary_failures:
+            exc.add_note(
+                "Secondary failure during PF abort: "
+                f"{failure['operation']}: {failure['error_type']}: "
+                f"{failure['message']}"
+            )
         raise
     finally:
-        try:
-            if cui_split_viz is not None:
+        if cui_split_viz is not None:
+            try:
                 cui_split_viz.close()
-                artifact_paths = (
-                    getattr(cui_split_viz, "latest_overview_path", None),
-                    getattr(cui_split_viz, "latest_robot_path", None),
-                    getattr(cui_split_viz, "latest_pf_path", None),
-                    getattr(cui_split_viz, "latest_pf_labeled_path", None),
-                    getattr(cui_split_viz, "latest_spectrum_path", None),
-                )
-                if (
-                    completed_result is not None
-                    and cui_frame_rendered
-                    and all(isinstance(path, Path) for path in artifact_paths)
-                ):
-                    publish_final_cui_split_views(
-                        source_overview_path=artifact_paths[0],
-                        source_robot_path=artifact_paths[1],
-                        source_pf_path=artifact_paths[2],
-                        source_pf_labeled_path=artifact_paths[3],
-                        source_spectrum_path=artifact_paths[4],
-                        final_overview_path=(target / "final_experiment_overview.png"),
-                        final_robot_path=target / "final_robot_2d.png",
-                        final_pf_path=target / "final_pf_3d.png",
-                        final_pf_labeled_path=target / "final_pf_3d_labeled.png",
-                        final_spectrum_path=target / "final_spectrum.png",
-                    )
-        finally:
-            resources.close()
+            except BaseException:
+                pass
+        if cui_server_handle is not None:
+            try:
+                cui_server_handle.close()
+            except BaseException:
+                pass
+        resources.close()
+        bundle_publisher.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1561,7 +1599,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--profile", choices=("pf_strict",), default="pf_strict")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, required=True)
     args = parser.parse_args(None if argv is None else list(argv))
     result = run_pf_closed_loop(
         args.session_socket,

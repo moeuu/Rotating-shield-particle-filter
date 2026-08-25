@@ -28,6 +28,12 @@ def resolve_rotation_limit_for_active_program(
     baseline_shield_policy: Mapping[str, Any] | str | None,
 ) -> int:
     """Return the measurement count for one explicit shield program."""
+    if baseline_shield_policy is not None:
+        from baselines.ral_ablation.shield_policies import (
+            validate_baseline_shield_policy,
+        )
+
+        validate_baseline_shield_policy(baseline_shield_policy)
     base_limit = max(1, int(base_rotation_limit))
     if not active_shield_program:
         return base_limit
@@ -39,14 +45,10 @@ def resolve_rotation_limit_for_active_program(
 
 def _policy_name(policy_config: Mapping[str, Any] | str | None) -> str:
     """Return the exact canonical baseline path-policy name."""
-    if policy_config is None:
+    validated = validate_baseline_path_policy(policy_config)
+    if validated is None:
         return ""
-    if not isinstance(policy_config, Mapping):
-        raise TypeError("baseline_path_policy must be a JSON object or null.")
-    name = policy_config.get("name")
-    if not isinstance(name, str) or not name:
-        raise ValueError("baseline_path_policy.name must be a nonempty string.")
-    return name
+    return str(validated["name"])
 
 
 def _positive_json_integer(value: object, *, field_name: str) -> int:
@@ -54,6 +56,35 @@ def _positive_json_integer(value: object, *, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{field_name} must be a positive JSON integer.")
     return value
+
+
+def validate_baseline_path_policy(
+    policy_config: Mapping[str, Any] | str | None,
+) -> dict[str, Any] | None:
+    """Validate one exact discriminated RA-L path-policy object."""
+    if policy_config is None:
+        return None
+    if not isinstance(policy_config, Mapping):
+        raise TypeError("baseline_path_policy must be a JSON object or null.")
+    if any(not isinstance(key, str) for key in policy_config):
+        raise TypeError("baseline_path_policy keys must be JSON strings.")
+    name = policy_config.get("name")
+    if name != "passive_serpentine":
+        raise ValueError(
+            "baseline_path_policy.name must be exactly 'passive_serpentine'."
+        )
+    expected = {"name", "row_count"}
+    actual = set(policy_config)
+    if actual != expected:
+        raise ValueError(
+            "passive_serpentine policy must contain exactly name and row_count; "
+            f"missing={sorted(expected - actual)}, unknown={sorted(actual - expected)}."
+        )
+    row_count = _positive_json_integer(
+        policy_config["row_count"],
+        field_name="baseline_path_policy.row_count",
+    )
+    return {"name": "passive_serpentine", "row_count": row_count}
 
 
 def _serpentine_target(
@@ -86,10 +117,11 @@ def select_baseline_next_pose(
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]],
 ) -> BaselinePathSelection | None:
     """Select the next pose with a baseline path policy."""
-    policy = _policy_name(policy_config)
+    validated_policy = validate_baseline_path_policy(policy_config)
+    policy = _policy_name(validated_policy)
     if policy == "":
         return None
-    if not isinstance(policy_config, Mapping):
+    if not isinstance(validated_policy, Mapping):
         raise AssertionError("Validated path policy must be a mapping.")
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
     if candidates.ndim != 2 or candidates.shape[1] != 3 or candidates.shape[0] == 0:
@@ -123,14 +155,8 @@ def select_baseline_next_pose(
     ):
         raise ValueError("bounds_xyz must contain finite ordered 3-D bounds.")
     if policy == "passive_serpentine":
-        unknown = sorted(set(policy_config) - {"name", "row_count"})
-        if unknown:
-            raise ValueError(
-                "Unsupported passive_serpentine settings: "
-                + ", ".join(str(key) for key in unknown)
-            )
         row_count = _positive_json_integer(
-            policy_config.get("row_count", 6),
+            validated_policy["row_count"],
             field_name="baseline_path_policy.row_count",
         )
         target = _serpentine_target(
@@ -147,3 +173,11 @@ def select_baseline_next_pose(
             score=-float(distances[idx]),
         )
     raise ValueError(f"Unknown baseline_path_policy: {policy}")
+
+
+__all__ = [
+    "BaselinePathSelection",
+    "resolve_rotation_limit_for_active_program",
+    "select_baseline_next_pose",
+    "validate_baseline_path_policy",
+]

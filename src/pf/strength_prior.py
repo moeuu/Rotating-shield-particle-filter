@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import TypeAlias
 
 import numpy as np
@@ -13,6 +14,154 @@ from scipy.special import gammaincinv, gammaln
 SampleShape: TypeAlias = int | tuple[int, ...] | None
 FloatResult: TypeAlias = float | NDArray[np.float64]
 BoolResult: TypeAlias = bool | NDArray[np.bool_]
+STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY = 0.995
+
+
+def _strict_positive_number(value: object, *, name: str) -> float:
+    """Return one finite positive configuration number without coercion."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value,
+        (int, float, np.integer, np.floating),
+    ):
+        raise TypeError(f"{name} must be numeric.")
+    resolved = float(value)
+    if not np.isfinite(resolved) or resolved <= 0.0:
+        raise ValueError(f"{name} must be finite and positive.")
+    return resolved
+
+
+@dataclass(frozen=True, slots=True)
+class ShiftedGammaStrengthPriorConfig:
+    """Configure the production upper-unbounded source-strength prior."""
+
+    minimum_cps_1m: float
+    shape: float
+    scale_cps_1m: float
+    kind: str = field(default="shifted_gamma", init=False)
+
+    def __post_init__(self) -> None:
+        """Validate and freeze the exact shifted-gamma parameters."""
+        minimum = _strict_positive_number(
+            self.minimum_cps_1m,
+            name="strength_prior.minimum_cps_1m",
+        )
+        shape = _strict_positive_number(
+            self.shape,
+            name="strength_prior.shape",
+        )
+        scale = _strict_positive_number(
+            self.scale_cps_1m,
+            name="strength_prior.scale_cps_1m",
+        )
+        if shape < 1.0:
+            raise ValueError("strength_prior.shape must be at least one.")
+        object.__setattr__(self, "minimum_cps_1m", minimum)
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "scale_cps_1m", scale)
+
+    def build(self) -> StrengthPrior:
+        """Build the normalized prior with a deterministic proposal quantile."""
+        proposal_upper = float(
+            self.minimum_cps_1m
+            + self.scale_cps_1m
+            * gammaincinv(
+                self.shape,
+                STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY,
+            )
+        )
+        return StrengthPrior(
+            minimum=self.minimum_cps_1m,
+            maximum=proposal_upper,
+            family="shifted_gamma",
+            gamma_shape=self.shape,
+            gamma_scale=self.scale_cps_1m,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedUniformStrengthPriorTestConfig:
+    """Configure the bounded-uniform prior for deterministic test oracles only."""
+
+    minimum_cps_1m: float
+    maximum_cps_1m: float
+    kind: str = field(default="bounded_uniform_test_only", init=False)
+
+    def __post_init__(self) -> None:
+        """Validate and freeze the explicitly test-only finite bounds."""
+        minimum = _strict_positive_number(
+            self.minimum_cps_1m,
+            name="strength_prior.minimum_cps_1m",
+        )
+        maximum = _strict_positive_number(
+            self.maximum_cps_1m,
+            name="strength_prior.maximum_cps_1m",
+        )
+        if maximum <= minimum:
+            raise ValueError(
+                "strength_prior.maximum_cps_1m must exceed minimum_cps_1m."
+            )
+        object.__setattr__(self, "minimum_cps_1m", minimum)
+        object.__setattr__(self, "maximum_cps_1m", maximum)
+
+    def build(self) -> StrengthPrior:
+        """Build the normalized bounded-uniform test prior."""
+        return StrengthPrior(
+            minimum=self.minimum_cps_1m,
+            maximum=self.maximum_cps_1m,
+            family="bounded_uniform",
+        )
+
+
+StrengthPriorConfig: TypeAlias = (
+    ShiftedGammaStrengthPriorConfig | BoundedUniformStrengthPriorTestConfig
+)
+
+
+def resolve_strength_prior_config(value: object) -> StrengthPriorConfig:
+    """Resolve one exact discriminated strength-prior configuration."""
+    if isinstance(
+        value,
+        (ShiftedGammaStrengthPriorConfig, BoundedUniformStrengthPriorTestConfig),
+    ):
+        return value
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) for key in value
+    ):
+        raise TypeError("strength_prior must be a string-keyed object.")
+    kind = value.get("kind")
+    if kind == "shifted_gamma":
+        expected = frozenset(
+            {"kind", "minimum_cps_1m", "shape", "scale_cps_1m"}
+        )
+        actual = frozenset(value)
+        if actual != expected:
+            raise ValueError(
+                "shifted_gamma strength_prior keys differ from the exact "
+                f"contract: missing={sorted(expected - actual)}, "
+                f"unknown={sorted(actual - expected)}."
+            )
+        return ShiftedGammaStrengthPriorConfig(
+            minimum_cps_1m=value["minimum_cps_1m"],
+            shape=value["shape"],
+            scale_cps_1m=value["scale_cps_1m"],
+        )
+    if kind == "bounded_uniform_test_only":
+        expected = frozenset({"kind", "minimum_cps_1m", "maximum_cps_1m"})
+        actual = frozenset(value)
+        if actual != expected:
+            raise ValueError(
+                "bounded_uniform_test_only strength_prior keys differ from the "
+                f"exact contract: missing={sorted(expected - actual)}, "
+                f"unknown={sorted(actual - expected)}."
+            )
+        return BoundedUniformStrengthPriorTestConfig(
+            minimum_cps_1m=value["minimum_cps_1m"],
+            maximum_cps_1m=value["maximum_cps_1m"],
+        )
+    raise ValueError(
+        "strength_prior.kind must be 'shifted_gamma' in production or "
+        "'bounded_uniform_test_only' in explicit test oracles."
+    )
 
 
 def _float_result(
@@ -42,9 +191,10 @@ class StrengthPrior:
     """Represent a normalized physical source-strength prior.
 
     ``shifted_gamma`` removes the artificial upper support boundary while
-    retaining a proper, normalized density.  ``maximum`` remains a required
-    finite configuration field for backwards-compatible proposal-grid sizing;
-    it is not part of shifted-gamma support.
+    retaining a proper, normalized density. For shifted gamma, ``maximum`` is
+    an internal finite proposal reference derived from the fixed proposal
+    quantile; it is never accepted from the production configuration and is
+    not part of the mathematical support.
     """
 
     minimum: float
@@ -98,7 +248,10 @@ class StrengthPrior:
             return self.minimum + self.gamma_shape * self.gamma_scale
         return 0.5 * (self.minimum + self.maximum)
 
-    def finite_upper_quantile(self, probability: float = 0.995) -> float:
+    def finite_upper_quantile(
+        self,
+        probability: float = STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY,
+    ) -> float:
         """Return a finite prior quantile for proposal grids, never support."""
         quantile = float(probability)
         if not np.isfinite(quantile) or not 0.0 < quantile < 1.0:

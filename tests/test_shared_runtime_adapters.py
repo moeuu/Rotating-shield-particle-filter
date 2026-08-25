@@ -1,37 +1,11 @@
-"""Conformance tests for PF compatibility adapters to shared runtime APIs."""
+"""Conformance tests for PF-specific shared-runtime integration."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
-
-from pf import atomic_io, provenance, runtime_defaults
-from runtime import artifacts
+from pf import provenance
 from runtime import provenance as runtime_provenance
-from runtime.defaults import DEFAULT_CUI_SPLIT_VIEW_DIR
-
-
-def test_pf_canonical_json_and_atomic_io_delegate_to_runtime(
-    tmp_path: Path,
-) -> None:
-    """PF compatibility modules should retain byte-identical shared behavior."""
-    payload = {
-        "array": np.asarray([2, 1], dtype=np.int64),
-        "path": tmp_path / "value",
-    }
-
-    assert provenance.canonical_json_bytes(
-        payload
-    ) == runtime_provenance.canonical_json_bytes(payload)
-    assert atomic_io.atomic_write_bytes is artifacts.atomic_write_bytes
-    assert atomic_io.atomic_write_json is artifacts.atomic_write_json
-    assert atomic_io.atomic_write_text is artifacts.atomic_write_text
-
-
-def test_pf_cui_defaults_delegate_to_installable_runtime_package() -> None:
-    """PF CUI entry points should use the shared presentation defaults."""
-    assert runtime_defaults.DEFAULT_CUI_SPLIT_VIEW_DIR == DEFAULT_CUI_SPLIT_VIEW_DIR
 
 
 def test_pf_repository_provenance_keeps_pf_as_default_root() -> None:
@@ -41,3 +15,19 @@ def test_pf_repository_provenance_keeps_pf_as_default_root() -> None:
     assert provenance.repository_commit() == runtime_provenance.repository_commit(
         root
     )
+
+
+def test_pf_provenance_exports_only_strict_deterministic_json_helpers() -> None:
+    """The PF facade must not retain lossy or ambiguously named serializers."""
+    left = {"schema_version": 2, "nested": {"b": 2, "a": 1}}
+    right = {"nested": {"a": 1, "b": 2}, "schema_version": 2}
+
+    assert provenance.strict_canonical_json_bytes(left) == (
+        provenance.strict_canonical_json_bytes(right)
+    )
+    assert provenance.strict_sha256_json(left) == provenance.strict_sha256_json(
+        right
+    )
+    assert not hasattr(provenance, "canonical_json_bytes")
+    assert not hasattr(provenance, "sha256_json")
+    assert not hasattr(provenance, "json_safe")

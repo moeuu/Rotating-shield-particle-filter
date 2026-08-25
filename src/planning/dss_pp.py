@@ -24,19 +24,8 @@ from pf.full_spectrum import (
 )
 from pf.randomness import named_random_generator, named_stream_seed
 
-# Private imports preserve direct legacy paths without joining wildcard exports.
-from planning.dss_candidates import (  # noqa: F401
-    _free_space_mask_batch,
-    _cell_centers_batch,
-    _bounds_filter,
-    _dedupe_points,
-    _bearing_angle_xy,
-    _angle_distance_rad,
-    augment_candidate_stations,
-    _free_cell_centers,
-    _bounds_cell_centers,
-    _pose_matrix_or_empty,
-)
+# Private algorithm imports support the production planner implementation.
+from planning.dss_candidates import _free_cell_centers
 from planning.dss_eig import (  # noqa: F401
     _program_pair_id_matrix,
     _program_view_mask,
@@ -114,7 +103,6 @@ __all__ = [
     "SignatureMode",
     "estimate_lambda_cost",
     "extract_signature_modes",
-    "augment_candidate_stations",
     "ShieldProgram",
     "select_dss_pp_next_station",
 ]
@@ -674,15 +662,20 @@ def _program_information_gains_for_poses(
     else:
         resolved_eig_call_seed = int(eig_call_seed)
     if joint_particles is None:
-        joint_particles = estimator.planning_joint_particles(
-            max_particles=config.planning_particles,
-            method=config.planning_method,
-            rng=rng,
-        )
+        if config.planning_particles is None:
+            joint_particles = estimator.planning_joint_particles()
+        else:
+            joint_particles = estimator.planning_joint_particles(
+                max_particles=config.planning_particles,
+                method=config.planning_method,
+                rng=rng,
+            )
     if tuple(joint_particles.isotope_order) != isotopes:
         raise ValueError("Joint planning snapshot isotope order is inconsistent.")
     if int(np.asarray(joint_particles.weights_n).size) < 2:
-        return outputs
+        raise ValueError(
+            "Exact DSS EIG requires at least two aligned posterior particles."
+        )
     configured_samples = (
         pf_config.planning_eig_samples
         if sample_count_override is None
@@ -843,7 +836,7 @@ def _program_information_gains_for_poses(
                 "dss_pp",
                 "joint_full_spectrum_eig",
                 int(snapshot_index),
-                "action_seeded_sampler_fallback",
+                "sampler_interface_rng",
             )
             components = None
             retry_after_memory_error = False
@@ -863,7 +856,7 @@ def _program_information_gains_for_poses(
                 # action result before runtime transport. The device path
                 # allocates it only after transport, so it is not resident
                 # during scratch. Dense all-pair requests use less memory,
-                # but these generic bounds keep every legacy policy covered.
+                # but these bounds cover every supported action layout.
                 selected_response_bytes = int(
                     (0 if use_gpu else 6) * response_field_bytes
                 )
@@ -1009,7 +1002,6 @@ def _program_information_gains_for_poses(
                 ),
                 "oom_retry_count": int(len(oom_retry_events)),
                 "oom_retry_events": oom_retry_events,
-                "cpu_fallback_used": False,
             }
         )
     return outputs
@@ -1320,8 +1312,6 @@ def _compose_transition_score(
     *,
     node: DSSPPNode,
     previous_pose_xyz: NDArray[np.float64],
-    previous_pair_id: int | None,
-    estimator: RotatingShieldPFEstimator,
     map_api: object | None,
     config: DSSPPConfig,
     travel_time_override_s: float | None = None,
@@ -1345,63 +1335,54 @@ def _compose_transition_score(
             raise ValueError("path_length_override_m must be nonnegative and not NaN.")
     if not np.isfinite(path_length):
         return -float("inf"), float("inf")
-    if travel_time_override_s is None:
-        travel_time = path_length / float(config.robot_speed_m_s)
-    else:
-        travel_time = float(travel_time_override_s)
-        if not np.isfinite(travel_time) or travel_time < 0.0:
-            raise ValueError("travel_time_override_s must be finite and nonnegative.")
     motion_components = (
         horizontal_time_override_s,
         mast_vertical_time_override_s,
         settling_time_override_s,
     )
     if all(value is None for value in motion_components):
-        motion_penalty = float(config.lambda_time) * float(travel_time)
+        if travel_time_override_s is not None:
+            raise ValueError(
+                "A motion-time total cannot be supplied without all components."
+            )
+        if any(
+            float(weight) != 0.0
+            for weight in (
+                config.lambda_horizontal_time,
+                config.lambda_mast_vertical_time,
+                config.lambda_settling_time,
+            )
+        ):
+            raise ValueError(
+                "Nonzero motion weights require runtime-authored motion components."
+            )
+        motion_penalty = 0.0
     elif any(value is None for value in motion_components):
         raise ValueError("Motion-time component overrides must be supplied together.")
     else:
+        if travel_time_override_s is None:
+            raise ValueError(
+                "Motion-time components require the exact runtime-authored total."
+            )
+        travel_time = float(travel_time_override_s)
+        if not np.isfinite(travel_time) or travel_time < 0.0:
+            raise ValueError("travel_time_override_s must be finite and nonnegative.")
         component_values = tuple(float(value) for value in motion_components)
         if any(not np.isfinite(value) or value < 0.0 for value in component_values):
             raise ValueError(
                 "Motion-time component overrides must be finite and nonnegative."
             )
-        if not np.isclose(
-            sum(component_values),
-            travel_time,
-            rtol=1.0e-12,
-            atol=1.0e-12,
-        ):
+        if sum(component_values) != travel_time:
             raise ValueError("Motion-time component overrides must sum to travel time.")
-        horizontal_weight = (
-            float(config.lambda_time)
-            if config.lambda_horizontal_time is None
-            else float(config.lambda_horizontal_time)
-        )
-        mast_weight = (
-            float(config.lambda_time)
-            if config.lambda_mast_vertical_time is None
-            else float(config.lambda_mast_vertical_time)
-        )
-        settling_weight = (
-            float(config.lambda_time)
-            if config.lambda_settling_time is None
-            else float(config.lambda_settling_time)
-        )
         motion_penalty = (
-            horizontal_weight * component_values[0]
-            + mast_weight * component_values[1]
-            + settling_weight * component_values[2]
+            float(config.lambda_horizontal_time) * component_values[0]
+            + float(config.lambda_mast_vertical_time) * component_values[1]
+            + float(config.lambda_settling_time) * component_values[2]
         )
-    measurement_time_cost = len(node.program.pair_ids) * (
-        float(config.rotation_overhead_s) + float(config.live_time_s)
-    )
-    del previous_pair_id, estimator
     score = (
         float(node.static_score)
         - float(node.distance_weight) * float(path_length)
         - float(motion_penalty)
-        - float(config.lambda_time) * float(measurement_time_cost)
     )
     return float(score), float(path_length)
 
@@ -1497,16 +1478,8 @@ def _exact_eig_shortlist(
             "Every DSS pose must expose the complete predeclared program library."
         )
     pose_ranking_scores = np.max(ranking_scores[action_matrix], axis=1)
-    pose_limit = min(int(config.exact_eig_pose_limit), int(pose_indices.size))
+    pose_limit = min(int(config.exact_eig_pose_max), int(pose_indices.size))
     required_action_count = int(pose_limit * len(programs))
-    if required_action_count > int(config.exact_eig_action_limit):
-        raise ValueError(
-            "exact_eig_action_limit cannot hold a complete program sweep for "
-            "every shortlisted pose: "
-            f"{pose_limit} poses * {len(programs)} programs = "
-            f"{required_action_count} actions, but the limit is "
-            f"{int(config.exact_eig_action_limit)}."
-        )
     if pose_limit == int(pose_indices.size):
         return (
             np.arange(len(pending_nodes), dtype=np.int64),
@@ -1719,7 +1692,7 @@ def _slice_joint_program_components(
 def _conditional_contender_subsets(
     result: ConditionalGreedyResult,
 ) -> tuple[NDArray[np.int64], tuple[str, ...]]:
-    """Return greedy, best one-swap, and optional incumbent contenders."""
+    """Return greedy and best one-swap program contenders."""
     contenders = [
         np.asarray(result.greedy_program_pair_ids_al, dtype=np.int64),
     ]
@@ -1732,14 +1705,6 @@ def _conditional_contender_subsets(
             )
         )
         names.append("one_swap")
-    if int(result.incumbent_candidate_count_per_action) > 0:
-        contenders.append(
-            np.asarray(
-                result.incumbent_best_program_pair_ids_al,
-                dtype=np.int64,
-            )
-        )
-        names.append("legacy48_guard")
     subsets = np.stack(contenders, axis=1)
     return np.asarray(subsets, dtype=np.int64), tuple(names)
 
@@ -1864,7 +1829,6 @@ def _conditional_search_with_components(
     eig_call_seed: int,
     stream_name: str,
     enable_one_swap: bool,
-    incumbent_subsets_ck: NDArray[np.int64] | None,
     confirm_ambiguous: bool,
     confidence: float,
     shadow_prefix_view_counts: tuple[int, ...] = (),
@@ -1888,7 +1852,6 @@ def _conditional_search_with_components(
         num_orientations=int(estimator.num_orientations),
         program_length=int(program_length),
         enable_one_swap=bool(enable_one_swap),
-        incumbent_subsets=incumbent_subsets_ck,
     )
     contenders, contender_names = _conditional_contender_subsets(result)
     contender_tensor = torch.as_tensor(
@@ -2134,9 +2097,6 @@ def _conditional_search_with_components(
         "one_swap_candidate_count_per_pose": int(
             result.one_swap_candidate_count_per_action
         ),
-        "legacy_guard_candidate_count_per_pose": int(
-            result.incumbent_candidate_count_per_action
-        ),
         "initial_selection_sources": list(result.selection_source_a),
         "selected_sources": list(selected_sources),
         "ambiguous_program_pose_count": int(np.count_nonzero(ambiguous)),
@@ -2158,9 +2118,6 @@ def _conditional_search_with_components(
             float(value) for value in combined_lower
         ],
         "one_swap_applied_count": int(np.count_nonzero(result.one_swap_applied_a)),
-        "legacy_guard_applied_count": int(
-            np.count_nonzero(result.incumbent_floor_applied_a)
-        ),
         "shadow_prefix_view_counts": [
             int(value) for value in shadow_prefix_view_counts
         ],
@@ -2200,7 +2157,6 @@ def _evaluate_conditional_pose_batches(
     working_memory_budget_bytes: int,
     maximum_subset_candidate_count: int,
     enable_one_swap: bool,
-    incumbent_subsets_ck: NDArray[np.int64] | None,
     confirm_ambiguous: bool,
 ) -> _ConditionalPoseEvaluation:
     """Evaluate all-pair searches in response-preserving batched pose chunks."""
@@ -2342,7 +2298,6 @@ def _evaluate_conditional_pose_batches(
                     eig_call_seed=int(seed),
                     stream_name=f"{stream_name}_replica_{replica_index}",
                     enable_one_swap=bool(enable_one_swap),
-                    incumbent_subsets_ck=incumbent_subsets_ck,
                     confirm_ambiguous=bool(confirm_ambiguous),
                     confidence=float(config.proxy_boundary_confidence),
                     shadow_prefix_view_counts=(
@@ -2753,27 +2708,14 @@ def _proxy_replica_scores_payload(
     ]
 
 
-def _shadow_measurement_penalty(
-    config: DSSPPConfig,
-    *,
-    view_count: int,
-) -> float:
-    """Return the uncalibrated measurement penalty for audit reporting only."""
-    return (
-        float(config.lambda_time)
-        * int(view_count)
-        * (float(config.rotation_overhead_s) + float(config.live_time_s))
-    )
-
-
-def _shadow_scores_without_measurement_penalty(
+def _shadow_scores_for_view_counts(
     reference_scores_a: NDArray[np.float64],
     reference_information_gains_a: NDArray[np.float64],
     information_gains_la: NDArray[np.float64],
     *,
     config: DSSPPConfig,
 ) -> NDArray[np.float64]:
-    """Compose K-specific counterfactual scores without a K time penalty."""
+    """Compose view-count scores from common deterministic pose utility."""
     scores = np.asarray(reference_scores_a, dtype=np.float64).reshape(-1)
     reference_gains = np.asarray(
         reference_information_gains_a,
@@ -2789,14 +2731,7 @@ def _shadow_scores_without_measurement_penalty(
         or np.any(~np.isfinite(reference_gains))
     ):
         raise ValueError("Shadow view-count scores require aligned finite inputs.")
-    deterministic = (
-        scores
-        - float(config.lambda_eig) * reference_gains
-        + _shadow_measurement_penalty(
-            config,
-            view_count=int(config.program_length),
-        )
-    )
+    deterministic = scores - float(config.lambda_eig) * reference_gains
     output = deterministic[np.newaxis, :] + float(config.lambda_eig) * gains
     if np.any(~np.isfinite(output)):
         raise RuntimeError("Shadow view-count scores became nonfinite.")
@@ -2920,54 +2855,8 @@ def _shadow_selected_action_payload(
         "information_gain_mean_nat": float(
             gains[selected_length_indices[leader], leader]
         ),
-        "pose_score_without_measurement_time_penalty": float(selected_scores[leader]),
+        "pose_score": float(selected_scores[leader]),
     }
-
-
-def _shadow_configured_time_weight_action(
-    *,
-    scores_without_measurement_penalty_la: NDArray[np.float64],
-    information_gains_la: NDArray[np.float64],
-    programs_by_view_count: Mapping[int, NDArray[np.int64]],
-    candidate_view_counts: tuple[int, ...],
-    pose_indices_a: NDArray[np.int64],
-    poses_a3: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> dict[str, object]:
-    """Return the explicitly uncalibrated configured-time counterfactual."""
-    scores = np.asarray(
-        scores_without_measurement_penalty_la,
-        dtype=np.float64,
-    )
-    counts = np.asarray(candidate_view_counts, dtype=np.int64)
-    penalties = np.asarray(
-        [
-            _shadow_measurement_penalty(config, view_count=int(view_count))
-            for view_count in counts
-        ],
-        dtype=np.float64,
-    )
-    if scores.ndim != 2 or scores.shape[0] != counts.size:
-        raise ValueError("Configured-time shadow scores must align by view count.")
-    adjusted_scores = scores - penalties[:, np.newaxis]
-    selected_indices = np.argmax(adjusted_scores, axis=0)
-    payload = _shadow_selected_action_payload(
-        selected_view_counts_a=np.asarray(
-            counts[selected_indices],
-            dtype=np.int64,
-        ),
-        scores_la=np.asarray(adjusted_scores, dtype=np.float64),
-        information_gains_la=information_gains_la,
-        programs_by_view_count=programs_by_view_count,
-        candidate_view_counts=candidate_view_counts,
-        pose_indices_a=pose_indices_a,
-        poses_a3=poses_a3,
-    )
-    adjusted_score = payload.pop("pose_score_without_measurement_time_penalty")
-    payload["pose_score_with_configured_measurement_time_weight"] = adjusted_score
-    payload["configured_measurement_time_weight"] = float(config.lambda_time)
-    payload["calibrated_for_dynamic_acquisition"] = False
-    return payload
 
 
 def _shadow_exact_diagnostics(
@@ -2999,7 +2888,7 @@ def _shadow_exact_diagnostics(
             config.shield_view_count_shadow_per_comparison_confidence
         ),
     )
-    scores = _shadow_scores_without_measurement_penalty(
+    scores = _shadow_scores_for_view_counts(
         reference_scores_a,
         reference_information_gains_a,
         decision.information_gain_mean_la,
@@ -3025,10 +2914,6 @@ def _shadow_exact_diagnostics(
         added_live_time = float(
             (int(view_count) - int(previous_count)) * float(config.live_time_s)
         )
-        added_elapsed_time = float(
-            (int(view_count) - int(previous_count))
-            * (float(config.live_time_s) + float(config.rotation_overhead_s))
-        )
         retained = decision.retained_fraction_la[length_index]
         payload: dict[str, object] = {
             "pair_ids": np.asarray(
@@ -3048,27 +2933,7 @@ def _shadow_exact_diagnostics(
             "measurement_live_time_s": float(
                 int(view_count) * float(config.live_time_s)
             ),
-            "measurement_elapsed_time_s": float(
-                int(view_count)
-                * (float(config.live_time_s) + float(config.rotation_overhead_s))
-            ),
-            "pose_score_without_measurement_time_penalty": scores[
-                length_index
-            ].tolist(),
-            "pose_score_with_configured_measurement_time_weight": (
-                scores[length_index]
-                - _shadow_measurement_penalty(
-                    config,
-                    view_count=int(view_count),
-                )
-            ).tolist(),
-            "uncalibrated_time_utility_at_configured_weight": (
-                decision.information_gain_mean_la[length_index]
-                - _shadow_measurement_penalty(
-                    config,
-                    view_count=int(view_count),
-                )
-            ).tolist(),
+            "pose_score": scores[length_index].tolist(),
             "nested_prefix_increment": {
                 "previous_view_count": int(previous_count),
                 "added_view_count": int(view_count) - int(previous_count),
@@ -3076,12 +2941,8 @@ def _shadow_exact_diagnostics(
                 "paired_standard_error_nat": increment_se.tolist(),
                 "one_sided_mc_lcb_nat": increment_lcb.tolist(),
                 "added_live_time_s": added_live_time,
-                "added_elapsed_time_s": added_elapsed_time,
                 "mean_nat_per_added_live_second": (
                     increment_mean / added_live_time
-                ).tolist(),
-                "mean_nat_per_added_elapsed_second": (
-                    increment_mean / added_elapsed_time
                 ).tolist(),
             },
         }
@@ -3143,17 +3004,6 @@ def _shadow_exact_diagnostics(
             pose_indices_a=pose_indices,
             poses_a3=poses,
         ),
-        "configured_time_weight_counterfactual_action": (
-            _shadow_configured_time_weight_action(
-                scores_without_measurement_penalty_la=scores,
-                information_gains_la=decision.information_gain_mean_la,
-                programs_by_view_count=programs_by_view_count,
-                candidate_view_counts=candidate_counts,
-                pose_indices_a=pose_indices,
-                poses_a3=poses,
-                config=config,
-            )
-        ),
     }
 
 
@@ -3185,7 +3035,7 @@ def _shadow_proxy_diagnostics(
         )
         for view_count in candidate_counts
     }
-    scores = _shadow_scores_without_measurement_penalty(
+    scores = _shadow_scores_for_view_counts(
         reference_scores_a,
         evaluation.information_gains_ra[0],
         gains,
@@ -3219,9 +3069,7 @@ def _shadow_proxy_diagnostics(
                 "pair_ids": programs[view_count].tolist(),
                 "program_semantics": "nested_conditional_greedy_prefix",
                 "information_gain_mean_nat": gains[length_index].tolist(),
-                "pose_score_without_measurement_time_penalty": scores[
-                    length_index
-                ].tolist(),
+                "pose_score": scores[length_index].tolist(),
             }
             for length_index, view_count in enumerate(candidate_counts)
         },
@@ -3295,7 +3143,6 @@ def _build_conditional_nodes(
     config: DSSPPConfig,
     rng: np.random.Generator,
     joint_particles: JointPlanningParticles,
-    legacy_guard_programs: Sequence[ShieldProgram],
     motion_times: NDArray[np.float64] | None,
     motion_time_components: tuple[
         NDArray[np.float64],
@@ -3383,7 +3230,6 @@ def _build_conditional_nodes(
             working_memory_budget_bytes=int(config.proxy_memory_budget_bytes),
             maximum_subset_candidate_count=(int(estimator.num_orientations) ** 2),
             enable_one_swap=False,
-            incumbent_subsets_ck=None,
             confirm_ambiguous=False,
         )
         proxy_motion_times = (
@@ -3399,7 +3245,6 @@ def _build_conditional_nodes(
             static_scores[valid_pose_indices],
             paths[valid_pose_indices],
             config=config,
-            program_length=int(config.program_length),
             motion_times_p=proxy_motion_times,
             motion_time_components_p=proxy_motion_components,
         )
@@ -3442,7 +3287,6 @@ def _build_conditional_nodes(
                 working_memory_budget_bytes=int(config.proxy_memory_budget_bytes),
                 maximum_subset_candidate_count=(int(estimator.num_orientations) ** 2),
                 enable_one_swap=False,
-                incumbent_subsets_ck=None,
                 confirm_ambiguous=False,
             )
             resolved_proxy_config = replace(
@@ -3455,7 +3299,6 @@ def _build_conditional_nodes(
                     static_scores[valid_pose_indices[refinement_local_indices]],
                     paths[valid_pose_indices[refinement_local_indices]],
                     config=resolved_proxy_config,
-                    program_length=int(config.program_length),
                     motion_times_p=(
                         None
                         if motion_times is None
@@ -3531,7 +3374,7 @@ def _build_conditional_nodes(
             ],
             axis=0,
         )
-        shadow_proxy_scores = _shadow_scores_without_measurement_penalty(
+        shadow_proxy_scores = _shadow_scores_for_view_counts(
             base_proxy_scores,
             proxy_evaluation.information_gains_ra[0],
             shadow_proxy_gains,
@@ -3547,16 +3390,6 @@ def _build_conditional_nodes(
         ~np.isin(shadow_union_local_indices, shortlisted_local_indices)
     ]
     shadow_extra_pose_indices = valid_pose_indices[shadow_extra_local_indices]
-    incumbent_matrix = None
-    if bool(config.legacy_program_guard_enabled):
-        from planning.legacy_program_guard import legacy_program_pair_matrix
-
-        incumbent_matrix = legacy_program_pair_matrix(legacy_guard_programs)
-        if incumbent_matrix.shape != (
-            len(legacy_guard_programs),
-            int(config.program_length),
-        ):
-            raise RuntimeError("Legacy program guard has an invalid pair matrix.")
     conditional_pair_count = int(estimator.num_orientations) ** 2
     conditional_swap_count = (
         int(config.program_length)
@@ -3567,7 +3400,6 @@ def _build_conditional_nodes(
     exact_maximum_candidate_count = max(
         conditional_pair_count,
         conditional_swap_count,
-        0 if incumbent_matrix is None else int(incumbent_matrix.shape[0]),
     )
     exact_evaluation = _evaluate_conditional_pose_batches(
         estimator=estimator,
@@ -3581,7 +3413,6 @@ def _build_conditional_nodes(
         working_memory_budget_bytes=int(config.exact_eig_memory_budget_bytes),
         maximum_subset_candidate_count=int(exact_maximum_candidate_count),
         enable_one_swap=bool(config.conditional_greedy_one_swap),
-        incumbent_subsets_ck=incumbent_matrix,
         confirm_ambiguous=True,
     )
     exact_gains = exact_evaluation.information_gains_ra[0].copy()
@@ -3607,7 +3438,6 @@ def _build_conditional_nodes(
         static_scores[exact_pose_indices],
         paths[exact_pose_indices],
         config=config,
-        program_length=int(config.program_length),
         motion_times_p=exact_motion_times,
         motion_time_components_p=exact_motion_components,
     )
@@ -3628,7 +3458,6 @@ def _build_conditional_nodes(
             static_scores[exact_pose_indices],
             paths[exact_pose_indices],
             config=config,
-            program_length=int(config.program_length),
             motion_times_p=exact_motion_times,
             motion_time_components_p=exact_motion_components,
         )
@@ -3701,7 +3530,6 @@ def _build_conditional_nodes(
                 static_scores[exact_pose_indices],
                 paths[exact_pose_indices],
                 config=config,
-                program_length=int(config.program_length),
                 motion_times_p=exact_motion_times,
                 motion_time_components_p=exact_motion_components,
             )
@@ -3740,7 +3568,6 @@ def _build_conditional_nodes(
                 working_memory_budget_bytes=int(config.exact_eig_memory_budget_bytes),
                 maximum_subset_candidate_count=int(conditional_pair_count),
                 enable_one_swap=False,
-                incumbent_subsets_ck=None,
                 confirm_ambiguous=False,
             )
             shadow_extra_gains = shadow_extra_evaluation.information_gains_ra[0].copy()
@@ -3752,7 +3579,6 @@ def _build_conditional_nodes(
                     config,
                     lambda_distance=float(exact_distance_weight),
                 ),
-                program_length=int(config.program_length),
                 motion_times_p=(
                     None
                     if motion_times is None
@@ -3921,10 +3747,6 @@ def _build_conditional_nodes(
                 ),
                 "lcb_pass_condition": "strictly_greater_than_zero",
                 "program_semantics": "nested_conditional_greedy_prefix",
-                "measurement_time_weight_affects_selection": False,
-                "configured_measurement_time_weight_audit_only": float(
-                    config.lambda_time
-                ),
             },
             "mc_contract": {
                 "status": "evaluated",
@@ -3956,7 +3778,6 @@ def _build_conditional_nodes(
     source_kind = {
         "greedy": "conditional_greedy_all_pairs",
         "one_swap": "conditional_greedy_one_swap",
-        "legacy48_guard": "legacy48_same_sample_eig_guard",
     }
     nodes = [
         DSSPPNode(
@@ -3995,8 +3816,7 @@ def _build_conditional_nodes(
         if bool(config.conditional_greedy_one_swap)
         else 0
     )
-    guard_count = int(0 if incumbent_matrix is None else incumbent_matrix.shape[0])
-    contender_count = 1 + int(swap_count > 0) + int(guard_count > 0)
+    contender_count = 1 + int(swap_count > 0)
     program_confirmation_count = int(
         sum(
             int(replica["independently_confirmed_program_pose_count"])
@@ -4016,11 +3836,12 @@ def _build_conditional_nodes(
     )
     exact_subset_evaluation_count = int(
         exact_pose_indices.size
-        * (greedy_count + swap_count + guard_count + contender_count)
+        * (greedy_count + swap_count + contender_count)
         + program_confirmation_count * contender_count
         + pose_confirmation_count
     )
     diagnostics: dict[str, object] = {
+        "candidate_pose_count": int(available_pose_count),
         "total_action_count": int(available_pose_count),
         "path_length_support": str(path_length_support),
         "proxy_action_count": int(proxy_subset_evaluation_count),
@@ -4040,12 +3861,7 @@ def _build_conditional_nodes(
             "proxy_conditional_greedy_plus_spatial_minus_motion_with_"
             "paired_mc_stability_adaptive_8_12_16"
         ),
-        "program_search_contract": (
-            "all_pairs_conditional_greedy_then_one_swap_then_same_sample_"
-            "legacy48_eig_floor"
-            if incumbent_matrix is not None
-            else "all_pairs_conditional_greedy_then_one_swap_without_legacy_guard"
-        ),
+        "program_search_contract": "all_pairs_conditional_greedy_then_one_swap",
         "exact_eig_seed": int(exact_seed),
         "adaptive_exact_eig_round_count": 1,
         "adaptive_exact_eig_exhausted_all_actions": bool(
@@ -4088,7 +3904,6 @@ def _build_conditional_nodes(
         "pose_confirmation_memory_chunk_plan": dict(pose_confirmation_memory_plan),
         "conditional_greedy_candidate_count_per_pose": int(greedy_count),
         "one_swap_candidate_count_per_pose": int(swap_count),
-        "legacy_guard_candidate_count_per_pose": int(guard_count),
         "independently_confirmed_program_pose_count": int(program_confirmation_count),
         "coverage_support": str(coverage_support),
         "coverage_quadrature": coverage_quadrature_diagnostics,
@@ -4105,7 +3920,6 @@ def _build_nodes(
     programs: Sequence[ShieldProgram],
     modes_by_isotope: dict[str, list[SignatureMode]],
     current_pose_xyz: NDArray[np.float64],
-    current_pair_id: int | None,
     visited_poses_xyz: NDArray[np.float64] | None,
     map_api: object | None,
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
@@ -4161,11 +3975,9 @@ def _build_nodes(
                 "Candidate motion-time components must align with candidates and "
                 "contain finite nonnegative values."
             )
-        if motion_times is None or not np.allclose(
+        if motion_times is None or not np.array_equal(
             np.sum(np.vstack(motion_time_components), axis=0),
             motion_times,
-            rtol=1.0e-12,
-            atol=1.0e-12,
         ):
             raise ValueError(
                 "Candidate motion-time components must sum to motion times."
@@ -4221,7 +4033,26 @@ def _build_nodes(
         None,
     )
     coverage_quadrature_diagnostics: dict[str, object] | None = None
-    if callable(surface_quadrature_builder):
+    coverage_enabled = bool(
+        float(config.lambda_coverage) > 0.0
+        or float(config.coverage_floor_weight) > 0.0
+        or int(config.exact_eig_coverage_reserve) > 0
+    )
+    if not coverage_enabled:
+        coverage_raw = np.zeros(candidate_poses.shape[0], dtype=np.float64)
+        coverage_quadrature_diagnostics = {
+            "enabled": False,
+            "sample_count": 0,
+        }
+        coverage_support = "disabled"
+    elif callable(surface_quadrature_builder):
+        if (
+            config.coverage_surface_quadrature_max_points is None
+            or config.coverage_surface_max_hausdorff_m is None
+        ):
+            raise ValueError(
+                "Enabled coverage requires explicit surface quadrature settings."
+            )
         surface_quadrature = surface_quadrature_builder(
             max_points=int(config.coverage_surface_quadrature_max_points),
             maximum_hausdorff_bound_m=float(config.coverage_surface_max_hausdorff_m),
@@ -4261,6 +4092,10 @@ def _build_nodes(
     else:
         # A small deterministic oracle remains available only to unit-test
         # score composition without constructing a production estimator.
+        if config.coverage_surface_quadrature_max_points is None:
+            raise ValueError(
+                "Enabled coverage requires an explicit quadrature point limit."
+            )
         surface_coverage_points = _free_cell_centers(
             map_api,
             z_value=float(current_pose_xyz[2]),
@@ -4273,7 +4108,7 @@ def _build_nodes(
             visited_poses_xyz=visited_poses_xyz,
             radius_m=float(config.coverage_radius_m),
         )
-        coverage_support = "test_only_free_cell_fallback_3d"
+        coverage_support = "test_only_free_cell_oracle_3d"
     coverage_norm = coverage_raw.copy()
     max_coverage = float(np.max(coverage_norm)) if coverage_norm.size else 0.0
     if max_coverage > 0.0:
@@ -4327,14 +4162,8 @@ def _build_nodes(
         modes_by_isotope,
         config=config,
     )
-    conditional_shadow_diagnostics: dict[str, object] | None = None
-    conditional_policy_active = (
-        config.forced_program_pair_ids is None
-        and config.shield_program_search_policy
-        in {"conditional_greedy_all_pairs", "conditional_greedy_shadow"}
-    )
-    if conditional_policy_active:
-        conditional_nodes, conditional_diagnostics = _build_conditional_nodes(
+    if config.forced_program_pair_ids is None:
+        return _build_conditional_nodes(
             estimator=estimator,
             candidate_poses=candidate_poses,
             path_lengths=path_lengths,
@@ -4352,14 +4181,10 @@ def _build_nodes(
             config=config,
             rng=rng,
             joint_particles=joint_particles,
-            legacy_guard_programs=programs,
             motion_times=motion_times,
             motion_time_components=motion_time_components,
             path_length_support=str(path_length_support),
         )
-        if config.shield_program_search_policy == "conditional_greedy_all_pairs":
-            return conditional_nodes, conditional_diagnostics
-        conditional_shadow_diagnostics = conditional_diagnostics
     evaluation_pose_indices = np.arange(candidate_poses.shape[0], dtype=np.int64)
     raw_nodes: list[DSSPPNode] = []
     pending: list[_PendingDSSPPNode] = []
@@ -4398,24 +4223,11 @@ def _build_nodes(
             "proxy_action_count": 0,
             "exact_action_count": 0,
             "path_length_support": path_length_support,
+            "coverage_support": coverage_support,
+            "coverage_quadrature": coverage_quadrature_diagnostics,
         }
     total_action_count = len(pending)
     available_pose_count = len({int(item.pose_index) for item in pending})
-    exact_pose_count = min(
-        int(config.exact_eig_pose_limit),
-        int(available_pose_count),
-    )
-    required_exact_action_count = int(exact_pose_count * len(programs))
-    if float(config.lambda_eig) > 0.0 and required_exact_action_count > int(
-        config.exact_eig_action_limit
-    ):
-        raise ValueError(
-            "exact_eig_action_limit cannot hold all programs for the "
-            "configured exact_eig_pose_limit: "
-            f"{exact_pose_count} poses * {len(programs)} programs = "
-            f"{required_exact_action_count} actions, but the limit is "
-            f"{int(config.exact_eig_action_limit)}."
-        )
     proxy_wall_s = 0.0
     exact_wall_s = 0.0
     proxy_information_scores = np.zeros(
@@ -4448,7 +4260,7 @@ def _build_nodes(
         )
     )
     if float(config.lambda_eig) > 0.0 and available_pose_count > int(
-        config.exact_eig_pose_limit
+        config.exact_eig_pose_max
     ):
         proxy_joint_particles = estimator.planning_joint_particles(
             max_particles=int(config.proxy_planning_particles),
@@ -4611,10 +4423,7 @@ def _build_nodes(
         next_stop = (
             initial_indices.size
             if next_evaluation_offset == 0
-            else min(
-                next_evaluation_offset + int(config.exact_eig_action_limit),
-                total_action_count,
-            )
+            else total_action_count
         )
         if next_stop <= next_evaluation_offset:
             raise RuntimeError("Adaptive exact-EIG batch made no progress.")
@@ -4684,8 +4493,6 @@ def _build_nodes(
             score, _ = _compose_transition_score(
                 node=placeholder_node,
                 previous_pose_xyz=current_pose_xyz,
-                previous_pair_id=current_pair_id,
-                estimator=estimator,
                 map_api=map_api,
                 config=config,
                 path_length_override_m=float(
@@ -4742,8 +4549,6 @@ def _build_nodes(
             lower_score, _ = _compose_transition_score(
                 node=lower_node,
                 previous_pose_xyz=current_pose_xyz,
-                previous_pair_id=current_pair_id,
-                estimator=estimator,
                 map_api=map_api,
                 config=config,
                 path_length_override_m=float(path_lengths[int(lower_node.pose_index)]),
@@ -4781,8 +4586,6 @@ def _build_nodes(
             upper_score, _ = _compose_transition_score(
                 node=upper_node,
                 previous_pose_xyz=current_pose_xyz,
-                previous_pair_id=current_pair_id,
-                estimator=estimator,
                 map_api=map_api,
                 config=config,
                 path_length_override_m=float(path_lengths[int(upper_node.pose_index)]),
@@ -4798,12 +4601,8 @@ def _build_nodes(
         shortlist_bound_certified = bool(
             evaluated_objective_lower >= excluded_universal_upper - 1.0e-12
         )
-        # ``exact_eig_action_limit`` is a real-time planning budget.  Expanding
-        # beyond it until the very loose finite-sample KL bound certifies the
-        # winner can degenerate into exhaustive exact evaluation whenever one
-        # posterior particle has tiny positive weight.  The proxy already
-        # evaluates every action with the same generative model, while the
-        # exact stage re-evaluates the predeclared diverse shortlist only.
+        # The proxy already evaluates every action with the same generative
+        # model; the exact stage re-evaluates the fixed-program pose shortlist.
         break
 
     best_exact_score = float(raw_nodes[0].score) if raw_nodes else -float("inf")
@@ -4847,23 +4646,27 @@ def _build_nodes(
         and np.all(evaluated_program_counts == len(programs))
     )
     diagnostics: dict[str, object] = {
+        "candidate_pose_count": int(available_pose_count),
         "total_action_count": int(total_action_count),
         "path_length_support": path_length_support,
+        "coverage_support": coverage_support,
+        "coverage_quadrature": coverage_quadrature_diagnostics,
         "proxy_action_count": int(proxy_action_count),
+        "proxy_subset_evaluation_count": int(proxy_action_count),
         "proxy_particle_count": int(proxy_particle_count),
         "proxy_eig_samples": int(config.proxy_eig_samples),
         "shared_full_spectrum_detector_aperture_samples": int(
             config.detector_aperture_samples
         ),
         "exact_action_count": int(exact_action_count),
-        "exact_eig_pose_limit": int(config.exact_eig_pose_limit),
-        "exact_eig_action_limit": int(config.exact_eig_action_limit),
+        "exact_subset_evaluation_count": int(exact_action_count),
+        "exact_eig_pose_max": int(config.exact_eig_pose_max),
         "shortlisted_pose_count": int(evaluated_pose_indices.size),
         "programs_per_shortlisted_pose": int(len(programs)),
         "full_program_sweep_per_shortlisted_pose": bool(full_program_sweep),
         "pose_shortlist_contract": (
             "proxy_ranks_poses_by_best_proxy_program_then_exact_evaluates_"
-            "every_predeclared_program_at_each_shortlisted_pose"
+            "the_forced_baseline_program_at_each_shortlisted_pose"
         ),
         "exact_eig_seed": int(exact_eig_seed),
         "adaptive_exact_eig_round_count": int(adaptive_round_count),
@@ -4878,7 +4681,7 @@ def _build_nodes(
             "rounds": list(exact_eig_runtime_rounds),
         },
         "proxy_unique_action_count": int(proxy_action_count),
-        "legacy_all_exact_bin_state_operations": int(
+        "exhaustive_exact_bin_state_operations": int(
             total_action_count
             * max(sample_count, 0)
             * particle_count
@@ -4928,29 +4731,24 @@ def _build_nodes(
         ),
         "shortlist_certification_note": (
             "Every pose is ranked by its best shared full-spectrum proxy "
-            "program. Every predeclared program is then exactly evaluated at "
-            "each shortlisted pose; exact_eig_action_limit is only a safety "
-            "cap and may never truncate a pose's program sweep. A formal "
+            "program. The forced baseline program is then exactly evaluated "
+            "at each shortlisted pose. A formal "
             "pose-recall certificate is reported only when the evaluated set "
             "also exceeds the safe finite-sample objective bound."
         ),
         "eig_shortlist_wall_s": float(proxy_wall_s + exact_wall_s),
     }
-    if conditional_shadow_diagnostics is not None:
-        diagnostics["conditional_greedy_shadow"] = dict(conditional_shadow_diagnostics)
     return raw_nodes, diagnostics
 
 
-def select_dss_pp_next_station(
+def _select_dss_pp_core(
     estimator: RotatingShieldPFEstimator,
     candidate_poses_xyz: NDArray[np.float64],
     current_pose_xyz: NDArray[np.float64],
     *,
-    current_pair_id: int | None = None,
     visited_poses_xyz: NDArray[np.float64] | None = None,
     map_api: object | None = None,
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
-    continuous_height_bounds_m: tuple[float, float] | None = None,
     config: DSSPPConfig | None = None,
     rng: np.random.Generator | None = None,
     candidate_motion_times_s: NDArray[np.float64] | None = None,
@@ -4958,14 +4756,7 @@ def select_dss_pp_next_station(
     candidate_mast_vertical_times_s: NDArray[np.float64] | None = None,
     candidate_settling_times_s: NDArray[np.float64] | None = None,
 ) -> DSSPPResult:
-    """Select the next station and its actually executed shield program.
-
-    When ``continuous_height_bounds_m`` is provided, newly augmented xy
-    stations receive deterministic low-discrepancy heights within that range;
-    caller-provided candidate heights remain unchanged. No height/lateral
-    alternation constraint is imposed; exact EIG and global surface
-    observability decide among all reachable actions.
-    """
+    """Run the shared DSS-PP implementation over validated or oracle inputs."""
     cfg = config or DSSPPConfig()
     if not isinstance(rng, np.random.Generator):
         raise TypeError(
@@ -4978,27 +4769,15 @@ def select_dss_pp_next_station(
     current_pose = np.asarray(current_pose_xyz, dtype=float)
     if current_pose.shape != (3,) or np.any(~np.isfinite(current_pose)):
         raise ValueError("current_pose_xyz must be a finite shape-(3,) vector.")
-    if current_pair_id is not None:
-        if isinstance(current_pair_id, bool) or not isinstance(
-            current_pair_id,
-            (int, np.integer),
-        ):
-            raise ValueError("current_pair_id must be an integer or None.")
-        current_pair_count = int(estimator.num_orientations) ** 2
-        if not 0 <= int(current_pair_id) < current_pair_count:
-            raise ValueError(
-                "current_pair_id lies outside the estimator shield-pair "
-                f"support [0, {current_pair_count - 1}]."
-            )
-    joint_particles = estimator.planning_joint_particles(
-        max_particles=cfg.planning_particles,
-        method=cfg.planning_method,
-        rng=planning_rng,
-    )
-    geometry_joint_particles = estimator.planning_joint_particles(
-        max_particles=0,
-        method="top_weight",
-    )
+    if cfg.planning_particles is None:
+        joint_particles = estimator.planning_joint_particles()
+    else:
+        joint_particles = estimator.planning_joint_particles(
+            max_particles=cfg.planning_particles,
+            method=cfg.planning_method,
+            rng=planning_rng,
+        )
+    geometry_joint_particles = estimator.planning_joint_particles()
     modes = extract_signature_modes(
         estimator,
         mode_cluster_radius_m=float(cfg.mode_cluster_radius_m),
@@ -5035,11 +4814,6 @@ def select_dss_pp_next_station(
                 "candidate_motion_times_s must align with candidates and "
                 "contain finite nonnegative values."
             )
-        if cfg.augment_candidates:
-            raise ValueError(
-                "Runtime motion times require augment_candidates=False; "
-                "new physical poses must be authored and timed by runtime."
-            )
     raw_motion_components = (
         candidate_horizontal_travel_times_s,
         candidate_mast_vertical_times_s,
@@ -5068,32 +4842,20 @@ def select_dss_pp_next_station(
             )
         component_totals = np.sum(np.vstack(input_motion_components), axis=0)
         if input_motion_times is None:
-            input_motion_times = component_totals
-        elif not np.allclose(
+            raise ValueError(
+                "Candidate motion-time components require exact total motion times."
+            )
+        if not np.array_equal(
             input_motion_times,
             component_totals,
-            rtol=1.0e-12,
-            atol=1.0e-12,
         ):
             raise ValueError(
                 "Candidate motion-time components must sum to motion times."
             )
-        if cfg.augment_candidates:
-            raise ValueError(
-                "Runtime motion times require augment_candidates=False; "
-                "new physical poses must be authored and timed by runtime."
-            )
-    if cfg.augment_candidates:
-        candidates = augment_candidate_stations(
-            candidates,
-            modes_by_isotope=modes,
-            current_pose_xyz=current_pose,
-            visited_poses_xyz=visited_poses_xyz,
-            map_api=map_api,
-            bounds_xyz=bounds_xyz,
-            config=cfg,
-            continuous_height_bounds_m=continuous_height_bounds_m,
-            rng=planning_rng,
+    if (input_motion_times is None) is not (input_motion_components is None):
+        raise ValueError(
+            "Candidate motion totals and all three components must be supplied "
+            "together."
         )
 
     candidates, separation_filtered = _filter_station_separation(
@@ -5137,32 +4899,7 @@ def select_dss_pp_next_station(
             "DSS-PP received no reachable candidate after the generic 3-D "
             "station-separation contract."
         )
-    if (
-        cfg.forced_program_pair_ids is None
-        and cfg.shield_program_search_policy == "conditional_greedy_all_pairs"
-        and bool(cfg.legacy_program_guard_enabled)
-    ):
-        from planning.legacy_program_guard import legacy_program_guard_candidates
-
-        programs = list(
-            legacy_program_guard_candidates(
-                estimator.normals,
-                program_length=int(cfg.program_length),
-                max_programs=int(cfg.max_programs),
-            )
-        )
-    elif cfg.forced_program_pair_ids is None and cfg.shield_program_search_policy in {
-        "predeclared_library",
-        "conditional_greedy_shadow",
-    }:
-        from planning.shield_programs import build_shield_program_library
-
-        programs = build_shield_program_library(
-            estimator.normals,
-            program_length=int(cfg.program_length),
-            max_programs=int(cfg.max_programs),
-        )
-    elif cfg.forced_program_pair_ids is not None:
+    if cfg.forced_program_pair_ids is not None:
         pair_count = int(estimator.num_orientations) ** 2
         if any(int(pair_id) >= pair_count for pair_id in cfg.forced_program_pair_ids):
             raise ValueError(
@@ -5197,7 +4934,6 @@ def select_dss_pp_next_station(
         programs=programs,
         modes_by_isotope=modes,
         current_pose_xyz=current_pose,
-        current_pair_id=current_pair_id,
         visited_poses_xyz=visited_poses_xyz,
         map_api=map_api,
         bounds_xyz=bounds_xyz,
@@ -5239,10 +4975,7 @@ def select_dss_pp_next_station(
             atol=1.0e-12,
         )
     )
-    conditional_standard = bool(
-        cfg.forced_program_pair_ids is None
-        and cfg.shield_program_search_policy == "conditional_greedy_all_pairs"
-    )
+    conditional_standard = cfg.forced_program_pair_ids is None
     if float(cfg.lambda_eig) > 0.0:
         if conditional_standard and len(selected_pose_nodes) != 1:
             raise RuntimeError(
@@ -5276,50 +5009,27 @@ def select_dss_pp_next_station(
             motion_time_components is not None
         ),
         "motion_time_weights": {
-            "horizontal": float(
-                cfg.lambda_time
-                if cfg.lambda_horizontal_time is None
-                else cfg.lambda_horizontal_time
-            ),
-            "mast_vertical": float(
-                cfg.lambda_time
-                if cfg.lambda_mast_vertical_time is None
-                else cfg.lambda_mast_vertical_time
-            ),
-            "settling": float(
-                cfg.lambda_time
-                if cfg.lambda_settling_time is None
-                else cfg.lambda_settling_time
-            ),
-            "measurement": float(cfg.lambda_time),
+            "horizontal": float(cfg.lambda_horizontal_time),
+            "mast_vertical": float(cfg.lambda_mast_vertical_time),
+            "settling": float(cfg.lambda_settling_time),
         },
         "program_count": int(
             int(estimator.num_orientations) ** 2
             if conditional_standard
             else len(programs)
         ),
-        "predeclared_program_count": int(len(programs)),
-        "legacy_guard_program_count": int(
-            len(programs)
-            if conditional_standard and cfg.legacy_program_guard_enabled
-            else 0
-        ),
+        "forced_baseline_program_count": int(len(programs)),
         "shield_pair_count": int(estimator.num_orientations) ** 2,
-        "shield_program_search_policy": str(cfg.shield_program_search_policy),
-        "program_library_configured_capacity": int(cfg.max_programs),
+        "shield_program_search_policy": (
+            "conditional_greedy_all_pairs"
+            if conditional_standard
+            else "forced_baseline"
+        ),
         "program_library_realized_count": int(len(programs)),
         "program_library_policy": (
-            "forced_predeclared_baseline"
+            "forced_baseline"
             if cfg.forced_program_pair_ids is not None
-            else (
-                (
-                    "conditional_greedy_all_64_pairs_with_legacy48_guard"
-                    if cfg.legacy_program_guard_enabled
-                    else "conditional_greedy_all_64_pairs_without_legacy_guard"
-                )
-                if conditional_standard
-                else "balanced_multi_partition_predeclared_action_set"
-            )
+            else "conditional_greedy_all_pairs"
         ),
         "program_library_global_optimality_claimed": False,
         "program_library_exact_eig_over_every_predeclared_action": bool(
@@ -5347,12 +5057,6 @@ def select_dss_pp_next_station(
             if positive_occurrences.size
             else 0
         ),
-        "legacy_guard_pair_occurrence_min": int(
-            np.min(positive_occurrences) if positive_occurrences.size else 0
-        ),
-        "legacy_guard_pair_occurrence_max": int(
-            np.max(positive_occurrences) if positive_occurrences.size else 0
-        ),
         "program_library_companion_diversity_min": int(
             int(estimator.num_orientations) ** 2 - 1
             if conditional_standard
@@ -5368,11 +5072,6 @@ def select_dss_pp_next_station(
                 (len(companions) for companions in companion_sets.values()),
                 default=0,
             )
-        ),
-        "continuous_height_bounds_m": (
-            None
-            if continuous_height_bounds_m is None
-            else [float(value) for value in continuous_height_bounds_m]
         ),
         "evaluated_candidate_count": int(len({int(node.pose_index) for node in nodes})),
         "node_count": int(len(nodes)),
@@ -5394,12 +5093,9 @@ def select_dss_pp_next_station(
             "best_exact_program_eig_plus_spatial_coverage_and_robot_motion_terms"
         ),
         "program_selection_objective": (
-            "maximum_same_sample_eig_among_conditional_greedy_one_swap_and_"
-            "legacy48_guard"
-            if conditional_standard and cfg.legacy_program_guard_enabled
-            else "maximum_same_sample_eig_among_conditional_greedy_and_one_swap"
+            "maximum_same_sample_eig_among_conditional_greedy_and_one_swap"
             if conditional_standard
-            else "maximum_exact_eig_within_predeclared_program_library"
+            else "forced_baseline_program_exact_eig"
         ),
         "shield_rotation_cost_applied": False,
         "first_program_kind": first.program.kind,
@@ -5441,7 +5137,7 @@ def select_dss_pp_next_station(
         "coverage_sample_count": int(
             (shortlist_diagnostics.get("coverage_quadrature") or {}).get(
                 "sample_count",
-                cfg.coverage_surface_quadrature_max_points,
+                cfg.coverage_surface_quadrature_max_points or 0,
             )
         ),
         "first_revisit_penalty": float(first.revisit_penalty),
@@ -5464,4 +5160,74 @@ def select_dss_pp_next_station(
         score=best_score,
         sequence=tuple(sequence),
         diagnostics=diagnostics,
+    )
+
+
+def _select_dss_pp_test_oracle(
+    estimator: RotatingShieldPFEstimator,
+    candidate_poses_xyz: NDArray[np.float64],
+    current_pose_xyz: NDArray[np.float64],
+    *,
+    visited_poses_xyz: NDArray[np.float64] | None = None,
+    map_api: object | None = None,
+    bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
+    config: DSSPPConfig | None = None,
+    rng: np.random.Generator | None = None,
+    candidate_motion_times_s: NDArray[np.float64] | None = None,
+    candidate_horizontal_travel_times_s: NDArray[np.float64] | None = None,
+    candidate_mast_vertical_times_s: NDArray[np.float64] | None = None,
+    candidate_settling_times_s: NDArray[np.float64] | None = None,
+) -> DSSPPResult:
+    """Expose optional deterministic inputs only to focused unit tests."""
+    return _select_dss_pp_core(
+        estimator,
+        candidate_poses_xyz,
+        current_pose_xyz,
+        visited_poses_xyz=visited_poses_xyz,
+        map_api=map_api,
+        bounds_xyz=bounds_xyz,
+        config=config,
+        rng=rng,
+        candidate_motion_times_s=candidate_motion_times_s,
+        candidate_horizontal_travel_times_s=(
+            candidate_horizontal_travel_times_s
+        ),
+        candidate_mast_vertical_times_s=candidate_mast_vertical_times_s,
+        candidate_settling_times_s=candidate_settling_times_s,
+    )
+
+
+def select_dss_pp_next_station(
+    estimator: RotatingShieldPFEstimator,
+    candidate_poses_xyz: NDArray[np.float64],
+    current_pose_xyz: NDArray[np.float64],
+    *,
+    visited_poses_xyz: NDArray[np.float64],
+    map_api: object | None,
+    bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]],
+    config: DSSPPConfig,
+    rng: np.random.Generator,
+    candidate_motion_times_s: NDArray[np.float64],
+    candidate_horizontal_travel_times_s: NDArray[np.float64],
+    candidate_mast_vertical_times_s: NDArray[np.float64],
+    candidate_settling_times_s: NDArray[np.float64],
+) -> DSSPPResult:
+    """Select one live action from a complete runtime-authored contract."""
+    if not isinstance(config, DSSPPConfig):
+        raise TypeError("Live DSS-PP requires a validated DSSPPConfig.")
+    return _select_dss_pp_core(
+        estimator,
+        candidate_poses_xyz,
+        current_pose_xyz,
+        visited_poses_xyz=visited_poses_xyz,
+        map_api=map_api,
+        bounds_xyz=bounds_xyz,
+        config=config,
+        rng=rng,
+        candidate_motion_times_s=candidate_motion_times_s,
+        candidate_horizontal_travel_times_s=(
+            candidate_horizontal_travel_times_s
+        ),
+        candidate_mast_vertical_times_s=candidate_mast_vertical_times_s,
+        candidate_settling_times_s=candidate_settling_times_s,
     )

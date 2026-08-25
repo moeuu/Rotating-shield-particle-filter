@@ -11,20 +11,19 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.special import logsumexp
 
-from pf.estimator_compat import runtime_estimator_export
 from pf.estimator_sampling import _stratified_joint_cardinality_draws
 from pf.estimator_types import JointStationObservation
 from pf.particle_filter import (
     IsotopeParticle,
     IsotopeParticleFilter,
     JointRowIdentity,
-    TemperingIncrementRequiresRejuvenation,
 )
+from pf.particle_filter_tempering import TemperingIncrementRequiresRejuvenation
 from pf.randomness import named_random_generator
+from pf.resampling import systematic_resample
 from pf.state import IsotopeState
 from pf.structural_rj import (
     ContinuousBlockStrengthProposal,
-    cross_isotope_transfer_log_proposal,
     shifted_log_strength_random_walk_log_reverse_ratio,
 )
 
@@ -34,147 +33,6 @@ if TYPE_CHECKING:
 
 class JointRejuvenationMixin:
     """Provide joint state moves, resampling, mixing, and tempering."""
-
-    @staticmethod
-    def _joint_isotope_state_log_prior(
-        filt: IsotopeParticleFilter,
-        state: IsotopeState,
-    ) -> float:
-        """Return the exact labeled continuous-state prior log density."""
-        atlas = filt._structural_rj_surface_atlas
-        cardinality_prior = filt._structural_rj_cardinality_prior
-        if atlas is None or cardinality_prior is None:
-            raise RuntimeError("Cross-isotope transfer priors are unavailable.")
-        cardinality = int(state.num_sources)
-        value = float(cardinality_prior.log_prob(cardinality)) + math.lgamma(
-            float(cardinality) + 1.0
-        )
-        if cardinality:
-            value += float(
-                np.sum(
-                    atlas.log_chart_probabilities[state.surface_chart_ids]
-                    + np.asarray(
-                        filt._strength_prior.log_prob(state.strengths),
-                        dtype=np.float64,
-                    )
-                )
-            )
-        return value
-
-    @staticmethod
-    def _cross_isotope_transferred_states(
-        donor_filter: IsotopeParticleFilter,
-        receiver_filter: IsotopeParticleFilter,
-        donor_state: IsotopeState,
-        receiver_state: IsotopeState,
-        transferred_indices: NDArray[np.int64],
-    ) -> tuple[IsotopeState, IsotopeState]:
-        """Return canonical donor/receiver states after identity transfer."""
-        selected = np.asarray(transferred_indices, dtype=np.int64).reshape(-1)
-        donor_count = int(donor_state.num_sources)
-        if (
-            selected.size == 0
-            or np.unique(selected).size != selected.size
-            or np.any(selected < 0)
-            or np.any(selected >= donor_count)
-        ):
-            raise ValueError("Cross-isotope transferred indices are invalid.")
-        keep = np.ones(donor_count, dtype=bool)
-        keep[selected] = False
-        new_donor = IsotopeState(
-            num_sources=int(np.sum(keep)),
-            strengths=donor_state.strengths[keep],
-            surface_chart_ids=donor_state.surface_chart_ids[keep],
-            surface_uv=donor_state.surface_uv[keep],
-        )
-        new_receiver = IsotopeState(
-            num_sources=int(receiver_state.num_sources + selected.size),
-            strengths=np.concatenate(
-                (receiver_state.strengths, donor_state.strengths[selected])
-            ),
-            surface_chart_ids=np.concatenate(
-                (
-                    receiver_state.surface_chart_ids,
-                    donor_state.surface_chart_ids[selected],
-                )
-            ),
-            surface_uv=np.concatenate(
-                (receiver_state.surface_uv, donor_state.surface_uv[selected]),
-                axis=0,
-            ),
-        )
-        donor_filter._canonicalize_structural_rj_state(new_donor)
-        receiver_filter._canonicalize_structural_rj_state(new_receiver)
-        return new_donor, new_receiver
-
-    def _evaluate_cross_isotope_receiver_states(
-        self,
-        *,
-        stations: Sequence[JointStationObservation],
-        receiver_states: Mapping[int, IsotopeState],
-        receiver_by_row: NDArray[np.int64],
-        isotope_order: tuple[str, ...],
-        target_beta: float,
-    ) -> NDArray[np.float64]:
-        """Evaluate batched receiver states with temporary donor cache active."""
-        proposed_target = np.full(
-            receiver_by_row.size,
-            float("nan"),
-            dtype=np.float64,
-        )
-        for receiver_index, isotope in enumerate(isotope_order):
-            rows_for_isotope = np.flatnonzero(receiver_by_row == receiver_index)
-            if rows_for_isotope.size == 0:
-                continue
-            filt = self.filters[isotope]
-            evidence = self._joint_history_structural_geometry(
-                isotope,
-                stations,
-            )
-            cardinalities = np.asarray(
-                [receiver_states[int(row)].num_sources for row in rows_for_isotope],
-                dtype=np.int64,
-            )
-            for cardinality in np.unique(cardinalities).tolist():
-                local = np.flatnonzero(cardinalities == int(cardinality))
-                rows = rows_for_isotope[local]
-                states = [receiver_states[int(row)] for row in rows]
-                if int(cardinality):
-                    chart_ids = np.stack(
-                        [state.surface_chart_ids for state in states],
-                        axis=0,
-                    )
-                    strengths = np.stack(
-                        [state.strengths for state in states],
-                        axis=0,
-                    )
-                    positions = np.stack(
-                        [filt.continuous_state_positions(state) for state in states],
-                        axis=0,
-                    )
-                else:
-                    chart_ids = np.empty((rows.size, 0), dtype=np.int64)
-                    strengths = np.empty((rows.size, 0), dtype=np.float64)
-                    positions = np.empty((rows.size, 0, 3), dtype=np.float64)
-                proposed_target[rows] = self._joint_structural_target_evaluator(
-                    filt=filt,
-                    data=evidence,
-                    positions_pks=positions,
-                    chart_ids_pk=chart_ids,
-                    strengths_pk=strengths,
-                    particle_indices=rows,
-                    target_beta=float(target_beta),
-                    tempering_start_row=sum(
-                        int(station.fe_indices.size) for station in stations[:-1]
-                    ),
-                )
-        evaluated_rows = np.asarray(
-            sorted(receiver_states),
-            dtype=np.int64,
-        )
-        if np.any(~np.isfinite(proposed_target[evaluated_rows])):
-            raise RuntimeError("Cross-isotope target evaluation was incomplete.")
-        return proposed_target
 
     def _joint_packed_strength_state(
         self,
@@ -476,7 +334,7 @@ class JointRejuvenationMixin:
         )
         if rows.size == 0:
             return current_target
-        minimum = float(self.pf_config.strength_prior_min_cps_1m)
+        minimum = float(self.pf_config.strength_prior.minimum_cps_1m)
         old = current_strengths[rows]
         mask = active_mask[rows]
         shifted = old - minimum
@@ -559,447 +417,6 @@ class JointRejuvenationMixin:
                 np.sum(weights[accepted_rows])
             )
         return current_target
-
-    def _apply_joint_cross_isotope_transfer(
-        self,
-        stations: Sequence[JointStationObservation],
-        *,
-        target_beta: float,
-        current_target_log_likelihood: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        """Apply an exact multi-source isotope-identity transfer proposal.
-
-        A uniformly selected subset of one isotope is relabeled as another
-        isotope while retaining its continuous surface coordinates and
-        strengths.  The state-dependent subset and group-size probabilities,
-        both isotope priors, and the full joint likelihood are all included in
-        the MH ratio.  This crosses the likelihood barrier created when a clear
-        peak has been assigned to the wrong isotope during early resampling.
-        """
-        probability = float(self.pf_config.joint_cross_isotope_transfer_probability)
-        isotope_order = self.joint_isotope_order()
-        if probability <= 0.0 or len(isotope_order) < 2:
-            return np.asarray(current_target_log_likelihood, dtype=np.float64)
-        particle_count = int(self.pf_config.num_particles)
-        weights = self._strict_joint_particle_weights()
-        rng = self._joint_random_generator
-        attempted = rng.random(particle_count) < probability
-        donor_by_row = rng.integers(
-            0,
-            len(isotope_order),
-            size=particle_count,
-        )
-        receiver_offset = rng.integers(
-            1,
-            len(isotope_order),
-            size=particle_count,
-        )
-        receiver_by_row = (donor_by_row + receiver_offset) % len(isotope_order)
-        cardinalities = np.stack(
-            [
-                np.asarray(
-                    [
-                        particle.state.num_sources
-                        for particle in self.filters[isotope].continuous_particles
-                    ],
-                    dtype=np.int64,
-                )
-                for isotope in isotope_order
-            ],
-            axis=1,
-        )
-        row_indices = np.arange(particle_count, dtype=np.int64)
-        donor_cardinality = cardinalities[row_indices, donor_by_row]
-        receiver_cardinality = cardinalities[row_indices, receiver_by_row]
-        maximum_sources = self.pf_config.cardinality_capacity
-        maximum_group = np.minimum.reduce(
-            (
-                donor_cardinality,
-                maximum_sources - receiver_cardinality,
-                np.full(
-                    particle_count,
-                    int(self.pf_config.joint_cross_isotope_transfer_max_group),
-                    dtype=np.int64,
-                ),
-            )
-        )
-        feasible = attempted & (maximum_group > 0)
-        attempted_rows = np.flatnonzero(attempted)
-        rows = np.flatnonzero(feasible)
-        self.last_joint_cross_isotope_attempted_weight_mass += float(
-            np.sum(weights[attempted_rows])
-        )
-        if rows.size == 0:
-            self.last_joint_cross_isotope_rejection_diagnostics = {
-                "attempted": int(attempted_rows.size),
-                "accepted": 0,
-                "support_rejected": int(attempted_rows.size),
-                "geometry_support_rejected": 0,
-                "strength_support_rejected": 0,
-                "other_support_rejected": int(attempted_rows.size),
-                "nonfinite_rejected": 0,
-                "mh_random_rejected": 0,
-                "component_quantiles": {},
-                "by_isotope_cardinality_transfer": {},
-            }
-            return np.asarray(current_target_log_likelihood, dtype=np.float64)
-        group_sizes = np.ones(particle_count, dtype=np.int64)
-        group_sizes[rows] = (
-            np.floor(rng.random(rows.size) * maximum_group[rows]).astype(np.int64) + 1
-        )
-        donor_states: dict[int, IsotopeState] = {}
-        receiver_states: dict[int, IsotopeState] = {}
-        old_donor_states: dict[int, IsotopeState] = {}
-        old_receiver_states: dict[int, IsotopeState] = {}
-        log_forward = np.full(particle_count, float("-inf"), dtype=np.float64)
-        log_reverse = np.full(particle_count, float("-inf"), dtype=np.float64)
-        log_prior_ratio = np.zeros(particle_count, dtype=np.float64)
-        for row in rows.tolist():
-            donor_filter = self.filters[isotope_order[donor_by_row[row]]]
-            receiver_filter = self.filters[isotope_order[receiver_by_row[row]]]
-            donor_state = donor_filter.continuous_particles[row].state
-            receiver_state = receiver_filter.continuous_particles[row].state
-            group_size = int(group_sizes[row])
-            selected = np.sort(
-                rng.choice(
-                    int(donor_state.num_sources),
-                    size=group_size,
-                    replace=False,
-                )
-            )
-            proposed_donor, proposed_receiver = self._cross_isotope_transferred_states(
-                donor_filter,
-                receiver_filter,
-                donor_state,
-                receiver_state,
-                selected,
-            )
-            donor_states[row] = proposed_donor
-            receiver_states[row] = proposed_receiver
-            old_donor_states[row] = donor_state.copy()
-            old_receiver_states[row] = receiver_state.copy()
-            log_forward[row] = cross_isotope_transfer_log_proposal(
-                donor_cardinality=int(donor_state.num_sources),
-                receiver_cardinality=int(receiver_state.num_sources),
-                group_size=group_size,
-                maximum_sources=maximum_sources,
-                maximum_group_size=int(
-                    self.pf_config.joint_cross_isotope_transfer_max_group
-                ),
-            )
-            log_reverse[row] = cross_isotope_transfer_log_proposal(
-                donor_cardinality=int(proposed_receiver.num_sources),
-                receiver_cardinality=int(proposed_donor.num_sources),
-                group_size=group_size,
-                maximum_sources=maximum_sources,
-                maximum_group_size=int(
-                    self.pf_config.joint_cross_isotope_transfer_max_group
-                ),
-            )
-            old_prior = self._joint_isotope_state_log_prior(
-                donor_filter,
-                donor_state,
-            ) + self._joint_isotope_state_log_prior(
-                receiver_filter,
-                receiver_state,
-            )
-            new_prior = self._joint_isotope_state_log_prior(
-                donor_filter,
-                proposed_donor,
-            ) + self._joint_isotope_state_log_prior(
-                receiver_filter,
-                proposed_receiver,
-            )
-            log_prior_ratio[row] = new_prior - old_prior
-
-        touched_donors = sorted(set(donor_by_row[rows].tolist()))
-        for row in rows.tolist():
-            donor_filter = self.filters[isotope_order[donor_by_row[row]]]
-            donor_filter.continuous_particles[row].state = donor_states[row]
-        try:
-            for isotope_index in touched_donors:
-                isotope_rows = rows[donor_by_row[rows] == isotope_index]
-                self._refresh_joint_structural_transport_cache_isotope(
-                    stations,
-                    isotope_order[isotope_index],
-                    particle_indices=isotope_rows,
-                )
-            proposed_target = self._evaluate_cross_isotope_receiver_states(
-                stations=stations,
-                receiver_states=receiver_states,
-                receiver_by_row=np.where(
-                    feasible,
-                    receiver_by_row,
-                    -1,
-                ),
-                isotope_order=isotope_order,
-                target_beta=float(target_beta),
-            )
-        finally:
-            for row in rows.tolist():
-                donor_filter = self.filters[isotope_order[donor_by_row[row]]]
-                donor_filter.continuous_particles[row].state = old_donor_states[row]
-            for isotope_index in touched_donors:
-                isotope_rows = rows[donor_by_row[rows] == isotope_index]
-                self._refresh_joint_structural_transport_cache_isotope(
-                    stations,
-                    isotope_order[isotope_index],
-                    particle_indices=isotope_rows,
-                )
-        current_target = np.asarray(
-            current_target_log_likelihood,
-            dtype=np.float64,
-        )
-        log_ratio = (
-            proposed_target[rows]
-            - current_target[rows]
-            + log_prior_ratio[rows]
-            + log_reverse[rows]
-            - log_forward[rows]
-        )
-        accepted_local = self._joint_mh_acceptance_mask(
-            log_ratio,
-            rng=rng,
-        )
-        accepted_rows = rows[accepted_local]
-        for row in accepted_rows.tolist():
-            donor_filter = self.filters[isotope_order[donor_by_row[row]]]
-            receiver_filter = self.filters[isotope_order[receiver_by_row[row]]]
-            donor_filter.continuous_particles[row].state = donor_states[row]
-            receiver_filter.continuous_particles[row].state = receiver_states[row]
-        if accepted_rows.size:
-            touched = sorted(
-                set(donor_by_row[accepted_rows].tolist())
-                | set(receiver_by_row[accepted_rows].tolist())
-            )
-            for isotope_index in touched:
-                isotope_rows = accepted_rows[
-                    (donor_by_row[accepted_rows] == isotope_index)
-                    | (receiver_by_row[accepted_rows] == isotope_index)
-                ]
-                self._refresh_joint_structural_transport_cache_isotope(
-                    stations,
-                    isotope_order[isotope_index],
-                    particle_indices=isotope_rows,
-                )
-            current_target = current_target.copy()
-            current_target[accepted_rows] = proposed_target[accepted_rows]
-            self.last_joint_cross_isotope_accepted_weight_mass += float(
-                np.sum(weights[accepted_rows])
-            )
-            self._invalidate_posterior_summary_cache()
-        diagnostic_delta_likelihood = np.full(
-            particle_count,
-            float("nan"),
-            dtype=np.float64,
-        )
-        diagnostic_log_ratio = np.full_like(
-            diagnostic_delta_likelihood,
-            float("nan"),
-        )
-        diagnostic_delta_likelihood[rows] = (
-            proposed_target[rows] - current_target_log_likelihood[rows]
-        )
-        diagnostic_log_ratio[rows] = log_ratio
-        diagnostic_accepted = np.zeros(particle_count, dtype=np.bool_)
-        diagnostic_accepted[accepted_rows] = True
-        diagnostic_strength_support = np.ones(
-            particle_count,
-            dtype=np.bool_,
-        )
-        for row in rows.tolist():
-            donor_filter = self.filters[isotope_order[donor_by_row[row]]]
-            receiver_filter = self.filters[isotope_order[receiver_by_row[row]]]
-            diagnostic_strength_support[row] = bool(
-                np.all(
-                    donor_filter._strength_prior.in_support(donor_states[row].strengths)
-                )
-                and np.all(
-                    receiver_filter._strength_prior.in_support(
-                        receiver_states[row].strengths
-                    )
-                )
-            )
-        diagnostic_support = (
-            feasible
-            & diagnostic_strength_support
-            & np.isfinite(log_forward)
-            & np.isfinite(log_reverse)
-            & np.isfinite(log_prior_ratio)
-        )
-        diagnostic_proposal_ratio = np.full(
-            particle_count,
-            float("nan"),
-            dtype=np.float64,
-        )
-        diagnostic_proposal_ratio[rows] = log_reverse[rows] - log_forward[rows]
-        self.last_joint_cross_isotope_rejection_diagnostics = (
-            self._summarize_joint_cross_isotope_transfer(
-                attempted_rows=attempted_rows,
-                donor_by_row=donor_by_row,
-                receiver_by_row=receiver_by_row,
-                donor_cardinality=donor_cardinality,
-                receiver_cardinality=receiver_cardinality,
-                group_sizes=group_sizes,
-                isotope_order=isotope_order,
-                delta_log_likelihood=diagnostic_delta_likelihood,
-                delta_log_prior=log_prior_ratio,
-                log_reverse_minus_forward=diagnostic_proposal_ratio,
-                log_acceptance_ratio=diagnostic_log_ratio,
-                support_feasible=diagnostic_support,
-                strength_support_feasible=diagnostic_strength_support,
-                accepted=diagnostic_accepted,
-            )
-        )
-        self._assert_joint_particle_alignment()
-        return current_target
-
-    @staticmethod
-    def _summarize_joint_cross_isotope_transfer(
-        *,
-        attempted_rows: NDArray[np.int64],
-        donor_by_row: NDArray[np.int64],
-        receiver_by_row: NDArray[np.int64],
-        donor_cardinality: NDArray[np.int64],
-        receiver_cardinality: NDArray[np.int64],
-        group_sizes: NDArray[np.int64],
-        isotope_order: Sequence[str],
-        delta_log_likelihood: NDArray[np.float64],
-        delta_log_prior: NDArray[np.float64],
-        log_reverse_minus_forward: NDArray[np.float64],
-        log_acceptance_ratio: NDArray[np.float64],
-        support_feasible: NDArray[np.bool_],
-        strength_support_feasible: NDArray[np.bool_],
-        accepted: NDArray[np.bool_],
-    ) -> dict[str, object]:
-        """Summarize exact isotope-transfer MH terms on attempted rows."""
-        selected = np.asarray(attempted_rows, dtype=np.int64).reshape(-1)
-        quantile_levels = np.asarray(
-            [0.0, 0.1, 0.5, 0.9, 1.0],
-            dtype=np.float64,
-        )
-        numeric = {
-            "delta_log_likelihood": np.asarray(
-                delta_log_likelihood,
-                dtype=np.float64,
-            ),
-            "delta_log_prior": np.asarray(
-                delta_log_prior,
-                dtype=np.float64,
-            ),
-            "log_reverse_minus_forward": np.asarray(
-                log_reverse_minus_forward,
-                dtype=np.float64,
-            ),
-            "log_jacobian": np.zeros(
-                np.asarray(delta_log_likelihood).shape,
-                dtype=np.float64,
-            ),
-            "log_acceptance_ratio": np.asarray(
-                log_acceptance_ratio,
-                dtype=np.float64,
-            ),
-        }
-        support = np.asarray(support_feasible, dtype=np.bool_)
-        strength_support = np.asarray(
-            strength_support_feasible,
-            dtype=np.bool_,
-        )
-        acceptance = np.asarray(accepted, dtype=np.bool_)
-
-        def _rows_summary(rows: NDArray[np.int64]) -> dict[str, object]:
-            """Summarize one batched subset of transfer attempts."""
-            finite_all = support[rows].copy()
-            component_quantiles: dict[
-                str,
-                dict[str, float | int] | None,
-            ] = {}
-            for name, all_values in numeric.items():
-                values = all_values[rows]
-                finite = np.isfinite(values)
-                finite_all &= finite
-                if not np.any(finite):
-                    component_quantiles[name] = None
-                    continue
-                finite_values = values[finite]
-                resolved = np.quantile(finite_values, quantile_levels)
-                component_quantiles[name] = {
-                    "finite_count": int(finite_values.size),
-                    "mean": float(np.mean(finite_values)),
-                    "std": float(np.std(finite_values)),
-                    **{
-                        label: float(value)
-                        for label, value in zip(
-                            ("min", "p10", "median", "p90", "max"),
-                            resolved,
-                            strict=True,
-                        )
-                    },
-                }
-            return {
-                "attempted": int(rows.size),
-                "accepted": int(np.count_nonzero(acceptance[rows])),
-                "support_rejected": int(np.count_nonzero(~support[rows])),
-                "geometry_support_rejected": 0,
-                "strength_support_rejected": int(
-                    np.count_nonzero(~strength_support[rows])
-                ),
-                "other_support_rejected": int(
-                    np.count_nonzero(strength_support[rows] & ~support[rows])
-                ),
-                "nonfinite_rejected": int(
-                    np.count_nonzero(support[rows] & ~finite_all)
-                ),
-                "mh_random_rejected": int(
-                    np.count_nonzero(support[rows] & finite_all & ~acceptance[rows])
-                ),
-                "component_quantiles": component_quantiles,
-            }
-
-        summary = _rows_summary(selected)
-        transitions: dict[str, object] = {}
-        # Isotope pairs and group sizes are bounded by the configured isotope
-        # set and max transfer group, so this packages batched arrays only.
-        if selected.size:
-            labels = np.stack(
-                (
-                    np.asarray(donor_by_row, dtype=np.int64),
-                    np.asarray(receiver_by_row, dtype=np.int64),
-                    np.asarray(donor_cardinality, dtype=np.int64),
-                    np.asarray(receiver_cardinality, dtype=np.int64),
-                    np.asarray(group_sizes, dtype=np.int64),
-                ),
-                axis=1,
-            )
-            for donor, receiver, donor_k, receiver_k, group_size in np.unique(
-                labels[selected],
-                axis=0,
-            ).tolist():
-                matching = selected[
-                    np.all(
-                        labels[selected]
-                        == np.asarray(
-                            (
-                                donor,
-                                receiver,
-                                donor_k,
-                                receiver_k,
-                                group_size,
-                            ),
-                            dtype=np.int64,
-                        ),
-                        axis=1,
-                    )
-                ]
-                key = (
-                    f"{isotope_order[int(donor)]}:{int(donor_k)}"
-                    f"->{int(donor_k) - int(group_size)}|"
-                    f"{isotope_order[int(receiver)]}:{int(receiver_k)}"
-                    f"->{int(receiver_k) + int(group_size)}"
-                )
-                transitions[key] = _rows_summary(matching)
-        summary["by_isotope_cardinality_transfer"] = transitions
-        return summary
 
     def _apply_joint_cross_isotope_state_block(
         self,
@@ -1340,7 +757,6 @@ class JointRejuvenationMixin:
         normalized_log_weights: NDArray[np.float64],
     ) -> NDArray[np.int64]:
         """Apply one systematic ancestor vector to every isotope state row."""
-        systematic_resample = runtime_estimator_export("systematic_resample")
         log_weights = np.asarray(
             normalized_log_weights,
             dtype=np.float64,
@@ -1505,8 +921,7 @@ class JointRejuvenationMixin:
         filt: IsotopeParticleFilter,
     ) -> NDArray[np.int64]:
         """Return PF rows whose accepted isotope state changed exactly."""
-        estimator_type = runtime_estimator_export("RotatingShieldPFEstimator")
-        after = estimator_type._joint_isotope_cache_state(filt)
+        after = JointRejuvenationMixin._joint_isotope_cache_state(filt)
         if len(before) != len(after) or any(
             first.shape != second.shape
             for first, second in zip(before, after, strict=True)
@@ -1800,10 +1215,6 @@ class JointRejuvenationMixin:
             return {}
         state_before = self._joint_mixing_snapshot()
         diagnostics: dict[str, float] = {}
-        cross_attempted_start = float(
-            self.last_joint_cross_isotope_attempted_weight_mass
-        )
-        cross_accepted_start = float(self.last_joint_cross_isotope_accepted_weight_mass)
         cross_state_attempted_start = float(
             self.last_joint_cross_isotope_state_attempted_weight_mass
         )
@@ -1926,27 +1337,11 @@ class JointRejuvenationMixin:
                         current_target_log_likelihood=(current_target_log_likelihood),
                     )
                 )
-            if float(self.pf_config.joint_cross_isotope_transfer_probability) > 0.0:
-                current_target_log_likelihood = (
-                    self._apply_joint_cross_isotope_transfer(
-                        active,
-                        target_beta=float(target_beta),
-                        current_target_log_likelihood=(current_target_log_likelihood),
-                    )
-                )
             diagnostics = self._joint_mixing_diagnostics(
                 state_before,
                 self._joint_mixing_snapshot(),
                 target_before=target_before,
                 target_after=current_target_log_likelihood,
-            )
-            diagnostics["cross_isotope_attempted_weight_mass"] = float(
-                self.last_joint_cross_isotope_attempted_weight_mass
-                - cross_attempted_start
-            )
-            diagnostics["cross_isotope_accepted_weight_mass"] = float(
-                self.last_joint_cross_isotope_accepted_weight_mass
-                - cross_accepted_start
             )
             diagnostics["cross_isotope_state_attempted_weight_mass"] = float(
                 self.last_joint_cross_isotope_state_attempted_weight_mass
@@ -1982,10 +1377,12 @@ class JointRejuvenationMixin:
         newest_prefix_count: int,
         station_start_s: float,
     ) -> None:
-        """Run exact sweeps until movement is adequate or the soft budget binds."""
+        """Run exact sweeps and fail unless declared movement gates are met."""
         minimum_sweeps = int(self.pf_config.joint_rejuvenation_min_sweeps)
         maximum_sweeps = int(self.pf_config.joint_rejuvenation_max_sweeps)
-        soft_budget_s = float(self.pf_config.joint_smc_soft_wall_time_s)
+        wall_time_limit_s = float(
+            self.pf_config.joint_smc_rejuvenation_wall_time_limit_s
+        )
         cumulative_k_transition_mass = 0.0
         cumulative_boundary_escape_mass = 0.0
         self.last_joint_rejuvenation_mixing_incomplete = True
@@ -1997,7 +1394,9 @@ class JointRejuvenationMixin:
                 newest_prefix_count=newest_prefix_count,
             )
             if not isinstance(diagnostics, Mapping):
-                return
+                raise RuntimeError(
+                    "Joint rejuvenation did not return mixing diagnostics."
+                )
             record = {str(key): float(value) for key, value in diagnostics.items()}
             record.update(
                 {
@@ -2023,6 +1422,15 @@ class JointRejuvenationMixin:
             record["cumulative_boundary_escape_weight_mass"] = float(
                 cumulative_boundary_escape_mass
             )
+            station_elapsed = time.perf_counter() - station_start_s
+            if station_elapsed >= wall_time_limit_s:
+                self.last_joint_smc_wall_time_limit_exceeded = True
+                raise RuntimeError(
+                    "Joint SMC exceeded its rejuvenation wall-time contract "
+                    f"before accepting a completed sweep: "
+                    f"elapsed_s={station_elapsed:.3f}, "
+                    f"limit_s={wall_time_limit_s:.3f}."
+                )
             if sweep_index + 1 < minimum_sweeps:
                 continue
             state_mass = float(diagnostics.get("state_change_weight_mass", 0.0))
@@ -2058,17 +1466,6 @@ class JointRejuvenationMixin:
             if continuous_movement_sufficient and structural_movement_sufficient:
                 self.last_joint_rejuvenation_mixing_incomplete = False
                 break
-            station_elapsed = time.perf_counter() - station_start_s
-            if station_elapsed >= soft_budget_s and not boundary_requires_structure:
-                self.last_joint_smc_soft_budget_exceeded = True
-                print(
-                    "[joint-smc] soft-budget "
-                    f"elapsed_s={station_elapsed:.3f} "
-                    f"budget_s={soft_budget_s:.3f} "
-                    "action=skip-optional-rejuvenation-only",
-                    flush=True,
-                )
-                break
             if sweep_index + 1 == maximum_sweeps:
                 self.last_joint_rejuvenation_mixing_incomplete = bool(
                     not continuous_movement_sufficient
@@ -2077,16 +1474,16 @@ class JointRejuvenationMixin:
                 self.last_joint_structural_mixing_incomplete = bool(
                     boundary_requires_structure and not structural_movement_sufficient
                 )
-                if self.last_joint_structural_mixing_incomplete:
-                    print(
-                        "[joint-smc] structural-mixing-incomplete "
-                        f"boundary_mass={boundary_mass:.12g} "
+                if self.last_joint_rejuvenation_mixing_incomplete:
+                    raise RuntimeError(
+                        "Joint rejuvenation reached its sweep limit before "
+                        "satisfying mixing gates: "
+                        f"boundary_mass={boundary_mass:.12g}, "
                         "cumulative_k_transition_mass="
-                        f"{cumulative_k_transition_mass:.12g} "
+                        f"{cumulative_k_transition_mass:.12g}, "
                         "cumulative_boundary_escape_mass="
-                        f"{cumulative_boundary_escape_mass:.12g} "
-                        f"sweeps={maximum_sweeps}",
-                        flush=True,
+                        f"{cumulative_boundary_escape_mass:.12g}, "
+                        f"sweeps={maximum_sweeps}."
                     )
 
     def _apply_joint_guided_initialization(
@@ -2434,7 +1831,7 @@ class JointRejuvenationMixin:
         for filt in self.filters.values():
             filt.reset_step_stats()
         self.last_joint_rejuvenation_diagnostics = []
-        self.last_joint_smc_soft_budget_exceeded = False
+        self.last_joint_smc_wall_time_limit_exceeded = False
         self.last_joint_rejuvenation_mixing_incomplete = False
         self.last_joint_structural_mixing_incomplete = False
         station_start = time.perf_counter()
@@ -2678,9 +2075,6 @@ class JointRejuvenationMixin:
         self.last_joint_temper_steps = steps
         self.last_joint_station_unique_ancestor_count = station_unique_ancestors
         self.last_joint_cumulative_unique_ancestor_count = cumulative_unique_ancestors
-        # Backward-compatible field now has the conservative cumulative
-        # meaning; station-local ancestry is reported separately.
-        self.last_joint_unique_ancestor_count = cumulative_unique_ancestors
         for filt in self.filters.values():
             filt.last_temper_steps = [dict(step) for step in steps]
             filt.last_temper_resample_count = int(resamples)
@@ -2689,7 +2083,6 @@ class JointRejuvenationMixin:
             )
             filt.last_station_unique_ancestor_count = station_unique_ancestors
             filt.last_cumulative_unique_ancestor_count = cumulative_unique_ancestors
-            filt.last_unique_ancestor_count = cumulative_unique_ancestors
             filt.last_ess_pre = float(initial_ess)
             filt.last_ess = float(final_ess)
             filt.last_ess_post = float(final_ess)

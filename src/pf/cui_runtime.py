@@ -1,4 +1,4 @@
-"""Compatibility wrappers for the shared runtime CUI server API."""
+"""PF-owned lifecycle for the shared runtime CUI server API."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from runtime.cui import (
     start_cui_server,
 )
 
-from pf.runtime_defaults import (
+from runtime.defaults import (
     DEFAULT_CUI_SPLIT_VIEW_DIR,
     DEFAULT_CUI_SPLIT_VIEW_HOST,
     DEFAULT_CUI_SPLIT_VIEW_PORT,
@@ -21,23 +21,19 @@ from pf.runtime_defaults import (
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CUI_VIEW_DIR = ROOT / DEFAULT_CUI_SPLIT_VIEW_DIR
 
-_CUIServerKey = tuple[Path, Path, str, int, str]
-_CUI_SERVER_HANDLES: dict[_CUIServerKey, CUIServerHandle] = {}
-
 
 def resolve_cui_split_view_enabled(
     runtime_config: Mapping[str, object],
-    *,
-    save_outputs: bool,
 ) -> bool:
-    """Return whether the URL-served CUI progress view should run."""
-    if "cui_split_view" in runtime_config:
-        return bool(runtime_config["cui_split_view"])
-    return bool(save_outputs)
+    """Return whether the CUI progress renderer should run."""
+    value = runtime_config["cui_split_view"]
+    if type(value) is not bool:
+        raise TypeError("cui_split_view must be a boolean.")
+    return value
 
 
 def _nonzero_cui_port(value: object) -> int:
-    """Return a valid legacy PF CUI port without accepting coercion or zero."""
+    """Return a valid PF CUI port without accepting coercion or zero."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("CUI split visualization port must be an integer.")
     if value < 1 or value > 65535:
@@ -65,23 +61,15 @@ def _server_root_and_index(
     return static_path, relative_output / "index.html"
 
 
-def _close_cui_server_handles() -> None:
-    """Close every shared server retained by this compatibility module."""
-    unique_handles = {id(handle): handle for handle in _CUI_SERVER_HANDLES.values()}
-    _CUI_SERVER_HANDLES.clear()
-    for handle in unique_handles.values():
-        handle.close()
-
-
-def ensure_cui_view_server(
+def start_cui_view_server(
     output_dir: Path,
     *,
     host: str = DEFAULT_CUI_SPLIT_VIEW_HOST,
     port: int = DEFAULT_CUI_SPLIT_VIEW_PORT,
     public_host: str | None = None,
     static_root: Path = DEFAULT_CUI_VIEW_DIR,
-) -> str:
-    """Start or reuse the shared server while preserving the PF string API."""
+) -> CUIServerHandle:
+    """Bind one fixed-port CUI server and return its sole owning handle."""
     root, index_path = _server_root_and_index(output_dir, static_root)
     resolved_public_host = resolve_cui_public_host(host, public_host)
     config = CUIDashboardConfig(
@@ -90,29 +78,22 @@ def ensure_cui_view_server(
         port=_nonzero_cui_port(port),
         public_host=resolved_public_host,
     )
-    resolved_index = (root / index_path).resolve()
-    server_key = (
-        root,
-        resolved_index,
-        config.host,
-        config.port,
-        str(config.public_host),
-    )
-    existing = _CUI_SERVER_HANDLES.get(server_key)
-    if existing is not None and not getattr(existing, "_closed", False):
-        if existing.url is None:
-            raise RuntimeError("Retained CUI server has no dashboard URL.")
-        return existing.url
-    _CUI_SERVER_HANDLES.pop(server_key, None)
     handle = start_cui_server(
         root,
         index_path=index_path,
         config=config,
     )
-    _CUI_SERVER_HANDLES[server_key] = handle
     if handle.url is None:
-        raise RuntimeError("Shared runtime did not provide a CUI dashboard URL.")
-    return handle.url
+        error = RuntimeError("Shared runtime did not provide a CUI dashboard URL.")
+        try:
+            handle.close()
+        except BaseException as close_error:
+            error.add_note(
+                "Secondary CUI server cleanup failure: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        raise error
+    return handle
 
 
-__all__ = ["ensure_cui_view_server", "resolve_cui_split_view_enabled"]
+__all__ = ["resolve_cui_split_view_enabled", "start_cui_view_server"]

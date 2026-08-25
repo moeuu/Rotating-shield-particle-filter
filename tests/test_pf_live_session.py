@@ -4,29 +4,111 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
+from runtime.adaptive_client import AdaptiveCandidateSnapshot, AdaptiveStepRequest
 from runtime.measurement_log import load_measurement_log
 from runtime.prefix import measurement_records_digest
-from runtime.provenance import DigestIdentity
+from runtime.provenance import DigestIdentity, strict_canonical_json_bytes
 
+from pf.control_policy import PFControlPolicyProvenance
 from pf.live_session import (
     PFExternalSurfaceGuidance,
     PFLiveSession,
     PFLiveSessionError,
-    bind_published_measurement_log,
+    ValidatedProductionPFConfig,
+    _compact_pf_diagnostics,
+    _strict_live_artifact_json_bytes,
     build_live_estimator,
-    load_live_pf_config,
+    load_production_live_pf_config,
     measurement_record_to_station_input,
 )
 from pf.estimator_structural import EstimatorStructuralProposalMixin
 from pf.estimator_types import JointPlanningParticles
 from pf.pure_estimator import RotatingShieldPFConfig
+from pf.provenance import strict_sha256_json
 from tests.pure_pf_test_support import make_measurement_log
+
+
+def _production_live_config() -> dict[str, Any]:
+    """Return a detached copy of the shipped complete schema-v2 config."""
+    path = Path(__file__).parents[1] / "configs/pf/pf_strict_3d.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _validated_test_config(path: Path) -> ValidatedProductionPFConfig:
+    """Write and load one complete provenance-bound production config."""
+    path.write_text(json.dumps(_production_live_config()), encoding="utf-8")
+    return load_production_live_pf_config(path, profile="pf_strict")
+
+
+def test_resolved_session_hash_changes_with_only_control_policy() -> None:
+    """Control-policy content must be part of the resolved live identity."""
+    from hashlib import sha256
+
+    from pf.live_session import _live_session_hash_payload
+
+    canonical_policy = strict_canonical_json_bytes(
+        {"schema_version": 1, "path_policy": None, "shield_policy": None}
+    )
+    external = PFControlPolicyProvenance(
+        policy_family="ral_ablation",
+        source_sha256="b" * 64,
+        canonical_sha256=sha256(canonical_policy).hexdigest(),
+        canonical_policy_json=canonical_policy,
+    )
+    common = {
+        "runtime_config_sha256": "a" * 64,
+        "measurement_log_sha256": "unavailable",
+        "actual_pf": {"num_particles": 100},
+        "random_seed": 7,
+    }
+
+    native_hash = strict_sha256_json(
+        _live_session_hash_payload(
+            **common,
+            control_policy_provenance=PFControlPolicyProvenance.native_dss_pp(),
+        )
+    )
+    external_hash = strict_sha256_json(
+        _live_session_hash_payload(
+            **common,
+            control_policy_provenance=external,
+        )
+    )
+
+    assert native_hash != external_hash
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"path": Path("implicit-path.json")},
+        {"numpy_scalar": np.int64(7)},
+        {1: "non-string-key"},
+        {"arbitrary_object": object()},
+    ],
+    ids=("path", "numpy-scalar", "non-string-key", "arbitrary-object"),
+)
+def test_live_artifact_boundary_rejects_lossy_json_values(
+    payload: object,
+) -> None:
+    """Production live artifacts must reject every implicit JSON coercion."""
+    with pytest.raises(
+        PFLiveSessionError,
+        match="must contain only strict finite JSON values",
+    ):
+        _strict_live_artifact_json_bytes(
+            payload,
+            artifact_name="Test live artifact",
+        )
 
 
 def test_live_builder_uses_run_context_without_synthetic_log(
@@ -78,12 +160,15 @@ def test_live_builder_uses_run_context_without_synthetic_log(
         build_from_forward,
     )
 
+    validated_config = _validated_test_config(tmp_path / "pf.json")
+    control_provenance = PFControlPolicyProvenance.native_dss_pp()
     actual = build_live_estimator(
         context,  # type: ignore[arg-type]
-        {"pure_pf_schema_version": 1},
+        validated_config,
         profile="pf_strict",
         seed=9,
         runtime_root=tmp_path,
+        control_policy_provenance=control_provenance,
     )
 
     assert actual is estimator
@@ -95,39 +180,60 @@ def test_live_builder_uses_run_context_without_synthetic_log(
         "seed": 9,
         "measurement_log_schema_version": 2,
         "measurement_runtime_config_sha256": "a" * 64,
-        "config_hash": None,
-        "inference_isotopes": None,
+        "control_policy_provenance": control_provenance,
     }
+
+
+def test_context_energy_dimensions_require_exact_identity() -> None:
+    """A nearly equal model endpoint must not authorize another energy axis."""
+    from pf import live_session
+
+    context = SimpleNamespace(
+        runtime_config={
+            "full_spectrum_generative_model": {
+                "energy_bin_count": 2,
+                "energy_min_keV": 0.0,
+                "energy_max_keV": np.nextafter(2.0, 3.0),
+                "bin_width_keV": 2.0,
+            }
+        }
+    )
+
+    with pytest.raises(PFLiveSessionError, match="dimensions are inconsistent"):
+        live_session._context_energy_bin_edges(context)
 
 
 def test_live_pf_config_loader_rejects_unknown_fields(tmp_path: Path) -> None:
     """The public in-process config API must never discard unknown options."""
     config_path = tmp_path / "pf.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "pure_pf_schema_version": 1,
-                "estimator_profile": "pf_strict",
-                "num_particles": 8,
-                "max_sources": 1,
-                "init_num_sources": [0, 1],
-                "use_gpu": False,
-            }
-        ),
-        encoding="utf-8",
-    )
+    config_path.write_text(json.dumps(_production_live_config()), encoding="utf-8")
 
-    payload, source_sha256 = load_live_pf_config(
+    loaded = load_production_live_pf_config(
         config_path,
         profile="pf_strict",
     )
 
-    assert payload["num_particles"] == 8
-    assert len(source_sha256) == 64
+    payload = loaded.settings()
+    assert payload["num_particles"] == 4096
+    assert len(loaded.source_sha256) == 64
     payload["num_particels"] = payload.pop("num_particles")
     config_path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(PFLiveSessionError, match="unknown fields.*num_particels"):
-        load_live_pf_config(config_path, profile="pf_strict")
+    with pytest.raises(PFLiveSessionError, match="unknown_or_retired.*num_particels"):
+        load_production_live_pf_config(config_path, profile="pf_strict")
+
+
+def test_validated_live_config_rejects_caller_minting(tmp_path: Path) -> None:
+    """Only the production loader may mint the live-config capability."""
+    config_path = tmp_path / "pf.json"
+    config_path.write_text(json.dumps(_production_live_config()), encoding="utf-8")
+    loaded = load_production_live_pf_config(config_path, profile="pf_strict")
+
+    with pytest.raises(PFLiveSessionError, match="load_production_live_pf_config"):
+        ValidatedProductionPFConfig(
+            document=loaded.document,
+            profile="pf_strict",
+            _validation_token=object(),
+        )
 
 
 def test_live_pf_config_validates_nested_adaptive_stop_thresholds(
@@ -135,24 +241,27 @@ def test_live_pf_config_validates_nested_adaptive_stop_thresholds(
 ) -> None:
     """Adaptive-stop thresholds must be validated from their single block."""
     config_path = tmp_path / "pf.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "pure_pf_schema_version": 1,
-                "estimator_profile": "pf_strict",
-                "adaptive_stop": {
-                    "enabled": True,
-                    "assessment_start_station": 10,
-                    "required_consecutive_stations": 3,
-                    "minimum_joint_map_cardinality_probability": 1.1,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    payload = _production_live_config()
+    payload["adaptive_stop"][
+        "minimum_joint_map_cardinality_probability"
+    ] = 1.1
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(PFLiveSessionError, match="incompatible"):
-        load_live_pf_config(config_path, profile="pf_strict")
+        load_production_live_pf_config(config_path, profile="pf_strict")
+
+
+def test_live_pf_config_validates_planner_values_before_runtime_connection(
+    tmp_path: Path,
+) -> None:
+    """Malformed planner values must fail in the file loader itself."""
+    config_path = tmp_path / "pf.json"
+    payload = _production_live_config()
+    payload["dss_pp"]["proxy_eig_samples"] = "2"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(PFLiveSessionError, match="proxy_eig_samples"):
+        load_production_live_pf_config(config_path, profile="pf_strict")
 
 
 def test_live_pf_config_rejects_top_level_adaptive_stop_threshold(
@@ -160,19 +269,12 @@ def test_live_pf_config_rejects_top_level_adaptive_stop_threshold(
 ) -> None:
     """Estimator-facing stop settings must not duplicate the nested block."""
     config_path = tmp_path / "pf.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "pure_pf_schema_version": 1,
-                "estimator_profile": "pf_strict",
-                "adaptive_stop_innovation_confidence": 0.99,
-            }
-        ),
-        encoding="utf-8",
-    )
+    payload = _production_live_config()
+    payload["adaptive_stop_innovation_confidence"] = 0.99
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(PFLiveSessionError, match="unknown fields"):
-        load_live_pf_config(config_path, profile="pf_strict")
+    with pytest.raises(PFLiveSessionError, match="unknown_or_retired"):
+        load_production_live_pf_config(config_path, profile="pf_strict")
 
 
 def test_live_record_forwards_only_raw_spectrum_and_action_geometry(
@@ -219,53 +321,6 @@ def test_live_record_rejects_coercion(
 
     with pytest.raises(PFLiveSessionError):
         measurement_record_to_station_input(SimpleNamespace(**values))
-
-
-def test_published_log_binding_requires_the_live_record_count(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Final provenance binding accepts only the assimilated live session."""
-    from pf import live_session
-
-    published = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log", record_count=1)
-    )
-    isotopes = tuple(published.run_manifest["isotopes"])
-    estimator = SimpleNamespace(
-        candidate_isotopes=isotopes,
-        joint_isotope_order=lambda: isotopes,
-        measurements=[object()],
-        pf_config=RotatingShieldPFConfig(),
-        random_seed=7,
-        measurement_log_sha256="unavailable",
-        resolved_config_hash="unavailable",
-    )
-    validated: list[object] = []
-    monkeypatch.setattr(
-        live_session,
-        "_validate_published_forward_context",
-        validated.append,
-    )
-
-    bind_published_measurement_log(
-        estimator,
-        published,
-        live_records=published.records,
-    )
-
-    assert validated == [published]
-    assert estimator.measurement_log_sha256 == published.log_sha256
-    assert len(estimator.resolved_config_hash) == 64
-
-    changed_record = replace(published.records[0], live_time_s=2.0)
-    changed_published = replace(published, records=(changed_record,))
-    with pytest.raises(PFLiveSessionError, match="ordered live records"):
-        bind_published_measurement_log(
-            estimator,
-            changed_published,
-            live_records=published.records,
-        )
 
 
 class _SpyPosterior:
@@ -324,7 +379,6 @@ class _SpyEstimator:
 
     def __init__(self, isotopes: tuple[str, ...], contract_hash: str) -> None:
         """Initialize mutable fields required by the existing live helpers."""
-        self.candidate_isotopes = isotopes
         self.isotopes = isotopes
         self.measurements: list[object] = []
         self.poses = [np.asarray([0.25, 0.25, 0.4], dtype=np.float64)]
@@ -475,6 +529,7 @@ class _SpyEstimator:
         """Return state bytes depending only on completed station updates."""
         return json.dumps(
             {
+                "schema_version": 1,
                 "measurement_count": len(self.measurements),
                 "station_update_count": len(self.update_calls),
                 "rng_states": {"joint": {"state": 17}},
@@ -489,7 +544,7 @@ class _SpyEstimator:
     def posterior_convergence_diagnostics(self) -> dict[str, object]:
         """Return compactable truth-free convergence evidence."""
         sampler_health = {
-            "smc_soft_budget_respected": True,
+            "smc_rejuvenation_wall_time_respected": True,
             "rejuvenation_mixing_complete": True,
             "structural_mixing_complete": True,
         }
@@ -500,7 +555,16 @@ class _SpyEstimator:
                 **sampler_health,
                 "joint_map_cardinality_probability": False,
             },
-            "isotopes": {},
+            "isotopes": {
+                isotope: {
+                    "cardinality_distribution": {0: 0.1, 1: 0.9},
+                    "gates": {
+                        "cardinality_not_at_upper_boundary": True,
+                        "surface_path_concentration": False,
+                    }
+                }
+                for isotope in self.isotopes
+            },
         }
 
     def posterior_predictive_check(self) -> dict[str, object]:
@@ -508,9 +572,28 @@ class _SpyEstimator:
         return {"available": False}
 
 
+def test_compact_diagnostics_encodes_validated_cardinality_keys() -> None:
+    """The live schema must explicitly encode known integer cardinalities."""
+    estimator = _SpyEstimator(("Cs-137",), "a" * 64)
+
+    payload = _compact_pf_diagnostics(estimator)
+
+    distribution = payload["posterior_convergence"]["isotopes"]["Cs-137"][
+        "cardinality_distribution"
+    ]
+    assert distribution == {"0": 0.1, "1": 0.9}
+    _strict_live_artifact_json_bytes(
+        payload,
+        artifact_name="PF diagnostics",
+    )
+
+
 def _facade_with_spy(
     monkeypatch: pytest.MonkeyPatch,
     log: object,
+    *,
+    initial_candidates: AdaptiveCandidateSnapshot | None = None,
+    control_policy_provenance: PFControlPolicyProvenance | None = None,
 ) -> tuple[PFLiveSession, _SpyEstimator]:
     """Construct a facade while replacing only the expensive PF estimator."""
     from pf import live_session
@@ -528,18 +611,44 @@ def _facade_with_spy(
     ) -> _SpyEstimator:
         """Verify authenticated construction inputs and return the spy."""
         assert actual_context is context
-        assert config == {"pure_pf_schema_version": 1}
+        assert isinstance(config, ValidatedProductionPFConfig)
+        assert config.settings()["pure_pf_schema_version"] == 2
         assert kwargs["profile"] == "pf_strict"
         assert kwargs["seed"] == 17
         return estimator
 
     monkeypatch.setattr(live_session, "build_live_estimator", build_spy)
+    config = _validated_test_config(
+        Path(log.path).parent / f".{Path(log.path).name}.pf-test.json"
+    )
+    resolved_control_provenance = (
+        PFControlPolicyProvenance.native_dss_pp()
+        if control_policy_provenance is None
+        else control_policy_provenance
+    )
+    if initial_candidates is None:
+        initial_pose = tuple(
+            float(value) for value in context.environment["detector_position"]
+        )
+        initial_candidates = AdaptiveCandidateSnapshot(
+            current_pose_xyz=initial_pose,
+            candidate_poses_xyz=(initial_pose,),
+            travel_costs=(0.0,),
+            allowed_pair_ids=tuple(range(64)),
+            current_pair_id=0,
+            shield_angular_speed_rad_s=1.0,
+            horizontal_travel_times_s=(0.0,),
+            mast_vertical_times_s=(0.0,),
+            settling_times_s=(0.0,),
+        )
     session = PFLiveSession(
         context,
-        {"pure_pf_schema_version": 1},
+        config,
+        initial_candidates=initial_candidates,
         profile="pf_strict",
         seed=17,
         runtime_root=log.path,
+        control_policy_provenance=resolved_control_provenance,
     )
     return session, estimator
 
@@ -570,6 +679,520 @@ def test_facade_assimilates_only_complete_persisted_stations(
     )
     assert session.records == log.records
     assert session.station_count == 1
+
+
+def _response_candidates(
+    record: object,
+    *,
+    current_pair_id: int | None = None,
+    pose_xyz: tuple[float, float, float] | None = None,
+    allowed_pair_ids: tuple[int, ...] | None = None,
+    shield_angular_speed_rad_s: float = 1.0,
+) -> AdaptiveCandidateSnapshot:
+    """Return one strict next-candidate snapshot for an acquired record."""
+    record_pose = tuple(float(value) for value in record.detector_pose_xyz)
+    pose = record_pose if pose_xyz is None else pose_xyz
+    pair_id = (
+        int(record.fe_orientation_index) * 8 + int(record.pb_orientation_index)
+        if current_pair_id is None
+        else current_pair_id
+    )
+    return AdaptiveCandidateSnapshot(
+        current_pose_xyz=pose,
+        candidate_poses_xyz=(pose,),
+        travel_costs=(0.0,),
+        allowed_pair_ids=(
+            tuple(range(64)) if allowed_pair_ids is None else allowed_pair_ids
+        ),
+        current_pair_id=pair_id,
+        shield_angular_speed_rad_s=shield_angular_speed_rad_s,
+        horizontal_travel_times_s=(0.0,),
+        mast_vertical_times_s=(0.0,),
+        settling_times_s=(0.0,),
+    )
+
+
+def _request_candidates(
+    record: object,
+    *,
+    current_pose_xyz: tuple[float, float, float] | None = None,
+) -> AdaptiveCandidateSnapshot:
+    """Return the exact pre-action snapshot that selects the record pose."""
+    target_pose = tuple(float(value) for value in record.detector_pose_xyz)
+    current_pose = target_pose if current_pose_xyz is None else current_pose_xyz
+    travel_time_s = float(record.travel_time_s)
+    if current_pose == target_pose:
+        alternate_pose = (target_pose[0] + 0.25, target_pose[1], target_pose[2])
+        poses = (target_pose, alternate_pose)
+        travel_costs = (0.0, travel_time_s)
+    else:
+        poses = (current_pose, target_pose)
+        travel_costs = (0.0, travel_time_s)
+    return AdaptiveCandidateSnapshot(
+        current_pose_xyz=current_pose,
+        candidate_poses_xyz=poses,
+        travel_costs=travel_costs,
+        allowed_pair_ids=tuple(range(64)),
+        current_pair_id=0,
+        shield_angular_speed_rad_s=1.0,
+        horizontal_travel_times_s=travel_costs,
+        mast_vertical_times_s=(0.0, 0.0),
+        settling_times_s=(0.0, 0.0),
+    )
+
+
+def _selected_candidate_index(
+    record: object,
+    candidates: AdaptiveCandidateSnapshot,
+) -> int:
+    """Return the exact candidate index for one fixture record pose."""
+    target = tuple(float(value) for value in record.detector_pose_xyz)
+    return candidates.candidate_poses_xyz.index(target)
+
+
+def test_acquired_response_is_validated_before_canonical_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An exact action response must enter the session and update only once."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            station_complete_markers=True,
+        )
+    )
+    raw_record = log.records[0]
+    request_candidates = _request_candidates(raw_record)
+    session, estimator = _facade_with_spy(
+        monkeypatch,
+        log,
+        initial_candidates=request_candidates,
+    )
+    requested_pair_id = (
+        int(raw_record.fe_orientation_index) * 8
+        + int(raw_record.pb_orientation_index)
+    )
+    candidate_index = _selected_candidate_index(raw_record, request_candidates)
+    record = replace(
+        raw_record,
+        travel_time_s=request_candidates.travel_costs[candidate_index],
+        shield_actuation_time_s=(
+            request_candidates.quote_shield_program_time_s((requested_pair_id,))
+        ),
+    )
+    request = AdaptiveStepRequest(
+        action_id=0,
+        candidate_index=candidate_index,
+        fe_orientation_index=record.fe_orientation_index,
+        pb_orientation_index=record.pb_orientation_index,
+        dwell_time_s=record.live_time_s,
+        station_id=record.station_id,
+        station_complete=True,
+    )
+
+    completed = session.receive_acquired(
+        record,
+        request=request,
+        request_candidates=request_candidates,
+        next_candidates=_response_candidates(record),
+    )
+
+    assert completed is True
+    assert session.records == (record,)
+    assert session.station_count == 1
+    assert len(estimator.update_calls) == 1
+
+
+def test_session_owns_candidate_refinement_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A refinement event must extend exactly the session-owned snapshot."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            station_complete_markers=True,
+        )
+    )
+    initial = _request_candidates(log.records[0])
+    session, _estimator = _facade_with_spy(
+        monkeypatch,
+        log,
+        initial_candidates=initial,
+    )
+    target = initial.candidate_poses_xyz[-1]
+    added_pose = (target[0], target[1] + 0.25, target[2])
+    refined = AdaptiveCandidateSnapshot(
+        current_pose_xyz=initial.current_pose_xyz,
+        candidate_poses_xyz=(*initial.candidate_poses_xyz, added_pose),
+        travel_costs=(*initial.travel_costs, 0.5),
+        allowed_pair_ids=initial.allowed_pair_ids,
+        current_pair_id=initial.current_pair_id,
+        shield_angular_speed_rad_s=initial.shield_angular_speed_rad_s,
+        horizontal_travel_times_s=(*initial.horizontal_travel_times_s, 0.5),
+        mast_vertical_times_s=(*initial.mast_vertical_times_s, 0.0),
+        settling_times_s=(*initial.settling_times_s, 0.0),
+    )
+
+    session.receive_refined_candidates(refined)
+
+    assert session.phase == "receiving"
+    with pytest.raises(RuntimeError, match="did not add"):
+        session.receive_refined_candidates(refined)
+    assert session.phase == "failed"
+    assert session.records == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("allowed_pairs", "all 64 shield pairs"),
+        ("shield_speed", "shield speed differs"),
+    ),
+)
+def test_handshake_candidates_match_the_runtime_motion_contract(
+    mutation: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Initial candidates cannot rewrite shield availability or motion speed."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            station_complete_markers=True,
+        )
+    )
+    candidates = _request_candidates(log.records[0])
+    if mutation == "allowed_pairs":
+        candidates = replace(candidates, allowed_pair_ids=tuple(reversed(range(64))))
+    else:
+        candidates = replace(candidates, shield_angular_speed_rad_s=2.0)
+
+    with pytest.raises(PFLiveSessionError, match=message):
+        _facade_with_spy(
+            monkeypatch,
+            log,
+            initial_candidates=candidates,
+        )
+
+
+def test_acquired_response_accepts_equivalent_quaternion_sign(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The response may use either sign for the same commanded orientation."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            station_complete_markers=True,
+        )
+    )
+    raw_record = log.records[0]
+    request_candidates = _request_candidates(raw_record)
+    session, estimator = _facade_with_spy(
+        monkeypatch,
+        log,
+        initial_candidates=request_candidates,
+    )
+    requested_pair_id = (
+        int(raw_record.fe_orientation_index) * 8
+        + int(raw_record.pb_orientation_index)
+    )
+    candidate_index = _selected_candidate_index(raw_record, request_candidates)
+    record = replace(
+        raw_record,
+        detector_quat_wxyz=(-1.0, 0.0, 0.0, 0.0),
+        travel_time_s=request_candidates.travel_costs[candidate_index],
+        shield_actuation_time_s=(
+            request_candidates.quote_shield_program_time_s((requested_pair_id,))
+        ),
+    )
+    request = AdaptiveStepRequest(
+        action_id=0,
+        candidate_index=candidate_index,
+        fe_orientation_index=record.fe_orientation_index,
+        pb_orientation_index=record.pb_orientation_index,
+        dwell_time_s=record.live_time_s,
+        station_id=record.station_id,
+        station_complete=True,
+    )
+
+    completed = session.receive_acquired(
+        record,
+        request=request,
+        request_candidates=request_candidates,
+        next_candidates=_response_candidates(record),
+    )
+
+    assert completed is True
+    assert session.records == (record,)
+    assert len(estimator.update_calls) == 1
+
+
+def test_zero_motion_response_preserves_previous_commanded_yaw(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A shield-only follow-up must retain the preceding arrival yaw."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=2,
+            station_complete_markers=True,
+        )
+    )
+    half_sqrt_two = math.sqrt(0.5)
+    yaw_quaternion = (half_sqrt_two, 0.0, 0.0, half_sqrt_two)
+
+    raw_first = log.records[0]
+    initial_pose = tuple(
+        float(value) for value in log.context.environment["detector_position"]
+    )
+    target_pose = (initial_pose[0], initial_pose[1] + 0.25, initial_pose[2])
+    first = replace(
+        raw_first,
+        detector_pose_xyz=target_pose,
+        detector_quat_wxyz=yaw_quaternion,
+    )
+    first_candidates = _request_candidates(
+        first,
+        current_pose_xyz=initial_pose,
+    )
+    session, estimator = _facade_with_spy(
+        monkeypatch,
+        log,
+        initial_candidates=first_candidates,
+    )
+    first_pair_id = (
+        int(first.fe_orientation_index) * 8
+        + int(first.pb_orientation_index)
+    )
+    first = replace(
+        first,
+        shield_actuation_time_s=(
+            first_candidates.quote_shield_program_time_s((first_pair_id,))
+        ),
+    )
+    first_request = AdaptiveStepRequest(
+        action_id=0,
+        candidate_index=_selected_candidate_index(first, first_candidates),
+        fe_orientation_index=first.fe_orientation_index,
+        pb_orientation_index=first.pb_orientation_index,
+        dwell_time_s=first.live_time_s,
+        station_id=first.station_id,
+        station_complete=False,
+    )
+    second_candidates = _response_candidates(first)
+
+    assert session.receive_acquired(
+        first,
+        request=first_request,
+        request_candidates=first_candidates,
+        next_candidates=second_candidates,
+    ) is False
+    assert estimator.update_calls == []
+
+    raw_second = log.records[1]
+    second_pair_id = (
+        int(raw_second.fe_orientation_index) * 8
+        + int(raw_second.pb_orientation_index)
+    )
+    second = replace(
+        raw_second,
+        detector_pose_xyz=target_pose,
+        detector_quat_wxyz=yaw_quaternion,
+        travel_time_s=0.0,
+        shield_actuation_time_s=(
+            second_candidates.quote_shield_program_time_s((second_pair_id,))
+        ),
+    )
+    second_request = AdaptiveStepRequest(
+        action_id=1,
+        candidate_index=0,
+        fe_orientation_index=second.fe_orientation_index,
+        pb_orientation_index=second.pb_orientation_index,
+        dwell_time_s=second.live_time_s,
+        station_id=second.station_id,
+        station_complete=True,
+    )
+
+    assert session.receive_acquired(
+        second,
+        request=second_request,
+        request_candidates=second_candidates,
+        next_candidates=_response_candidates(second),
+    ) is True
+    assert session.records == (first, second)
+    assert len(estimator.update_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    (
+        "request.action_id",
+        "request.candidate_index",
+        "request_candidates",
+        "step_id",
+        "action_id",
+        "station_id",
+        "detector_pose_xyz",
+        "detector_quat_wxyz",
+        "fe_orientation_index",
+        "pb_orientation_index",
+        "live_time_s",
+        "travel_time_s",
+        "shield_actuation_time_s",
+        "station_complete",
+        "energy_bin_edges_keV",
+        "full_spectrum_contract_hash_sha256",
+        "candidates.current_pair_id",
+        "candidates.current_pose",
+        "candidates.allowed_pair_ids",
+        "candidates.shield_angular_speed_rad_s",
+    ),
+)
+def test_acquired_response_mismatch_fails_before_ingestion(
+    mismatch: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Every request, spectrum-axis, contract, and candidate mismatch must abort."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            station_complete_markers=True,
+        )
+    )
+    raw_original = log.records[0]
+    request_candidates = _request_candidates(raw_original)
+    session, estimator = _facade_with_spy(
+        monkeypatch,
+        log,
+        initial_candidates=request_candidates,
+    )
+    requested_pair_id = (
+        int(raw_original.fe_orientation_index) * 8
+        + int(raw_original.pb_orientation_index)
+    )
+    candidate_index = _selected_candidate_index(raw_original, request_candidates)
+    original = replace(
+        raw_original,
+        travel_time_s=request_candidates.travel_costs[candidate_index],
+        shield_actuation_time_s=(
+            request_candidates.quote_shield_program_time_s((requested_pair_id,))
+        ),
+    )
+    request = AdaptiveStepRequest(
+        action_id=0,
+        candidate_index=candidate_index,
+        fe_orientation_index=original.fe_orientation_index,
+        pb_orientation_index=original.pb_orientation_index,
+        dwell_time_s=original.live_time_s,
+        station_id=original.station_id,
+        station_complete=True,
+    )
+    record = original
+    candidates = _response_candidates(original)
+    if mismatch == "request.action_id":
+        request = replace(request, action_id=1)
+    elif mismatch == "request.candidate_index":
+        request = replace(request, candidate_index=2)
+    elif mismatch == "request_candidates":
+        request_candidates = replace(
+            request_candidates,
+            current_pair_id=(request_candidates.current_pair_id + 2) % 64,
+        )
+    elif mismatch == "step_id":
+        record = replace(record, step_id=1)
+    elif mismatch == "action_id":
+        record = replace(record, action_id=1)
+    elif mismatch == "station_id":
+        record = replace(record, station_id=1)
+    elif mismatch == "detector_pose_xyz":
+        record = replace(record, detector_pose_xyz=(0.25, 0.5, 0.5))
+    elif mismatch == "detector_quat_wxyz":
+        record = replace(record, detector_quat_wxyz=(0.0, 0.0, 0.0, 1.0))
+    elif mismatch == "fe_orientation_index":
+        record = replace(record, fe_orientation_index=1)
+    elif mismatch == "pb_orientation_index":
+        record = replace(record, pb_orientation_index=1)
+    elif mismatch == "live_time_s":
+        record = replace(record, live_time_s=original.live_time_s + 1.0)
+    elif mismatch == "travel_time_s":
+        record = replace(record, travel_time_s=original.travel_time_s + 1.0)
+    elif mismatch == "shield_actuation_time_s":
+        record = replace(
+            record,
+            shield_actuation_time_s=original.shield_actuation_time_s + 1.0,
+        )
+    elif mismatch == "station_complete":
+        record = replace(
+            record,
+            metadata={
+                key: value
+                for key, value in record.metadata.items()
+                if key != "station_complete"
+            },
+        )
+    elif mismatch == "energy_bin_edges_keV":
+        record = replace(
+            record,
+            energy_bin_edges_keV=np.asarray(
+                record.energy_bin_edges_keV,
+                dtype=np.float64,
+            )
+            + 0.25,
+        )
+    elif mismatch == "full_spectrum_contract_hash_sha256":
+        record = replace(
+            record,
+            metadata={
+                **dict(record.metadata),
+                "full_spectrum_contract_hash_sha256": "f" * 64,
+            },
+        )
+    elif mismatch == "candidates.current_pair_id":
+        pair_id = (
+            int(original.fe_orientation_index) * 8
+            + int(original.pb_orientation_index)
+        )
+        candidates = _response_candidates(
+            original,
+            current_pair_id=(pair_id + 1) % 64,
+        )
+    elif mismatch == "candidates.current_pose":
+        candidates = _response_candidates(
+            original,
+            pose_xyz=(0.25, 0.5, 0.5),
+        )
+    elif mismatch == "candidates.allowed_pair_ids":
+        candidates = _response_candidates(
+            original,
+            allowed_pair_ids=tuple(reversed(range(64))),
+        )
+    elif mismatch == "candidates.shield_angular_speed_rad_s":
+        candidates = _response_candidates(
+            original,
+            shield_angular_speed_rad_s=2.0,
+        )
+
+    with pytest.raises(PFLiveSessionError, match=mismatch.replace(".", r"\.")):
+        session.receive_acquired(
+            record,
+            request=request,
+            request_candidates=request_candidates,
+            next_candidates=candidates,
+        )
+
+    assert session.phase == "failed"
+    assert session.records == ()
+    assert estimator.update_calls == []
 
 
 def test_mle_style_surface_guidance_adjusts_pf_proposals_without_weights(
@@ -624,6 +1247,41 @@ def test_mle_style_surface_guidance_adjusts_pf_proposals_without_weights(
     assert receipt.mapped_chart_count == 2
     assert receipt.target_preserving is True
     assert receipt.direct_weight_update is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_run_id", 7),
+        ("source_run_id", " run-1"),
+        ("isotope_order", ("Cs-137", 7)),
+        ("isotope_order", ("Cs-137 ",)),
+    ),
+)
+def test_surface_guidance_rejects_string_coercion(
+    field: str,
+    value: object,
+) -> None:
+    """External proposal lineage must preserve exact run and isotope strings."""
+    values: dict[str, object] = {
+        "source_run_id": "run-1",
+        "record_count": 1,
+        "data_cutoff_step": 0,
+        "data_cutoff_station": 0,
+        "covered_records_digest": DigestIdentity(
+            algorithm="measurement-records-v1",
+            sha256="a" * 64,
+        ),
+        "isotope_order": ("Cs-137",),
+        "patch_centroids_xyz": np.asarray([[0.0, 0.0, 0.0]]),
+        "density_by_isotope": np.asarray([[1.0]]),
+        "proposal_mass": 0.5,
+        "bandwidth_m": 0.5,
+    }
+    values[field] = value
+
+    with pytest.raises((TypeError, ValueError)):
+        PFExternalSurfaceGuidance(**values)
 
 
 def test_surface_guidance_mix_is_vectorized_and_proposal_only() -> None:
@@ -735,133 +1393,6 @@ def test_facade_particle_snapshot_is_an_immutable_copy(
     assert estimator.posterior_summary_calls == 1
 
 
-def test_facade_delegates_pose_and_shield_planning_to_pf_package(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """The live facade must return the PF planner's complete runtime action."""
-    from pf import live_session
-
-    log = load_measurement_log(
-        make_measurement_log(
-            tmp_path / "measurement-log",
-            record_count=2,
-            station_complete_markers=True,
-        )
-    )
-    session, estimator = _facade_with_spy(monkeypatch, log)
-    session.receive_persisted_station(log.records)
-    captured: dict[str, object] = {}
-
-    class _Forward:
-        """Expose only runtime-owned planning geometry."""
-
-        bounds_xyz = (
-            np.asarray([0.0, 0.0, 0.0]),
-            np.asarray([2.0, 2.0, 2.0]),
-        )
-        obstacle_grid = object()
-
-    class _Resolver:
-        """Return the authenticated planning geometry sentinel."""
-
-        @classmethod
-        def from_run_context(cls, context: object, *, run_root: Path) -> _Forward:
-            """Validate the facade's context and runtime root."""
-            del cls
-            assert context.to_payload() == log.context.to_payload()
-            assert run_root == log.path
-            return _Forward()
-
-    def select(
-        estimator_arg: object,
-        candidates: object,
-        current: object,
-        **kwargs: object,
-    ) -> object:
-        """Capture PF-owned planner inputs and return a complete action."""
-        assert estimator_arg is estimator
-        captured["candidates"] = candidates
-        captured["current"] = current
-        captured["kwargs"] = kwargs
-        return SimpleNamespace(
-            # DSS-PP may index its filtered candidates, so the public facade
-            # must remap the selected pose to the original runtime snapshot.
-            next_pose_index=0,
-            next_pose=np.asarray([1.0, 1.5, 0.5]),
-            shield_program=SimpleNamespace(
-                pair_ids=(7, 23),
-                name="dynamic",
-                kind="dss_pp",
-            ),
-            score=3.5,
-            diagnostics={"selected_information_gain": 2.25},
-        )
-
-    monkeypatch.setattr(live_session, "ResolvedForwardContext", _Resolver)
-    monkeypatch.setattr(live_session, "select_dss_pp_next_station", select)
-    action = session.plan_next_action(
-        [[0.5, 0.5, 0.5], [1.0, 1.5, 0.5]],
-        candidate_motion_times_s=[0.0, 2.0],
-        candidate_horizontal_travel_times_s=[0.0, 1.0],
-        candidate_mast_vertical_times_s=[0.0, 0.5],
-        candidate_settling_times_s=[0.0, 0.5],
-        config={"augment_candidates": False, "program_length": 2},
-    )
-
-    assert action.candidate_index == 1
-    assert action.detector_pose_xyz == (1.0, 1.5, 0.5)
-    assert action.shield_pair_ids == (7, 23)
-    assert action.diagnostics()["selected_information_gain"] == 2.25
-    assert set(action.diagnostics()) == {
-        "schema_version",
-        "selected_information_gain",
-    }
-    kwargs = captured["kwargs"]
-    assert isinstance(kwargs, dict)
-    assert kwargs["current_pair_id"] == (
-        log.records[-1].fe_orientation_index * 8
-        + log.records[-1].pb_orientation_index
-    )
-    assert kwargs["map_api"] is _Forward.obstacle_grid
-    assert kwargs["config"].augment_candidates is False
-    np.testing.assert_allclose(
-        kwargs["candidate_horizontal_travel_times_s"],
-        [0.0, 1.0],
-    )
-    np.testing.assert_allclose(
-        kwargs["candidate_mast_vertical_times_s"],
-        [0.0, 0.5],
-    )
-    np.testing.assert_allclose(
-        kwargs["candidate_settling_times_s"],
-        [0.0, 0.5],
-    )
-
-
-def test_facade_rejects_unknown_pf_planning_configuration(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Unknown planning settings must fail instead of being silently dropped."""
-    log = load_measurement_log(
-        make_measurement_log(
-            tmp_path / "measurement-log",
-            record_count=2,
-            station_complete_markers=True,
-        )
-    )
-    session, _ = _facade_with_spy(monkeypatch, log)
-    session.receive_persisted_station(log.records)
-
-    with pytest.raises(PFLiveSessionError, match="configuration is incompatible"):
-        session.plan_next_action(
-            [[0.5, 0.5, 0.5]],
-            candidate_motion_times_s=[0.0],
-            config={"augment_candidates": False, "unknown_option": 1},
-        )
-
-
 def test_bind_and_publication_never_advance_completed_pf(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -892,9 +1423,103 @@ def test_bind_and_publication_never_advance_completed_pf(
     assert publication is bound
     assert bound.completed is completed
     assert bound.checkpoint_state == completed.checkpoint_state
+    checkpoint_state = json.loads(bound.checkpoint_state)
+    assert checkpoint_state["schema_version"] == 2
+    assert checkpoint_state["estimator_state_schema_version"] == 1
+    assert checkpoint_state["control_policy"] == (
+        PFControlPolicyProvenance.native_dss_pp().to_dict()
+    )
     posterior = json.loads(bound.posterior_json)
     assert posterior["provenance"]["measurement_log_sha256"] == log.log_sha256
+    assert posterior["provenance"]["control_policy"] == (
+        PFControlPolicyProvenance.native_dss_pp().to_dict()
+    )
     assert session.phase == "bound"
+
+
+def test_external_policy_provenance_matches_posterior_state_and_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Every final live artifact must carry the same exact external policy."""
+    from hashlib import sha256
+
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=2,
+            station_complete_markers=True,
+        )
+    )
+    canonical_policy = strict_canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "path_policy": {"name": "passive_serpentine", "row_count": 2},
+            "shield_policy": {"name": "fixed", "fixed_pair_id": 0},
+        }
+    )
+    control_provenance = PFControlPolicyProvenance(
+        policy_family="ral_ablation",
+        source_sha256="b" * 64,
+        canonical_sha256=sha256(canonical_policy).hexdigest(),
+        canonical_policy_json=canonical_policy,
+    )
+    session, _estimator = _facade_with_spy(
+        monkeypatch,
+        log,
+        control_policy_provenance=control_provenance,
+    )
+    session.receive_persisted_station(log.records)
+    completed = session.complete_live_state()
+    bound = session.bind_published_log(log)
+    published = session.publish_bound_result(tmp_path / "pf-result")
+    expected = control_provenance.to_dict()
+
+    assert json.loads(completed.checkpoint_state)["control_policy"] == expected
+    assert json.loads(bound.posterior_json)["provenance"]["control_policy"] == expected
+    checkpoint = json.loads(published.checkpoint_path.read_text(encoding="utf-8"))
+    assert checkpoint["schema_version"] == 2
+    assert checkpoint["state_schema_version"] == 2
+    assert checkpoint["control_policy"] == expected
+
+
+def test_live_completion_rejects_failed_sampler_health(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Final sealing must not promote an unhealthy sampler to complete."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=2,
+            station_complete_markers=True,
+        )
+    )
+    session, estimator = _facade_with_spy(monkeypatch, log)
+    session.receive_persisted_station(log.records)
+    original_diagnostics = estimator.posterior_convergence_diagnostics
+
+    def unhealthy_diagnostics() -> dict[str, object]:
+        """Return the normal schema with one explicit failed sampler gate."""
+        diagnostics = original_diagnostics()
+        sampler = diagnostics["sampler_health"]
+        joint = diagnostics["joint_gates"]
+        assert isinstance(sampler, dict)
+        assert isinstance(joint, dict)
+        sampler["rejuvenation_mixing_complete"] = False
+        joint["rejuvenation_mixing_complete"] = False
+        return diagnostics
+
+    monkeypatch.setattr(
+        estimator,
+        "posterior_convergence_diagnostics",
+        unhealthy_diagnostics,
+    )
+
+    with pytest.raises(PFLiveSessionError, match="sampler-health gates"):
+        session.complete_live_state()
+
+    assert session.phase == "failed"
 
 
 def test_bound_facade_publishes_package_owned_result_bundle(
@@ -923,12 +1548,22 @@ def test_bound_facade_publishes_package_owned_result_bundle(
     assert published.checkpoint_state_path.is_file()
     assert published.particle_snapshot_path.is_file()
     assert published.diagnostics_path.is_file()
+    inventory_path = published.root / "pf_artifact_inventory.json"
+    assert inventory_path.is_file()
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    assert inventory["metadata"]["artifact_family"] == "pure_pf_live_result"
+    assert inventory["metadata"]["source_run_id"] == log.run_id
     diagnostics = json.loads(
         published.diagnostics_path.read_text(encoding="utf-8")
     )
     assert diagnostics["schema_version"] == 2
     assert diagnostics["posterior_predictive_check"] == {"available": False}
-    assert diagnostics["sampler_health"]["smc_soft_budget_respected"] is True
+    assert (
+        diagnostics["sampler_health"][
+            "smc_rejuvenation_wall_time_respected"
+        ]
+        is True
+    )
     assert "measurement_log_sha256" not in diagnostics
     assert "config" not in diagnostics
     assert not (published.root / "pf_trace.jsonl").exists()
@@ -937,6 +1572,9 @@ def test_bound_facade_publishes_package_owned_result_bundle(
     checkpoint = json.loads(published.checkpoint_path.read_text(encoding="utf-8"))
     assert checkpoint["prefix_measurement_log_sha256"] == log.log_sha256
     assert checkpoint["covered_step_ids"] == [0, 1]
+    assert checkpoint["control_policy"] == (
+        PFControlPolicyProvenance.native_dss_pp().to_dict()
+    )
     with np.load(published.particle_snapshot_path, allow_pickle=False) as arrays:
         assert arrays["weights_n"].tolist() == [0.75, 0.25]
         assert arrays["isotope_names"].tolist() == list(log.context.isotopes)

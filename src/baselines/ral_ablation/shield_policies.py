@@ -17,28 +17,10 @@ class BaselineShieldProgram:
 
 def _read_policy_name(policy_config: Mapping[str, Any] | str | None) -> str:
     """Return the exact canonical baseline shield-policy name."""
-    if policy_config is None:
+    validated = validate_baseline_shield_policy(policy_config)
+    if validated is None:
         return ""
-    if not isinstance(policy_config, Mapping):
-        raise TypeError("baseline_shield_policy must be a JSON object or null.")
-    name = policy_config.get("name")
-    if not isinstance(name, str) or not name:
-        raise ValueError("baseline_shield_policy.name must be a nonempty string.")
-    return name
-
-
-def _read_int(
-    policy_config: Mapping[str, Any] | str | None,
-    key: str,
-    default: int,
-) -> int:
-    """Read a strict JSON integer setting from a shield-policy payload."""
-    if not isinstance(policy_config, Mapping):
-        return default
-    value = policy_config.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"baseline_shield_policy.{key} must be a JSON integer.")
-    return value
+    return str(validated["name"])
 
 
 def _positive_json_integer(value: object, *, field_name: str) -> int:
@@ -55,6 +37,60 @@ def _nonnegative_json_integer(value: object, *, field_name: str) -> int:
     return value
 
 
+def validate_baseline_shield_policy(
+    policy_config: Mapping[str, Any] | str | None,
+) -> dict[str, Any] | None:
+    """Validate one exact discriminated RA-L shield-policy object."""
+    if policy_config is None:
+        return None
+    if not isinstance(policy_config, Mapping):
+        raise TypeError("baseline_shield_policy must be a JSON object or null.")
+    if any(not isinstance(key, str) for key in policy_config):
+        raise TypeError("baseline_shield_policy keys must be JSON strings.")
+    name = policy_config.get("name")
+    if name == "fixed":
+        expected = {"name", "fixed_pair_id"}
+        actual = set(policy_config)
+        if actual != expected:
+            raise ValueError(
+                "fixed shield policy must contain exactly name and fixed_pair_id; "
+                f"missing={sorted(expected - actual)}, "
+                f"unknown={sorted(actual - expected)}."
+            )
+        fixed_pair_id = _nonnegative_json_integer(
+            policy_config["fixed_pair_id"],
+            field_name="baseline_shield_policy.fixed_pair_id",
+        )
+        return {"name": "fixed", "fixed_pair_id": fixed_pair_id}
+    if name == "round_robin":
+        expected = {"name", "start_pair_id", "advance_by_pose"}
+        actual = set(policy_config)
+        if actual != expected:
+            raise ValueError(
+                "round_robin shield policy must contain exactly name, "
+                "start_pair_id, and advance_by_pose; "
+                f"missing={sorted(expected - actual)}, "
+                f"unknown={sorted(actual - expected)}."
+            )
+        start_pair_id = _nonnegative_json_integer(
+            policy_config["start_pair_id"],
+            field_name="baseline_shield_policy.start_pair_id",
+        )
+        advance_by_pose = policy_config["advance_by_pose"]
+        if not isinstance(advance_by_pose, bool):
+            raise ValueError(
+                "baseline_shield_policy.advance_by_pose must be a JSON boolean."
+            )
+        return {
+            "name": "round_robin",
+            "start_pair_id": start_pair_id,
+            "advance_by_pose": advance_by_pose,
+        }
+    raise ValueError(
+        "baseline_shield_policy.name must be exactly 'fixed' or 'round_robin'."
+    )
+
+
 def select_baseline_shield_program(
     policy_config: Mapping[str, Any] | str | None,
     *,
@@ -64,10 +100,11 @@ def select_baseline_shield_program(
     current_pair_id: int | None = None,
 ) -> BaselineShieldProgram | None:
     """Return a baseline shield program, or None when no baseline policy is active."""
-    policy = _read_policy_name(policy_config)
+    validated_policy = validate_baseline_shield_policy(policy_config)
+    policy = _read_policy_name(validated_policy)
     if policy == "":
         return None
-    if not isinstance(policy_config, Mapping):
+    if not isinstance(validated_policy, Mapping):
         raise AssertionError("Validated shield policy must be a mapping.")
     total = _positive_json_integer(total_pairs, field_name="total_pairs")
     length = _positive_json_integer(program_length, field_name="program_length")
@@ -79,16 +116,11 @@ def select_baseline_shield_program(
         )
         if current >= total:
             raise ValueError("current_pair_id must be smaller than total_pairs.")
-    else:
-        current = None
     if policy == "fixed":
-        unknown = sorted(set(policy_config) - {"name", "fixed_pair_id"})
-        if unknown:
-            raise ValueError(
-                "Unsupported fixed shield settings: "
-                + ", ".join(str(key) for key in unknown)
-            )
-        fixed_pair = _read_int(policy_config, "fixed_pair_id", 0)
+        fixed_pair = _nonnegative_json_integer(
+            validated_policy["fixed_pair_id"],
+            field_name="baseline_shield_policy.fixed_pair_id",
+        )
         if not 0 <= fixed_pair < total:
             raise ValueError(
                 "baseline_shield_policy.fixed_pair_id must be in "
@@ -99,30 +131,17 @@ def select_baseline_shield_program(
             pair_ids=tuple(fixed_pair for _ in range(length)),
         )
     if policy == "round_robin":
-        unknown = sorted(
-            set(policy_config)
-            - {"name", "start_pair_id", "advance_by_pose"}
-        )
-        if unknown:
-            raise ValueError(
-                "Unsupported round_robin shield settings: "
-                + ", ".join(str(key) for key in unknown)
-            )
-        start = _read_int(
-            policy_config,
-            "start_pair_id",
-            0 if current is None else (current + 1) % total,
+        start = _nonnegative_json_integer(
+            validated_policy["start_pair_id"],
+            field_name="baseline_shield_policy.start_pair_id",
         )
         if not 0 <= start < total:
             raise ValueError(
                 "baseline_shield_policy.start_pair_id must be in "
                 "[0, total_pairs)."
             )
-        advance_by_pose = policy_config.get("advance_by_pose", True)
-        if not isinstance(advance_by_pose, bool):
-            raise ValueError(
-                "baseline_shield_policy.advance_by_pose must be a JSON boolean."
-            )
+        advance_by_pose = validated_policy["advance_by_pose"]
+        assert isinstance(advance_by_pose, bool)
         if advance_by_pose:
             start += pose * length
         return BaselineShieldProgram(
@@ -130,3 +149,10 @@ def select_baseline_shield_program(
             pair_ids=tuple((start + idx) % total for idx in range(length)),
         )
     raise ValueError(f"Unknown baseline_shield_policy: {policy}")
+
+
+__all__ = [
+    "BaselineShieldProgram",
+    "select_baseline_shield_program",
+    "validate_baseline_shield_policy",
+]

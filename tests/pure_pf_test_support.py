@@ -12,7 +12,7 @@ import numpy as np
 from measurement.source_boundary import surface_emission_policy_sha256
 from measurement.shielding import SHIELD_POSE_CONTRACT_SHA256
 from pf.full_spectrum import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
-from pf.provenance import canonical_json_bytes
+from pf.provenance import strict_canonical_json_bytes
 from runtime.measurement_log import (
     MeasurementLogRecord,
     build_forward_model_manifest,
@@ -28,6 +28,7 @@ from spectrum.physics_contracts import (
 from spectrum.additive_scatter import (
     ADDITIVE_SCATTER_INCIDENT_LABEL_SEMANTICS,
     ADDITIVE_SCATTER_RIDGE_LAMBDA_GRID,
+    DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS,
     AdditiveNoncollidedTransportResponse,
 )
 from spectrum.transport_spectral import (
@@ -109,11 +110,26 @@ def _synthetic_validation_manifest(
             "passed": True,
         }
     return {
-        "schema_version": 1,
+        "schema_version": 3,
         "validation_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
         "approved_model_contract_sha256": str(model_contract_hash),
+        "acceptance_run_contract_sha256": sha256(
+            b"test-validation-acceptance-run-contract"
+        ).hexdigest(),
+        "runtime_config_sha256": sha256(
+            b"test-validation-runtime-config"
+        ).hexdigest(),
+        "native_executable_sha256": sha256(
+            b"test-validation-native-executable"
+        ).hexdigest(),
+        "native_execution_environment_sha256": sha256(
+            b"test-validation-native-execution-environment"
+        ).hexdigest(),
+        "implementation_bundle_sha256": sha256(
+            b"test-validation-implementation-bundle"
+        ).hexdigest(),
         "native_response_contract_sha256": (
             NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
         ),
@@ -182,6 +198,9 @@ def _synthetic_additive_scatter_response(
     return AdditiveNoncollidedTransportResponse(
         coefficients=(0.8, 0.5, 0.4, 0.2, 0.1, 0.05, 0.025),
         ridge_lambda=0.1,
+        feature_basis_semantics=(
+            DETECTOR_CONE_AIR_XCOM_SINGLE_SCATTER_BASIS_SEMANTICS
+        ),
         training_manifest={
             "schema_version": 2,
             "acceptance_contract_sha256": (
@@ -279,10 +298,6 @@ def _runtime_config_template() -> dict[str, object]:
         "source_rate_model": "detector_cps_1m",
         "candidate_isotopes": list(TEST_ISOTOPES),
         "line_resolved_shield_attenuation": True,
-        "detector_model_id": "test-detector",
-        "shield_model_id": "test-shield",
-        "transport_model_id": "test-transport",
-        "spectrum_model_id": "test-full-spectrum",
         "detector_count_radius_m": 0.025,
         "detector_aperture_radius_m": 0.0,
         "detector_aperture_samples": 1,
@@ -310,12 +325,12 @@ def environment() -> dict[str, object]:
     """Return a small physical room without embedded source truth."""
     return {
         "environment_model_id": "test-room",
-        "obstacle_model_id": "test-obstacle-empty",
         "size_x": 2.0,
         "size_y": 2.0,
         "size_z": 1.5,
         "detector_position": [0.25, 0.25, 0.4],
         "obstacle_grid": None,
+        "adaptive_measurement": {"shield_angular_speed_rad_s": 1.0},
     }
 
 
@@ -378,7 +393,7 @@ def make_measurement_log(
     if runtime_overrides:
         config.update(runtime_overrides)
     env = environment()
-    config_hash = sha256(canonical_json_bytes(config)).hexdigest()
+    config_hash = sha256(strict_canonical_json_bytes(config)).hexdigest()
     forward = build_forward_model_manifest(
         runtime_config=config,
         environment=env,

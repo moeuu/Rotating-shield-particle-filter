@@ -7,7 +7,6 @@ import math
 import numpy as np
 import pytest
 
-from pf.estimator import RotatingShieldPFEstimator
 from pf.particle_filter import IsotopeParticleFilter
 from pf.structural_rj import (
     BirthDeathMoveProbabilities,
@@ -28,7 +27,6 @@ from pf.structural_rj import (
     continuous_relocated_merge_log_acceptance_ratio,
     continuous_relocated_split_log_acceptance_ratio,
     continuous_split_log_acceptance_ratio,
-    cross_isotope_transfer_log_proposal,
     distance_weighted_ordered_pair_probabilities,
     independence_refresh_log_acceptance_ratio,
     log_acceptance_probability,
@@ -74,36 +72,6 @@ def test_structural_rejection_diagnostics_decompose_exact_mh_terms() -> None:
     assert summary["by_cardinality_transition"]["4->3"]["attempted"] == 2
 
 
-def test_cross_isotope_rejection_diagnostics_group_cardinality_transfer() -> None:
-    """Identity-transfer diagnostics must expose isotope and K changes."""
-    summary = RotatingShieldPFEstimator._summarize_joint_cross_isotope_transfer(
-        attempted_rows=np.asarray([0, 1], dtype=np.int64),
-        donor_by_row=np.asarray([0, 0], dtype=np.int64),
-        receiver_by_row=np.asarray([1, 1], dtype=np.int64),
-        donor_cardinality=np.asarray([2, 2], dtype=np.int64),
-        receiver_cardinality=np.asarray([1, 1], dtype=np.int64),
-        group_sizes=np.asarray([1, 1], dtype=np.int64),
-        isotope_order=("Cs-137", "Co-60"),
-        delta_log_likelihood=np.asarray([-5.0, -1.0]),
-        delta_log_prior=np.asarray([0.5, 0.5]),
-        log_reverse_minus_forward=np.asarray([0.0, 0.0]),
-        log_acceptance_ratio=np.asarray([-4.5, -0.5]),
-        support_feasible=np.asarray([True, False]),
-        strength_support_feasible=np.asarray([True, False]),
-        accepted=np.asarray([False, False]),
-    )
-
-    assert summary["attempted"] == 2
-    assert summary["strength_support_rejected"] == 1
-    transfer = summary["by_isotope_cardinality_transfer"][
-        "Cs-137:2->1|Co-60:1->2"
-    ]
-    assert transfer["attempted"] == 2
-    assert transfer["component_quantiles"]["delta_log_likelihood"][
-        "median"
-    ] == pytest.approx(-3.0)
-
-
 def test_poisson_geometric_tail_keeps_five_typical_but_six_possible() -> None:
     """The ordinary K=5 boundary must have a thin proper nonzero tail."""
     probabilities = poisson_geometric_tail_cardinality_probabilities(
@@ -139,41 +107,6 @@ def test_nonconserving_refresh_ratio_is_exactly_reciprocal() -> None:
     )
 
     np.testing.assert_allclose(down, -up, atol=1.0e-14)
-
-
-def test_cross_isotope_transfer_proposal_is_reciprocal() -> None:
-    """Forward and reverse subset probabilities use the exact changed states."""
-    forward = cross_isotope_transfer_log_proposal(
-        donor_cardinality=5,
-        receiver_cardinality=0,
-        group_size=3,
-        maximum_sources=5,
-        maximum_group_size=3,
-    )
-    reverse = cross_isotope_transfer_log_proposal(
-        donor_cardinality=3,
-        receiver_cardinality=2,
-        group_size=3,
-        maximum_sources=5,
-        maximum_group_size=3,
-    )
-
-    assert forward == pytest.approx(-math.log(3.0) - math.log(10.0))
-    assert reverse == pytest.approx(-math.log(3.0))
-    assert (reverse - forward) == pytest.approx(math.log(10.0))
-
-
-def test_cross_isotope_transfer_rejects_infeasible_group() -> None:
-    """A receiver without capacity has zero proposal density."""
-    value = cross_isotope_transfer_log_proposal(
-        donor_cardinality=2,
-        receiver_cardinality=5,
-        group_size=1,
-        maximum_sources=5,
-        maximum_group_size=3,
-    )
-
-    assert value == -math.inf
 
 
 def test_shifted_log_strength_ratio_matches_scalar_jacobian_oracle() -> None:

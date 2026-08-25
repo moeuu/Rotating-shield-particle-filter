@@ -12,6 +12,7 @@ from measurement.continuous_kernels import (
 )
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
+from measurement.shielding import rotation_matrix_from_normal
 
 
 def test_gpu_pair_counts_match_continuous_kernel_with_line_obstacles() -> None:
@@ -201,8 +202,8 @@ def test_geometric_scaling_inverse_square() -> None:
     d2 = 2.0
     lam1 = expected_counts_single_isotope(
         detector_position=np.array([d1, 0.0, 0.0]),
-        RFe=np.array([1.0, 0.0, 0.0]),
-        RPb=np.array([1.0, 0.0, 0.0]),
+        RFe=rotation_matrix_from_normal(np.array([-1.0, 0.0, 0.0])),
+        RPb=rotation_matrix_from_normal(np.array([-1.0, 0.0, 0.0])),
         sources=src,
         strengths=strength,
         background=0.0,
@@ -211,8 +212,8 @@ def test_geometric_scaling_inverse_square() -> None:
     )
     lam2 = expected_counts_single_isotope(
         detector_position=np.array([d2, 0.0, 0.0]),
-        RFe=np.array([1.0, 0.0, 0.0]),
-        RPb=np.array([1.0, 0.0, 0.0]),
+        RFe=rotation_matrix_from_normal(np.array([-1.0, 0.0, 0.0])),
+        RPb=rotation_matrix_from_normal(np.array([-1.0, 0.0, 0.0])),
         sources=src,
         strengths=strength,
         background=0.0,
@@ -229,8 +230,8 @@ def test_shield_attenuation_factor_both_materials() -> None:
     strength = np.array([5.0])
     lam_free = expected_counts_single_isotope(
         detector_position=det,
-        RFe=np.array([1.0, 1.0, 1.0]),
-        RPb=np.array([1.0, 1.0, 1.0]),
+        RFe=rotation_matrix_from_normal(np.array([-1.0, -1.0, -1.0])),
+        RPb=rotation_matrix_from_normal(np.array([-1.0, -1.0, -1.0])),
         sources=src,
         strengths=strength,
         background=0.0,
@@ -239,8 +240,8 @@ def test_shield_attenuation_factor_both_materials() -> None:
     )
     lam_blocked = expected_counts_single_isotope(
         detector_position=det,
-        RFe=np.array([-1.0, -1.0, -1.0]),
-        RPb=np.array([-1.0, -1.0, -1.0]),
+        RFe=rotation_matrix_from_normal(np.array([1.0, 1.0, 1.0])),
+        RPb=rotation_matrix_from_normal(np.array([1.0, 1.0, 1.0])),
         sources=src,
         strengths=strength,
         background=0.0,

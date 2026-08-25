@@ -29,7 +29,7 @@ def main() -> None:
         "--runtime-config",
         type=Path,
         default=DEFAULT_RUNTIME_CONFIG,
-        help="Canonical shared-runtime Geant4 config inherited by each trial.",
+        help="Canonical shared-runtime Geant4 config copied into each trial.",
     )
     parser.add_argument(
         "--pf-config",
@@ -65,8 +65,8 @@ def main() -> None:
         nargs="+",
         default=None,
         help=(
-            "Independent PF seeds for exact replay. One is required per "
-            "explicit scene seed; fresh PF seeds are otherwise generated."
+            "Recorded independent PF seeds for exact replay. Required with "
+            "--seeds and forbidden for a fresh batch."
         ),
     )
     parser.add_argument(
@@ -75,8 +75,17 @@ def main() -> None:
         nargs="+",
         default=None,
         help=(
-            "Independent transport seeds for exact replay. One is required "
-            "per explicit scene seed; fresh values are otherwise generated."
+            "Recorded independent transport seeds for exact replay. Required "
+            "with --seeds and forbidden for a fresh batch."
+        ),
+    )
+    parser.add_argument(
+        "--batch-ids",
+        nargs="+",
+        default=None,
+        help=(
+            "Recorded opaque batch identifiers for exact replay. Required with "
+            "--seeds; fresh batches generate opaque identifiers."
         ),
     )
     parser.add_argument(
@@ -101,6 +110,11 @@ def main() -> None:
             None
             if args.transport_seeds is None
             else tuple(int(seed) for seed in args.transport_seeds)
+        ),
+        batch_ids=(
+            None
+            if args.batch_ids is None
+            else tuple(str(batch_id) for batch_id in args.batch_ids)
         ),
         output_tag_suffix=str(args.output_tag_suffix),
     )

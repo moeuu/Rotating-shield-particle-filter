@@ -1,4 +1,4 @@
-"""Legacy-independent shield program for the first PF station."""
+"""Deterministic balanced shield program for the first PF station."""
 
 from __future__ import annotations
 
@@ -12,13 +12,12 @@ def build_balanced_bootstrap_program(
     num_orientations: int,
     program_length: int,
 ) -> ShieldProgram:
-    """Return a deterministic unique-pair program without the old library.
+    """Return a deterministic unique-pair program from orientation geometry.
 
     Pair IDs advance by ``num_orientations + 1`` modulo the square Fe/Pb
     pair domain. This step is coprime to ``num_orientations ** 2``, so every
     prefix is repetition-free. For the production 8-by-8, eight-view setup,
-    the result visits each Fe and Pb orientation exactly once and matches the
-    previously executed first-station program.
+    the result visits each Fe and Pb orientation exactly once.
     """
     for name, value in {
         "num_orientations": num_orientations,

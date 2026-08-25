@@ -294,27 +294,26 @@ class SubsetCrossLikelihoodMemoryModel(Protocol):
         """Return resident-cache plus peak candidate workspace bytes."""
 
 
-def validate_full_spectrum_model(
+def _full_spectrum_model_protocol(
     model: object,
 ) -> FullSpectrumGenerativeModel:
-    """Return a structurally complete, training-approved runtime model."""
+    """Return a model implementing the complete full-spectrum protocol."""
     if not isinstance(model, FullSpectrumGenerativeModel):
         raise TypeError(
             "Pure PF requires a FullSpectrumGenerativeModel implementing the "
             "shared NumPy/Torch likelihood, predictive sampler, and manifest."
         )
-    model.require_runtime_ready()
-    runtime_ready = model.runtime_ready
-    if type(runtime_ready) is not bool or runtime_ready is not True:
-        raise RuntimeError(
-            "Full-spectrum model reported runtime_ready=False after its "
-            "training-only runtime gate."
-        )
+    return model
+
+
+def _validate_full_spectrum_contract(
+    model: FullSpectrumGenerativeModel,
+) -> FullSpectrumGenerativeModel:
+    """Validate immutable structure shared by training and production use."""
     contract_hash = model.contract_hash_sha256
     if (
         type(contract_hash) is not str
-        or
-        len(contract_hash) != 64
+        or len(contract_hash) != 64
         or any(character not in "0123456789abcdef" for character in contract_hash)
     ):
         raise ValueError("Full-spectrum model contract hash must be SHA-256.")
@@ -343,6 +342,36 @@ def validate_full_spectrum_model(
             "(tau_fe, tau_pb, tau_obstacle, distance_m)."
         )
     return model
+
+
+def validate_training_full_spectrum_model(
+    model: object,
+) -> FullSpectrumGenerativeModel:
+    """Validate a model for explicit non-production training or holdout use."""
+    validated = _full_spectrum_model_protocol(model)
+    validated.require_runtime_ready()
+    runtime_ready = validated.runtime_ready
+    if type(runtime_ready) is not bool or runtime_ready is not True:
+        raise RuntimeError(
+            "Full-spectrum model reported runtime_ready=False after its "
+            "training-only runtime gate."
+        )
+    return _validate_full_spectrum_contract(validated)
+
+
+def validate_full_spectrum_model(
+    model: object,
+) -> FullSpectrumGenerativeModel:
+    """Validate an independently approved model for production PF use."""
+    validated = validate_training_full_spectrum_model(model)
+    validated.require_production_ready()
+    production_ready = validated.production_ready
+    if type(production_ready) is not bool or production_ready is not True:
+        raise RuntimeError(
+            "Full-spectrum model reported production_ready=False after its "
+            "independent holdout gate."
+        )
+    return validated
 
 
 def validate_observed_spectrum(

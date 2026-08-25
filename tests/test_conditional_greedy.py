@@ -316,36 +316,6 @@ def test_one_swap_is_one_batch_and_never_decreases_information_gain() -> None:
     assert result.information_gain_a[0] > result.greedy_information_gain_a[0]
 
 
-def test_optional_incumbent_library_is_a_same_cache_eig_floor() -> None:
-    """An optional legacy library must floor the refined finite-MC EIG."""
-    cache = _MappedSubsetLikelihoodCache(
-        pair_count=4,
-        score=_nonadditive_score,
-        device=_test_device(),
-    )
-    incumbents = np.asarray([[0, 1], [1, 3]], dtype=np.int64)
-
-    result = select_conditional_greedy_programs(
-        cache,
-        np.asarray([0.5, 0.5], dtype=np.float64),
-        num_orientations=2,
-        program_length=2,
-        enable_one_swap=True,
-        incumbent_subsets=incumbents,
-    )
-
-    assert np.array_equal(result.program_pair_ids_al, [[1, 3]])
-    assert result.selection_source_a == ("incumbent",)
-    assert result.incumbent_candidate_count_per_action == 2
-    assert bool(result.incumbent_floor_applied_a[0]) is True
-    assert result.incumbent_best_index_a[0] == 1
-    assert np.array_equal(result.incumbent_best_program_pair_ids_al, [[1, 3]])
-    assert result.information_gain_a[0] >= (
-        result.one_swap_best_information_gain_a[0]
-    )
-    assert cache.call_shapes[-1] == (1, 2, 2)
-
-
 def test_public_recheck_helper_retains_paired_kl_samples_on_device() -> None:
     """Ambiguous contenders must expose paired samples without new physics."""
     cache = _AdditiveLikelihoodCache(
@@ -385,13 +355,11 @@ def test_ties_choose_lowest_pair_and_do_not_replace_the_greedy_program() -> None
         num_orientations=3,
         program_length=3,
         enable_one_swap=True,
-        incumbent_subsets=np.asarray([[8, 7, 6]], dtype=np.int64),
     )
 
     assert np.array_equal(result.program_pair_ids_al, [[0, 1, 2]])
     assert result.selection_source_a == ("greedy",)
     assert not bool(result.one_swap_applied_a[0])
-    assert not bool(result.incumbent_floor_applied_a[0])
 
 
 def test_pair_count_is_derived_from_orientation_contract() -> None:
@@ -410,19 +378,19 @@ def test_pair_count_is_derived_from_orientation_contract() -> None:
         )
 
 
-def test_incumbent_subsets_must_contain_unique_pairs() -> None:
-    """No incumbent compatibility program may repeat a physical pair."""
+def test_cache_pair_count_alias_is_rejected() -> None:
+    """Prepared caches must publish the current view_count field exactly."""
     cache = _AdditiveLikelihoodCache(
         np.zeros((1, 4), dtype=np.float64),
         device=_test_device(),
     )
+    cache.pair_count = cache.view_count
+    del cache.view_count
 
-    with pytest.raises(ValueError, match="unique"):
+    with pytest.raises(AttributeError, match="view_count"):
         select_conditional_greedy_programs(
             cache,
             np.asarray([0.5, 0.5], dtype=np.float64),
             num_orientations=2,
             program_length=2,
-            enable_one_swap=False,
-            incumbent_subsets=np.asarray([[1, 1]], dtype=np.int64),
         )

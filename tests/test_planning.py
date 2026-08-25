@@ -1,14 +1,12 @@
 """Tests for joint DSS planning and measurement geometry."""
 
 import inspect
-import math
 from types import SimpleNamespace
 import weakref
 
 import numpy as np
 import pytest
 
-import planning.candidate_generation as candidate_generation
 import planning.dss_eig as dss_eig
 import planning.dss_pp as dss_pp
 from measurement.kernels import ShieldParams
@@ -20,19 +18,13 @@ from pf.estimator import (
 )
 from measurement.surface_atlas import ContinuousSurfaceAtlas
 from pf.state import IsotopeState
-from pf.provenance import json_safe
+from pf.provenance import strict_canonical_json_bytes, strict_json_loads
 from planning.audit import build_planner_audit
 from planning.dss_pp import (
     DSSPPConfig,
     _continuous_kernel_for_estimator,
+    _select_dss_pp_test_oracle as select_dss_pp_next_station,
     estimate_lambda_cost,
-    select_dss_pp_next_station,
-)
-from planning.shield_programs import build_shield_program_library
-from planning.candidate_generation import (
-    expand_candidate_height_actions,
-    generate_candidate_poses,
-    resolve_detector_height_actions,
 )
 from pf.particle_filter import IsotopeParticle
 from measurement.shielding import generate_octant_orientations
@@ -119,6 +111,7 @@ def _build_simple_estimator(
         mu_by_isotope={"Cs-137": 0.5},
         pf_config=config,
         shield_params=ShieldParams(),
+        detector_radius_m=0.025,
         full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     estimator.add_measurement_pose(np.array([0.0, 0.0, 0.0]))
@@ -667,11 +660,9 @@ def test_dss_torch_sampler_capability_is_checked_before_transport(
             np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
             [[program]],
             config=DSSPPConfig(
-                max_programs=1,
                 program_length=1,
                 forced_program_pair_ids=(0,),
                 exact_eig_coverage_reserve=0,
-                exact_eig_program_diversity_reserve=0,
             ),
             rng=np.random.default_rng(17),
             joint_particles=joint,
@@ -1153,14 +1144,12 @@ def test_dss_full_spectrum_proxy_matches_direct_reduced_eig() -> None:
         kind="test",
     )
     config = DSSPPConfig(
-        max_programs=1,
         program_length=1,
         forced_program_pair_ids=(0,),
         live_time_s=1.0,
         detector_aperture_samples=121,
         proxy_eig_samples=2,
         exact_eig_coverage_reserve=0,
-        exact_eig_program_diversity_reserve=0,
     )
     proxy_diagnostics: dict[str, object] = {}
     proxy_scores = dss_pp._program_information_proxy_for_poses(
@@ -1222,12 +1211,10 @@ def test_dss_exact_eig_is_action_batch_invariant(
     )
     programs_by_pose = [[program] for _ in range(detectors.shape[0])]
     config = DSSPPConfig(
-        max_programs=1,
         program_length=1,
         forced_program_pair_ids=(0,),
         live_time_s=1.0,
         exact_eig_coverage_reserve=0,
-        exact_eig_program_diversity_reserve=0,
     )
 
     monkeypatch.setattr(
@@ -1339,12 +1326,10 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
     )
     programs_by_pose = [[program] for _ in range(detectors.shape[0])]
     config = DSSPPConfig(
-        max_programs=1,
         program_length=1,
         forced_program_pair_ids=(0,),
         live_time_s=1.0,
         exact_eig_coverage_reserve=0,
-        exact_eig_program_diversity_reserve=0,
     )
     exact_batch_size = dss_pp._dss_eig_action_batch_size
     monkeypatch.setattr(
@@ -1427,7 +1412,7 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
     assert all(count == 1 for count in attempted_action_counts[1:])
     assert diagnostics["oom_retry_count"] == 1
     assert release_calls == 1
-    assert diagnostics["cpu_fallback_used"] is False
+    assert "cpu_fallback_used" not in diagnostics
     assert diagnostics["attempted_action_batch_sizes"] == [3, 1, 1, 1]
     assert diagnostics["successful_action_batch_sizes"] == [1, 1, 1]
     memory_contracts = diagnostics["memory_contracts"]
@@ -1496,7 +1481,6 @@ def test_conditional_pose_batch_retries_without_changing_eig(
         dtype=np.float64,
     )
     config = DSSPPConfig(
-        max_programs=1,
         program_length=1,
         forced_program_pair_ids=(0,),
         live_time_s=1.0,
@@ -1514,7 +1498,6 @@ def test_conditional_pose_batch_retries_without_changing_eig(
         "working_memory_budget_bytes": config.exact_eig_memory_budget_bytes,
         "maximum_subset_candidate_count": 1,
         "enable_one_swap": False,
-        "incumbent_subsets_ck": None,
         "confirm_ambiguous": False,
     }
     expected = dss_pp._evaluate_conditional_pose_batches(**call_kwargs)
@@ -1569,7 +1552,6 @@ def test_fixed_confirmation_releases_failed_cache_before_retry(
     estimator = _build_full_spectrum_planning_estimator()
     joint = estimator.planning_joint_particles()
     config = DSSPPConfig(
-        max_programs=1,
         program_length=1,
         forced_program_pair_ids=(0,),
         detector_aperture_samples=1,
@@ -1688,228 +1670,6 @@ def test_fixed_confirmation_releases_failed_cache_before_retry(
     assert release_calls == 1
 
 
-def test_candidate_generation_adds_map_cells_when_random_sampling_is_sparse() -> None:
-    """Candidate generation should include deterministic free-cell centers."""
-
-    class SparseRuntimeMap:
-        """Expose one runtime-authored free cell through the planner contract."""
-
-        origin = (0.0, 0.0)
-        cell_size = 1.0
-        traversable_cells = ((8, 8),)
-
-        def is_free_batch(self, points: np.ndarray) -> np.ndarray:
-            """Accept only points inside the declared runtime free cell."""
-            values = np.asarray(points, dtype=float)
-            cells = np.floor(values[:, :2]).astype(np.int64)
-            return np.all(cells == np.asarray([8, 8]), axis=1)
-
-    traversable = SparseRuntimeMap()
-
-    candidates = generate_candidate_poses(
-        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
-        map_api=traversable,
-        n_candidates=4,
-        strategy="free_space_sobol",
-        min_dist_from_visited=1.0,
-        visited_poses_xyz=np.array([[0.5, 0.5, 0.5]], dtype=float),
-        bounds_xyz=(
-            np.array([0.0, 0.0, 0.5], dtype=float),
-            np.array([10.0, 10.0, 0.5], dtype=float),
-        ),
-        rng=np.random.default_rng(7),
-    )
-
-    assert any(np.allclose(candidate, [8.5, 8.5, 0.5]) for candidate in candidates)
-
-
-def test_candidate_generation_rejects_missing_or_inverted_bounds() -> None:
-    """A hidden default cube or reordered bounds can exclude the true workspace."""
-    common = {
-        "current_pose_xyz": np.asarray([0.5, 0.5, 0.5], dtype=float),
-        "map_api": None,
-        "n_candidates": 4,
-        "rng": np.random.default_rng(7),
-    }
-    with pytest.raises(ValueError, match="explicit environment bounds"):
-        generate_candidate_poses(**common)
-    with pytest.raises(ValueError, match="finite ordered"):
-        generate_candidate_poses(
-            **common,
-            bounds_xyz=(
-                np.asarray([2.0, 0.0, 0.0], dtype=float),
-                np.asarray([1.0, 1.0, 1.0], dtype=float),
-            ),
-        )
-
-
-def test_candidate_generation_rejects_unknown_map_capabilities() -> None:
-    """Unknown maps must not silently mark obstacles or paths as free."""
-
-    class UnknownMap:
-        """Deliberately omit every free-space map contract."""
-
-    with pytest.raises(TypeError, match="is_free_batch"):
-        generate_candidate_poses(
-            current_pose_xyz=np.asarray([0.5, 0.5, 0.5], dtype=float),
-            map_api=UnknownMap(),
-            n_candidates=4,
-            bounds_xyz=(
-                np.zeros(3, dtype=float),
-                np.ones(3, dtype=float),
-            ),
-            rng=np.random.default_rng(7),
-        )
-
-
-def test_candidate_generation_replenishes_after_batch_reachability_filter() -> None:
-    """Reachability loss must trigger native map-center replenishment."""
-
-    class ReachabilityMap:
-        """Expose one reachable native cell and reject sampled off-center poses."""
-
-        origin = (0.0, 0.0)
-        cell_size = 1.0
-        grid_shape = (10, 10)
-        traversable_cells = ((8, 8),)
-
-        def __init__(self) -> None:
-            """Initialize batched reachability accounting."""
-            self.reachability_calls = 0
-
-        def cell_center(self, cell: tuple[int, int]) -> tuple[float, float]:
-            """Return the center of one native map cell."""
-            return float(cell[0]) + 0.5, float(cell[1]) + 0.5
-
-        def is_free(self, _point: np.ndarray) -> bool:
-            """Reject accidental use of the scalar free-space callback."""
-            raise AssertionError("scalar free-space path must not be selected")
-
-        def is_free_batch(self, points: np.ndarray) -> np.ndarray:
-            """Mark all sampled endpoints free before reachability filtering."""
-            return np.ones(np.asarray(points).shape[0], dtype=bool)
-
-        def is_motion_reachable_batch(
-            self,
-            _start_xyz: np.ndarray,
-            goals_xyz: np.ndarray,
-        ) -> np.ndarray:
-            """Keep only the native center to make replenishment deterministic."""
-            self.reachability_calls += 1
-            goals = np.asarray(goals_xyz, dtype=float)
-            return np.all(
-                np.isclose(goals, np.array([8.5, 8.5, 0.5])[None, :]),
-                axis=1,
-            )
-
-    planning_map = ReachabilityMap()
-    candidates = generate_candidate_poses(
-        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
-        map_api=planning_map,
-        n_candidates=4,
-        strategy="free_space_sobol",
-        min_dist_from_visited=1.0,
-        visited_poses_xyz=np.array([[0.5, 0.5, 0.5]], dtype=float),
-        bounds_xyz=(
-            np.array([0.0, 0.0, 0.5], dtype=float),
-            np.array([10.0, 10.0, 0.5], dtype=float),
-        ),
-        rng=np.random.default_rng(7),
-        require_motion_reachable=True,
-    )
-
-    assert planning_map.reachability_calls >= 2
-    np.testing.assert_allclose(candidates, np.array([[8.5, 8.5, 0.5]]))
-
-
-def test_candidate_filter_prefers_batched_free_space_path() -> None:
-    """Standard maps should filter candidate arrays without scalar callbacks."""
-
-    class BatchPlanningMap:
-        """Expose both paths while making an accidental scalar call fail."""
-
-        def __init__(self) -> None:
-            """Initialize batch-call accounting."""
-            self.batch_calls = 0
-
-        def is_free(self, _point: np.ndarray) -> bool:
-            """Reject use of the compatibility-only scalar path."""
-            raise AssertionError("scalar free-space path must not be selected")
-
-        def is_free_batch(self, points: np.ndarray) -> np.ndarray:
-            """Accept candidates whose x coordinate is at least one metre."""
-            self.batch_calls += 1
-            return np.asarray(points, dtype=float)[:, 0] >= 1.0
-
-    planning_map = BatchPlanningMap()
-    candidates = np.asarray(
-        [[0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [2.5, 0.5, 1.5]],
-        dtype=float,
-    )
-
-    filtered = candidate_generation._filter_candidates(
-        candidates,
-        visited_poses_xyz=None,
-        min_dist_from_visited=0.0,
-        is_free_batch_fn=(
-            candidate_generation._resolve_free_space_batch_checker(planning_map)
-        ),
-    )
-
-    assert planning_map.batch_calls == 1
-    assert np.allclose(filtered, candidates[1:])
-
-
-def test_candidate_height_expansion_matches_scalar_oracle() -> None:
-    """Discrete height actions should be a vectorized Cartesian expansion."""
-    candidates = np.array(
-        [[1.0, 2.0, 0.5], [3.0, 4.0, 0.5]],
-        dtype=float,
-    )
-    heights = resolve_detector_height_actions(
-        [1.5, 0.5, 1.5],
-        default_height_m=0.5,
-        bounds_z=(0.0, 2.0),
-    )
-
-    expanded = expand_candidate_height_actions(candidates, heights)
-    expected = np.asarray(
-        [
-            [candidate[0], candidate[1], height]
-            for candidate in candidates
-            for height in heights
-        ],
-        dtype=float,
-    )
-
-    assert np.allclose(expanded, expected)
-
-
-def test_candidate_filter_uses_one_generic_3d_separation() -> None:
-    """Vertical and lateral actions must obey the same Euclidean spacing."""
-    visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
-    candidates = np.array(
-        [
-            [1.0, 1.0, 0.5001],
-            [1.0, 1.0, 3.5],
-            [4.0, 1.0, 0.5],
-        ],
-        dtype=float,
-    )
-
-    filtered = candidate_generation._filter_candidates(
-        candidates,
-        visited,
-        3.0,
-        is_free_batch_fn=lambda points: np.ones(
-            np.asarray(points).shape[0],
-            dtype=bool,
-        ),
-    )
-
-    assert np.allclose(filtered, candidates[1:])
-
-
 def test_dss_station_spacing_uses_one_generic_3d_separation() -> None:
     """DSS filtering and revisit penalties must use Euclidean XYZ distance."""
     visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
@@ -1937,197 +1697,6 @@ def test_dss_station_spacing_uses_one_generic_3d_separation() -> None:
     assert np.allclose(filtered, candidates[1:])
     assert penalties[1] == pytest.approx(0.0)
     assert penalties[0] > 0.0
-
-
-def test_dss_continuous_augmentation_preserves_base_and_uses_batch_filter() -> None:
-    """Continuous augmentation should vary z and use batched free-space checks."""
-
-    class BatchOnlyPlanningMap:
-        """Expose only a usable batched free-space runtime path."""
-
-        def __init__(self) -> None:
-            """Initialize batch-call accounting."""
-            self.batch_calls = 0
-
-        def is_free(self, _point: np.ndarray) -> bool:
-            """Reject accidental use of the scalar compatibility path."""
-            raise AssertionError("scalar free-space path must not be selected")
-
-        def is_free_batch(self, points: np.ndarray) -> np.ndarray:
-            """Accept every in-bounds candidate in one batch."""
-            self.batch_calls += 1
-            return np.ones(np.asarray(points).shape[0], dtype=bool)
-
-    planning_map = BatchOnlyPlanningMap()
-    base = np.array(
-        [[0.25, 0.25, 0.4], [0.75, 0.75, 1.4]],
-        dtype=float,
-    )
-    current = np.array([0.5, 0.5, 0.5], dtype=float)
-    bounds = (
-        np.array([0.0, 0.0, 0.25], dtype=float),
-        np.array([2.0, 2.0, 1.75], dtype=float),
-    )
-    config = DSSPPConfig(max_augmented_candidates=16)
-
-    continuous = dss_pp.augment_candidate_stations(
-        base,
-        modes_by_isotope={},
-        current_pose_xyz=current,
-        visited_poses_xyz=None,
-        map_api=planning_map,
-        bounds_xyz=bounds,
-        config=config,
-        continuous_height_bounds_m=(0.25, 1.75),
-        rng=np.random.default_rng(17),
-    )
-    legacy = dss_pp.augment_candidate_stations(
-        base,
-        modes_by_isotope={},
-        current_pose_xyz=current,
-        visited_poses_xyz=None,
-        map_api=planning_map,
-        bounds_xyz=bounds,
-        config=config,
-        rng=np.random.default_rng(17),
-    )
-
-    assert planning_map.batch_calls == 2
-    assert np.allclose(continuous[: base.shape[0]], base)
-    assert np.unique(np.round(continuous[base.shape[0] :, 2], 6)).size > 1
-    assert np.all(
-        (continuous[base.shape[0] :, 2] >= 0.25)
-        & (continuous[base.shape[0] :, 2] <= 1.75)
-    )
-    assert np.allclose(legacy[: base.shape[0]], base)
-    assert np.allclose(legacy[base.shape[0] :, 2], current[2])
-
-
-def test_dss_augmented_geometry_matches_scalar_test_oracle() -> None:
-    """Batched ring and cross-bearing construction must preserve geometry."""
-    base = np.array([[9.0, 9.0, 0.5]], dtype=np.float64)
-    current = np.array([5.0, 5.0, 0.5], dtype=np.float64)
-    visited = np.array(
-        [[2.0, 0.0, 0.5], [0.0, 3.0, 1.0]],
-        dtype=np.float64,
-    )
-    modes = [
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([0.0, 0.0, 0.0], dtype=np.float64),
-            strength_cps_1m=100.0,
-            weight=0.7,
-            spread_m=0.2,
-        ),
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([4.0, 1.0, 1.0], dtype=np.float64),
-            strength_cps_1m=50.0,
-            weight=0.3,
-            spread_m=0.4,
-        ),
-    ]
-    config = DSSPPConfig(
-        ring_radii_m=(1.0, 2.0),
-        ring_angles=4,
-        max_augmented_candidates=512,
-    )
-
-    actual = dss_pp.augment_candidate_stations(
-        base,
-        modes_by_isotope={"Cs-137": modes},
-        current_pose_xyz=current,
-        visited_poses_xyz=visited,
-        map_api=None,
-        bounds_xyz=None,
-        config=config,
-        rng=np.random.default_rng(31),
-    )
-
-    scalar_points = [base[0].copy()]
-    angles = np.linspace(0.0, 2.0 * np.pi, 4, endpoint=False)
-    for mode in modes:
-        for radius in config.ring_radii_m:
-            for angle in angles:
-                scalar_points.append(
-                    np.array(
-                        [
-                            mode.position_xyz[0] + radius * np.cos(angle),
-                            mode.position_xyz[1] + radius * np.sin(angle),
-                            current[2],
-                        ],
-                        dtype=np.float64,
-                    )
-                )
-    for mode in modes:
-        for pose in visited:
-            delta = pose[:2] - mode.position_xyz[:2]
-            base_angle = float(np.arctan2(delta[1], delta[0]))
-            for offset in (0.5 * np.pi, -0.5 * np.pi, np.pi):
-                for radius in config.ring_radii_m:
-                    angle = base_angle + offset
-                    scalar_points.append(
-                        np.array(
-                            [
-                                mode.position_xyz[0] + radius * np.cos(angle),
-                                mode.position_xyz[1] + radius * np.sin(angle),
-                                current[2],
-                            ],
-                            dtype=np.float64,
-                        )
-                    )
-    expected = dss_pp._dedupe_points(np.vstack(scalar_points))
-
-    assert actual.shape == expected.shape
-    actual_order = np.lexsort((actual[:, 2], actual[:, 1], actual[:, 0]))
-    expected_order = np.lexsort((expected[:, 2], expected[:, 1], expected[:, 0]))
-    assert np.allclose(actual[actual_order], expected[expected_order])
-
-
-def test_dss_grid_augmentation_uses_batched_cell_centers() -> None:
-    """Boundary and coverage candidates must avoid scalar cell callbacks."""
-
-    class BatchCellMap:
-        """Expose vectorized planning geometry and reject scalar callbacks."""
-
-        origin = (0.0, 0.0)
-        cell_size = 1.0
-        grid_shape = (3, 2)
-        traversable_cells = ((0, 0), (0, 1), (1, 0), (2, 1))
-
-        def __init__(self) -> None:
-            """Initialize callback accounting."""
-            self.center_batch_calls = 0
-
-        def cell_center(self, _cell: tuple[int, int]) -> tuple[float, float]:
-            """Reject accidental scalar center construction."""
-            raise AssertionError("scalar cell-center path must not be selected")
-
-        def cell_centers_batch(self, cells: np.ndarray) -> np.ndarray:
-            """Return all requested centers in one numerical batch."""
-            self.center_batch_calls += 1
-            return np.asarray(cells, dtype=np.float64) + 0.5
-
-        @staticmethod
-        def is_free_batch(points: np.ndarray) -> np.ndarray:
-            """Accept the fixture's candidate batch."""
-            return np.ones(np.asarray(points).shape[0], dtype=bool)
-
-    planning_map = BatchCellMap()
-    result = dss_pp.augment_candidate_stations(
-        np.array([[0.5, 0.5, 0.5]], dtype=np.float64),
-        modes_by_isotope={},
-        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=np.float64),
-        visited_poses_xyz=None,
-        map_api=planning_map,
-        bounds_xyz=None,
-        config=DSSPPConfig(max_augmented_candidates=32),
-        rng=np.random.default_rng(37),
-    )
-
-    assert planning_map.center_batch_calls == 2
-    assert result.shape[1] == 3
-    assert any(np.allclose(row, [2.5, 1.5, 0.5]) for row in result)
 
 
 def test_batched_bearing_diversity_matches_scalar_test_oracle() -> None:
@@ -2335,17 +1904,14 @@ def test_dss_selection_uses_batch_lengths_for_filter_and_node_build() -> None:
         visited_poses_xyz=None,
         map_api=planning_map,
         config=DSSPPConfig(
-            max_programs=4,
             program_length=1,
             forced_program_pair_ids=(0,),
             live_time_s=1.0,
             lambda_eig=0.0,
             lambda_distance=1.0,
-            lambda_rotation=0.0,
             lambda_coverage=0.0,
             eta_revisit=0.0,
             min_station_separation_m=0.0,
-            augment_candidates=False,
         ),
     )
 
@@ -2353,41 +1919,31 @@ def test_dss_selection_uses_batch_lengths_for_filter_and_node_build() -> None:
     assert any(np.allclose(result.next_pose, pose) for pose in candidates)
 
 
-def test_dss_runtime_motion_times_need_no_local_map_geometry() -> None:
-    """Runtime reachability and time costs must replace local map surrogates."""
+def test_dss_runtime_rejects_motion_totals_without_components() -> None:
+    """A total-only motion quote must not enter a component-weighted objective."""
     estimator = _build_simple_estimator()
     candidates = np.array(
         [[1.5, 1.5, 0.5], [2.5, 1.5, 0.5]],
         dtype=float,
     )
 
-    result = select_dss_pp_next_station(
-        estimator=estimator,
-        rng=np.random.default_rng(123),
-        candidate_poses_xyz=candidates,
-        candidate_motion_times_s=np.array([4.0, 2.0], dtype=float),
-        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
-        map_api=object(),
-        config=DSSPPConfig(
-            max_programs=4,
-            program_length=1,
-            forced_program_pair_ids=(0,),
-            live_time_s=1.0,
-            lambda_eig=0.0,
-            lambda_distance=0.0,
-            lambda_time=1.0,
-            lambda_rotation=0.0,
-            lambda_coverage=0.0,
-            augment_candidates=False,
-        ),
-    )
-
-    np.testing.assert_allclose(result.next_pose, candidates[1])
-    assert result.diagnostics["path_filtered_candidates"] == 0
-    assert result.diagnostics["runtime_motion_times_applied"] is True
-    assert result.diagnostics["planning_eig_shortlist"]["path_length_support"] == (
-        "runtime_reachable_candidates_with_time_cost_only"
-    )
+    with pytest.raises(ValueError, match="totals and all three components"):
+        select_dss_pp_next_station(
+            estimator=estimator,
+            rng=np.random.default_rng(123),
+            candidate_poses_xyz=candidates,
+            candidate_motion_times_s=np.array([4.0, 2.0], dtype=float),
+            current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
+            map_api=object(),
+            config=DSSPPConfig(
+                program_length=1,
+                forced_program_pair_ids=(0,),
+                live_time_s=1.0,
+                lambda_eig=0.0,
+                lambda_distance=0.0,
+                lambda_coverage=0.0,
+            ),
+        )
 
 
 def test_dss_runtime_scores_motion_time_components_with_separate_weights() -> None:
@@ -2409,19 +1965,15 @@ def test_dss_runtime_scores_motion_time_components_with_separate_weights() -> No
         current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
         map_api=object(),
         config=DSSPPConfig(
-            max_programs=4,
             program_length=1,
             forced_program_pair_ids=(0,),
             live_time_s=1.0,
             lambda_eig=0.0,
             lambda_distance=0.0,
-            lambda_time=0.0,
             lambda_horizontal_time=1.0,
             lambda_mast_vertical_time=0.1,
             lambda_settling_time=1.0,
-            lambda_rotation=0.0,
             lambda_coverage=0.0,
-            augment_candidates=False,
         ),
     )
 
@@ -2431,7 +1983,6 @@ def test_dss_runtime_scores_motion_time_components_with_separate_weights() -> No
         "horizontal": 1.0,
         "mast_vertical": 0.1,
         "settling": 1.0,
-        "measurement": 0.0,
     }
 
 
@@ -2442,142 +1993,6 @@ def test_estimate_lambda_cost_range_scales_motion() -> None:
     lam = estimate_lambda_cost(uncertainties, distances, method="range")
     expected = (4.0 - 1.0) / (2.5 - 0.5)
     assert lam == pytest.approx(expected)
-
-
-def test_dss_pp_program_library_balances_every_shield_pair() -> None:
-    """Every canonical pair must be represented without within-station repeats."""
-    normals = np.asarray(generate_octant_orientations(), dtype=float)
-    programs = build_shield_program_library(
-        normals,
-        program_length=8,
-        max_programs=48,
-    )
-    occurrences = np.bincount(
-        np.asarray(
-            [pair_id for program in programs for pair_id in program.pair_ids],
-            dtype=np.int64,
-        ),
-        minlength=64,
-    )
-
-    assert len(programs) == 48
-    assert all(
-        program.kind == "all_pair_balanced_multi_partition" for program in programs
-    )
-    assert all(len(program.pair_ids) == 8 for program in programs)
-    assert all(len(set(program.pair_ids)) == 8 for program in programs)
-    assert set(np.flatnonzero(occurrences)) == set(range(64))
-    assert np.max(occurrences) == np.min(occurrences) == 6
-    companions = {pair_id: set() for pair_id in range(64)}
-    for program in programs:
-        for pair_id in program.pair_ids:
-            companions[pair_id].update(
-                other for other in program.pair_ids if other != pair_id
-            )
-    assert min(len(values) for values in companions.values()) >= 28
-
-
-@pytest.mark.parametrize(
-    ("orientation_count", "program_length", "max_programs"),
-    ((8, 8, 48), (5, 3, 9)),
-)
-def test_shield_program_batch_schedule_matches_scalar_test_oracle(
-    orientation_count: int,
-    program_length: int,
-    max_programs: int,
-) -> None:
-    """Vectorized pair schedules must equal an independent scalar oracle."""
-    programs = build_shield_program_library(
-        np.zeros((orientation_count, 3), dtype=np.float64),
-        program_length=program_length,
-        max_programs=max_programs,
-    )
-    expected: list[tuple[str, tuple[int, ...]]] = []
-    if orientation_count == 8 and program_length == 8:
-        partitions: list[tuple[str, list[tuple[int, ...]]]] = []
-        for slope in range(orientation_count):
-            if math.gcd(slope, orientation_count) != 1:
-                continue
-            rows = []
-            for offset in range(orientation_count):
-                rows.append(
-                    tuple(
-                        fe_index * orientation_count
-                        + (slope * fe_index + offset) % orientation_count
-                        for fe_index in range(orientation_count)
-                    )
-                )
-            partitions.append((f"latin_slope_{slope}", rows))
-        partitions.append(
-            (
-                "fixed_fe",
-                [
-                    tuple(
-                        fe_index * orientation_count + pb_index
-                        for pb_index in range(orientation_count)
-                    )
-                    for fe_index in range(orientation_count)
-                ],
-            )
-        )
-        partitions.append(
-            (
-                "fixed_pb",
-                [
-                    tuple(
-                        fe_index * orientation_count + pb_index
-                        for fe_index in range(orientation_count)
-                    )
-                    for pb_index in range(orientation_count)
-                ],
-            )
-        )
-        expected = [
-            (f"{partition_name}_{index:02d}", row)
-            for partition_name, rows in partitions
-            for index, row in enumerate(rows)
-        ]
-    else:
-        ordered = tuple(
-            fe_index * orientation_count + (fe_index + offset) % orientation_count
-            for offset in range(orientation_count)
-            for fe_index in range(orientation_count)
-        )
-        required = int(
-            np.ceil(orientation_count * orientation_count / float(program_length))
-        )
-        for index in range(required):
-            start = index * program_length
-            selected = list(ordered[start : start + program_length])
-            selected.extend(ordered[: program_length - len(selected)])
-            expected.append((f"all_pair_balanced_{index:02d}", tuple(selected)))
-
-    assert [(program.name, program.pair_ids) for program in programs] == expected
-
-
-def test_dss_pp_program_library_rejects_insufficient_pair_capacity() -> None:
-    """A truncated library must not silently hide valid shield actions."""
-    normals = np.asarray(generate_octant_orientations(), dtype=float)
-
-    with pytest.raises(ValueError, match="too small.*multi-partition"):
-        build_shield_program_library(
-            normals,
-            program_length=8,
-            max_programs=47,
-        )
-
-
-def test_canonical_program_capacity_does_not_request_extra_programs() -> None:
-    """A capacity above 48 must not invent arbitrary non-Latin programs."""
-    normals = np.asarray(generate_octant_orientations(), dtype=float)
-
-    programs = build_shield_program_library(
-        normals,
-        program_length=8,
-        max_programs=64,
-    )
-
-    assert len(programs) == 48
 
 
 def test_extract_signature_modes_uses_pf_posterior_weights() -> None:
@@ -2694,286 +2109,6 @@ def test_extract_signature_modes_preserves_all_marginal_mode_mass() -> None:
     )
 
 
-def test_candidate_augmentation_interleaves_every_material_mode() -> None:
-    """A finite augmentation budget must represent every material mode once."""
-    modes = [
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.asarray([position, 0.0, 0.0], dtype=float),
-            strength_cps_1m=300_000.0,
-            weight=weight,
-            spread_m=0.1,
-            isotope_presence_probability=1.0,
-        )
-        for position, weight in zip(
-            (1.0, 5.0, 9.0),
-            (0.8, 0.15, 0.05),
-            strict=True,
-        )
-    ]
-    config = DSSPPConfig(
-        max_modes_per_isotope=1,
-        max_augmented_candidates=3,
-        ring_radii_m=(1.0,),
-        ring_angles=4,
-    )
-
-    augmented = dss_pp.augment_candidate_stations(
-        np.zeros((0, 3), dtype=float),
-        modes_by_isotope={"Cs-137": modes},
-        current_pose_xyz=np.asarray([0.0, 0.0, 1.0], dtype=float),
-        visited_poses_xyz=None,
-        map_api=None,
-        bounds_xyz=None,
-        config=config,
-        rng=np.random.default_rng(3),
-    )
-
-    np.testing.assert_allclose(
-        augmented,
-        np.asarray(
-            [
-                [2.0, 0.0, 1.0],
-                [6.0, 0.0, 1.0],
-                [10.0, 0.0, 1.0],
-            ],
-            dtype=float,
-        ),
-        rtol=0.0,
-        atol=1.0e-12,
-    )
-
-
-def test_candidate_augmentation_expands_before_dropping_material_modes() -> None:
-    """An undersized ordinary budget must expand to retain every mode."""
-    modes = [
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.asarray([float(index), 0.0, 0.0]),
-            strength_cps_1m=300_000.0,
-            weight=0.25,
-            spread_m=0.1,
-            isotope_presence_probability=1.0,
-        )
-        for index in range(4)
-    ]
-
-    augmented = dss_pp.augment_candidate_stations(
-        np.zeros((0, 3), dtype=float),
-        modes_by_isotope={"Cs-137": modes},
-        current_pose_xyz=np.asarray([0.0, 0.0, 1.0], dtype=float),
-        visited_poses_xyz=None,
-        map_api=None,
-        bounds_xyz=None,
-        config=DSSPPConfig(max_augmented_candidates=3),
-        rng=np.random.default_rng(4),
-    )
-
-    np.testing.assert_allclose(
-        augmented,
-        np.asarray(
-            [
-                [2.0, 0.0, 1.0],
-                [3.0, 0.0, 1.0],
-                [4.0, 0.0, 1.0],
-                [5.0, 0.0, 1.0],
-            ],
-            dtype=float,
-        ),
-        rtol=0.0,
-        atol=1.0e-12,
-    )
-
-
-def test_extract_signature_modes_packed_joint_matches_state_oracle() -> None:
-    """Packed aligned mode extraction must equal the state-object oracle."""
-    states = [
-        IsotopeState(
-            num_sources=0,
-            strengths=np.zeros(0, dtype=float),
-            surface_chart_ids=np.zeros(0, dtype=np.int64),
-            surface_uv=np.zeros((0, 2), dtype=float),
-        ),
-        _encoded_surface_state(
-            np.array([[1.0, 0.0, 0.0]], dtype=float),
-            np.array([100.0], dtype=float),
-        ),
-        _encoded_surface_state(
-            np.array(
-                [[1.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
-                dtype=float,
-            ),
-            np.array([90.0, 30.0], dtype=float),
-        ),
-    ]
-    weights = np.array([0.1, 0.3, 0.6], dtype=float)
-    estimator = SimpleNamespace(
-        isotopes=("Cs-137",),
-        filters={
-            "Cs-137": SimpleNamespace(
-                continuous_state_positions=_decode_encoded_surface_state,
-            )
-        },
-        planning_particles=lambda **_kwargs: {"Cs-137": (states, weights)},
-    )
-    packed_positions = np.zeros((3, 2, 3), dtype=float)
-    packed_positions[1, 0] = np.array([1.0, 0.0, 0.0])
-    packed_positions[2] = np.array(
-        [[1.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    packed_strengths = np.array(
-        [[0.0, 0.0], [100.0, 0.0], [90.0, 30.0]],
-        dtype=float,
-    )
-    packed_mask = packed_strengths > 0.0
-    joint = dss_pp.JointPlanningParticles(
-        isotope_order=("Cs-137",),
-        weights_n=weights,
-        positions_nk3_by_isotope={"Cs-137": packed_positions},
-        surface_chart_ids_nk_by_isotope={"Cs-137": np.zeros((3, 2), dtype=np.int64)},
-        surface_uv_nk2_by_isotope={"Cs-137": np.zeros((3, 2, 2), dtype=float)},
-        strengths_nk_by_isotope={"Cs-137": packed_strengths},
-        source_mask_nk_by_isotope={"Cs-137": packed_mask},
-        original_particle_indices=np.arange(3, dtype=np.int64),
-    )
-
-    oracle = dss_pp.extract_signature_modes(
-        estimator,
-        mode_cluster_radius_m=0.1,
-        max_modes_per_isotope=2,
-        rng=np.random.default_rng(1),
-    )["Cs-137"]
-    packed = dss_pp.extract_signature_modes(
-        estimator,
-        mode_cluster_radius_m=0.1,
-        max_modes_per_isotope=2,
-        rng=np.random.default_rng(1),
-        joint_particles=joint,
-    )["Cs-137"]
-
-    assert len(packed) == len(oracle) == 2
-    for packed_mode, oracle_mode in zip(packed, oracle):
-        assert packed_mode.position_xyz == pytest.approx(oracle_mode.position_xyz)
-        assert packed_mode.strength_cps_1m == pytest.approx(oracle_mode.strength_cps_1m)
-        assert packed_mode.weight == pytest.approx(oracle_mode.weight)
-        assert packed_mode.isotope_presence_probability == pytest.approx(
-            oracle_mode.isotope_presence_probability
-        )
-
-
-def test_surface_mode_representative_uses_intrinsic_medoid() -> None:
-    """A folded surface must use path distance rather than XYZ averaging."""
-    positions = np.array(
-        [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [10.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    lookup = {
-        (0, 1): 100.0,
-        (1, 0): 100.0,
-        (0, 2): 1.0,
-        (2, 0): 1.0,
-        (1, 2): 1.0,
-        (2, 1): 1.0,
-    }
-
-    def surface_distance(
-        left: np.ndarray,
-        right: np.ndarray,
-    ) -> np.ndarray:
-        """Return a deterministic folded-surface path metric."""
-        left_ids = np.argmin(
-            np.linalg.norm(left[:, None, :] - positions[None, :, :], axis=2),
-            axis=1,
-        )
-        right_ids = np.argmin(
-            np.linalg.norm(right[:, None, :] - positions[None, :, :], axis=2),
-            axis=1,
-        )
-        return np.asarray(
-            [
-                0.0 if left_id == right_id else lookup[(left_id, right_id)]
-                for left_id, right_id in zip(left_ids, right_ids)
-            ],
-            dtype=float,
-        )
-
-    medoid = dss_pp._weighted_surface_medoid_index(
-        positions,
-        np.full(3, 1.0 / 3.0, dtype=float),
-        surface_path_distance=surface_distance,
-    )
-
-    assert medoid == 2
-
-
-def test_surface_mode_clustering_uses_authoritative_chart_coordinates() -> None:
-    """Coincident XYZ points on disconnected charts must remain distinct."""
-    positions = np.zeros((2, 3), dtype=float)
-    chart_ids = np.asarray([4, 9], dtype=np.int64)
-    surface_uv = np.asarray(
-        [[0.25, 0.75], [0.25, 0.75]],
-        dtype=float,
-    )
-
-    def coordinate_distance(
-        left_ids: np.ndarray,
-        left_uv: np.ndarray,
-        right_ids: np.ndarray,
-        right_uv: np.ndarray,
-    ) -> np.ndarray:
-        """Return zero within a chart and infinity across components."""
-        del left_uv, right_uv
-        left, right = np.broadcast_arrays(left_ids, right_ids)
-        return np.where(left == right, 0.0, np.inf)
-
-    modes = dss_pp._cluster_source_samples(
-        "Cs-137",
-        positions,
-        np.asarray([300_000.0, 500_000.0]),
-        np.asarray([0.4, 0.6]),
-        radius_m=1.0,
-        max_modes=2,
-        particle_ids=np.asarray([0, 1], dtype=np.int64),
-        isotope_presence_probability=1.0,
-        surface_chart_ids=chart_ids,
-        surface_uv=surface_uv,
-        surface_coordinate_path_distance=coordinate_distance,
-    )
-
-    assert len(modes) == 2
-    assert {mode.surface_chart_id for mode in modes} == {4, 9}
-    assert all(mode.surface_uv == pytest.approx((0.25, 0.75)) for mode in modes)
-
-
-def test_information_gain_cannot_resurrect_zero_mass_particles() -> None:
-    """A zero-prior particle must remain absent even at enormous likelihood."""
-    likelihood = np.asarray([[[0.0, 1_000.0]]], dtype=float)
-
-    gain = dss_pp._information_gain_from_log_likelihood(
-        likelihood,
-        np.asarray([1.0, 0.0], dtype=float),
-    )
-
-    assert gain == pytest.approx(np.asarray([0.0]))
-
-
-def test_dss_probability_consumers_reject_numeric_strings() -> None:
-    """Planner summaries must not cast textual scores into posterior mass."""
-    with pytest.raises(ValueError, match="real number"):
-        dss_pp._posterior_mode_weights(["0.5"])
-    hostile_mode = dss_pp.SignatureMode(
-        isotope="Cs-137",
-        position_xyz=np.zeros(3, dtype=np.float64),
-        strength_cps_1m=300_000.0,
-        weight=0.5,
-        spread_m=0.1,
-        isotope_presence_probability="0.5",  # type: ignore[arg-type]
-    )
-    with pytest.raises(ValueError, match="real number"):
-        dss_pp._isotope_presence_probability([hostile_mode])
-
-
 def test_information_gain_fails_if_positive_mass_has_no_support() -> None:
     """An impossible predictive observation must not become a finite EIG."""
     with pytest.raises(RuntimeError, match="outside every positive-mass"):
@@ -3002,12 +2137,6 @@ def test_finite_sample_eig_bound_is_not_replaced_by_prior_entropy() -> None:
     assert finite_sample_bound == pytest.approx(-np.log(0.01))
 
 
-def test_planner_configuration_does_not_silently_expand_ring_angles() -> None:
-    """Invalid ring diversity must fail instead of being clamped at runtime."""
-    with pytest.raises(ValueError, match="ring_angles"):
-        DSSPPConfig(ring_angles=3)
-
-
 def test_conditional_runtime_rejects_single_exact_eig_sample() -> None:
     """Direct planner callers must preserve paired exact-MC uncertainty."""
     estimator = _build_simple_estimator(canonical_octants=True)
@@ -3023,8 +2152,6 @@ def test_conditional_runtime_rejects_single_exact_eig_sample() -> None:
             ),
             current_pose_xyz=np.zeros(3, dtype=np.float64),
             config=DSSPPConfig(
-                shield_program_search_policy="conditional_greedy_all_pairs",
-                augment_candidates=False,
             ),
         )
 
@@ -3045,7 +2172,6 @@ def test_forced_pair_support_comes_from_estimator_orientation_count() -> None:
             config=DSSPPConfig(
                 lambda_eig=0.0,
                 lambda_distance=0.0,
-                augment_candidates=False,
                 min_station_separation_m=0.0,
                 forced_program_pair_ids=(63,),
             ),
@@ -3056,33 +2182,6 @@ def test_forced_program_must_contain_a_physical_view() -> None:
     """An empty forced program must fail before it can skip all measurements."""
     with pytest.raises(ValueError, match="at least one pair"):
         DSSPPConfig(forced_program_pair_ids=())
-
-
-@pytest.mark.parametrize("current_pair_id", (-1, 4, True, 1.5))
-def test_current_pair_must_match_estimator_shield_support(
-    current_pair_id: object,
-) -> None:
-    """Rotation cost must not decode an invalid previous shield state."""
-    estimator = _build_simple_estimator()
-
-    with pytest.raises(ValueError, match="current_pair_id"):
-        select_dss_pp_next_station(
-            estimator=estimator,
-            rng=np.random.default_rng(7),
-            candidate_poses_xyz=np.asarray(
-                [[1.0, 0.0, 0.0]],
-                dtype=np.float64,
-            ),
-            current_pose_xyz=np.zeros(3, dtype=np.float64),
-            current_pair_id=current_pair_id,  # type: ignore[arg-type]
-            config=DSSPPConfig(
-                lambda_eig=0.0,
-                lambda_distance=0.0,
-                augment_candidates=False,
-                min_station_separation_m=0.0,
-                forced_program_pair_ids=(0,),
-            ),
-        )
 
 
 def test_planner_geometry_modes_match_official_joint_map_projection() -> None:
@@ -3259,7 +2358,7 @@ def test_dss_pp_requires_one_persistent_rng() -> None:
             current_pose_xyz=np.zeros(3, dtype=float),
             config=DSSPPConfig(
                 lambda_eig=0.0,
-                augment_candidates=False,
+                forced_program_pair_ids=(0,),
                 min_station_separation_m=0.0,
             ),
         )
@@ -3299,11 +2398,8 @@ def test_dss_evaluates_every_action_below_shortlist_threshold(
         config=DSSPPConfig(
             lambda_eig=1.0,
             lambda_distance=0.0,
-            lambda_rotation=0.0,
-            max_programs=4,
             program_length=1,
             forced_program_pair_ids=(0,),
-            augment_candidates=False,
             min_station_separation_m=0.0,
         ),
     )
@@ -3318,10 +2414,10 @@ def test_dss_evaluates_every_action_below_shortlist_threshold(
     assert diagnostics["exact_eig_wall_s"] >= 0.0
 
 
-def test_dss_exact_eig_respects_predeclared_pose_budget(
+def test_forced_baseline_exact_eig_respects_current_pose_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The exact stage must shortlist poses without truncating their programs."""
+    """The fixed baseline must use the current adaptive pose bound."""
     estimator = _build_simple_estimator()
     candidates = np.asarray(
         [
@@ -3396,15 +2492,11 @@ def test_dss_exact_eig_respects_predeclared_pose_budget(
     common_config = {
         "lambda_eig": 1.0,
         "lambda_distance": 0.0,
-        "lambda_time": 0.0,
-        "lambda_rotation": 0.0,
-        "max_programs": 1,
         "program_length": 1,
         "forced_program_pair_ids": (0,),
-        "augment_candidates": False,
         "min_station_separation_m": 0.0,
         "exact_eig_coverage_reserve": 0,
-        "exact_eig_program_diversity_reserve": 0,
+        "proxy_planning_particles": 2,
     }
     exhaustive = select_dss_pp_next_station(
         estimator=estimator,
@@ -3413,8 +2505,8 @@ def test_dss_exact_eig_respects_predeclared_pose_budget(
         current_pose_xyz=np.zeros(3, dtype=np.float64),
         config=DSSPPConfig(
             **common_config,
-            exact_eig_pose_limit=4,
-            exact_eig_action_limit=4,
+            exact_eig_pose_min=4,
+            exact_eig_pose_max=4,
         ),
     )
     shortlisted = select_dss_pp_next_station(
@@ -3424,8 +2516,9 @@ def test_dss_exact_eig_respects_predeclared_pose_budget(
         current_pose_xyz=np.zeros(3, dtype=np.float64),
         config=DSSPPConfig(
             **common_config,
-            exact_eig_pose_limit=2,
-            exact_eig_action_limit=2,
+            exact_eig_pose_min=2,
+            exact_eig_pose_max=2,
+            exact_eig_pose_step=2,
         ),
     )
 
@@ -3441,7 +2534,7 @@ def test_dss_exact_eig_respects_predeclared_pose_budget(
     assert diagnostics["exact_eig_wall_s"] >= 0.0
     assert (
         diagnostics["shortlisted_exact_bin_state_operations"]
-        < diagnostics["legacy_all_exact_bin_state_operations"]
+        < diagnostics["exhaustive_exact_bin_state_operations"]
     )
     assert diagnostics["shortlist_selected_proxy_rank"] == 2
     assert diagnostics["shortlist_mc_winner_exceeds_universal_excluded_bound"] is False
@@ -3449,101 +2542,7 @@ def test_dss_exact_eig_respects_predeclared_pose_budget(
     assert "joint_full_spectrum" in diagnostics["proxy_contract"]
 
 
-def test_dss_exactly_sweeps_every_program_at_shortlisted_poses(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pose proxy pruning must retain all 48 programs for batched exact EIG."""
-    estimator = _build_simple_estimator(canonical_octants=True)
-    candidates = np.asarray(
-        [
-            [1.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-            [3.0, 0.0, 0.0],
-        ],
-        dtype=np.float64,
-    )
-    exact_batch_shapes: list[tuple[int, tuple[int, ...]]] = []
-
-    def fake_proxy(
-        _estimator: object,
-        detector_positions: np.ndarray,
-        programs: list[object],
-        **_kwargs: object,
-    ) -> np.ndarray:
-        """Rank the first two poses while keeping program order tied."""
-        pose_scores = np.asarray([0.9, 0.8, 0.1], dtype=np.float64)
-        return np.broadcast_to(
-            pose_scores[:, None],
-            (len(detector_positions), len(programs)),
-        ).copy()
-
-    def fake_exact_eig(
-        _estimator: object,
-        detector_positions: np.ndarray,
-        programs_by_pose: list[list[object]],
-        **_kwargs: object,
-    ) -> list[np.ndarray]:
-        """Make the last program at the second shortlisted pose optimal."""
-        exact_batch_shapes.append(
-            (
-                int(len(detector_positions)),
-                tuple(len(programs) for programs in programs_by_pose),
-            )
-        )
-        return [
-            np.arange(len(programs), dtype=np.float64)
-            + 100.0 * int(float(position[0]) == 2.0)
-            for position, programs in zip(
-                np.asarray(detector_positions, dtype=np.float64),
-                programs_by_pose,
-                strict=True,
-            )
-        ]
-
-    monkeypatch.setattr(
-        dss_pp,
-        "_program_information_proxy_for_poses",
-        fake_proxy,
-    )
-    monkeypatch.setattr(
-        dss_pp,
-        "_program_information_gains_for_poses",
-        fake_exact_eig,
-    )
-    result = select_dss_pp_next_station(
-        estimator=estimator,
-        rng=np.random.default_rng(29),
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.zeros(3, dtype=np.float64),
-        config=DSSPPConfig(
-            max_programs=48,
-            program_length=8,
-            lambda_eig=1.0,
-            lambda_distance=0.0,
-            lambda_time=0.0,
-            lambda_rotation=0.0,
-            augment_candidates=False,
-            min_station_separation_m=0.0,
-            exact_eig_pose_limit=2,
-            exact_eig_action_limit=96,
-            exact_eig_coverage_reserve=0,
-        ),
-    )
-
-    assert exact_batch_shapes == [(2, (48, 48))]
-    assert result.next_pose[0] == pytest.approx(2.0)
-    assert result.diagnostics["selected_pose_exact_program_count"] == 48
-    assert (
-        result.diagnostics["selected_program_is_exact_eig_leader_at_selected_pose"]
-        is True
-    )
-    diagnostics = result.diagnostics["planning_eig_shortlist"]
-    assert diagnostics["shortlisted_pose_count"] == 2
-    assert diagnostics["exact_action_count"] == 96
-    assert diagnostics["full_program_sweep_per_shortlisted_pose"] is True
-
-
-def test_dss_conditional_policy_searches_all_pairs_and_retains_eig_guard() -> None:
+def test_dss_conditional_policy_searches_all_pairs_without_a_guard() -> None:
     """The standard path must select eight unique pairs from all 64 views."""
     estimator = _build_full_spectrum_planning_estimator(
         shield_normals=np.asarray(generate_octant_orientations(), dtype=float),
@@ -3558,16 +2557,12 @@ def test_dss_conditional_policy_searches_all_pairs_and_retains_eig_guard() -> No
         ),
         current_pose_xyz=np.zeros(3, dtype=np.float64),
         config=DSSPPConfig(
-            max_programs=48,
             program_length=8,
             live_time_s=1.0,
             lambda_eig=1.0,
             lambda_distance=0.0,
-            lambda_time=0.0,
-            augment_candidates=False,
             exact_eig_coverage_reserve=0,
             detector_aperture_samples=1,
-            shield_program_search_policy="conditional_greedy_all_pairs",
             exact_eig_pose_min=8,
             exact_eig_pose_max=16,
         ),
@@ -3579,16 +2574,18 @@ def test_dss_conditional_policy_searches_all_pairs_and_retains_eig_guard() -> No
     assert result.shield_program.kind in {
         "conditional_greedy_all_pairs",
         "conditional_greedy_one_swap",
-        "legacy48_same_sample_eig_guard",
     }
     diagnostics = result.diagnostics["planning_eig_shortlist"]
     assert diagnostics["conditional_greedy_candidate_count_per_pose"] == 484
     assert diagnostics["one_swap_candidate_count_per_pose"] == 448
-    assert diagnostics["legacy_guard_candidate_count_per_pose"] == 48
+    assert "legacy_guard_candidate_count_per_pose" not in diagnostics
     assert diagnostics["programs_per_shortlisted_pose"] == 1
     assert diagnostics["full_program_sweep_per_shortlisted_pose"] is False
     assert result.diagnostics["selected_program_is_exact_eig_leader_at_selected_pose"]
-    assert isinstance(json_safe(result.diagnostics), dict)
+    assert isinstance(
+        strict_json_loads(strict_canonical_json_bytes(result.diagnostics)),
+        dict,
+    )
 
 
 def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> None:
@@ -3601,7 +2598,6 @@ def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> N
     def _run(
         *,
         enabled: bool,
-        measurement_weight: float,
     ) -> tuple[dss_pp.DSSPPResult, float]:
         """Run one isolated conditional planner with the requested audit mode."""
         estimator = _build_full_spectrum_planning_estimator(
@@ -3619,16 +2615,12 @@ def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> N
             candidate_mast_vertical_times_s=np.zeros(candidates.shape[0]),
             candidate_settling_times_s=np.zeros(candidates.shape[0]),
             config=DSSPPConfig(
-                max_programs=48,
                 program_length=8,
                 live_time_s=1.0,
                 lambda_eig=1.0,
                 lambda_distance=0.0,
-                lambda_time=measurement_weight,
-                augment_candidates=False,
                 exact_eig_coverage_reserve=0,
                 detector_aperture_samples=1,
-                shield_program_search_policy="conditional_greedy_all_pairs",
                 exact_eig_pose_min=8,
                 exact_eig_pose_max=16,
                 shield_view_count_shadow_enabled=enabled,
@@ -3636,31 +2628,17 @@ def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> N
         )
         return result, float(planner_rng.random())
 
-    baseline, baseline_next_random = _run(enabled=False, measurement_weight=0.0)
-    shadow, shadow_next_random = _run(enabled=True, measurement_weight=0.0)
-    weighted_shadow, _weighted_next_random = _run(
-        enabled=True,
-        measurement_weight=1000.0,
-    )
+    baseline, baseline_next_random = _run(enabled=False)
+    shadow, shadow_next_random = _run(enabled=True)
 
     assert shadow.next_pose_index == baseline.next_pose_index
     assert shadow.shield_program == baseline.shield_program
     assert shadow.score == baseline.score
     assert shadow.sequence[0].information_gain == baseline.sequence[0].information_gain
     assert shadow_next_random == baseline_next_random
-    assert (
-        weighted_shadow.diagnostics["planning_eig_shortlist"][
-            "shield_view_count_shadow"
-        ]["exact"]["paired_lcb_rule_action"]
-        == shadow.diagnostics["planning_eig_shortlist"]["shield_view_count_shadow"][
-            "exact"
-        ]["paired_lcb_rule_action"]
-    )
-
     audit = shadow.diagnostics["planning_eig_shortlist"]["shield_view_count_shadow"]
     assert audit["mode"] == "audit_only_fixed_8_execution"
     assert audit["policy"]["candidate_view_counts"] == [2, 4, 8]
-    assert audit["policy"]["measurement_time_weight_affects_selection"] is False
     assert audit["mc_contract"]["paired_across_view_counts"] is True
     assert (
         audit["mc_contract"]["prefix_selection_independent_of_exact_lcb_samples"]
@@ -3677,12 +2655,7 @@ def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> N
         for block in audit["exact"]["paired_evaluation_holdout_seed_blocks"]
     }
     assert selection_seeds.isdisjoint(holdout_seeds)
-    assert (
-        audit["exact"]["configured_time_weight_counterfactual_action"][
-            "calibrated_for_dynamic_acquisition"
-        ]
-        is False
-    )
+    assert "configured_time_weight_counterfactual_action" not in audit["exact"]
     by_count = audit["exact"]["by_view_count"]
     for view_count in (2, 4, 8):
         programs = by_count[str(view_count)]["pair_ids"]
@@ -3691,16 +2664,17 @@ def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> N
         assert by_count[str(view_count)]["measurement_live_time_s"] == pytest.approx(
             float(view_count)
         )
-        assert by_count[str(view_count)]["measurement_elapsed_time_s"] == pytest.approx(
-            float(view_count) * 1.5
-        )
+        assert "measurement_elapsed_time_s" not in by_count[str(view_count)]
     for pose_index in range(2):
         pairs_2 = by_count["2"]["pair_ids"][pose_index]
         pairs_4 = by_count["4"]["pair_ids"][pose_index]
         pairs_8 = by_count["8"]["pair_ids"][pose_index]
         assert pairs_4[:2] == pairs_2
         assert pairs_8[:4] == pairs_4
-    assert isinstance(json_safe(audit), dict)
+    assert isinstance(
+        strict_json_loads(strict_canonical_json_bytes(audit)),
+        dict,
+    )
     persisted = build_planner_audit(
         station_id=1,
         belief_after_station_id=0,
@@ -3710,7 +2684,10 @@ def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> N
         persisted["shield_view_count_shadow"]["actual_execution"]["view_count"]
         == 8
     )
-    assert isinstance(json_safe(persisted), dict)
+    assert isinstance(
+        strict_json_loads(strict_canonical_json_bytes(persisted)),
+        dict,
+    )
 
 
 def test_shield_view_count_shadow_logs_all_proxy_poses_and_exact_union() -> None:
@@ -3737,19 +2714,16 @@ def test_shield_view_count_shadow_logs_all_proxy_poses_and_exact_union() -> None
         candidate_mast_vertical_times_s=np.zeros(candidates.shape[0]),
         candidate_settling_times_s=np.zeros(candidates.shape[0]),
         config=DSSPPConfig(
-            max_programs=48,
             program_length=8,
             live_time_s=1.0,
             lambda_eig=1.0,
             lambda_distance=0.0,
-            lambda_time=0.0,
-            augment_candidates=False,
             exact_eig_coverage_reserve=0,
             detector_aperture_samples=1,
-            shield_program_search_policy="conditional_greedy_all_pairs",
             exact_eig_pose_min=8,
             exact_eig_pose_max=16,
             proxy_stability_refinement_pool=24,
+            proxy_planning_particles=2,
             shield_view_count_shadow_enabled=True,
         ),
     )
@@ -3791,8 +2765,8 @@ def test_shield_view_count_shadow_logs_all_proxy_poses_and_exact_union() -> None
     assert "pose_xyz" not in persisted_exact
 
 
-def test_dss_conditional_policy_has_a_legacy_free_execution_path() -> None:
-    """Disabling the guard must remove every old48 candidate from production."""
+def test_dss_conditional_policy_exposes_no_retired_program_path() -> None:
+    """The sole production search must expose no retired program candidates."""
     estimator = _build_full_spectrum_planning_estimator(
         shield_normals=np.asarray(generate_octant_orientations(), dtype=float),
         use_gpu=False,
@@ -3803,54 +2777,24 @@ def test_dss_conditional_policy_has_a_legacy_free_execution_path() -> None:
         candidate_poses_xyz=np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
         current_pose_xyz=np.zeros(3, dtype=np.float64),
         config=DSSPPConfig(
-            max_programs=1,
             program_length=8,
             live_time_s=1.0,
             lambda_eig=1.0,
             lambda_distance=0.0,
-            lambda_time=0.0,
-            augment_candidates=False,
             exact_eig_coverage_reserve=0,
             detector_aperture_samples=1,
-            shield_program_search_policy="conditional_greedy_all_pairs",
-            legacy_program_guard_enabled=False,
         ),
     )
 
     shortlist = result.diagnostics["planning_eig_shortlist"]
-    assert shortlist["legacy_guard_candidate_count_per_pose"] == 0
-    assert "without_legacy_guard" in shortlist["program_search_contract"]
-    assert result.diagnostics["predeclared_program_count"] == 0
-    assert result.diagnostics["legacy_guard_program_count"] == 0
-    assert result.shield_program.kind != "legacy48_same_sample_eig_guard"
-
-
-def test_dss_canonical_program_diagnostics_cover_all_pairs_at_horizon_one() -> None:
-    """The runtime library must expose all 64 pairs in a one-step policy."""
-    estimator = _build_simple_estimator(canonical_octants=True)
-    result = select_dss_pp_next_station(
-        estimator=estimator,
-        rng=np.random.default_rng(31),
-        candidate_poses_xyz=np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
-        current_pose_xyz=np.zeros(3, dtype=np.float64),
-        config=DSSPPConfig(
-            max_programs=48,
-            program_length=8,
-            lambda_eig=0.0,
-            lambda_distance=0.0,
-            lambda_time=0.0,
-            lambda_rotation=0.0,
-            augment_candidates=False,
-            min_station_separation_m=0.0,
-        ),
+    assert shortlist["program_search_contract"] == (
+        "all_pairs_conditional_greedy_then_one_swap"
     )
-
-    assert result.diagnostics["planning_policy"] == "one_step_joint_eig"
-    assert len(result.sequence) == 1
-    assert result.diagnostics["program_count"] == 48
-    assert result.diagnostics["program_library_unique_pair_count"] == 64
-    assert result.diagnostics["program_library_pair_occurrence_min"] == 6
-    assert result.diagnostics["program_library_pair_occurrence_max"] == 6
+    assert result.diagnostics["forced_baseline_program_count"] == 0
+    assert result.diagnostics["program_library_policy"] == (
+        "conditional_greedy_all_pairs"
+    )
+    assert not any("legacy" in str(key) for key in shortlist)
 
 
 def test_dss_pp_selects_station_and_shield_program() -> None:
@@ -3863,7 +2807,6 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
         max_sources=1,
         variable_cardinality=False,
         use_gpu=False,
-        planning_particles=None,
         init_num_sources=(1, 1),
     )
     est = RotatingShieldPFEstimator(
@@ -3908,13 +2851,11 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([2.0, 2.0, 0.5], dtype=float),
         config=DSSPPConfig(
-            max_programs=32,
             program_length=2,
             live_time_s=1.0,
             lambda_eig=0.0,
+            forced_program_pair_ids=(0, 1),
             lambda_distance=0.0,
-            lambda_rotation=0.0,
-            augment_candidates=False,
         ),
     )
 
@@ -3942,7 +2883,6 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
         max_sources=1,
         variable_cardinality=False,
         use_gpu=False,
-        planning_particles=None,
         init_num_sources=(1, 1),
     )
     est = RotatingShieldPFEstimator(
@@ -3984,14 +2924,11 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
         candidate_poses_xyz=np.array([[2.0, 0.5, 0.5], [2.0, 6.0, 0.5]]),
         current_pose_xyz=np.array([2.0, 2.0, 0.5], dtype=float),
         config=DSSPPConfig(
-            max_programs=32,
             program_length=4,
             forced_program_pair_ids=forced_pairs,
             live_time_s=1.0,
             lambda_eig=0.0,
             lambda_distance=0.0,
-            lambda_rotation=0.0,
-            augment_candidates=False,
         ),
     )
 
@@ -4013,7 +2950,6 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
         max_sources=1,
         variable_cardinality=False,
         use_gpu=False,
-        planning_particles=None,
         init_num_sources=(1, 1),
     )
     est = RotatingShieldPFEstimator(
@@ -4054,13 +2990,11 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
         candidate_poses_xyz=np.array([[2.0, 0.5, 0.5], [2.0, 6.0, 0.5]]),
         current_pose_xyz=np.array([2.0, 2.0, 0.5], dtype=float),
         config=DSSPPConfig(
-            max_programs=32,
             program_length=2,
             live_time_s=1.0,
             lambda_eig=0.0,
+            forced_program_pair_ids=(0, 1),
             lambda_distance=0.0,
-            lambda_rotation=0.0,
-            augment_candidates=False,
             diagnostic_ranked_node_limit=0,
         ),
     )
@@ -4078,7 +3012,7 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
     candidate_sources = np.array([[0.0, 0.0, 0.5]], dtype=float)
     shield_normals = np.asarray(generate_octant_orientations(), dtype=float)
     config = RotatingShieldPFConfig(
-        num_particles=1,
+        num_particles=2,
         max_sources=1,
         variable_cardinality=False,
         use_gpu=False,
@@ -4095,6 +3029,10 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
     )
     est.add_measurement_pose(np.array([1.0, 1.0, 0.5], dtype=float))
     est._ensure_kernel_cache()
+    row_identities = [
+        particle.joint_row_identity
+        for particle in est.filters["Cs-137"].continuous_particles
+    ]
     est.filters["Cs-137"].continuous_particles = [
         IsotopeParticle(
             state=_state_on_filter(
@@ -4102,11 +3040,10 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
                 np.array([[0.0, 0.0, 0.5]], dtype=float),
                 np.array([100.0], dtype=float),
             ),
-            log_weight=0.0,
-            joint_row_identity=est.filters["Cs-137"]
-            .continuous_particles[0]
-            .joint_row_identity,
+            log_weight=-np.log(2.0),
+            joint_row_identity=row_identities[index],
         )
+        for index in range(2)
     ]
     candidates = np.array(
         [[1.5, 1.5, 0.5], [8.5, 8.5, 0.5]],
@@ -4121,18 +3058,15 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
         visited_poses_xyz=np.array([[1.0, 1.0, 0.5]], dtype=float),
         map_api=None,
         config=DSSPPConfig(
-            max_programs=4,
             program_length=1,
             forced_program_pair_ids=(0,),
             live_time_s=1.0,
             lambda_eig=0.0,
             lambda_distance=0.0,
-            lambda_rotation=0.0,
             lambda_coverage=1.0,
             eta_revisit=1.0,
             min_station_separation_m=3.0,
             coverage_radius_m=2.0,
-            augment_candidates=False,
         ),
     )
 
@@ -4147,7 +3081,7 @@ def test_dss_pp_coverage_floor_rejects_low_coverage_candidates(
     est = _build_simple_estimator()
     quadrature = SimpleNamespace(
         positions_s3=np.array(
-            [[8.5, 8.5, 0.5]],
+            [[8.0, 8.5, 0.5]],
             dtype=float,
         ),
         area_weights_m2_s=np.ones(1, dtype=float),
@@ -4174,19 +3108,17 @@ def test_dss_pp_coverage_floor_rejects_low_coverage_candidates(
         visited_poses_xyz=np.array([[1.0, 1.0, 0.5]], dtype=float),
         map_api=None,
         config=DSSPPConfig(
-            max_programs=4,
             program_length=1,
             live_time_s=1.0,
             lambda_eig=0.0,
+            forced_program_pair_ids=(0,),
             lambda_distance=0.0,
-            lambda_rotation=0.0,
             lambda_coverage=0.0,
             coverage_floor_quantile=1.0,
             coverage_floor_weight=100.0,
             eta_revisit=0.0,
             min_station_separation_m=0.0,
             coverage_radius_m=2.0,
-            augment_candidates=False,
         ),
     )
 
@@ -4208,13 +3140,11 @@ def test_dss_pp_fails_when_generic_separation_removes_every_candidate() -> None:
             visited_poses_xyz=np.array([current], dtype=float),
             map_api=None,
             config=DSSPPConfig(
-                max_programs=4,
                 program_length=1,
                 lambda_eig=0.0,
+                forced_program_pair_ids=(0,),
                 lambda_distance=0.0,
-                lambda_rotation=0.0,
                 min_station_separation_m=2.0,
-                augment_candidates=False,
             ),
         )
 
@@ -4245,8 +3175,6 @@ def test_dss_pp_production_estimator_requires_continuous_surface_atlas() -> None
                 np.array([10.0, 20.0, 1.0], dtype=float),
             ),
             config=DSSPPConfig(
-                augment_candidates=False,
-                max_programs=2,
                 forced_program_pair_ids=(0, 1),
                 lambda_eig=0.0,
                 lambda_distance=0.0,
@@ -4315,7 +3243,8 @@ def test_dss_coverage_uses_full_surface_atlas_without_pf_modes(
         current_pose_xyz=np.zeros(3, dtype=float),
         config=DSSPPConfig(
             lambda_eig=0.0,
-            augment_candidates=False,
+            forced_program_pair_ids=(0,),
+            lambda_coverage=1.0,
             min_station_separation_m=0.0,
             coverage_surface_quadrature_max_points=3,
             coverage_surface_max_hausdorff_m=1.0,
@@ -4325,6 +3254,46 @@ def test_dss_coverage_uses_full_surface_atlas_without_pf_modes(
     assert len(observed) == 1
     np.testing.assert_allclose(observed[0], atlas_points)
     assert float(np.max(observed[0][:, 2])) == pytest.approx(10.0)
+
+
+def test_dss_skips_surface_coverage_when_the_feature_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A null production coverage branch must perform no quadrature work."""
+    estimator = _build_simple_estimator()
+
+    def forbidden_quadrature(**_kwargs: object) -> object:
+        """Fail if a disabled coverage feature invokes its retired compute path."""
+        raise AssertionError("disabled coverage requested surface quadrature")
+
+    monkeypatch.setattr(
+        estimator,
+        "surface_atlas_area_quadrature",
+        forbidden_quadrature,
+    )
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(123),
+        candidate_poses_xyz=np.array(
+            [[1.0, 0.0, 0.5], [2.0, 0.0, 1.5]],
+            dtype=float,
+        ),
+        current_pose_xyz=np.zeros(3, dtype=float),
+        config=DSSPPConfig(
+            lambda_eig=0.0,
+            forced_program_pair_ids=(0,),
+            lambda_coverage=0.0,
+            coverage_floor_quantile=0.0,
+            coverage_floor_weight=0.0,
+            coverage_surface_quadrature_max_points=None,
+            coverage_surface_max_hausdorff_m=None,
+            exact_eig_coverage_reserve=0,
+            min_station_separation_m=0.0,
+        ),
+    )
+
+    assert result.diagnostics["coverage_support"] == "disabled"
+    assert result.diagnostics["coverage_sample_count"] == 0
 
 
 def test_complete_surface_quadrature_includes_every_physical_face() -> None:
@@ -4568,8 +3537,6 @@ def test_dss_pp_filters_near_revisit_when_alternatives_exist() -> None:
             np.array([10.0, 10.0, 1.0], dtype=float),
         ),
         config=DSSPPConfig(
-            augment_candidates=False,
-            max_programs=2,
             forced_program_pair_ids=(0, 1),
             lambda_eig=0.0,
             lambda_distance=0.0,
@@ -4580,41 +3547,6 @@ def test_dss_pp_filters_near_revisit_when_alternatives_exist() -> None:
 
     assert np.allclose(result.next_pose, candidates[1])
     assert int(result.diagnostics["separation_filtered_candidates"]) == 1
-
-
-def test_dss_pp_augments_with_global_unvisited_coverage_candidates() -> None:
-    """DSS-PP should add global coverage candidates when base candidates revisit."""
-    est = _build_simple_estimator()
-    current = np.array([1.0, 1.0, 0.5], dtype=float)
-    visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
-    candidates = np.array([[1.2, 1.0, 0.5]], dtype=float)
-
-    result = select_dss_pp_next_station(
-        estimator=est,
-        rng=np.random.default_rng(123),
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=current,
-        visited_poses_xyz=visited,
-        bounds_xyz=(
-            np.array([0.0, 0.0, 0.5], dtype=float),
-            np.array([10.0, 10.0, 0.5], dtype=float),
-        ),
-        config=DSSPPConfig(
-            augment_candidates=True,
-            max_augmented_candidates=32,
-            max_programs=2,
-            forced_program_pair_ids=(0, 1),
-            lambda_eig=0.0,
-            lambda_distance=0.0,
-            lambda_coverage=10.0,
-            lambda_rotation=0.0,
-            min_station_separation_m=3.0,
-            coverage_radius_m=2.0,
-        ),
-    )
-
-    assert not np.allclose(result.next_pose, candidates[0])
-    assert result.diagnostics["candidate_count"] > 1
 
 
 def test_dss_pp_local_orbit_prefers_informative_annulus() -> None:
@@ -4634,17 +3566,14 @@ def test_dss_pp_local_orbit_prefers_informative_annulus() -> None:
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([5.0, 5.0, 0.0], dtype=float),
         config=DSSPPConfig(
-            max_programs=4,
             program_length=1,
             forced_program_pair_ids=(0,),
             live_time_s=1.0,
             lambda_eig=0.0,
             lambda_distance=0.0,
-            lambda_rotation=0.0,
             lambda_local_orbit=10.0,
             ring_radii_m=(3.0,),
             local_orbit_sigma_m=0.5,
-            augment_candidates=False,
         ),
     )
 
@@ -4710,14 +3639,11 @@ def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([2.0, 3.0, 0.5], dtype=float),
         config=DSSPPConfig(
-            max_programs=32,
             forced_program_pair_ids=(0, 1),
             lambda_eig=0.0,
             lambda_distance=0.0,
             lambda_coverage=0.0,
             lambda_bearing_diversity=10.0,
-            lambda_rotation=0.0,
-            augment_candidates=False,
         ),
     )
 
@@ -4745,15 +3671,12 @@ def test_dss_pp_turn_smoothness_discourages_backtracking() -> None:
         current_pose_xyz=current,
         visited_poses_xyz=visited,
         config=DSSPPConfig(
-            max_programs=2,
             forced_program_pair_ids=(0, 1),
             lambda_eig=0.0,
             lambda_distance=0.0,
             lambda_coverage=0.0,
             lambda_turn_smoothness=5.0,
-            lambda_rotation=0.0,
             min_station_separation_m=0.0,
-            augment_candidates=False,
         ),
     )
 

@@ -352,7 +352,7 @@ def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
         shield_normals=None,
         mu_by_isotope={isotope: 0.0},
         pf_config=RotatingShieldPFConfig(
-            num_particles=1,
+            num_particles=2,
             max_sources=1,
             variable_cardinality=False,
             init_num_sources=(1, 1),
@@ -361,8 +361,12 @@ def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
             structural_rj_surface_chart_max_edge_m=0.5,
         ),
         obstacle_grid=obstacle_grid,
-        measurement_log_sha256="c" * 64,
         full_spectrum_generative_model=approved_full_spectrum_model(),
+        measurement_log_schema_version=2,
+        config_hash="a" * 64,
+        resolved_config_hash="b" * 64,
+        measurement_log_sha256="c" * 64,
+        random_seed=0,
     )
     estimator.add_measurement_pose(np.asarray([0.5, 0.5, 0.5], dtype=float))
     estimator._ensure_kernel_cache()
@@ -378,22 +382,25 @@ def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
         np.asarray([bottom_chart_id], dtype=np.int64),
         bottom_uv,
     )[0]
+    original_identities = [
+        particle.joint_row_identity for particle in filt.continuous_particles
+    ]
+    bottom_state = IsotopeState(
+        num_sources=1,
+        strengths=np.asarray([300_000.0], dtype=float),
+        surface_chart_ids=np.asarray(
+            [bottom_chart_id],
+            dtype=np.int64,
+        ),
+        surface_uv=bottom_uv,
+    )
     filt.continuous_particles = [
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                strengths=np.asarray([300_000.0], dtype=float),
-                surface_chart_ids=np.asarray(
-                    [bottom_chart_id],
-                    dtype=np.int64,
-                ),
-                surface_uv=bottom_uv,
-            ),
-            log_weight=0.0,
-            joint_row_identity=(
-                filt.continuous_particles[0].joint_row_identity
-            ),
+            state=bottom_state.copy(),
+            log_weight=-np.log(2.0),
+            joint_row_identity=original_identities[index],
         )
+        for index in range(2)
     ]
 
     diagnostics = estimator.posterior_source_uncertainty(

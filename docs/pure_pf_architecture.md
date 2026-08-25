@@ -3,7 +3,7 @@
 ## Estimator boundary
 
 The scientific runtime accepts one estimator profile, `pf_strict`, under
-`pure_pf_schema_version: 1`. Its sequential data flow is:
+`pure_pf_schema_version: 2`. Its sequential data flow is:
 
 ```text
 unit-weight Geant4 detector events
@@ -97,20 +97,21 @@ uniform component, and the complete normalized selector is included in the RJ
 ratio.  A separate all-isotope strength block changes every active strength in
 one batched likelihood evaluation.  It imposes no conservation law between
 isotopes: simultaneous increases and decreases are merely proposals judged by
-the shared mixed-spectrum posterior.  Isotope-identity transfer is diagnostic
-and disabled in the strict profile by default.
+the shared mixed-spectrum posterior. The retired scalar isotope-identity
+transfer kernel is not present in the production package.
 
 The standard cardinality policy is
-`independent_truncated_poisson_surface_source_count_v1`: independently for
-each isotope, a Poisson source-count prior with predeclared mean 2.0 is
-normalized on the exact configured support `K = 0, ..., 5`. This encodes the
-design assumption of sparse surface contamination; it is fixed before any
-observation and was not selected from a failed diagnostic run. Every result manifest
-records the policy name, mean, support, and complete normalized probability
-vector. Ground-truth isotope counts and strengths are checked against PF
-support before any external Geant4 process starts. The policy remains subject
-to the designated independent holdout acceptance gate; a failed holdout does
-not authorize retuning it on that holdout.
+`independent_poisson_with_thin_geometric_capacity_tail_v1`: independently for
+each isotope, a Poisson source-count prior with predeclared mean 2.0 defines
+`K = 0, ..., 5`, followed by the fixed geometric capacity tail through `K = 8`.
+This encodes the design assumption of sparse surface contamination while
+keeping positive mass above the ordinary range; it is fixed before any
+observation and was not selected from a failed diagnostic run. Every result
+manifest records the policy name, mean, support, tail ratio, and complete
+normalized probability vector. Ground-truth isotope counts and strengths are
+checked against PF support before any external Geant4 process starts. The
+policy remains subject to the designated independent holdout acceptance gate;
+a failed holdout does not authorize retuning it on that holdout.
 
 Each station is tempered to `beta = 1`. If a partial likelihood would cross the
 target ESS, the PF applies only the admissible increment, resamples all isotope
@@ -134,11 +135,6 @@ kernel includes:
   imposing a false strength-conservation law; and
 - an exact joint isotope-state block whose isotope priors remain independent
   while the shared full-spectrum likelihood decides one simultaneous move.
-
-The older cross-isotope cardinality-transfer proposal is disabled in the
-strict runtime. It remains available only through the explicitly labelled
-`pf_strict_gamma_legacy_transfer.json` causal diagnostic, where the joint
-isotope-state block is disabled so the two proposal generations are not mixed.
 
 The ordinary cardinality model is defined through `K=5`. A proper geometric
 tail gives `K=6..8` nonzero support so `K=5` is not an artificial absorbing
@@ -229,9 +225,9 @@ Isotope-fitted counts and truth are not part of the inference record.
 
 During a live session, the runtime durably appends a completed station before
 returning its typed event. PF validates and assimilates that station before it
-proposes the next reachable pose and shield program. A resumed session may
-restore the runtime-provided active prefix before continuing, but no API or
-command runs inference from the beginning of an already finalized log.
+proposes the next reachable pose and shield program. Production acquisition is
+fresh-run only: an interruption aborts without publishing a partial log, and no
+resume, prefix-replay, or finalized-log inference entrypoint exists.
 
 `PFLiveSession` owns this in-process causal boundary. It holds the estimator and
 ordered durable records together, uses the same canonical station assimilation

@@ -22,7 +22,6 @@ def reset_step_diagnostics(target: Any) -> None:
     target.last_temper_steps = []
     target.last_temper_resample_count = 0
     target.last_temper_min_ess = None
-    target.last_unique_ancestor_count = None
     target.last_station_unique_ancestor_count = None
     target.last_cumulative_unique_ancestor_count = None
     target.last_source_event_diagnostics = []

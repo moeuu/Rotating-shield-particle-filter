@@ -7,7 +7,7 @@ from dataclasses import asdict, fields
 import numpy as np
 import pytest
 
-from pf.particle_filter import PFConfig
+from pf.estimator_config import RotatingShieldPFConfig
 from pf.state import IsotopeState
 
 
@@ -71,7 +71,14 @@ def test_surface_state_rejects_noninteger_cardinality(invalid: object) -> None:
 
 def test_pf_config_requires_positive_strengths_and_float64() -> None:
     """Production state and GPU arithmetic must share strict numeric support."""
-    with pytest.raises(ValueError, match="strictly positive"):
-        PFConfig(strength_prior_min_cps_1m=0.0)
+    with pytest.raises(ValueError, match="positive"):
+        RotatingShieldPFConfig(
+            strength_prior={
+                "kind": "shifted_gamma",
+                "minimum_cps_1m": 0.0,
+                "shape": 2.0,
+                "scale_cps_1m": 1.0,
+            }
+        )
     with pytest.raises(ValueError, match="gpu_dtype='float64'"):
-        PFConfig(gpu_dtype="float32")
+        RotatingShieldPFConfig(gpu_dtype="float32")

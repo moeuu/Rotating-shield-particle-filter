@@ -59,6 +59,32 @@ def test_requested_torch_backend_propagates_device_failure(
         )
 
 
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    (
+        ("use_gpu", 1),
+        ("gpu_device", " cuda "),
+        ("gpu_device", "CUDA"),
+        ("gpu_dtype", " FLOAT64 "),
+        ("gpu_dtype", "float32"),
+    ),
+)
+def test_backend_preflight_rejects_coercible_configuration(
+    field_name: str,
+    field_value: object,
+) -> None:
+    """Backend selection must not normalize truthy or padded values."""
+    values: dict[str, object] = {
+        "use_gpu": False,
+        "gpu_device": "cuda",
+        "gpu_dtype": "float64",
+    }
+    values[field_name] = field_value
+
+    with pytest.raises((TypeError, ValueError)):
+        gpu_utils.preflight_compute_backend(**values)  # type: ignore[arg-type]
+
+
 def test_filter_requested_torch_backend_does_not_fall_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

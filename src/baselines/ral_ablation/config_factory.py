@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import copy
 import csv
-import json
 import secrets
 import shlex
 import stat
@@ -13,8 +13,19 @@ from pathlib import Path
 from typing import Any
 
 from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
+from sim.runtime import (
+    load_production_runtime_config,
+    validate_production_runtime_config,
+)
 
-from pf.atomic_io import atomic_write_json, atomic_write_text
+from runtime.artifacts import atomic_write_json, atomic_write_text
+from baselines.ral_ablation.control_policy import (
+    RALControlPolicy,
+    load_ral_control_policy_document,
+    validate_ral_control_policy_payload,
+    validate_ral_control_policy_pf_settings,
+)
+from pf.configuration import load_pf_config
 from pf.profiles import enforce_pure_runtime_settings
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -48,10 +59,22 @@ def generate_fresh_batch_id() -> str:
     return secrets.token_hex(8)
 
 
-def _json_integer(value: object, *, name: str, minimum: int = 0) -> int:
-    """Return an exact JSON integer satisfying an inclusive lower bound."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(f"{name} must be an integer of at least {minimum}.")
+def _json_integer(
+    value: object,
+    *,
+    name: str,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    """Return an exact JSON integer inside inclusive declared bounds."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
+        upper = "" if maximum is None else f" and at most {maximum}"
+        raise ValueError(f"{name} must be an integer of at least {minimum}{upper}.")
     return int(value)
 
 
@@ -90,7 +113,15 @@ def resolve_ablation_seeds(seeds: Sequence[int] | None) -> tuple[int, ...]:
     """Resolve private live seeds or create one fresh comparison seed."""
     if seeds is None:
         return (generate_fresh_ablation_seed(),)
-    resolved = tuple(_json_integer(seed, name="seed") for seed in seeds)
+    resolved = tuple(
+        _json_integer(
+            seed,
+            name="seed",
+            minimum=1,
+            maximum=MAX_FRESH_ABLATION_SEED,
+        )
+        for seed in seeds
+    )
     if not resolved:
         raise ValueError("seeds must contain at least one seed.")
     if len(set(resolved)) != len(resolved):
@@ -106,18 +137,27 @@ def resolve_pf_seeds(
     scenes = tuple(scene_seeds)
     if pf_seeds is None:
         resolved: list[int] = []
-        for scene_seed in scenes:
+        forbidden_scene_seeds = set(scenes)
+        for _scene_seed in scenes:
             pf_seed = generate_fresh_pf_seed()
-            while pf_seed == scene_seed or pf_seed in resolved:
+            while pf_seed in forbidden_scene_seeds or pf_seed in resolved:
                 pf_seed = generate_fresh_pf_seed()
             resolved.append(pf_seed)
         return tuple(resolved)
-    resolved = tuple(_json_integer(seed, name="PF seed") for seed in pf_seeds)
+    resolved = tuple(
+        _json_integer(
+            seed,
+            name="PF seed",
+            minimum=1,
+            maximum=MAX_FRESH_ABLATION_SEED,
+        )
+        for seed in pf_seeds
+    )
     if len(resolved) != len(scenes):
         raise ValueError("pf_seeds must contain one value per scene seed.")
     if len(set(resolved)) != len(resolved):
         raise ValueError("pf_seeds must not contain duplicates.")
-    if any(pf_seed == scene_seed for pf_seed, scene_seed in zip(resolved, scenes)):
+    if set(resolved).intersection(scenes):
         raise ValueError("PF seeds must be independent from private scene seeds.")
     return resolved
 
@@ -134,27 +174,29 @@ def resolve_transport_seeds(
         raise ValueError("scene_seeds and pf_seeds must have equal length.")
     if transport_seeds is None:
         resolved: list[int] = []
-        for scene_seed, pf_seed in zip(scenes, estimators):
+        forbidden_seed_streams = {*scenes, *estimators}
+        for _scene_seed, _pf_seed in zip(scenes, estimators):
             transport_seed = generate_fresh_transport_seed()
-            while transport_seed in {scene_seed, pf_seed, *resolved}:
+            while (
+                transport_seed in forbidden_seed_streams or transport_seed in resolved
+            ):
                 transport_seed = generate_fresh_transport_seed()
             resolved.append(transport_seed)
         return tuple(resolved)
     resolved = tuple(
-        _json_integer(seed, name="transport seed") for seed in transport_seeds
+        _json_integer(
+            seed,
+            name="transport seed",
+            minimum=1,
+            maximum=MAX_FRESH_ABLATION_SEED,
+        )
+        for seed in transport_seeds
     )
     if len(resolved) != len(scenes):
         raise ValueError("transport_seeds must contain one value per scene seed.")
     if len(set(resolved)) != len(resolved):
         raise ValueError("transport_seeds must not contain duplicates.")
-    if any(
-        transport_seed in {scene_seed, pf_seed}
-        for transport_seed, scene_seed, pf_seed in zip(
-            resolved,
-            scenes,
-            estimators,
-        )
-    ):
+    if set(resolved).intersection({*scenes, *estimators}):
         raise ValueError("Transport seeds must be independent from scene/PF seeds.")
     return resolved
 
@@ -175,23 +217,10 @@ def resolve_batch_ids(
         return tuple(resolved)
     resolved = tuple(_safe_batch_id(value) for value in batch_ids)
     if len(resolved) != count:
-        raise ValueError("batch_ids must contain one value per scene seed and case.")
+        raise ValueError("batch_ids must contain one value per scene seed.")
     if len(set(resolved)) != len(resolved):
         raise ValueError("batch_ids must not contain duplicates.")
     return resolved
-
-
-@dataclass(frozen=True, slots=True)
-class AblationCase:
-    """Describe one paper case whose private scene is runtime-authored."""
-
-    name: str
-    description: str
-
-    def __post_init__(self) -> None:
-        """Validate one private case declaration before plan generation."""
-        _nonempty_string(self.name, name="AblationCase.name")
-        _nonempty_string(self.description, name="AblationCase.description")
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +250,21 @@ class AblationVariant:
             raise TypeError("AblationVariant.shield_policy must be a mapping or null.")
         if self.path_policy is not None and self.shield_policy is None:
             raise ValueError("A fixed path variant requires an explicit shield policy.")
+        validate_ral_control_policy_payload(
+            {
+                "schema_version": 1,
+                "path_policy": self.path_policy,
+                "shield_policy": self.shield_policy,
+            }
+        )
+        unknown_runtime = sorted(
+            set(self.runtime_overrides).difference(RAL_RUNTIME_INTERVENTION_FIELDS)
+        )
+        if unknown_runtime:
+            raise ValueError(
+                "RA-L runtime overrides may change only declared shield "
+                f"interventions; unknown={unknown_runtime}."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,14 +272,18 @@ class AblationPlanEntry:
     """Store one private experiment session and truth-free PF invocation."""
 
     case: str
+    experiment_profile_id: str
+    scene_variant_id: str
     variant: str
     batch_id: str
     scene_seed: int
     pf_seed: int
     transport_seed: int
     seed_policy: str
+    run_id: str
     pf_config_path: Path
     control_policy_path: Path
+    control_policy_sha256: str
     runtime_config_path: Path
     scenario_path: Path
     truth_manifest_path: Path
@@ -245,11 +293,11 @@ class AblationPlanEntry:
     session_command: tuple[str, ...]
 
 
-DEFAULT_ABLATION_CASES: tuple[AblationCase, ...] = (
-    AblationCase(
-        name="mix9_multi_isotope_cardinality",
-        description="Runtime-default private multi-isotope surface scene.",
-    ),
+RAL_CASE_NAME = "mix9_multi_isotope_cardinality"
+RAL_EXPERIMENT_PROFILE_ID = STANDARD_EXPERIMENT_PROFILE.profile_id
+RAL_SCENE_VARIANT_ID = "mix9"
+RAL_RUNTIME_INTERVENTION_FIELDS = frozenset(
+    {"shield_transmission_target"}
 )
 
 DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
@@ -262,10 +310,14 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
     AblationVariant(
         name="baseline_passive_equal_time_no_shield",
         description="Passive equal-time path with physically absent shields.",
-        pf_overrides={},
+        pf_overrides={
+            "dss_pp": None,
+            "planning_eig_samples": None,
+            "runtime_candidate_refinement_top_k": 0,
+            "planner_audit_top_k": 0,
+        },
         runtime_overrides={
             "shield_transmission_target": 1.0,
-            "shield_thickness_scale": 0.0,
         },
         path_policy={"name": "passive_serpentine", "row_count": 8},
         shield_policy={"name": "fixed", "fixed_pair_id": 0},
@@ -273,7 +325,12 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
     AblationVariant(
         name="round_robin_shield",
         description="Cycle Fe/Pb pairs without posterior-dependent selection.",
-        pf_overrides={},
+        pf_overrides={
+            "dss_pp": {
+                "shield_view_count_shadow_enabled": False,
+                "conditional_greedy_one_swap": False,
+            },
+        },
         runtime_overrides={},
         shield_policy={
             "name": "round_robin",
@@ -287,10 +344,20 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
         pf_overrides={
             "dss_pp": {
                 "coverage_weight": 0.0,
+                "coverage_floor_quantile": 0.0,
+                "coverage_floor_weight": 0.0,
+                "coverage_surface_max_hausdorff_m": None,
+                "coverage_surface_quadrature_max_points": None,
+                "exact_eig_coverage_reserve": 0,
                 "bearing_diversity_weight": 0.0,
                 "frontier_weight": 0.0,
                 "local_orbit_weight": 0.0,
+                "local_orbit_ring_radii_m": [],
+                "local_orbit_sigma_m": None,
                 "elevation_condition_weight": 0.0,
+                "elevation_pair_xy_scale_m": None,
+                "elevation_pair_z_scale_m": None,
+                "elevation_angle_threshold_deg": None,
                 "revisit_penalty_weight": 0.0,
                 "turn_smoothness_weight": 0.0,
             },
@@ -298,14 +365,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
         runtime_overrides={},
     ),
 )
-
-
-def _load_json(path: Path) -> dict[str, Any]:
-    """Load one JSON object used as a generated-config base."""
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected a JSON object in {path}.")
-    return payload
 
 
 def _deep_update(
@@ -332,14 +391,17 @@ def _pf_config(
         _deep_update(base, variant.pf_overrides),
         profile="pf_strict",
     )
-    if config.get("variable_cardinality") is not True:
-        raise ValueError("RA-L requires variable_cardinality=true.")
+    policy = RALControlPolicy(
+        path_policy=variant.path_policy,
+        shield_policy=variant.shield_policy,
+    )
+    validate_ral_control_policy_pf_settings(policy, config)
     return config
 
 
 def _control_policy(variant: AblationVariant) -> dict[str, object]:
     """Return the separate RA-L adapter policy for one experiment variant."""
-    return {
+    return validate_ral_control_policy_payload({
         "schema_version": 1,
         "path_policy": (
             None if variant.path_policy is None else dict(variant.path_policy)
@@ -347,25 +409,47 @@ def _control_policy(variant: AblationVariant) -> dict[str, object]:
         "shield_policy": (
             None if variant.shield_policy is None else dict(variant.shield_policy)
         ),
-    }
+    })
 
 
 def _runtime_config(
-    base_path: Path,
+    base: Mapping[str, Any],
     *,
     variant: AblationVariant,
     seed: int,
 ) -> dict[str, Any]:
-    """Return a private runtime override that inherits canonical physics."""
-    payload: dict[str, Any] = {
-        "extends": base_path.resolve().as_posix(),
-        "random_seed_base": seed,
-        "primary_sampling_fraction": 1.0,
-        "accelerated_weighted_transport_enable": False,
-        "target_sampled_primaries": None,
-    }
+    """Return one self-contained strict private runtime configuration."""
+    payload = copy.deepcopy(dict(base))
+    payload["random_seed_base"] = seed
     payload.update(variant.runtime_overrides)
+    validate_production_runtime_config(payload)
     return payload
+
+
+def _require_effective_variant_deltas(
+    pf_base: Mapping[str, Any],
+    runtime_base: Mapping[str, Any],
+    variants: Sequence[AblationVariant],
+) -> None:
+    """Reject declared ablations that do not change their shared base."""
+    for variant in variants:
+        if variant.pf_overrides and _deep_update(
+            pf_base,
+            variant.pf_overrides,
+        ) == dict(pf_base):
+            raise ValueError(
+                f"RA-L variant {variant.name!r} has a no-op PF intervention."
+            )
+        no_op_runtime = sorted(
+            field
+            for field, value in variant.runtime_overrides.items()
+            if runtime_base.get(field) == value
+        )
+        if no_op_runtime:
+            raise ValueError(
+                f"RA-L variant {variant.name!r} has no-op runtime interventions: "
+                f"{no_op_runtime}."
+            )
 
 
 def _scenario_command(
@@ -377,6 +461,8 @@ def _scenario_command(
     run_id: str,
     runtime_config_path: Path,
     scene_seed: int,
+    experiment_profile_id: str,
+    scene_variant_id: str,
 ) -> tuple[str, ...]:
     """Return the private runtime scenario and truth-manifest command."""
     return (
@@ -397,6 +483,10 @@ def _scenario_command(
         runtime_config_path.as_posix(),
         "--scene-seed",
         str(scene_seed),
+        "--experiment-profile",
+        experiment_profile_id,
+        "--scene-variant",
+        scene_variant_id,
     )
 
 
@@ -406,6 +496,7 @@ def _session_command(
     runtime_root: Path,
     pf_config_path: Path,
     control_policy_path: Path,
+    control_policy_sha256: str,
     pf_output_dir: Path,
     pf_seed: int,
 ) -> tuple[str, ...]:
@@ -426,6 +517,8 @@ def _session_command(
         pf_config_path.as_posix(),
         "--control-policy",
         control_policy_path.as_posix(),
+        "--expected-control-policy-sha256",
+        control_policy_sha256,
         "--pf-output-dir",
         pf_output_dir.as_posix(),
         "--pf-seed",
@@ -444,8 +537,6 @@ def build_ablation_plan(
     pf_seeds: Sequence[int] | None = None,
     transport_seeds: Sequence[int] | None = None,
     batch_ids: Sequence[str] | None = None,
-    cases: Sequence[AblationCase] = DEFAULT_ABLATION_CASES,
-    variants: Sequence[AblationVariant] = DEFAULT_ABLATION_VARIANTS,
     output_tag_suffix: str = "",
 ) -> list[AblationPlanEntry]:
     """Build sessions whose PF-facing artifacts contain no private truth."""
@@ -460,10 +551,24 @@ def build_ablation_plan(
         raise FileNotFoundError(
             f"Shared runtime config does not exist: {runtime_config_path}"
         )
-    private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    private_root.chmod(0o700)
-    pf_base = _load_json(pf_config_path)
-    seed_policy = "fresh_per_batch" if seeds is None else "explicit_live_repeat"
+    pf_base = load_pf_config(pf_config_path).config()
+    runtime_base = load_production_runtime_config(runtime_config_path)
+    resolved_variants = DEFAULT_ABLATION_VARIANTS
+    _require_effective_variant_deltas(pf_base, runtime_base, resolved_variants)
+    if seeds is None:
+        if pf_seeds is not None or transport_seeds is not None:
+            raise ValueError(
+                "Fresh RA-L batches generate scene, PF, and transport seeds "
+                "together; omit every seed option."
+            )
+        seed_policy = "fresh_per_batch"
+    else:
+        if pf_seeds is None or transport_seeds is None or batch_ids is None:
+            raise ValueError(
+                "An explicit live repeat requires recorded scene, PF, transport, "
+                "and batch identifiers."
+            )
+        seed_policy = "explicit_live_repeat"
     suffix = _safe_suffix(output_tag_suffix)
     resolved_scene_seeds = resolve_ablation_seeds(seeds)
     resolved_pf_seeds = resolve_pf_seeds(resolved_scene_seeds, pf_seeds)
@@ -472,91 +577,106 @@ def build_ablation_plan(
         resolved_pf_seeds,
         transport_seeds,
     )
-    batch_count = len(cases) * len(resolved_scene_seeds)
+    batch_count = len(resolved_scene_seeds)
     resolved_batch_ids = iter(resolve_batch_ids(batch_count, batch_ids))
     entries: list[AblationPlanEntry] = []
-    for case in cases:
-        for scene_seed, pf_seed, transport_seed in zip(
-            resolved_scene_seeds,
-            resolved_pf_seeds,
-            resolved_transport_seeds,
-        ):
-            batch_id = next(resolved_batch_ids)
-            for variant in variants:
-                tag = f"ral_{batch_id}_{variant.name}"
-                if suffix:
-                    tag = f"{tag}_{suffix}"
-                generated_pf_path = output_dir / "configs" / f"{tag}.json"
-                control_policy_path = output_dir / "control_policies" / f"{tag}.json"
-                generated_runtime_path = (
-                    private_root / "runtime_configs" / f"{tag}.json"
+    private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    private_root.chmod(0o700)
+    for scene_seed, pf_seed, transport_seed in zip(
+        resolved_scene_seeds,
+        resolved_pf_seeds,
+        resolved_transport_seeds,
+    ):
+        batch_id = next(resolved_batch_ids)
+        for variant in resolved_variants:
+            tag = f"ral_{batch_id}_{variant.name}"
+            if suffix:
+                tag = f"{tag}_{suffix}"
+            generated_pf_path = output_dir / "configs" / f"{tag}.json"
+            control_policy_path = output_dir / "control_policies" / f"{tag}.json"
+            generated_runtime_path = private_root / "runtime_configs" / f"{tag}.json"
+            scenario_path = private_root / "scenarios" / f"{tag}.json"
+            truth_manifest_path = private_root / "truth_manifests" / f"{tag}.json"
+            log_path = output_dir / "measurement_logs" / tag
+            pf_output = output_dir / "runs" / tag
+            atomic_write_json(
+                generated_pf_path,
+                _pf_config(pf_base, variant=variant),
+            )
+            atomic_write_json(control_policy_path, _control_policy(variant))
+            control_document = load_ral_control_policy_document(control_policy_path)
+            if control_document.source_sha256 != control_document.canonical_sha256:
+                raise ValueError(
+                    "Generated RA-L control policy must use exact canonical bytes."
                 )
-                scenario_path = private_root / "scenarios" / f"{tag}.json"
-                truth_manifest_path = private_root / "truth_manifests" / f"{tag}.json"
-                log_path = output_dir / "measurement_logs" / tag
-                pf_output = output_dir / "runs" / tag
-                atomic_write_json(
-                    generated_pf_path,
-                    _pf_config(pf_base, variant=variant),
-                )
-                atomic_write_json(control_policy_path, _control_policy(variant))
-                atomic_write_json(
-                    generated_runtime_path,
-                    _runtime_config(
-                        runtime_config_path,
-                        variant=variant,
-                        seed=transport_seed,
-                    ),
-                )
-                scenario_command = _scenario_command(
-                    runtime_root=runtime_root,
+            atomic_write_json(
+                generated_runtime_path,
+                _runtime_config(
+                    runtime_base,
+                    variant=variant,
+                    seed=transport_seed,
+                ),
+            )
+            scenario_command = _scenario_command(
+                runtime_root=runtime_root,
+                scenario_path=scenario_path,
+                truth_manifest_path=truth_manifest_path,
+                measurement_log_path=log_path,
+                run_id=tag,
+                runtime_config_path=generated_runtime_path,
+                scene_seed=scene_seed,
+                experiment_profile_id=RAL_EXPERIMENT_PROFILE_ID,
+                scene_variant_id=RAL_SCENE_VARIANT_ID,
+            )
+            entries.append(
+                AblationPlanEntry(
+                    case=RAL_CASE_NAME,
+                    experiment_profile_id=RAL_EXPERIMENT_PROFILE_ID,
+                    scene_variant_id=RAL_SCENE_VARIANT_ID,
+                    variant=variant.name,
+                    batch_id=batch_id,
+                    scene_seed=scene_seed,
+                    pf_seed=pf_seed,
+                    transport_seed=transport_seed,
+                    seed_policy=seed_policy,
+                    run_id=tag,
+                    pf_config_path=generated_pf_path,
+                    control_policy_path=control_policy_path,
+                    control_policy_sha256=control_document.source_sha256,
+                    runtime_config_path=generated_runtime_path,
                     scenario_path=scenario_path,
                     truth_manifest_path=truth_manifest_path,
                     measurement_log_path=log_path,
-                    run_id=tag,
-                    runtime_config_path=generated_runtime_path,
-                    scene_seed=scene_seed,
-                )
-                entries.append(
-                    AblationPlanEntry(
-                        case=case.name,
-                        variant=variant.name,
-                        batch_id=batch_id,
-                        scene_seed=scene_seed,
-                        pf_seed=pf_seed,
-                        transport_seed=transport_seed,
-                        seed_policy=seed_policy,
+                    pf_output_dir=pf_output,
+                    scenario_command=scenario_command,
+                    session_command=_session_command(
+                        scenario_path=scenario_path,
+                        runtime_root=runtime_root,
                         pf_config_path=generated_pf_path,
                         control_policy_path=control_policy_path,
-                        runtime_config_path=generated_runtime_path,
-                        scenario_path=scenario_path,
-                        truth_manifest_path=truth_manifest_path,
-                        measurement_log_path=log_path,
+                        control_policy_sha256=control_document.source_sha256,
                         pf_output_dir=pf_output,
-                        scenario_command=scenario_command,
-                        session_command=_session_command(
-                            scenario_path=scenario_path,
-                            runtime_root=runtime_root,
-                            pf_config_path=generated_pf_path,
-                            control_policy_path=control_policy_path,
-                            pf_output_dir=pf_output,
-                            pf_seed=pf_seed,
-                        ),
-                    )
+                        pf_seed=pf_seed,
+                    ),
                 )
+            )
     return entries
 
 
 MANIFEST_FIELDS = (
     "case",
+    "experiment_profile_id",
+    "scene_variant_id",
     "variant",
     "batch_id",
     "scene_seed",
     "pf_seed",
     "transport_seed",
     "seed_policy",
+    "run_id",
     "pf_config_path",
     "control_policy_path",
+    "control_policy_sha256",
     "runtime_config_path",
     "scenario_path",
     "truth_manifest_path",
@@ -571,14 +691,18 @@ def _entry_row(entry: AblationPlanEntry) -> dict[str, object]:
     """Return one private-manifest CSV row."""
     return {
         "case": entry.case,
+        "experiment_profile_id": entry.experiment_profile_id,
+        "scene_variant_id": entry.scene_variant_id,
         "variant": entry.variant,
         "batch_id": entry.batch_id,
         "scene_seed": entry.scene_seed,
         "pf_seed": entry.pf_seed,
         "transport_seed": entry.transport_seed,
         "seed_policy": entry.seed_policy,
+        "run_id": entry.run_id,
         "pf_config_path": entry.pf_config_path.as_posix(),
         "control_policy_path": entry.control_policy_path.as_posix(),
+        "control_policy_sha256": entry.control_policy_sha256,
         "runtime_config_path": entry.runtime_config_path.as_posix(),
         "scenario_path": entry.scenario_path.as_posix(),
         "truth_manifest_path": entry.truth_manifest_path.as_posix(),
@@ -620,7 +744,6 @@ def write_ablation_plan(
 
 
 __all__ = [
-    "DEFAULT_ABLATION_CASES",
     "DEFAULT_ABLATION_VARIANTS",
     "DEFAULT_OUTPUT_DIR",
     "DEFAULT_PF_CONFIG",
@@ -628,9 +751,13 @@ __all__ = [
     "DEFAULT_RUNTIME_CONFIG",
     "DEFAULT_RUNTIME_ROOT",
     "MANIFEST_FIELDS",
-    "AblationCase",
+    "MAX_FRESH_ABLATION_SEED",
     "AblationPlanEntry",
     "AblationVariant",
+    "RAL_CASE_NAME",
+    "RAL_EXPERIMENT_PROFILE_ID",
+    "RAL_RUNTIME_INTERVENTION_FIELDS",
+    "RAL_SCENE_VARIANT_ID",
     "build_ablation_plan",
     "generate_fresh_ablation_seed",
     "generate_fresh_batch_id",

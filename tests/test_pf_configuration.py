@@ -3,26 +3,41 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 
 import pytest
 
-from pf.configuration import PFConfigError, load_pf_config
+from pf.configuration import PFConfigDocument, PFConfigError, load_pf_config
 
 
-def test_load_pf_config_resolves_inheritance_and_hashes_leaf(tmp_path: Path) -> None:
-    """Inherited settings merge while provenance binds the selected leaf file."""
-    parent = tmp_path / "parent.json"
-    child = tmp_path / "child.json"
-    parent.write_text('{"num_particles":12,"use_gpu":false}', encoding="utf-8")
-    child_bytes = b'{"extends":"parent.json","num_particles":24}'
-    child.write_bytes(child_bytes)
+def test_load_pf_config_loads_and_hashes_one_self_contained_file(
+    tmp_path: Path,
+) -> None:
+    """Configuration provenance must bind one self-contained source file."""
+    config_path = tmp_path / "pf.json"
+    config_bytes = b'{"num_particles":24,"use_gpu":false}'
+    config_path.write_bytes(config_bytes)
 
-    config, digest = load_pf_config(child)
+    document = load_pf_config(config_path)
 
-    assert config == {"num_particles": 24, "use_gpu": False}
-    assert digest == hashlib.sha256(child_bytes).hexdigest()
+    assert document.config() == {"num_particles": 24, "use_gpu": False}
+    assert document.source_bytes == config_bytes
+    assert document.source_sha256 == hashlib.sha256(config_bytes).hexdigest()
+
+
+def test_pf_config_document_rejects_caller_forged_provenance(
+    tmp_path: Path,
+) -> None:
+    """Only the byte-reading loader may mint a provenance document."""
+    payload = b'{"num_particles":24}'
+    with pytest.raises(PFConfigError, match="load_pf_config"):
+        PFConfigDocument(
+            source_path=tmp_path / "pf.json",
+            source_bytes=payload,
+            source_sha256=hashlib.sha256(payload).hexdigest(),
+            canonical_config_json=payload,
+            _loader_token=object(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -45,32 +60,13 @@ def test_load_pf_config_rejects_noncanonical_json(
         load_pf_config(config_path)
 
 
-def test_load_pf_config_rejects_inheritance_cycles(tmp_path: Path) -> None:
-    """A cyclic extends chain must fail before settings reach the live PF."""
-    first = tmp_path / "first.json"
-    second = tmp_path / "second.json"
-    first.write_text('{"extends":"second.json"}', encoding="utf-8")
-    second.write_text('{"extends":"first.json"}', encoding="utf-8")
+def test_load_pf_config_rejects_retired_inheritance(tmp_path: Path) -> None:
+    """The retired extends mechanism must fail at the file boundary."""
+    config_path = tmp_path / "pf.json"
+    config_path.write_text(
+        '{"extends":"parent.json","num_particles":24}',
+        encoding="utf-8",
+    )
 
-    with pytest.raises(PFConfigError, match="Cyclic PF config inheritance"):
-        load_pf_config(first)
-
-
-def test_diagnostic_profiles_inherit_production_particle_count() -> None:
-    """Diagnostic profiles must not duplicate the production particle count."""
-    root = Path(__file__).resolve().parents[1]
-    production_path = root / "configs" / "pf" / "pf_strict_3d.json"
-    production, _ = load_pf_config(production_path)
-    particle_count = production.get("num_particles")
-
-    assert isinstance(particle_count, int)
-    assert not isinstance(particle_count, bool)
-    assert particle_count > 0
-    for diagnostic_path in sorted(
-        (production_path.parent / "diagnostics").glob("*.json")
-    ):
-        leaf = json.loads(diagnostic_path.read_text(encoding="utf-8"))
-        diagnostic, _ = load_pf_config(diagnostic_path)
-
-        assert "num_particles" not in leaf
-        assert diagnostic["num_particles"] == particle_count
+    with pytest.raises(PFConfigError, match="retired 'extends'"):
+        load_pf_config(config_path)

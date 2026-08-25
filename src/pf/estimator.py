@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import asdict, replace
 import hashlib
-import re
 import time
 from typing import Any, Mapping, Sequence
 
@@ -26,20 +25,17 @@ from pf.particle_filter import (
     IsotopeParticleFilter,
     JointRowIdentity,
     StructuralGeometryBatch,
-    PFConfig,
 )
 from pf.posterior import (
     PFPointEstimate,
-    posterior_point_estimate_from_states as posterior_point_estimate_from_states,
     validated_probability_distribution,
 )
-from pf.provenance import sha256_json
+from pf.provenance import strict_sha256_json
 from pf.randomness import (
     named_random_generator,
     normalize_pf_random_seed,
     pf_rng_provenance,
 )
-from pf.resampling import systematic_resample as systematic_resample
 from pf.state import IsotopeState
 from pf.estimator_config import (
     RotatingShieldPFConfig as RotatingShieldPFConfig,
@@ -58,6 +54,13 @@ from pf.estimator_sampling import (
     _stratified_joint_cardinality_draws as _stratified_joint_cardinality_draws,
 )
 from pf.estimator_structural import EstimatorStructuralProposalMixin
+from pf.estimator_structural import (
+    JOINT_STRENGTH_GRID_AUTOTUNE_MAX_BATCH_SIZE,
+    JOINT_STRUCTURAL_UNIT_CACHE_ACTIVE_STATE_MULTIPLIER,
+    JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE,
+    JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES,
+    JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES,
+)
 from pf.estimator_surface import (
     SurfaceAtlasQuadrature as SurfaceAtlasQuadrature,
     build_complete_surface_atlas_quadrature as build_complete_surface_atlas_quadrature,
@@ -78,30 +81,7 @@ __all__ = (
     "RotatingShieldPFEstimator",
     "SurfaceAtlasQuadrature",
     "build_complete_surface_atlas_quadrature",
-    "posterior_point_estimate_from_states",
-    "systematic_resample",
 )
-
-JOINT_STRENGTH_GRID_AUTOTUNE_MAX_BATCH_SIZE = 1024
-JOINT_STRUCTURAL_UNIT_CACHE_MAX_BYTES = 2_147_483_648
-JOINT_STRUCTURAL_UNIT_CACHE_ACTIVE_STATE_MULTIPLIER = 2
-JOINT_STRUCTURAL_UNIT_CACHE_KEY_DTYPE = np.dtype(
-    [
-        ("chart", "<i8"),
-        ("x", "<f8"),
-        ("y", "<f8"),
-        ("z", "<f8"),
-    ]
-)
-JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES = (
-    "total_kernel",
-    "uncollided_kernel",
-    "tau_fe",
-    "tau_pb",
-    "tau_obstacle",
-    "distance_m",
-)
-
 
 class RotatingShieldPFEstimator(
     JointLikelihoodMixin,
@@ -138,7 +118,6 @@ class RotatingShieldPFEstimator(
         line_mu_by_isotope: dict[str, object] | None = None,
         full_spectrum_generative_model: object | None = None,
         random_seed: int = 0,
-        candidate_isotopes: Sequence[str] | None = None,
     ) -> None:
         """Initialize per-isotope filters and shared measurement-model state."""
         configured_isotopes = tuple(isotopes)
@@ -152,31 +131,21 @@ class RotatingShieldPFEstimator(
         ):
             raise ValueError("Joint PF isotopes must be unique nonempty strings.")
         self.isotopes = list(configured_isotopes)
-        configured_candidates = (
-            configured_isotopes
-            if candidate_isotopes is None
-            else tuple(candidate_isotopes)
-        )
-        if (
-            not configured_candidates
-            or any(
-                not isinstance(isotope, str) or not isotope.strip()
-                for isotope in configured_candidates
-            )
-            or len(set(configured_candidates)) != len(configured_candidates)
-            or not set(configured_isotopes).issubset(configured_candidates)
-        ):
-            raise ValueError(
-                "Candidate isotopes must be unique nonempty strings containing "
-                "every active PF isotope."
-            )
-        self.candidate_isotopes = list(configured_candidates)
         self.random_seed = normalize_pf_random_seed(random_seed)
         self.rng_provenance = pf_rng_provenance(
             self.random_seed,
             self.isotopes,
         )
-        self.pf_config = pf_config or RotatingShieldPFConfig()
+        if pf_config is not None and not isinstance(
+            pf_config,
+            RotatingShieldPFConfig,
+        ):
+            raise TypeError(
+                "pf_config must be a RotatingShieldPFConfig instance."
+            )
+        self.pf_config = (
+            RotatingShieldPFConfig() if pf_config is None else pf_config
+        )
         self.shield_params = shield_params or ShieldParams()
         if not isinstance(self.shield_params, ShieldParams):
             raise TypeError("shield_params must be a ShieldParams instance.")
@@ -350,17 +319,11 @@ class RotatingShieldPFEstimator(
         self.last_joint_resample_indices = np.zeros(0, dtype=np.int64)
         self.last_joint_temper_steps: list[dict[str, float]] = []
         self.last_joint_rejuvenation_diagnostics: list[dict[str, float]] = []
-        self.last_joint_smc_soft_budget_exceeded = False
+        self.last_joint_smc_wall_time_limit_exceeded = False
         self.last_joint_rejuvenation_mixing_incomplete = False
         self.last_joint_structural_mixing_incomplete = False
         self._joint_guided_initialization_applied = False
         self.last_joint_guided_initialization_ess: float | None = None
-        self.last_joint_cross_isotope_attempted_weight_mass = 0.0
-        self.last_joint_cross_isotope_accepted_weight_mass = 0.0
-        self.last_joint_cross_isotope_rejection_diagnostics: dict[
-            str,
-            object,
-        ] = {}
         self.last_joint_cross_isotope_state_attempted_weight_mass = 0.0
         self.last_joint_cross_isotope_state_accepted_weight_mass = 0.0
         self.last_joint_cross_isotope_state_rejection_diagnostics: dict[
@@ -372,7 +335,6 @@ class RotatingShieldPFEstimator(
         self.last_joint_device_mh_acceptance_calls = 0
         self.last_joint_device_mh_acceptance_rows = 0
         self._joint_initial_product_prior_state_sha256: str | None = None
-        self.last_joint_unique_ancestor_count: int | None = None
         self.last_joint_station_unique_ancestor_count: int | None = None
         self.last_joint_cumulative_unique_ancestor_count: int | None = None
         self._joint_cumulative_lineage_ids: NDArray[np.int64] | None = None
@@ -768,60 +730,20 @@ class RotatingShieldPFEstimator(
     def _resolve_mu_by_isotope(
         self, mu_by_isotope: dict[str, object] | None
     ) -> dict[str, object]:
-        (
-            "\n        Ensure per-isotope attenuation coefficients are available "
-            "for all isotopes.\n\n"
-            "        When missing, attempt to populate values from the HVL/TVL "
-            "table; otherwise raise.\n        "
-        )
-        from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
-
-        def _norm_key(name: str) -> str:
-            """Return a normalized isotope key for attenuation lookup."""
-            return re.sub(r"[^A-Za-z0-9]", "", name).upper()
-
-        canonical_by_norm = {
-            "CS137": "Cs-137",
-            "CO60": "Co-60",
-            "EU154": "Eu-154",
-        }
-
-        resolved: dict[str, object] = {}
-        if mu_by_isotope is not None:
-            resolved.update(mu_by_isotope)
-        normalized: dict[str, object] = {}
-        for key, value in resolved.items():
-            normalized[_norm_key(key)] = value
-        isotope_names = self.isotopes
-        if isotope_names:
-            still_missing: list[str] = []
-            for iso in isotope_names:
-                if iso in resolved:
-                    continue
-                norm = _norm_key(iso)
-                if norm in normalized:
-                    resolved[iso] = normalized[norm]
-                    continue
-                canonical = canonical_by_norm.get(norm)
-                if canonical is not None:
-                    table_vals = mu_by_isotope_from_tvl_mm(
-                        HVL_TVL_TABLE_MM, isotopes=[canonical]
-                    )
-                    if canonical in table_vals:
-                        resolved[iso] = table_vals[canonical]
-                        normalized[norm] = table_vals[canonical]
-                        if canonical not in resolved:
-                            resolved[canonical] = table_vals[canonical]
-                        continue
-                still_missing.append(iso)
-            if still_missing:
-                missing_list = ", ".join(still_missing)
-                raise ValueError(
-                    "mu_by_isotope is missing entries for isotopes: "
-                    f"{missing_list}. Ensure isotope names match the "
-                    "HVL/TVL table keys."
-                )
-        return resolved
+        """Require one authenticated attenuation entry for every isotope."""
+        if not isinstance(mu_by_isotope, dict) or any(
+            not isinstance(key, str) for key in mu_by_isotope
+        ):
+            raise TypeError("mu_by_isotope must be a string-keyed dictionary.")
+        expected = set(self.isotopes)
+        actual = set(mu_by_isotope)
+        if actual != expected:
+            raise ValueError(
+                "mu_by_isotope keys must exactly match configured isotopes: "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}."
+            )
+        return dict(mu_by_isotope)
 
     def _ensure_kernel_cache(self) -> None:
         """Build the discrete kernel cache when it is first needed."""
@@ -851,7 +773,11 @@ class RotatingShieldPFEstimator(
                 self.filters[iso] = self._build_filter(iso, pf_conf)
         self._configure_joint_particle_filters()
 
-    def _build_filter(self, isotope: str, pf_conf: PFConfig) -> IsotopeParticleFilter:
+    def _build_filter(
+        self,
+        isotope: str,
+        pf_conf: RotatingShieldPFConfig,
+    ) -> IsotopeParticleFilter:
         """Build an isotope filter with shared PF observation-model settings."""
         return IsotopeParticleFilter(
             isotope,
@@ -872,14 +798,9 @@ class RotatingShieldPFEstimator(
             random_seed=self.random_seed,
         )
 
-    def _build_pf_config(self) -> PFConfig:
-        """Build the per-isotope config from the shared PF field contract."""
-        shared_values = {
-            field.name: getattr(self.pf_config, field.name)
-            for field in fields(PFConfig)
-            if hasattr(self.pf_config, field.name)
-        }
-        return PFConfig(**shared_values)
+    def _build_pf_config(self) -> RotatingShieldPFConfig:
+        """Build an independent canonical config for one isotope filter."""
+        return replace(self.pf_config)
 
     def _gpu_enabled(self) -> bool:
         """Return True if GPU computation is enabled and available."""
@@ -1016,7 +937,7 @@ class RotatingShieldPFEstimator(
         """Return the deterministic contract root for joint row identities."""
         atlas_sha256 = self._assert_joint_surface_atlas_alignment()
         model_sha256 = self._full_spectrum_model().contract_hash_sha256
-        return sha256_json(
+        return strict_sha256_json(
             {
                 "schema_version": 1,
                 "identity_domain": "pure_pf_joint_row_identity_root_v1",
@@ -1025,13 +946,7 @@ class RotatingShieldPFEstimator(
                 "particle_count": int(particle_count),
                 "surface_atlas_sha256": atlas_sha256,
                 "full_spectrum_contract_sha256": model_sha256,
-                "pf_config": {
-                    config_field.name: getattr(
-                        self.pf_config,
-                        config_field.name,
-                    )
-                    for config_field in fields(self.pf_config)
-                },
+                "pf_config": asdict(self.pf_config),
             }
         )
 
@@ -1391,47 +1306,57 @@ class RotatingShieldPFEstimator(
         weights = self._strict_joint_particle_weights()
         particle_count = int(weights.size)
         if max_particles is None:
-            max_particles = self.pf_config.planning_particles
-        method = str(method or self.pf_config.planning_method)
-        if (
-            max_particles is None
-            or int(max_particles) <= 0
-            or int(max_particles) >= particle_count
-        ):
+            if method is not None or rng is not None:
+                raise ValueError(
+                    "method and rng must be omitted when all planning particles "
+                    "are requested."
+                )
             indices = np.arange(particle_count, dtype=np.int64)
             selected_weights = weights.copy()
-        elif method == "top_weight":
-            indices = np.argsort(weights)[::-1][: int(max_particles)].astype(
+        else:
+            if isinstance(max_particles, bool) or not isinstance(
+                max_particles,
+                (int, np.integer),
+            ):
+                raise TypeError("max_particles must be an integer or None.")
+            resolved_max_particles = int(max_particles)
+            if not 1 <= resolved_max_particles <= particle_count:
+                raise ValueError(
+                    "max_particles must lie between 1 and the particle count."
+                )
+            if method not in {"top_weight", "resample"}:
+                raise ValueError(
+                    "A strict 'top_weight' or 'resample' method is required "
+                    "when planning selects a particle count."
+                )
+        if max_particles is not None and method == "top_weight":
+            indices = np.argsort(weights)[::-1][:resolved_max_particles].astype(
                 np.int64,
                 copy=False,
             )
             selected_weights = weights[indices]
             selected_weights /= float(np.sum(selected_weights))
-        elif method == "resample":
+        elif max_particles is not None and method == "resample":
             if rng is not None and not isinstance(rng, np.random.Generator):
                 raise TypeError("rng must be a numpy.random.Generator.")
             if rng is None:
                 rng = self._named_planning_rng(
                     "joint_particle_subset",
-                    int(max_particles),
+                    resolved_max_particles,
                 )
             indices = np.asarray(
                 rng.choice(
                     particle_count,
-                    size=int(max_particles),
+                    size=resolved_max_particles,
                     replace=True,
                     p=weights,
                 ),
                 dtype=np.int64,
             )
             selected_weights = np.full(
-                int(max_particles),
-                1.0 / float(max_particles),
+                resolved_max_particles,
+                1.0 / float(resolved_max_particles),
                 dtype=np.float64,
-            )
-        else:
-            raise ValueError(
-                f"Unknown joint planning particle selection method: {method}"
             )
         max_sources = self.pf_config.cardinality_capacity
         positions_by_isotope: dict[str, NDArray[np.float64]] = {}
@@ -1510,8 +1435,8 @@ class RotatingShieldPFEstimator(
         Select per-isotope particle subsets for orientation evaluation.
 
         Args:
-            max_particles: cap on particles per isotope; None uses config default.
-            method: "top_weight" or "resample"; None uses config default.
+            max_particles: cap on particles per isotope; None keeps every particle.
+            method: "top_weight" or "resample" when a subset is requested.
             rng: optional RNG for resampling.
         """
         joint = self.planning_joint_particles(

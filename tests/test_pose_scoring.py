@@ -14,7 +14,6 @@ def test_pose_scoring_separates_mast_motion_weight() -> None:
     config = DSSPPConfig(
         lambda_eig=1.0,
         lambda_distance=0.0,
-        lambda_time=0.02,
         lambda_horizontal_time=0.02,
         lambda_mast_vertical_time=0.005,
         lambda_settling_time=0.02,
@@ -24,7 +23,6 @@ def test_pose_scoring_separates_mast_motion_weight() -> None:
         np.asarray([1.0, 1.0]),
         np.asarray([3.0, 3.0]),
         config=config,
-        program_length=8,
         motion_times_p=np.asarray([5.0, 5.0]),
         motion_time_components_p=(
             np.asarray([3.0, 0.0]),
@@ -44,7 +42,6 @@ def test_pose_scoring_marks_unreachable_pose_as_negative_infinity() -> None:
         np.asarray([0.0, 0.0]),
         np.asarray([1.0, np.inf]),
         config=DSSPPConfig(lambda_distance=0.0),
-        program_length=8,
     )
 
     assert np.isfinite(scores[0])

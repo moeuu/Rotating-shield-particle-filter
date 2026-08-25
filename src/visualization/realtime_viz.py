@@ -7,8 +7,10 @@ import os
 import pickle
 import queue
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Sequence
+from uuid import uuid4
 
 import matplotlib.colors as mcolors
 import matplotlib.patheffects as path_effects
@@ -1573,34 +1575,49 @@ class CUISplitPFVisualizer:
 def _async_cui_split_worker(
     config: dict[str, Any],
     frame_queue: Any,
+    status_queue: Any,
+    run_token: str,
 ) -> None:
     """Render CUI split-view frames in a dedicated worker process."""
-    visualizer = CUISplitPFVisualizer(**config)
-    last_frame: PFFrame | None = None
-    while True:
-        message, payload = frame_queue.get()
-        if message == "close":
-            return
-        if message == "truth":
-            try:
+    operation_id = -1
+    try:
+        visualizer = CUISplitPFVisualizer(**config)
+        status_queue.put(("ready", operation_id, "startup", run_token))
+        last_frame: PFFrame | None = None
+        while True:
+            message, operation_id, payload = frame_queue.get()
+            if message == "close":
+                status_queue.put(
+                    ("closed", operation_id, "close", run_token)
+                )
+                return
+            if message == "truth":
                 true_sources, true_strengths = pickle.loads(payload)
                 visualizer.set_truth(true_sources, true_strengths)
                 if last_frame is not None:
                     visualizer.update(last_frame)
-            except Exception as exc:  # pragma: no cover - worker diagnostics.
-                print(
-                    f"Async CUI split truth update error: {exc}",
-                    flush=True,
+                status_queue.put(
+                    ("ack", operation_id, "truth", run_token)
                 )
-            continue
-        if message != "frame":
-            continue
-        try:
+                continue
+            if message != "frame":
+                raise RuntimeError(
+                    f"Unknown asynchronous CUI message {message!r}."
+                )
             frame = pickle.loads(payload)
             last_frame = frame
             visualizer.update(frame)
-        except Exception as exc:  # pragma: no cover - worker-side diagnostics only.
-            print(f"Async CUI split visualization worker error: {exc}", flush=True)
+            status_queue.put(("ack", operation_id, "frame", run_token))
+    except BaseException as exc:  # pragma: no cover - child-process boundary.
+        status_queue.put(
+            (
+                "error",
+                operation_id,
+                f"{type(exc).__name__}: {exc}",
+                run_token,
+            )
+        )
+        raise
 
 
 class AsyncCUISplitPFVisualizer:
@@ -1623,6 +1640,12 @@ class AsyncCUISplitPFVisualizer:
         """Start a renderer process that consumes latest PF frames asynchronously."""
         if not isinstance(save_step_history, bool):
             raise TypeError("save_step_history must be a boolean.")
+        if (
+            isinstance(queue_size, bool)
+            or not isinstance(queue_size, int)
+            or queue_size < 1
+        ):
+            raise ValueError("queue_size must be a positive integer.")
         self.isotopes = list(isotopes)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1633,8 +1656,18 @@ class AsyncCUISplitPFVisualizer:
         self.latest_pf_labeled_path = self.output_dir / "latest_pf_3d_labeled.png"
         self.latest_spectrum_path = self.output_dir / "latest_spectrum.png"
         self._closed = False
+        self._run_token = uuid4().hex
+        self._next_operation_id = 0
+        self._last_enqueued_operation_id = -1
+        self._last_acknowledged_operation_id = -1
+        self._operation_kinds: dict[int, str] = {}
+        self._ready_acknowledged = False
+        self._close_operation_id: int | None = None
+        self._close_acknowledged = False
+        self._worker_error: RuntimeError | None = None
         self._ctx = mp.get_context("spawn")
-        self._queue = self._ctx.Queue(maxsize=max(1, int(queue_size)))
+        self._queue = self._ctx.Queue(maxsize=queue_size)
+        self._status_queue = self._ctx.Queue()
         config = {
             "isotopes": self.isotopes,
             "output_dir": self.output_dir,
@@ -1648,25 +1681,223 @@ class AsyncCUISplitPFVisualizer:
         }
         self._process = self._ctx.Process(
             target=_async_cui_split_worker,
-            args=(config, self._queue),
+            args=(config, self._queue, self._status_queue, self._run_token),
             daemon=True,
         )
-        self._process.start()
+        try:
+            self._process.start()
+        except BaseException as exc:
+            self._closed = True
+            try:
+                if self._process.pid is not None:
+                    self._terminate_worker()
+            except BaseException as cleanup_exc:
+                exc.add_note(
+                    "Secondary async CUI startup cleanup failure: "
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+            raise
+        self._await_worker_ready(timeout_s=10.0)
 
-    def update(self, frame: PFFrame) -> None:
-        """Queue the latest frame for asynchronous rendering without blocking."""
-        if self._closed or not self._process.is_alive():
-            return
-        payload = pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL)
+    @property
+    def run_token(self) -> str:
+        """Return the opaque identity of this renderer generation."""
+        return self._run_token
+
+    @property
+    def last_acknowledged_operation_id(self) -> int:
+        """Return the last operation proven rendered by the worker."""
+        return int(self._last_acknowledged_operation_id)
+
+    def _accept_status(self, status: object) -> str:
+        """Validate one worker status and update acknowledged state."""
+        if (
+            not isinstance(status, tuple)
+            or len(status) != 4
+            or status[3] != self._run_token
+        ):
+            raise RuntimeError("Async CUI worker returned an invalid status.")
+        kind, raw_operation_id, detail, _token = status
+        if isinstance(raw_operation_id, bool) or not isinstance(
+            raw_operation_id,
+            int,
+        ):
+            raise RuntimeError("Async CUI worker returned an invalid operation ID.")
+        operation_id = int(raw_operation_id)
+        if not isinstance(kind, str) or not isinstance(detail, str):
+            raise RuntimeError("Async CUI worker returned an invalid status payload.")
+        if kind == "error":
+            known_operation = (
+                (operation_id == -1 and not self._ready_acknowledged)
+                or operation_id in self._operation_kinds
+                or operation_id == self._close_operation_id
+            )
+            if not known_operation or not detail:
+                raise RuntimeError(
+                    "Async CUI worker reported an invalid failure status."
+                )
+            self._worker_error = RuntimeError(
+                "Async CUI worker failed at operation "
+                f"{operation_id}: {detail}"
+            )
+            raise self._worker_error
+        if kind == "ready":
+            if (
+                self._ready_acknowledged
+                or operation_id != -1
+                or detail != "startup"
+            ):
+                raise RuntimeError(
+                    "Async CUI worker returned a mismatched startup acknowledgement."
+                )
+            self._ready_acknowledged = True
+            return kind
+        if kind == "ack":
+            if not self._ready_acknowledged:
+                raise RuntimeError(
+                    "Async CUI worker acknowledged work before startup."
+                )
+            expected_kind = self._operation_kinds.get(operation_id)
+            if expected_kind is None or detail != expected_kind:
+                raise RuntimeError(
+                    "Async CUI worker returned a mismatched operation acknowledgement."
+                )
+            if operation_id <= self._last_acknowledged_operation_id:
+                raise RuntimeError("Async CUI acknowledgements are not monotonic.")
+            self._last_acknowledged_operation_id = operation_id
+            self._operation_kinds.pop(operation_id)
+            return kind
+        if kind == "closed":
+            if (
+                not self._ready_acknowledged
+                or
+                self._close_acknowledged
+                or self._close_operation_id is None
+                or operation_id != self._close_operation_id
+                or detail != "close"
+            ):
+                raise RuntimeError(
+                    "Async CUI worker returned a mismatched close acknowledgement."
+                )
+            self._close_acknowledged = True
+            return kind
+        if kind not in {"ready", "ack", "closed"}:
+            raise RuntimeError(f"Unknown async CUI worker status {kind!r}.")
+        raise AssertionError("Async CUI status validation fell through.")
+
+    def _drain_worker_status(self) -> set[str]:
+        """Consume every immediately available worker status."""
+        kinds: set[str] = set()
         while True:
             try:
-                self._queue.put_nowait(("frame", payload))
-                return
-            except queue.Full:
+                status = self._status_queue.get_nowait()
+            except queue.Empty:
+                return kinds
+            kinds.add(self._accept_status(status))
+
+    def _await_worker_ready(self, *, timeout_s: float) -> None:
+        """Require an explicit startup acknowledgement from the child."""
+        try:
+            try:
+                status = self._status_queue.get(timeout=float(timeout_s))
+            except queue.Empty as exc:
+                raise RuntimeError(
+                    "Async CUI worker did not acknowledge startup."
+                ) from exc
+            if self._accept_status(status) != "ready":
+                raise RuntimeError("Async CUI worker did not start cleanly.")
+        except BaseException as exc:
+            self._terminate_after_failure(exc)
+            raise
+
+    def _terminate_worker(self) -> None:
+        """Stop and reap the renderer worker after a protocol failure."""
+        if self._process.is_alive():
+            self._process.terminate()
+        self._process.join(timeout=2.0)
+
+    def _terminate_after_failure(self, exc: BaseException) -> None:
+        """Reap the worker without allowing cleanup to replace its failure."""
+        self._closed = True
+        try:
+            self._terminate_worker()
+        except BaseException as cleanup_exc:
+            exc.add_note(
+                "Secondary async CUI cleanup failure: "
+                f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+            )
+
+    def _collect_close_status(self, *, timeout_s: float) -> set[str]:
+        """Collect terminal statuses through the explicit close acknowledgement."""
+        kinds: set[str] = set()
+        deadline = time.monotonic() + min(max(0.1, float(timeout_s)), 1.0)
+        while not self._close_acknowledged:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            try:
+                status = self._status_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            kinds.add(self._accept_status(status))
+        kinds.update(self._drain_worker_status())
+        return kinds
+
+    def _require_live_worker(self) -> None:
+        """Raise when the renderer has failed, closed, or exited."""
+        try:
+            self._drain_worker_status()
+            if self._worker_error is not None:
+                raise self._worker_error
+            if self._closed:
+                raise RuntimeError("Async CUI visualizer is already closed.")
+            if not self._process.is_alive():
+                raise RuntimeError(
+                    "Async CUI worker exited before acknowledging queued work."
+                )
+        except BaseException as exc:
+            self._terminate_after_failure(exc)
+            raise
+
+    def _enqueue_latest(self, kind: str, payload: bytes) -> None:
+        """Queue one operation, replacing only an older unprocessed operation."""
+        try:
+            self._require_live_worker()
+            operation_id = int(self._next_operation_id)
+            message = (kind, operation_id, payload)
+            while True:
                 try:
-                    self._queue.get_nowait()
-                except queue.Empty:
+                    self._queue.put_nowait(message)
+                    self._operation_kinds[operation_id] = kind
+                    self._next_operation_id += 1
+                    self._last_enqueued_operation_id = operation_id
                     return
+                except queue.Full:
+                    try:
+                        dropped = self._queue.get_nowait()
+                    except queue.Empty as exc:
+                        raise RuntimeError(
+                            "Async CUI queue reported full but yielded no operation."
+                        ) from exc
+                    if (
+                        not isinstance(dropped, tuple)
+                        or len(dropped) != 3
+                        or isinstance(dropped[1], bool)
+                        or not isinstance(dropped[1], int)
+                    ):
+                        raise RuntimeError(
+                            "Async CUI queue contained an invalid operation."
+                        )
+                    self._operation_kinds.pop(int(dropped[1]), None)
+        except BaseException as exc:
+            if not self._closed:
+                self._terminate_after_failure(exc)
+            raise
+
+    def update(self, frame: PFFrame) -> None:
+        """Queue the latest frame and fail if the renderer is unavailable."""
+        payload = pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL)
+        self._enqueue_latest("frame", payload)
 
     def set_truth(
         self,
@@ -1674,28 +1905,55 @@ class AsyncCUISplitPFVisualizer:
         true_strengths: dict[str, float | Sequence[float]],
     ) -> None:
         """Queue evaluation truth for post-run rendering only."""
-        if self._closed or not self._process.is_alive():
-            return
         payload = pickle.dumps(
             (true_sources, true_strengths),
             protocol=pickle.HIGHEST_PROTOCOL,
         )
-        self._queue.put(("truth", payload), timeout=5.0)
+        self._enqueue_latest("truth", payload)
 
     def close(self, timeout_s: float = 10.0) -> None:
         """Ask the renderer process to finish queued work and stop."""
         if self._closed:
             return
-        self._closed = True
-        if self._process.is_alive():
+        try:
+            self._require_live_worker()
+            close_operation_id = int(self._next_operation_id)
+            self._close_operation_id = close_operation_id
             try:
-                self._queue.put(("close", None), timeout=1.0)
-            except queue.Full:
-                pass
+                self._queue.put(
+                    ("close", close_operation_id, None),
+                    timeout=max(0.1, float(timeout_s)),
+                )
+            except queue.Full as exc:
+                raise RuntimeError(
+                    "Async CUI worker did not accept close."
+                ) from exc
+            self._closed = True
             self._process.join(timeout=max(0.1, float(timeout_s)))
             if self._process.is_alive():
-                self._process.terminate()
-                self._process.join(timeout=2.0)
+                raise RuntimeError(
+                    "Async CUI worker did not close before its deadline."
+                )
+            status_kinds = self._collect_close_status(timeout_s=timeout_s)
+            if self._process.exitcode != 0:
+                raise RuntimeError(
+                    f"Async CUI worker exited with code {self._process.exitcode}."
+                )
+            if "closed" not in status_kinds or not self._close_acknowledged:
+                raise RuntimeError(
+                    "Async CUI worker omitted its close acknowledgement."
+                )
+            if (
+                self._last_enqueued_operation_id >= 0
+                and self._last_acknowledged_operation_id
+                != self._last_enqueued_operation_id
+            ):
+                raise RuntimeError(
+                    "Async CUI worker did not acknowledge the latest queued operation."
+                )
+        except BaseException as exc:
+            self._terminate_after_failure(exc)
+            raise
 
 
 def build_frame_from_pf(
@@ -1704,9 +1962,6 @@ def build_frame_from_pf(
     time_sec: float,
     *,
     detector_position: NDArray[np.float64],
-    live_time_s: float,
-    RFe: NDArray[np.float64] | None = None,
-    RPb: NDArray[np.float64] | None = None,
     spectrum_energy_keV: NDArray[np.float64] | None = None,
     spectrum_counts: NDArray[np.int64] | None = None,
 ) -> PFFrame:
@@ -1718,18 +1973,15 @@ def build_frame_from_pf(
         step_index: integer step
         time_sec: cumulative time in seconds
         detector_position: Physical detector XYZ used by the likelihood.
-        live_time_s: Fixed observation live time in seconds.
-        RFe: Iron-shield incoming normal or legacy active world rotation.
-        RPb: Lead-shield incoming normal or legacy active world rotation.
         spectrum_energy_keV: Native incident-energy bin axis.
         spectrum_counts: Raw nonnegative native histogram.
     """
-    if hasattr(pf, "visualization_estimates"):
-        est: dict[str, object] = pf.visualization_estimates()
-    elif hasattr(pf, "estimate_all"):
-        est = pf.estimate_all()
-    else:
-        est = pf.estimates()  # type: ignore[attr-defined]
+    visualization_estimates = getattr(pf, "visualization_estimates", None)
+    if not callable(visualization_estimates):
+        raise TypeError("PF must implement visualization_estimates().")
+    est: dict[str, object] = visualization_estimates()
+    if not isinstance(est, dict):
+        raise TypeError("PF visualization_estimates() must return a dictionary.")
     particle_positions: dict[str, NDArray[np.float64]] = {}
     particle_weights: dict[str, NDArray[np.float64]] = {}
     particle_representative_positions: dict[str, NDArray[np.float64]] = {}
@@ -1763,15 +2015,13 @@ def build_frame_from_pf(
             )
         if iso in est:
             value = est[iso]
-            if hasattr(value, "positions"):
-                est_pos = np.asarray(value.positions, dtype=float)
-                est_str = np.asarray(value.strengths, dtype=float)
-            elif isinstance(value, tuple) and len(value) == 2:
+            if isinstance(value, tuple) and len(value) == 2:
                 est_pos = np.asarray(value[0], dtype=float)
                 est_str = np.asarray(value[1], dtype=float)
             else:
                 raise TypeError(
-                    "PF estimate_all() must return (positions, strengths) "
+                    "PF visualization_estimates() must return "
+                    "(positions, strengths) "
                     f"for isotope {iso}."
                 )
         else:
@@ -1781,35 +2031,24 @@ def build_frame_from_pf(
         est_str = np.asarray(est_str, dtype=float).reshape(-1)
         if est_pos.shape[0] != est_str.shape[0]:
             raise ValueError(
-                "PF estimate_all() must return one strength per estimated "
+                "PF visualization_estimates() must return one strength per estimated "
                 f"source for isotope {iso}."
             )
         if np.any(~np.isfinite(est_pos)) or np.any(~np.isfinite(est_str)):
-            raise ValueError(f"PF estimate_all() returned non-finite values for {iso}.")
+            raise ValueError(
+                "PF visualization_estimates() returned non-finite values "
+                f"for {iso}."
+            )
         estimated_sources[iso] = est_pos
         estimated_strengths[iso] = est_str
 
     robot_pos = np.asarray(detector_position, dtype=float)
     if robot_pos.shape != (3,) or np.any(~np.isfinite(robot_pos)):
         raise ValueError("detector_position must be a finite XYZ vector.")
-    duration = float(live_time_s)
-    if not np.isfinite(duration) or duration <= 0.0:
-        raise ValueError("live_time_s must be finite and positive.")
-    rotation_fe = (
-        np.eye(3, dtype=float) if RFe is None else np.asarray(RFe, dtype=float)
-    )
-    rotation_pb = (
-        np.eye(3, dtype=float) if RPb is None else np.asarray(RPb, dtype=float)
-    )
-
     return PFFrame(
         step_index=step_index,
         time=time_sec,
         robot_position=robot_pos,
-        robot_orientation=None,
-        RFe=rotation_fe,
-        RPb=rotation_pb,
-        duration=duration,
         particle_positions=particle_positions,
         particle_weights=particle_weights,
         estimated_sources=estimated_sources,

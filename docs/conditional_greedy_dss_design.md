@@ -31,9 +31,8 @@ robot-pose selection:
 8. Exact search retains 512 PF planning particles, 50 predictive samples,
    float64 arithmetic, the production full-spectrum law, and 121-ray detector
    aperture integration. Poses are processed in batches of at most four.
-9. Every exact pose compares conditional greedy, all 448 one-pass 1-swap
-   neighbors, and the EIG leader of the legacy 48-program library on the same
-   Monte Carlo observations. The largest EIG is retained.
+9. Every exact pose compares conditional greedy with all 448 one-pass 1-swap
+   neighbors on the same Monte Carlo observations. The largest EIG is retained.
 10. Only contenders or poses whose paired EIG/score gap is not separated from
     zero are checked with an independent seed. This confirmation does not
     lower particle count, sample count, or response fidelity.
@@ -52,20 +51,28 @@ The PF repository owns posterior sampling, conditional-greedy subset search,
 adaptive pose budgeting, spatial utility, and diagnostics. PF code receives an
 opaque cache and cannot extract or approximate the runtime nuisance axes.
 
-The 48-program implementation is not imported by the conditional-greedy core.
-It remains available only through the legacy policy, RA-L baseline paths, and
-the narrow `legacy_program_guard` adapter. The generic `ShieldProgram` value is
-defined independently, so removing the compatibility guard does not affect the
-all-pairs search. Live acquisition's prior-only first station also uses a
-standalone balanced traversal that reproduces the former first program without
-importing the 48-program builder. The old builder is imported lazily only when
-a legacy or shadow policy explicitly requests it.
+Production exposes only the conditional all-pairs search. The retired
+48-program builder, its non-regression guard, and the old shadow/execution
+policies have been deleted rather than retained behind feature flags. Explicit
+RA-L comparison variants may still supply one fixed `ShieldProgram`, but that
+baseline cannot select or reconstruct the retired program library. Live
+acquisition's prior-only first station uses an independent balanced bootstrap
+traversal.
+
+Schema-v2 represents disabled compound spatial terms explicitly. A disabled
+local-orbit term requires an empty radius list and a null sigma; a disabled
+elevation term requires null scale and angle fields. Coverage-floor weight and
+quantile are either both positive or both zero, and disabling coverage also
+requires a zero exact-shortlist coverage reserve. The production loader rejects
+mixed active/inactive representations before connecting to the runtime. The
+RA-L `eig_only_path` uses these disabled states and retains only full-spectrum
+EIG and runtime-authored motion-time costs in its controlling pose score.
 
 ## Compute contract
 
 The response is kept as 64 unique views rather than expanded to 48 programs by
 eight views. Full-spectrum view terms are prepared once in bounded view slabs;
-greedy, one-swap, and incumbent evaluation then use selection-matrix reductions
+greedy and one-swap evaluation then use selection-matrix reductions
 without a scalar Python loop over pair candidates.
 
 The default scheduling is memory-aware:
@@ -146,11 +153,10 @@ or a replacement for a fresh independent full simulation.
 ## Limits and claims
 
 Conditional greedy followed by one 1-swap pass is not exhaustive search over
-all `C(64, 8)` subsets and has no global-optimality guarantee. The legacy floor
-prevents regression relative to the current 48 programs on the same finite MC
-sample, but does not prove optimality outside those candidates. The 8--16 pose
-shortlist is an uncertainty-controlled compute budget, not proof that the
-selected pose is globally optimal among all reachable poses.
+all `C(64, 8)` subsets and has no global-optimality guarantee. There is no
+compatibility floor that may override this decision. The 8--16 pose shortlist
+is an uncertainty-controlled compute budget, not proof that the selected pose
+is globally optimal among all reachable poses.
 
 The planner may use detailed runtime diagnostics internally, but the durable audit
 keeps only physical pose/subset counts, selected action/EIG, the EIG leader, compact
@@ -175,7 +181,7 @@ non-controlling shadow policy over view counts `{2, 4, 8}`:
   reusing the samples that selected the prefix. This avoids an in-sample
   winner's-curse interpretation of the paired interval. Physical response is
   reused; only virtual observations and likelihood reductions are repeated.
-  The executed K=8 one-swap/legacy-guard result remains separate and unchanged.
+  The executed K=8 one-swap result remains separate and unchanged.
 - The executed K=8 pose shortlist remains controlling. When it contains fewer
   than the configured maximum of 16 poses, K-specific proxy leaders fill only
   the unused audit capacity. These extra poses cannot affect the executed pose
@@ -189,11 +195,9 @@ non-controlling shadow policy over view counts `{2, 4, 8}`:
   Particle-diversity warnings, sampler failures, upper-cardinality-boundary
   mass, latest full-spectrum innovation failure, newly activated isotopes, or
   unavailable health force the hypothetical health-gated action to eight.
-- `measurement_time_weight` does not enter the shadow decision, pose score used by
-  that decision, the returned `ShieldProgram`, runtime station completion, or
-  measurement budget. The compact audit retains marginal EIG per added live second,
-  but drops the uncalibrated time-weight counterfactual and derivable elapsed-time
-  arrays.
+- The shadow decision does not apply an uncalibrated measurement-time utility.
+  The compact audit retains marginal EIG per added live second; executed timing and
+  the fixed eight-view budget remain runtime-owned facts.
 
 The audit stores point-rule, paired-LCB, and health-gated hypothetical actions. The
 top-level selected action plus `actual_execution` records that acquisition remained

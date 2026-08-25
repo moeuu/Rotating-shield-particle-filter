@@ -55,7 +55,7 @@ class ConditionalPoseChunkPlan:
     device_headroom_bytes: int | None
     schedulable_device_bytes: int | None
     memory_limited_pose_capacity: int | None
-    single_pose_low_memory_fallback: bool
+    single_pose_low_memory_schedule: bool
     accelerator_memory: AcceleratorMemorySnapshot | None
 
     def diagnostics(self) -> dict[str, object]:
@@ -273,7 +273,7 @@ def plan_conditional_pose_chunk(
     headroom: int | None = None
     schedulable: int | None = None
     memory_capacity: int | None = None
-    fallback = False
+    single_pose_schedule = False
     if snapshot is None:
         chunk_size = min(
             int(requested_pose_count),
@@ -314,7 +314,7 @@ def plan_conditional_pose_chunk(
             int(budget_capacity),
             int(memory_capacity),
         )
-    fallback = bool(
+    single_pose_schedule = bool(
         workload == "exact"
         and int(requested_pose_count) >= _EXACT_MINIMUM_POSE_CHUNK
         and int(chunk_size) < _EXACT_MINIMUM_POSE_CHUNK
@@ -363,7 +363,7 @@ def plan_conditional_pose_chunk(
         device_headroom_bytes=headroom,
         schedulable_device_bytes=schedulable,
         memory_limited_pose_capacity=memory_capacity,
-        single_pose_low_memory_fallback=bool(fallback),
+        single_pose_low_memory_schedule=bool(single_pose_schedule),
         accelerator_memory=snapshot,
     )
 

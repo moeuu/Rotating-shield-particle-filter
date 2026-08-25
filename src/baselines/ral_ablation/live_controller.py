@@ -7,7 +7,7 @@ from collections.abc import Sequence
 import json
 from pathlib import Path
 
-from baselines.ral_ablation.control_policy import load_ral_control_policy
+from baselines.ral_ablation.control_policy import load_ral_control_policy_document
 from pf.closed_loop import run_pf_closed_loop
 
 
@@ -18,10 +18,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--control-policy", type=Path, required=True)
+    parser.add_argument("--expected-control-policy-sha256", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--profile", choices=("pf_strict",), default="pf_strict")
     parser.add_argument("--seed", type=int, required=True)
     args = parser.parse_args(None if argv is None else list(argv))
+    policy_document = load_ral_control_policy_document(
+        args.control_policy,
+        expected_source_sha256=args.expected_control_policy_sha256,
+    )
     result = run_pf_closed_loop(
         args.session_socket,
         runtime_root=args.runtime_root,
@@ -29,7 +34,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=args.output_dir,
         profile=args.profile,
         seed=args.seed,
-        control_policy=load_ral_control_policy(args.control_policy),
+        control_policy=policy_document.policy(),
     )
     print(json.dumps(result.to_dict(), sort_keys=True, allow_nan=False))
     return 0

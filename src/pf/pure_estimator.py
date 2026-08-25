@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import numpy as np
@@ -27,10 +28,10 @@ from pf.profiles import (
     resolve_structural_transition_provenance,
 )
 from pf.provenance import (
-    canonical_json_bytes,
     repository_commit,
     repository_source_snapshot_sha256,
-    sha256_json,
+    strict_canonical_json_bytes,
+    strict_sha256_json,
 )
 from pf.structural_rj import (
     POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
@@ -39,6 +40,7 @@ from pf.structural_rj import (
     poisson_geometric_tail_cardinality_probabilities,
     validate_cardinality_prior_policy,
 )
+from pf.strength_prior import STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY
 
 
 class PurePFBoundaryError(RuntimeError):
@@ -114,18 +116,17 @@ class PurePFEstimator(_PFEstimatorCore):
     def __init__(
         self,
         *,
-        measurement_log_schema_version: int = 2,
-        config_hash: str | None = None,
-        resolved_config_hash: str | None = None,
-        measurement_log_sha256: str = "unavailable",
-        random_seed: int = 0,
+        measurement_log_schema_version: int,
+        config_hash: str,
+        resolved_config_hash: str,
+        measurement_log_sha256: str,
+        random_seed: int,
         **kwargs: Any,
     ) -> None:
         """Initialize the PF and its immutable result provenance."""
         pure_config = kwargs.get("pf_config")
         if pure_config is None:
-            pure_config = RotatingShieldPFConfig()
-            kwargs["pf_config"] = pure_config
+            raise TypeError("PurePFEstimator requires an explicit pf_config.")
         capabilities = apply_profile_to_config(pure_config)
         super().__init__(random_seed=random_seed, **kwargs)
         if apply_profile_to_config(self.pf_config) != capabilities:
@@ -142,19 +143,35 @@ class PurePFEstimator(_PFEstimatorCore):
                 "PurePFEstimator supports MeasurementLog schema version 2 only."
             )
         self.measurement_log_schema_version = measurement_log_schema_version
-        self.resolved_config_hash = (
-            str(resolved_config_hash)
-            if resolved_config_hash is not None
-            else sha256_json(self.pf_config)
-        )
-        self.config_hash = (
-            str(config_hash)
-            if config_hash is not None
-            else str(self.resolved_config_hash)
-        )
-        self.repository_commit = repository_commit()
-        self.repository_source_snapshot_sha256 = repository_source_snapshot_sha256()
-        self.measurement_log_sha256 = str(measurement_log_sha256)
+        for name, value in (
+            ("config_hash", config_hash),
+            ("resolved_config_hash", resolved_config_hash),
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest.")
+        self.resolved_config_hash = resolved_config_hash
+        self.config_hash = config_hash
+        commit = repository_commit()
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None:
+            raise PurePFBoundaryError(
+                "PF repository commit provenance is unavailable."
+            )
+        source_snapshot = repository_source_snapshot_sha256()
+        if re.fullmatch(r"[0-9a-f]{64}", source_snapshot) is None:
+            raise PurePFBoundaryError(
+                "PF repository source-snapshot provenance is unavailable."
+            )
+        self.repository_commit = commit
+        self.repository_source_snapshot_sha256 = source_snapshot
+        if measurement_log_sha256 != "unavailable" and re.fullmatch(
+            r"[0-9a-f]{64}",
+            measurement_log_sha256,
+        ) is None:
+            raise ValueError(
+                "measurement_log_sha256 must be 'unavailable' during live "
+                "ingestion or a lowercase SHA-256 digest."
+            )
+        self.measurement_log_sha256 = measurement_log_sha256
 
     @property
     def estimator_variant(self) -> str:
@@ -255,6 +272,9 @@ class PurePFEstimator(_PFEstimatorCore):
             "contract_hash_sha256",
             None,
         )
+        strength_prior = self.pf_config.build_strength_prior()
+        strength_prior_config = self.pf_config.strength_prior
+        support_maximum = strength_prior.support_maximum
         manifest_completeness = (
             "complete"
             if atlas_status in {"complete", "not_applicable"}
@@ -331,31 +351,36 @@ class PurePFEstimator(_PFEstimatorCore):
                 "external_optimizer": False,
             },
             "strength_prior": {
-                "kind": str(self.pf_config.strength_prior_family),
-                "minimum_cps_1m": float(self.pf_config.strength_prior_min_cps_1m),
-                "maximum_cps_1m": (
-                    None
-                    if self.pf_config.strength_prior_family == "shifted_gamma"
-                    else float(self.pf_config.strength_prior_max_cps_1m)
-                ),
-                "legacy_proposal_grid_maximum_cps_1m": float(
-                    self.pf_config.strength_prior_max_cps_1m
-                ),
+                "kind": str(strength_prior_config.kind),
+                "minimum_cps_1m": float(strength_prior.minimum),
                 "support_maximum_cps_1m": (
                     None
-                    if self.pf_config.strength_prior_family == "shifted_gamma"
-                    else float(self.pf_config.strength_prior_max_cps_1m)
+                    if not np.isfinite(support_maximum)
+                    else float(support_maximum)
                 ),
-                "gamma_shape": (
-                    float(self.pf_config.strength_prior_gamma_shape)
-                    if self.pf_config.strength_prior_family == "shifted_gamma"
+                "support_upper_unbounded": bool(
+                    not np.isfinite(support_maximum)
+                ),
+                "shape": (
+                    float(strength_prior.gamma_shape)
+                    if strength_prior.family == "shifted_gamma"
                     else None
                 ),
-                "gamma_scale_cps_1m": (
-                    float(self.pf_config.strength_prior_gamma_scale_cps_1m)
-                    if self.pf_config.strength_prior_family == "shifted_gamma"
+                "scale_cps_1m": (
+                    float(strength_prior.gamma_scale)
+                    if strength_prior.family == "shifted_gamma"
                     else None
                 ),
+                "proposal_grid_upper_quantile": {
+                    "probability": (
+                        STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY
+                    ),
+                    "value_cps_1m": float(
+                        strength_prior.finite_upper_quantile(
+                            STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY
+                        )
+                    ),
+                },
                 "units": "detector_cps_1m",
                 "unit_definition": ("expected_pre_dead_time_detector_pulse_rate_at_1m"),
                 "used_for_initialization": True,
@@ -453,7 +478,7 @@ class PurePFEstimator(_PFEstimatorCore):
                     "direct_continuous_xyz_kernel_without_chart_interpolation"
                 ),
                 "strength_proposal": (
-                    f"{self.pf_config.strength_prior_family}_prior_plus_"
+                    f"{strength_prior.family}_prior_plus_"
                     "chart_conditional_truncated_normal_mixture"
                 ),
                 "strength_proposal_prior_component_probability": float(
@@ -916,18 +941,6 @@ class PurePFEstimator(_PFEstimatorCore):
             structural_model_manifest=self.structural_model_manifest(),
         )
 
-    def estimates(
-        self,
-    ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Project the PF posterior into the historical array result format."""
-        return self._project_posterior_point_estimates(self.posterior_point_estimate())
-
-    def estimate_all(
-        self,
-    ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Return the PF posterior projection for visualization."""
-        return self.estimates()
-
     def serialized_state(self) -> bytes:
         """Return canonical bytes for causality and determinism tests."""
         if self.filters:
@@ -946,46 +959,57 @@ class PurePFEstimator(_PFEstimatorCore):
                             else particle.joint_row_identity.to_dict()
                         ),
                         "num_sources": int(state.num_sources),
-                        "strengths": np.asarray(state.strengths, dtype=float),
+                        "strengths": np.asarray(
+                            state.strengths,
+                            dtype=float,
+                        ).tolist(),
                         "surface_chart_ids": np.asarray(
                             state.surface_chart_ids,
                             dtype=np.int64,
-                        ),
+                        ).tolist(),
                         "surface_uv": np.asarray(
                             state.surface_uv,
                             dtype=np.float64,
-                        ),
+                        ).tolist(),
                     }
                 )
             isotope_payload[str(isotope)] = particles
         measurement_history = [
             {
-                "spectrum_counts_b": measurement.spectrum_counts_b,
+                "spectrum_counts_b": np.asarray(
+                    measurement.spectrum_counts_b,
+                    dtype=np.float64,
+                ).tolist(),
                 "pose_idx": int(measurement.pose_idx),
-                "fe_index": measurement.fe_index,
-                "pb_index": measurement.pb_index,
-                "detector_position_xyz_m": measurement.detector_position_xyz_m,
+                "fe_index": int(measurement.fe_index),
+                "pb_index": int(measurement.pb_index),
+                "detector_position_xyz_m": np.asarray(
+                    measurement.detector_position_xyz_m,
+                    dtype=np.float64,
+                ).tolist(),
                 "live_time_s": float(measurement.live_time_s),
-                "station_sequence_id": measurement.station_sequence_id,
-                "station_view_index": measurement.station_view_index,
+                "station_sequence_id": int(measurement.station_sequence_id),
+                "station_view_index": int(measurement.station_view_index),
                 "generative_contract_hash_sha256": (
                     measurement.generative_contract_hash_sha256
                 ),
             }
             for measurement in self.measurements
         ]
-        return canonical_json_bytes(
+        return strict_canonical_json_bytes(
             {
                 "schema_version": 1,
                 "estimator_variant": self.estimator_variant,
                 "measurement_count": len(self.measurements),
                 "measurement_poses_xyz": [
-                    np.asarray(pose, dtype=float) for pose in self.poses
+                    np.asarray(pose, dtype=float).tolist() for pose in self.poses
                 ],
                 "measurement_pose_indices": [
                     int(measurement.pose_idx) for measurement in self.measurements
                 ],
-                "measurement_history_sha256": sha256_json(measurement_history),
+                "measurement_history_sha256": strict_sha256_json(
+                    measurement_history
+                ),
                 "pure_pf_schema_version": PURE_PF_SCHEMA_VERSION,
                 "joint_row_identity_contract": {
                     "schema_version": 1,
@@ -997,7 +1021,7 @@ class PurePFEstimator(_PFEstimatorCore):
                         else np.asarray(
                             self._joint_cumulative_lineage_ids,
                             dtype=np.int64,
-                        )
+                        ).tolist()
                     ),
                 },
                 "rng_provenance": self.rng_provenance,
@@ -1015,7 +1039,7 @@ class PurePFEstimator(_PFEstimatorCore):
                     "energy_axis_keV": np.asarray(
                         self._full_spectrum_model().energy_axis_keV,
                         dtype=np.float64,
-                    ),
+                    ).tolist(),
                     "transport_feature_order": list(
                         self._full_spectrum_model().transport_feature_order
                     ),

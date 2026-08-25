@@ -65,6 +65,13 @@ def _local_orbit_gains_batch(
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
     if candidates.ndim != 2 or candidates.shape[1] != 3:
         raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
+    if not config.ring_radii_m:
+        if (
+            float(config.lambda_local_orbit) != 0.0
+            or config.local_orbit_sigma_m is not None
+        ):
+            raise ValueError("Local-orbit disabled-state configuration is invalid.")
+        return np.zeros(candidates.shape[0], dtype=float)
     radii = np.asarray(
         [float(radius) for radius in config.ring_radii_m if float(radius) > 0.0],
         dtype=float,
@@ -90,6 +97,8 @@ def _local_orbit_gains_batch(
     radial_error = np.min(
         np.abs(xy_distances[:, :, None] - radii[None, None, :]), axis=2
     )
+    if config.local_orbit_sigma_m is None:
+        raise ValueError("Active local-orbit scoring requires a numeric sigma.")
     sigma = float(config.local_orbit_sigma_m)
     radial_gain = np.exp(-0.5 * (radial_error / sigma) ** 2)
     isotope_count = len(modes_by_isotope)
@@ -113,6 +122,17 @@ def _elevation_condition_gains_batch(
     gains = np.zeros(candidates.shape[0], dtype=float)
     if candidates.shape[0] == 0:
         return gains
+    elevation_parameters = (
+        config.elevation_pair_z_scale_m,
+        config.elevation_pair_xy_scale_m,
+        config.elevation_angle_threshold_deg,
+    )
+    if all(value is None for value in elevation_parameters):
+        if float(config.lambda_elevation_condition) != 0.0:
+            raise ValueError("Elevation disabled-state configuration is invalid.")
+        return gains
+    if any(value is None for value in elevation_parameters):
+        raise ValueError("Elevation parameters must be all numeric or all null.")
     threshold = np.deg2rad(float(config.elevation_angle_threshold_deg))
     isotope_weight_values: list[float] = []
     isotope_gain_rows: list[NDArray[np.float64]] = []

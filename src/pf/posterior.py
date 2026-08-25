@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import itertools
 from numbers import Real
 from typing import Any, Callable, Mapping, Sequence
@@ -303,17 +303,17 @@ class PFPosteriorSnapshot:
     random_seed: int
     profile_capability_map: Mapping[str, bool]
     record_count: int
-    structural_transition_provenance: Mapping[str, Any] = field(default_factory=dict)
+    structural_transition_provenance: Mapping[str, Any]
+    structural_model_manifest: Mapping[str, Any]
     schema_version: int = 2
-    structural_model_manifest: Mapping[str, Any] = field(default_factory=dict)
-    pure_pf_schema_version: int = 1
+    pure_pf_schema_version: int = 2
 
     def to_dict(self) -> dict[str, Any]:
         """Return the required JSON-safe PF result contract."""
         validated_schema_fields: dict[str, int] = {}
         for field_name, value, expected in (
             ("schema_version", self.schema_version, 2),
-            ("pure_pf_schema_version", self.pure_pf_schema_version, 1),
+            ("pure_pf_schema_version", self.pure_pf_schema_version, 2),
             (
                 "measurement_log_schema_version",
                 self.measurement_log_schema_version,

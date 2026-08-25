@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from pf.provenance import json_safe
+from pf.provenance import strict_canonical_json_bytes, strict_json_loads
 
 
 PF_RNG_PROVENANCE_SCHEMA_VERSION = 1
@@ -178,7 +178,9 @@ def validate_pf_rng_provenance(
     """Validate logged PF RNG provenance and return its canonical mapping."""
     if not isinstance(value, Mapping):
         raise ValueError("PF RNG provenance must be an object.")
-    actual = json_safe(dict(value))
+    actual = strict_json_loads(strict_canonical_json_bytes(value))
+    if not isinstance(actual, dict):  # pragma: no cover - Mapping invariant.
+        raise ValueError("PF RNG provenance must serialize as an object.")
     expected = pf_rng_provenance(root_seed, isotopes)
     if actual != expected:
         raise ValueError(

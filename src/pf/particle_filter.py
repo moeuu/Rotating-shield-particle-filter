@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-import math
 from typing import TYPE_CHECKING, Callable
 
 import numpy as np
@@ -13,11 +12,8 @@ from numpy.typing import NDArray
 from measurement.kernels import MeasurementGeometry, ShieldParams
 from measurement.obstacles import ObstacleGrid
 from measurement.surface_atlas import ContinuousSurfaceAtlas
-from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.diagnostics import build_source_event_record, reset_step_diagnostics
-from pf.particle_filter_math import (
-    extended_log_target_ratio as _extended_log_target_ratio,  # noqa: F401
-)
+from pf.estimator_config import RotatingShieldPFConfig
 from pf.particle_filter_rj_basic import StructuralRJBasicMoveMixin
 from pf.particle_filter_rj_block import StructuralRJBlockIndependenceMixin
 from pf.particle_filter_rj_multi import StructuralRJMultiComponentMixin
@@ -26,15 +22,9 @@ from pf.particle_filter_rj_runtime import StructuralRJSweepMixin
 from pf.particle_filter_rj_split_merge import StructuralRJSplitMergeMixin
 from pf.particle_filter_rj_target import StructuralRJTargetMixin
 from pf.particle_filter_surface import ParticleSurfaceMixin
-from pf.particle_filter_tempering import (
-    ParticleTemperingMixin,
-    TemperingIncrementRequiresRejuvenation,  # noqa: F401
-)
+from pf.particle_filter_tempering import ParticleTemperingMixin
 from pf.posterior import posterior_point_estimate_from_states
-from pf.particle_types import (
-    StructuralGeometryBatch,
-    TorchLineTransportComponents,  # noqa: F401
-)
+from pf.particle_types import StructuralGeometryBatch
 from pf.randomness import isotope_random_generator, normalize_pf_random_seed
 from pf.state import IsotopeState
 from pf.strength_prior import StrengthPrior
@@ -45,11 +35,9 @@ from pf.structural_rj import (
     CardinalityPrior,
     ContinuousStrengthProposal,
     ContinuousSurfacePositionProposal,
-    TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
     SplitMergeMoveProbabilities,
     truncated_poisson_cardinality_probabilities,
     poisson_geometric_tail_cardinality_probabilities,
-    validate_cardinality_prior_policy,
 )
 
 if TYPE_CHECKING:
@@ -65,454 +53,6 @@ def _canonical_sha256(value: object, *, name: str) -> str:
     ):
         raise ValueError(f"{name} must be a lowercase SHA-256 string.")
     return value
-
-
-def _strict_config_boolean(value: object, *, name: str) -> bool:
-    """Return one exact PF configuration boolean."""
-    if not isinstance(value, bool):
-        raise TypeError(f"{name} must be a boolean.")
-    return value
-
-
-def _strict_config_integer(
-    value: object,
-    *,
-    name: str,
-    minimum: int,
-) -> int:
-    """Return one exact PF configuration integer above a lower bound."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(
-        value,
-        (int, np.integer),
-    ):
-        raise TypeError(f"{name} must be an integer.")
-    resolved = int(value)
-    if resolved < minimum:
-        raise ValueError(f"{name} must be at least {minimum}.")
-    return resolved
-
-
-def _strict_config_number(value: object, *, name: str) -> float:
-    """Return one finite numeric PF configuration value."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(
-        value,
-        (int, float, np.integer, np.floating),
-    ):
-        raise TypeError(f"{name} must be numeric.")
-    resolved = float(value)
-    if not np.isfinite(resolved):
-        raise ValueError(f"{name} must be finite.")
-    return resolved
-
-
-@dataclass
-class PFConfig:
-    """Particle filter configuration (Sec. 3.4)."""
-
-    num_particles: int = 200
-    max_sources: int | None = DEFAULT_MAX_SOURCES_PER_ISOTOPE
-    hard_max_sources: int | None = None
-    variable_cardinality: bool = True
-    structural_rj_surface_chart_max_edge_m: float = 1.0
-    structural_rj_move_probability: float = 1.0
-    structural_rj_birth_probability: float = 0.5
-    structural_rj_death_probability: float = 0.5
-    structural_rj_position_move_probability: float = 1.0
-    structural_rj_position_proposal_prior_weight: float = 0.5
-    structural_rj_strength_proposal_prior_weight: float = 0.5
-    structural_rj_strength_proposal_sigma_fraction: float = 0.15
-    structural_rj_strength_proposal_grid_size: int = 5
-    structural_rj_proposal_chart_batch_size: int = 256
-    structural_rj_proposal_score_cache_max_bytes: int = 268_435_456
-    structural_rj_local_position_move_probability: float = 1.0
-    structural_rj_local_position_sigma_m: float = 0.5
-    structural_rj_strength_move_probability: float = 1.0
-    structural_rj_split_merge_probability: float = 1.0
-    structural_rj_block_independence_probability: float = 0.1
-    structural_rj_multi_component_probability: float = 0.1
-    structural_rj_multi_component_max_group_size: int = 4
-    structural_rj_split_probability: float = 0.5
-    structural_rj_merge_probability: float = 0.5
-    structural_rj_split_global_position_probability: float = 0.1
-    structural_rj_merge_uniform_pair_probability: float = 0.1
-    structural_rj_merge_distance_sigma_m: float = 0.5
-    structural_rj_merge_response_sigma: float = 0.05
-    structural_cardinality_prior_policy: str = (
-        TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY
-    )
-    structural_cardinality_prior_probs: tuple[float, ...] | None = None
-    structural_cardinality_prior_mean: float = 2.0
-    structural_cardinality_tail_ratio: float = 0.05
-    target_ess_ratio: float = 0.5
-    max_temper_steps: int = 256
-    min_delta_beta: float = 1e-10
-    # Continuous PF priors (Sec. 3.3.2)
-    position_max: tuple[float, float, float] = (10.0, 10.0, 10.0)
-    init_num_sources: tuple[int, int] = (
-        0,
-        DEFAULT_MAX_SOURCES_PER_ISOTOPE,
-    )
-    strength_prior_min_cps_1m: float = 1.0
-    strength_prior_max_cps_1m: float = 2_000_000.0
-    strength_prior_family: str = "bounded_uniform"
-    strength_prior_gamma_shape: float = 2.0
-    strength_prior_gamma_scale_cps_1m: float = 425_000.0
-    use_gpu: bool = True
-    gpu_device: str = "cuda"
-    gpu_dtype: str = "float64"
-
-    def __post_init__(self) -> None:
-        """Normalize the exact surface-PF configuration and likelihood semantics."""
-        for name, value, minimum in (
-            ("num_particles", self.num_particles, 1),
-            (
-                "structural_rj_strength_proposal_grid_size",
-                self.structural_rj_strength_proposal_grid_size,
-                2,
-            ),
-            (
-                "structural_rj_proposal_chart_batch_size",
-                self.structural_rj_proposal_chart_batch_size,
-                1,
-            ),
-            (
-                "structural_rj_proposal_score_cache_max_bytes",
-                self.structural_rj_proposal_score_cache_max_bytes,
-                1,
-            ),
-            (
-                "structural_rj_multi_component_max_group_size",
-                self.structural_rj_multi_component_max_group_size,
-                3,
-            ),
-            ("max_temper_steps", self.max_temper_steps, 1),
-        ):
-            _strict_config_integer(value, name=name, minimum=minimum)
-        if self.max_sources is None:
-            raise ValueError("Pure PF requires a finite positive max_sources.")
-        _strict_config_integer(
-            self.max_sources,
-            name="max_sources",
-            minimum=1,
-        )
-        if self.hard_max_sources is None:
-            self.hard_max_sources = int(self.max_sources)
-        _strict_config_integer(
-            self.hard_max_sources,
-            name="hard_max_sources",
-            minimum=int(self.max_sources),
-        )
-        _strict_config_boolean(
-            self.variable_cardinality,
-            name="variable_cardinality",
-        )
-        _strict_config_boolean(self.use_gpu, name="use_gpu")
-        if (
-            not isinstance(self.init_num_sources, (tuple, list))
-            or len(self.init_num_sources) != 2
-        ):
-            raise TypeError("init_num_sources must contain two integers.")
-        for index, value in enumerate(self.init_num_sources):
-            _strict_config_integer(
-                value,
-                name=f"init_num_sources[{index}]",
-                minimum=0,
-            )
-        for name in (
-            "structural_rj_surface_chart_max_edge_m",
-            "structural_rj_move_probability",
-            "structural_rj_birth_probability",
-            "structural_rj_death_probability",
-            "structural_rj_position_move_probability",
-            "structural_rj_position_proposal_prior_weight",
-            "structural_rj_strength_proposal_prior_weight",
-            "structural_rj_strength_proposal_sigma_fraction",
-            "structural_rj_local_position_move_probability",
-            "structural_rj_local_position_sigma_m",
-            "structural_rj_strength_move_probability",
-            "structural_rj_split_merge_probability",
-            "structural_rj_block_independence_probability",
-            "structural_rj_multi_component_probability",
-            "structural_rj_split_probability",
-            "structural_rj_merge_probability",
-            "structural_rj_split_global_position_probability",
-            "structural_rj_merge_uniform_pair_probability",
-            "structural_rj_merge_distance_sigma_m",
-            "structural_rj_merge_response_sigma",
-            "structural_cardinality_prior_mean",
-            "structural_cardinality_tail_ratio",
-            "target_ess_ratio",
-            "min_delta_beta",
-            "strength_prior_min_cps_1m",
-            "strength_prior_max_cps_1m",
-            "strength_prior_gamma_shape",
-            "strength_prior_gamma_scale_cps_1m",
-        ):
-            _strict_config_number(getattr(self, name), name=name)
-        if self.structural_cardinality_prior_probs is not None:
-            for index, value in enumerate(self.structural_cardinality_prior_probs):
-                _strict_config_number(
-                    value,
-                    name=f"structural_cardinality_prior_probs[{index}]",
-                )
-        position_max = np.asarray(self.position_max, dtype=object).reshape(-1)
-        if position_max.shape != (3,):
-            raise ValueError("position_max must contain three values.")
-        for index, value in enumerate(position_max):
-            if (
-                _strict_config_number(
-                    value,
-                    name=f"position_max[{index}]",
-                )
-                <= 0.0
-            ):
-                raise ValueError("position_max values must be positive.")
-        if not isinstance(self.gpu_device, str) or not self.gpu_device.strip():
-            raise TypeError("gpu_device must be a nonempty string.")
-        if not isinstance(self.gpu_dtype, str):
-            raise TypeError("gpu_dtype must be a string.")
-        self.num_particles = int(self.num_particles)
-        if self.num_particles < 1:
-            raise ValueError("num_particles must be positive.")
-        if str(self.gpu_dtype).strip().lower() != "float64":
-            raise ValueError("Pure PF production kernels require gpu_dtype='float64'.")
-        self.gpu_dtype = "float64"
-        self.variable_cardinality = bool(self.variable_cardinality)
-        self.structural_cardinality_tail_ratio = float(
-            self.structural_cardinality_tail_ratio
-        )
-        if (
-            self.structural_cardinality_prior_policy
-            == POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY
-            and not 0.0 < self.structural_cardinality_tail_ratio < 1.0
-        ):
-            raise ValueError("structural_cardinality_tail_ratio must lie in (0, 1).")
-        self.structural_rj_surface_chart_max_edge_m = float(
-            self.structural_rj_surface_chart_max_edge_m
-        )
-        if (
-            not np.isfinite(self.structural_rj_surface_chart_max_edge_m)
-            or self.structural_rj_surface_chart_max_edge_m <= 0.0
-        ):
-            raise ValueError(
-                "structural_rj_surface_chart_max_edge_m must be finite and positive."
-            )
-        self.structural_rj_local_position_sigma_m = float(
-            self.structural_rj_local_position_sigma_m
-        )
-        if (
-            not np.isfinite(self.structural_rj_local_position_sigma_m)
-            or self.structural_rj_local_position_sigma_m <= 0.0
-        ):
-            raise ValueError(
-                "structural_rj_local_position_sigma_m must be finite and positive."
-            )
-        self.structural_rj_position_proposal_prior_weight = float(
-            self.structural_rj_position_proposal_prior_weight
-        )
-        if (
-            not np.isfinite(self.structural_rj_position_proposal_prior_weight)
-            or self.structural_rj_position_proposal_prior_weight <= 0.0
-            or self.structural_rj_position_proposal_prior_weight > 1.0
-        ):
-            raise ValueError(
-                "structural_rj_position_proposal_prior_weight must lie in (0, 1]."
-            )
-        self.structural_rj_strength_proposal_prior_weight = float(
-            self.structural_rj_strength_proposal_prior_weight
-        )
-        if (
-            not np.isfinite(self.structural_rj_strength_proposal_prior_weight)
-            or self.structural_rj_strength_proposal_prior_weight <= 0.0
-            or self.structural_rj_strength_proposal_prior_weight > 1.0
-        ):
-            raise ValueError(
-                "structural_rj_strength_proposal_prior_weight must lie in (0, 1]."
-            )
-        self.structural_rj_strength_proposal_sigma_fraction = float(
-            self.structural_rj_strength_proposal_sigma_fraction
-        )
-        if (
-            not np.isfinite(self.structural_rj_strength_proposal_sigma_fraction)
-            or self.structural_rj_strength_proposal_sigma_fraction <= 0.0
-        ):
-            raise ValueError(
-                "structural_rj_strength_proposal_sigma_fraction must be "
-                "finite and positive."
-            )
-        self.structural_rj_strength_proposal_grid_size = int(
-            self.structural_rj_strength_proposal_grid_size
-        )
-        if self.structural_rj_strength_proposal_grid_size < 2:
-            raise ValueError(
-                "structural_rj_strength_proposal_grid_size must be at least 2."
-            )
-        self.structural_rj_proposal_chart_batch_size = int(
-            self.structural_rj_proposal_chart_batch_size
-        )
-        if self.structural_rj_proposal_chart_batch_size < 1:
-            raise ValueError(
-                "structural_rj_proposal_chart_batch_size must be positive."
-            )
-        self.structural_rj_proposal_score_cache_max_bytes = int(
-            self.structural_rj_proposal_score_cache_max_bytes
-        )
-        if self.structural_rj_proposal_score_cache_max_bytes < 1:
-            raise ValueError(
-                "structural_rj_proposal_score_cache_max_bytes must be positive."
-            )
-        for probability_name in (
-            "structural_rj_move_probability",
-            "structural_rj_birth_probability",
-            "structural_rj_death_probability",
-            "structural_rj_position_move_probability",
-            "structural_rj_local_position_move_probability",
-            "structural_rj_strength_move_probability",
-            "structural_rj_split_merge_probability",
-            "structural_rj_block_independence_probability",
-            "structural_rj_multi_component_probability",
-            "structural_rj_split_probability",
-            "structural_rj_merge_probability",
-            "structural_rj_split_global_position_probability",
-            "structural_rj_merge_uniform_pair_probability",
-        ):
-            probability = float(getattr(self, probability_name))
-            if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
-                raise ValueError(f"{probability_name} must lie in [0, 1].")
-            setattr(self, probability_name, probability)
-        for full_support_probability_name in (
-            "structural_rj_split_global_position_probability",
-            "structural_rj_merge_uniform_pair_probability",
-        ):
-            if getattr(self, full_support_probability_name) <= 0.0:
-                raise ValueError(f"{full_support_probability_name} must lie in (0, 1].")
-        self.structural_rj_merge_distance_sigma_m = float(
-            self.structural_rj_merge_distance_sigma_m
-        )
-        if (
-            not np.isfinite(self.structural_rj_merge_distance_sigma_m)
-            or self.structural_rj_merge_distance_sigma_m <= 0.0
-        ):
-            raise ValueError(
-                "structural_rj_merge_distance_sigma_m must be finite and positive."
-            )
-        self.structural_rj_merge_response_sigma = float(
-            self.structural_rj_merge_response_sigma
-        )
-        if (
-            not np.isfinite(self.structural_rj_merge_response_sigma)
-            or self.structural_rj_merge_response_sigma <= 0.0
-        ):
-            raise ValueError(
-                "structural_rj_merge_response_sigma must be finite and positive."
-            )
-        self.structural_rj_multi_component_max_group_size = int(
-            self.structural_rj_multi_component_max_group_size
-        )
-        if self.structural_rj_multi_component_max_group_size < 3:
-            raise ValueError(
-                "structural_rj_multi_component_max_group_size must be at least 3."
-            )
-        if self.max_sources is None or int(self.max_sources) < 1:
-            raise ValueError("Pure PF requires a finite positive max_sources.")
-        self.max_sources = int(self.max_sources)
-        strength_prior = StrengthPrior(
-            minimum=self.strength_prior_min_cps_1m,
-            maximum=self.strength_prior_max_cps_1m,
-            family=self.strength_prior_family,
-            gamma_shape=self.strength_prior_gamma_shape,
-            gamma_scale=self.strength_prior_gamma_scale_cps_1m,
-        )
-        if strength_prior.minimum <= 0.0:
-            raise ValueError(
-                "Pure PF source states require a strictly positive strength "
-                "prior minimum."
-            )
-        self.strength_prior_min_cps_1m = strength_prior.minimum
-        self.strength_prior_max_cps_1m = strength_prior.maximum
-        self.strength_prior_family = strength_prior.family
-        self.strength_prior_gamma_shape = strength_prior.gamma_shape
-        self.strength_prior_gamma_scale_cps_1m = strength_prior.gamma_scale
-        self.structural_cardinality_prior_policy = validate_cardinality_prior_policy(
-            self.structural_cardinality_prior_policy,
-            has_explicit_probabilities=(
-                self.structural_cardinality_prior_probs is not None
-            ),
-        )
-        if self.structural_cardinality_prior_probs is not None:
-            cardinality_prior = np.asarray(
-                self.structural_cardinality_prior_probs,
-                dtype=float,
-            ).reshape(-1)
-            if (
-                cardinality_prior.size != int(self.hard_max_sources) + 1
-                or np.any(~np.isfinite(cardinality_prior))
-                or np.any(cardinality_prior <= 0.0)
-            ):
-                raise ValueError(
-                    "structural_cardinality_prior_probs must contain "
-                    "hard_max_sources + 1 finite positive values."
-                )
-            cardinality_prior /= math.fsum(float(value) for value in cardinality_prior)
-            self.structural_cardinality_prior_probs = tuple(
-                float(value) for value in cardinality_prior
-            )
-        self.structural_cardinality_prior_mean = float(
-            self.structural_cardinality_prior_mean
-        )
-        if (
-            not np.isfinite(self.structural_cardinality_prior_mean)
-            or self.structural_cardinality_prior_mean <= 0.0
-        ):
-            raise ValueError(
-                "structural_cardinality_prior_mean must be finite and positive."
-            )
-        initial_lower, initial_upper = (
-            int(self.init_num_sources[0]),
-            int(self.init_num_sources[1]),
-        )
-        if self.variable_cardinality:
-            if (
-                self.structural_rj_move_probability <= 0.0
-                or self.structural_rj_birth_probability <= 0.0
-                or self.structural_rj_death_probability <= 0.0
-            ):
-                raise ValueError(
-                    "Variable-cardinality pure PF requires positive structural "
-                    "move, birth, and death proposal probabilities."
-                )
-            if initial_lower != 0 or initial_upper != self.max_sources:
-                raise ValueError(
-                    "Variable-cardinality pure PF initialization must cover "
-                    "every cardinality from zero through max_sources."
-                )
-            if self.num_particles < self.max_sources + 1:
-                raise ValueError(
-                    "Variable-cardinality pure PF requires at least one initial "
-                    "particle per cardinality from zero through max_sources."
-                )
-        elif (
-            initial_lower != initial_upper
-            or initial_lower < 0
-            or initial_upper > self.max_sources
-        ):
-            raise ValueError(
-                "Fixed-cardinality pure PF requires "
-                "init_num_sources=(K, K) within zero through max_sources."
-            )
-        self.init_num_sources = (initial_lower, initial_upper)
-        self.target_ess_ratio = float(self.target_ess_ratio)
-        if (
-            not np.isfinite(self.target_ess_ratio)
-            or not 0.0 < self.target_ess_ratio < 1.0
-        ):
-            raise ValueError("target_ess_ratio must lie strictly between zero and one.")
-        self.max_temper_steps = int(self.max_temper_steps)
-        if self.max_temper_steps < 1:
-            raise ValueError("max_temper_steps must be positive.")
-        self.min_delta_beta = float(self.min_delta_beta)
-        if not np.isfinite(self.min_delta_beta) or not 0.0 < self.min_delta_beta <= 1.0:
-            raise ValueError("min_delta_beta must lie in (0, 1].")
 
 
 @dataclass(frozen=True)
@@ -660,7 +200,7 @@ class IsotopeParticleFilter(
         self,
         isotope: str,
         kernel: MeasurementGeometry | None,
-        config: PFConfig | None = None,
+        config: RotatingShieldPFConfig | None = None,
         obstacle_grid: ObstacleGrid | None = None,
         obstacle_height_m: float = 2.0,
         obstacle_mu_by_isotope: dict[str, float] | None = None,
@@ -678,7 +218,7 @@ class IsotopeParticleFilter(
         """Initialize particle state, priors, and continuous measurement kernels."""
         self.isotope = isotope
         self.kernel = kernel
-        self.config = config or PFConfig()
+        self.config = config or RotatingShieldPFConfig()
         self.N = self.config.num_particles
         self.obstacle_grid = obstacle_grid
         self.obstacle_height_m = float(obstacle_height_m)
@@ -779,7 +319,6 @@ class IsotopeParticleFilter(
         self.last_temper_steps: list[dict[str, float]] = []
         self.last_temper_resample_count = 0
         self.last_temper_min_ess: float | None = None
-        self.last_unique_ancestor_count: int | None = None
         self.last_station_unique_ancestor_count: int | None = None
         self.last_cumulative_unique_ancestor_count: int | None = None
         self.last_source_event_diagnostics: list[dict[str, object]] = []
@@ -800,13 +339,7 @@ class IsotopeParticleFilter(
 
     def _build_strength_prior(self) -> StrengthPrior:
         """Build the normalized strength prior shared by initialization and moves."""
-        return StrengthPrior(
-            minimum=float(self.config.strength_prior_min_cps_1m),
-            maximum=float(self.config.strength_prior_max_cps_1m),
-            family=str(self.config.strength_prior_family),
-            gamma_shape=float(self.config.strength_prior_gamma_shape),
-            gamma_scale=float(self.config.strength_prior_gamma_scale_cps_1m),
-        )
+        return self.config.build_strength_prior()
 
     def _build_structural_cardinality_prior(self) -> NDArray[np.float64]:
         """Return the normalized prior mass for cardinalities zero through max."""

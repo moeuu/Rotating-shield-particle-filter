@@ -10,13 +10,14 @@ import pytest
 
 from measurement.continuous_kernels import LineTransportComponents
 from measurement.source_boundary import surface_transport_positions
+from pf.estimator_config import RotatingShieldPFConfig
 from pf.particle_filter import (
     IsotopeParticleFilter,
-    PFConfig,
     StructuralGeometryBatch,
-    _extended_log_target_ratio,
 )
+from pf.particle_filter_math import extended_log_target_ratio
 from pf.state import IsotopeState
+from pf.strength_prior import BoundedUniformStrengthPriorTestConfig
 
 
 def _fixed_one_source_filter() -> IsotopeParticleFilter:
@@ -24,14 +25,16 @@ def _fixed_one_source_filter() -> IsotopeParticleFilter:
     filt = IsotopeParticleFilter(
         "Cs-137",
         kernel=None,
-        config=PFConfig(
+        config=RotatingShieldPFConfig(
             num_particles=12,
             max_sources=1,
             variable_cardinality=False,
             init_num_sources=(1, 1),
             position_max=(2.0, 2.0, 2.0),
-            strength_prior_min_cps_1m=1.0,
-            strength_prior_max_cps_1m=3.0,
+            strength_prior=BoundedUniformStrengthPriorTestConfig(
+                minimum_cps_1m=1.0,
+                maximum_cps_1m=3.0,
+            ),
             structural_rj_position_move_probability=1.0,
             structural_rj_position_proposal_prior_weight=1.0,
             structural_rj_strength_proposal_prior_weight=1.0,
@@ -84,14 +87,16 @@ def _split_merge_filter(
     filt = IsotopeParticleFilter(
         "Cs-137",
         kernel=None,
-        config=PFConfig(
+        config=RotatingShieldPFConfig(
             num_particles=12,
             max_sources=max_sources,
             variable_cardinality=True,
             init_num_sources=(0, max_sources),
             position_max=(2.0, 2.0, 2.0),
-            strength_prior_min_cps_1m=1.0,
-            strength_prior_max_cps_1m=3.0,
+            strength_prior=BoundedUniformStrengthPriorTestConfig(
+                minimum_cps_1m=1.0,
+                maximum_cps_1m=3.0,
+            ),
             structural_rj_split_merge_probability=1.0,
             structural_rj_position_proposal_prior_weight=1.0,
             structural_rj_strength_proposal_prior_weight=1.0,
@@ -588,7 +593,7 @@ def test_split_merge_does_not_evaluate_out_of_support_candidates(
 
 def test_extended_log_target_ratio_preserves_zero_mass_semantics() -> None:
     """Zero-mass proposals must reject without hiding invalid target values."""
-    ratio = _extended_log_target_ratio(
+    ratio = extended_log_target_ratio(
         np.asarray([3.0, -np.inf, 4.0, -np.inf], dtype=np.float64),
         np.asarray([1.0, 2.0, -np.inf, -np.inf], dtype=np.float64),
     )
@@ -600,12 +605,12 @@ def test_extended_log_target_ratio_preserves_zero_mass_semantics() -> None:
     assert not bool(np.log(0.5) < np.minimum(ratio[3], 0.0))
     for invalid in (np.nan, np.inf):
         with pytest.raises(ValueError, match="finite or negative infinity"):
-            _extended_log_target_ratio(
+            extended_log_target_ratio(
                 np.asarray([invalid], dtype=np.float64),
                 np.asarray([0.0], dtype=np.float64),
             )
         with pytest.raises(ValueError, match="finite or negative infinity"):
-            _extended_log_target_ratio(
+            extended_log_target_ratio(
                 np.asarray([0.0], dtype=np.float64),
                 np.asarray([invalid], dtype=np.float64),
             )

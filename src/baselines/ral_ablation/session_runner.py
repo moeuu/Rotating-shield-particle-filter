@@ -30,6 +30,7 @@ def _controller_command(
     runtime_root: Path,
     pf_config_path: Path,
     control_policy_path: Path,
+    expected_control_policy_sha256: str,
     pf_output_dir: Path,
     pf_seed: int,
 ) -> list[str]:
@@ -50,6 +51,8 @@ def _controller_command(
         pf_config_path.expanduser().resolve().as_posix(),
         "--control-policy",
         control_policy_path.expanduser().resolve().as_posix(),
+        "--expected-control-policy-sha256",
+        expected_control_policy_sha256,
         "--output-dir",
         pf_output_dir.expanduser().resolve().as_posix(),
         "--profile",
@@ -65,10 +68,9 @@ def run_isolated_ral_session(
     scenario_path: Path,
     pf_config_path: Path,
     control_policy_path: Path,
+    expected_control_policy_sha256: str,
     pf_output_dir: Path,
     pf_seed: int,
-    resume_stage_path: Path | None = None,
-    resume_compatibility_path: Path | None = None,
 ) -> int:
     """Run private acquisition and PF control with an opaque socket boundary."""
     runtime_root = runtime_root.expanduser().resolve()
@@ -91,19 +93,6 @@ def run_isolated_ral_session(
             "--socket-path",
             socket_path.as_posix(),
         ]
-        if resume_stage_path is not None:
-            runtime_command.extend(
-                ("--resume-stage", resume_stage_path.expanduser().resolve().as_posix())
-            )
-        if resume_compatibility_path is not None:
-            if resume_stage_path is None:
-                raise ValueError("resume compatibility requires a resume stage.")
-            runtime_command.extend(
-                (
-                    "--resume-compatibility",
-                    resume_compatibility_path.expanduser().resolve().as_posix(),
-                )
-            )
         runtime_process = subprocess.Popen(runtime_command, cwd=runtime_root)
         try:
             controller_command = _controller_command(
@@ -111,6 +100,7 @@ def run_isolated_ral_session(
                 runtime_root=runtime_root,
                 pf_config_path=pf_config_path,
                 control_policy_path=control_policy_path,
+                expected_control_policy_sha256=expected_control_policy_sha256,
                 pf_output_dir=pf_output_dir,
                 pf_seed=pf_seed,
             )
@@ -132,20 +122,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--scenario", type=Path, required=True)
     parser.add_argument("--pf-config", type=Path, required=True)
     parser.add_argument("--control-policy", type=Path, required=True)
+    parser.add_argument("--expected-control-policy-sha256", required=True)
     parser.add_argument("--pf-output-dir", type=Path, required=True)
     parser.add_argument("--pf-seed", type=int, required=True)
-    parser.add_argument("--resume-stage", type=Path, default=None)
-    parser.add_argument("--resume-compatibility", type=Path, default=None)
     args = parser.parse_args(None if argv is None else list(argv))
     return run_isolated_ral_session(
         runtime_root=args.runtime_root,
         scenario_path=args.scenario,
         pf_config_path=args.pf_config,
         control_policy_path=args.control_policy,
+        expected_control_policy_sha256=args.expected_control_policy_sha256,
         pf_output_dir=args.pf_output_dir,
         pf_seed=args.pf_seed,
-        resume_stage_path=args.resume_stage,
-        resume_compatibility_path=args.resume_compatibility,
     )
 
 

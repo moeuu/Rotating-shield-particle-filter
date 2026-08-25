@@ -8,12 +8,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_pf_package_exports_the_owned_live_facade() -> None:
-    """Integrators should not reconstruct PF live state outside this package."""
-    from pf import PFLiveSession
-    from pf.live_session import PFLiveSession as implementation
+def test_pf_package_requires_explicit_live_session_import() -> None:
+    """The package must not dynamically facade live-session symbols."""
+    import pf
 
-    assert PFLiveSession is implementation
+    assert not hasattr(pf, "PFLiveSession")
+    from pf.live_session import PFLiveSession
+
+    assert PFLiveSession.__module__ == "pf.live_session"
 
 
 def test_pf_repository_contains_no_simulation_implementation() -> None:
@@ -37,6 +39,7 @@ def test_pf_repository_contains_no_legacy_runtime_entry_points() -> None:
         ROOT / "environment.py",
         ROOT / "scripts" / "monitor_closed_loop_cui.py",
         ROOT / "src" / "realtime_demo.py",
+        ROOT / "src" / "planning" / "candidate_generation.py",
         ROOT / "src" / "planning" / "measurement_workspace.py",
         ROOT / "src" / "planning" / "traversability.py",
     )

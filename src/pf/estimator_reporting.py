@@ -13,7 +13,6 @@ from measurement.source_surfaces import (
     SOURCE_SURFACE_REPORT_LABELS,
     source_surface_kinds,
 )
-from pf.estimator_compat import runtime_estimator_export
 from pf.estimator_config import (
     _strict_config_number,
     _strict_nonnegative_integer,
@@ -30,6 +29,7 @@ from pf.particle_filter import (
 )
 from pf.posterior import (
     PFPointEstimate,
+    posterior_point_estimate_from_states,
     validated_probability_distribution,
     validated_state_cardinality,
 )
@@ -329,9 +329,6 @@ class EstimatorReportingMixin:
         cached = self._cached_posterior_point_estimate()
         if cached is not None:
             return cached
-        posterior_point_estimate_from_states = runtime_estimator_export(
-            "posterior_point_estimate_from_states"
-        )
         estimates: dict[str, PFPointEstimate] = {}
         for isotope, filt in self.filters.items():
             filt.validate_continuous_surface_states()
@@ -595,12 +592,6 @@ class EstimatorReportingMixin:
             output[isotope] = diagnostics
         return output
 
-    def estimate_all(
-        self,
-    ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Alias for estimates() to align with visualization helpers."""
-        return self.estimates()
-
     def step_diagnostics(
         self,
         top_k: int = 3,
@@ -636,14 +627,12 @@ class EstimatorReportingMixin:
                     "transition_weight_mass": {},
                     "temper_steps": [],
                     "joint_rejuvenation_diagnostics": [],
-                    "joint_smc_soft_budget_exceeded": False,
+                    "joint_smc_wall_time_limit_exceeded": False,
                     "joint_guided_initialization_ess": None,
-                    "joint_cross_isotope_rejection_diagnostics": {},
                     "joint_cross_isotope_state_rejection_diagnostics": {},
                     "joint_transport_cache": {},
                     "temper_resamples": 0,
                     "temper_min_ess": None,
-                    "unique_ancestor_count": None,
                     "station_unique_ancestor_count": None,
                     "cumulative_unique_ancestor_count": None,
                     "r_mean": 0.0,
@@ -771,8 +760,8 @@ class EstimatorReportingMixin:
                 "joint_rejuvenation_diagnostics": [
                     dict(entry) for entry in self.last_joint_rejuvenation_diagnostics
                 ],
-                "joint_smc_soft_budget_exceeded": bool(
-                    self.last_joint_smc_soft_budget_exceeded
+                "joint_smc_wall_time_limit_exceeded": bool(
+                    self.last_joint_smc_wall_time_limit_exceeded
                 ),
                 "joint_rejuvenation_mixing_incomplete": bool(
                     self.last_joint_rejuvenation_mixing_incomplete
@@ -782,9 +771,6 @@ class EstimatorReportingMixin:
                 ),
                 "joint_guided_initialization_ess": (
                     self.last_joint_guided_initialization_ess
-                ),
-                "joint_cross_isotope_rejection_diagnostics": dict(
-                    self.last_joint_cross_isotope_rejection_diagnostics
                 ),
                 "joint_cross_isotope_state_rejection_diagnostics": dict(
                     self.last_joint_cross_isotope_state_rejection_diagnostics
@@ -815,11 +801,6 @@ class EstimatorReportingMixin:
                 },
                 "temper_resamples": int(getattr(filt, "last_temper_resample_count", 0)),
                 "temper_min_ess": getattr(filt, "last_temper_min_ess", None),
-                "unique_ancestor_count": getattr(
-                    filt,
-                    "last_unique_ancestor_count",
-                    None,
-                ),
                 "station_unique_ancestor_count": getattr(
                     filt,
                     "last_station_unique_ancestor_count",
@@ -1442,7 +1423,7 @@ class EstimatorReportingMixin:
             ),
             "sample_count": count,
             "confidence": probability,
-            "candidate_isotopes": list(self.joint_isotope_order()),
+            "isotopes": list(self.joint_isotope_order()),
             "stations": station_results,
             "shield_pair_summary": pair_summary,
             "obstacle_line_of_sight_summary": obstacle_summary,
@@ -1505,8 +1486,8 @@ class EstimatorReportingMixin:
         )
         joint_map_probability = float(joint_distribution.get(joint_map_vector, 0.0))
         sampler_health = {
-            "smc_soft_budget_respected": bool(
-                not self.last_joint_smc_soft_budget_exceeded
+            "smc_rejuvenation_wall_time_respected": bool(
+                not self.last_joint_smc_wall_time_limit_exceeded
             ),
             "rejuvenation_mixing_complete": bool(
                 not self.last_joint_rejuvenation_mixing_incomplete

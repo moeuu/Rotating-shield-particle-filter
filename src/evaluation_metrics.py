@@ -12,7 +12,7 @@ from scipy.optimize import linear_sum_assignment
 from measurement.source_surfaces import SOURCE_SURFACE_REPORT_LABELS
 from measurement.surface_charts import surface_chart_geometry_sha256
 from measurement.surface_atlas import ContinuousSurfaceAtlas
-from pf.atomic_io import atomic_write_json
+from runtime.artifacts import atomic_write_json
 from evaluation.source_normalization import (
     Source,
     non_negative_finite as _non_negative_finite,

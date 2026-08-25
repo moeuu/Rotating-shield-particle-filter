@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from pf.provenance import json_safe
+from pf.provenance import strict_canonical_json_bytes, strict_json_loads
 from planning.conditional_memory import (
     AcceleratorMemorySnapshot,
     plan_conditional_pose_chunk,
@@ -83,7 +83,7 @@ def test_exact_chunk_uses_total_budget_and_device_capacity() -> None:
 
     assert plan.pose_chunk_size == 4
     assert plan.budget_limited_pose_capacity == 4
-    assert plan.single_pose_low_memory_fallback is False
+    assert plan.single_pose_low_memory_schedule is False
     assert plan.configured_total_phase_budget_bytes == 4 * gib
     assert plan.response_persistent_total_bytes == (
         4 * plan.response_persistent_per_pose_bytes
@@ -106,8 +106,8 @@ def test_exact_chunk_uses_total_budget_and_device_capacity() -> None:
     assert plan.response_materialization_peak_total_bytes <= 4 * gib
 
 
-def test_exact_chunk_has_explicit_single_pose_low_memory_fallback() -> None:
-    """Full fidelity must fall back to one pose instead of overcommitting."""
+def test_exact_chunk_has_explicit_single_pose_low_memory_schedule() -> None:
+    """Full fidelity must schedule one pose instead of overcommitting."""
     gib = 1024**3
     plan = _plan(
         workload="exact",
@@ -119,7 +119,7 @@ def test_exact_chunk_has_explicit_single_pose_low_memory_fallback() -> None:
 
     assert plan.pose_chunk_size == 1
     assert plan.budget_limited_pose_capacity == 1
-    assert plan.single_pose_low_memory_fallback is True
+    assert plan.single_pose_low_memory_schedule is True
 
 
 def test_proxy_chunk_preserves_batched_pose_cap() -> None:
@@ -136,7 +136,10 @@ def test_proxy_chunk_preserves_batched_pose_cap() -> None:
 
     assert plan.pose_chunk_size == 32
     assert plan.maximum_pose_chunk_size == 32
-    assert json_safe(plan.diagnostics()) == plan.diagnostics()
+    assert (
+        strict_json_loads(strict_canonical_json_bytes(plan.diagnostics()))
+        == plan.diagnostics()
+    )
 
 
 def test_reclaimable_allocator_memory_is_included_in_snapshot_contract() -> None:

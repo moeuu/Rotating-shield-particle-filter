@@ -4,17 +4,127 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-import math
 from typing import Any, Mapping
 
+from pf.estimator_config import RotatingShieldPFConfig
 from pf.structural_rj import (
     POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
-    TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
-    validate_cardinality_prior_policy,
 )
+from runtime.cui import CUIDashboardConfig
 
 
-PURE_PF_SCHEMA_VERSION = 1
+PURE_PF_SCHEMA_VERSION = 2
+
+PRODUCTION_ADAPTIVE_STOP_KEYS = frozenset(
+    {
+        "assessment_start_station",
+        "innovation_confidence",
+        "maximum_surface_path_radius_95_m",
+        "maximum_upper_cardinality_mass",
+        "minimum_joint_map_cardinality_probability",
+        "required_consecutive_stations",
+    }
+)
+PRODUCTION_CUI_KEYS = frozenset(
+    {
+        "cui_split_view",
+        "cui_split_view_host",
+        "cui_split_view_max_particles_per_isotope",
+        "cui_split_view_port",
+        "cui_split_view_public_host",
+        "cui_split_view_save_step_history",
+        "cui_split_view_serve",
+    }
+)
+PRODUCTION_SHIFTED_GAMMA_STRENGTH_PRIOR_KEYS = frozenset(
+    {"kind", "minimum_cps_1m", "shape", "scale_cps_1m"}
+)
+ADAPTIVE_STOP_TO_PF_FIELD = {
+    "innovation_confidence": "adaptive_stop_innovation_confidence",
+    "maximum_surface_path_radius_95_m": (
+        "adaptive_stop_maximum_surface_path_radius_95_m"
+    ),
+    "maximum_upper_cardinality_mass": (
+        "adaptive_stop_maximum_upper_cardinality_mass"
+    ),
+    "minimum_joint_map_cardinality_probability": (
+        "adaptive_stop_minimum_joint_map_cardinality_probability"
+    ),
+}
+PRODUCTION_PF_SETTING_KEYS = frozenset(
+    {
+        "estimator_profile",
+        "num_particles",
+        "max_sources",
+        "hard_max_sources",
+        "strength_prior",
+        "structural_cardinality_tail_ratio",
+        "structural_cardinality_prior_mean",
+        "structural_rj_surface_chart_max_edge_m",
+        "structural_rj_move_probability",
+        "structural_rj_birth_probability",
+        "structural_rj_death_probability",
+        "structural_rj_position_move_probability",
+        "structural_rj_local_position_move_probability",
+        "structural_rj_strength_move_probability",
+        "structural_rj_split_merge_probability",
+        "structural_rj_block_independence_probability",
+        "structural_rj_multi_component_probability",
+        "structural_rj_multi_component_max_group_size",
+        "structural_rj_local_position_sigma_m",
+        "structural_rj_merge_probability",
+        "structural_rj_split_global_position_probability",
+        "structural_rj_merge_uniform_pair_probability",
+        "structural_rj_merge_distance_sigma_m",
+        "structural_rj_merge_response_sigma",
+        "structural_rj_split_probability",
+        "structural_rj_position_proposal_prior_weight",
+        "structural_rj_proposal_chart_batch_size",
+        "structural_rj_proposal_score_cache_max_bytes",
+        "structural_rj_strength_proposal_grid_size",
+        "structural_rj_strength_proposal_prior_weight",
+        "structural_rj_strength_proposal_sigma_fraction",
+        "target_ess_ratio",
+        "max_temper_steps",
+        "min_delta_beta",
+        "joint_rejuvenation_min_sweeps",
+        "joint_rejuvenation_max_sweeps",
+        "joint_rejuvenation_min_state_change_weight_mass",
+        "joint_rejuvenation_min_surface_esjd_m2",
+        "joint_rejuvenation_min_log_strength_esjd",
+        "joint_rejuvenation_min_k_transition_weight_mass",
+        "joint_rejuvenation_boundary_mass_threshold",
+        "joint_smc_rejuvenation_wall_time_limit_s",
+        "joint_guided_initialization_prior_row_probability",
+        "joint_strength_block_probability",
+        "joint_strength_block_log_sigma",
+        "joint_strength_block_batch_size",
+        "joint_cross_isotope_state_block_probability",
+        "surface_diagnostic_response_cache_max_entries",
+        "planning_eig_samples",
+    }
+)
+PRODUCTION_FIXED_PF_VALUES: Mapping[str, object] = {
+    "variable_cardinality": True,
+    "structural_cardinality_prior_policy": (
+        POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY
+    ),
+    "structural_cardinality_prior_probs": None,
+    "joint_guided_initialization": True,
+    "gpu_dtype": "float64",
+}
+PRODUCTION_LIVE_TOP_LEVEL_KEYS = frozenset(
+    PRODUCTION_PF_SETTING_KEYS
+    | {
+        "adaptive_stop",
+        "compute_backend",
+        "dss_pp",
+        "planner_audit_top_k",
+        "pure_pf_schema_version",
+        "runtime_candidate_refinement_top_k",
+    }
+    | PRODUCTION_CUI_KEYS
+)
 
 
 class EstimatorProfile(StrEnum):
@@ -62,328 +172,6 @@ class StructuralTransitionProvenance:
 
 
 _PURE_CAPABILITIES = EstimatorCapabilities()
-_PURE_PF_RUNTIME_KEYS = frozenset(
-    {
-        "pf_buildup",
-        "pf_detector_aperture_radius_m",
-        "pf_detector_aperture_samples",
-        "pf_detector_aperture_sampling",
-        "pf_detector_count_radius_m",
-        "pf_detected_isotopes_only",
-        "pf_line_resolved_shield_attenuation",
-        "pf_max_sources",
-        "pf_hard_max_sources",
-        "pf_obstacle_attenuation",
-        "pf_obstacle_material",
-        "pf_obstacle_mu_by_isotope",
-        "pf_obstacle_source_extent_radius_m",
-        "pf_obstacle_source_extent_samples",
-        "pf_plot_save_every",
-        "pf_random_seed",
-        "pf_source_extent_radius_m",
-        "pf_source_extent_samples",
-        "pf_strength_prior_max_cps_1m",
-        "pf_strength_prior_min_cps_1m",
-        "pf_strength_prior_family",
-        "pf_strength_prior_gamma_shape",
-        "pf_strength_prior_gamma_scale_cps_1m",
-        "pf_visual_estimate_cross_size_m",
-        "pf_visual_estimate_cross_width_m",
-        "pf_visual_estimate_radius_m",
-        "pf_visual_max_particles_per_isotope",
-        "pf_visual_min_weight_fraction",
-        "pf_visual_particle_radius_m",
-        "pf_visualization_enabled",
-    }
-)
-_PURE_PF_RUNTIME_MAPPING_KEYS = frozenset(
-    {
-        "adaptive_stop",
-        "dss_pp",
-        "pf_buildup",
-        "pf_obstacle_mu_by_isotope",
-    }
-)
-_PURE_PF_STRUCTURAL_RUNTIME_KEYS = frozenset(
-    {
-        "structural_cardinality_prior_probs",
-        "structural_cardinality_prior_mean",
-        "structural_cardinality_prior_policy",
-        "structural_cardinality_tail_ratio",
-        "structural_rj_birth_probability",
-        "structural_rj_block_independence_probability",
-        "structural_rj_death_probability",
-        "structural_rj_local_position_move_probability",
-        "structural_rj_local_position_sigma_m",
-        "structural_rj_merge_distance_sigma_m",
-        "structural_rj_merge_probability",
-        "structural_rj_merge_response_sigma",
-        "structural_rj_merge_uniform_pair_probability",
-        "structural_rj_move_probability",
-        "structural_rj_multi_component_max_group_size",
-        "structural_rj_multi_component_probability",
-        "structural_rj_position_move_probability",
-        "structural_rj_position_proposal_prior_weight",
-        "structural_rj_proposal_chart_batch_size",
-        "structural_rj_proposal_score_cache_max_bytes",
-        "structural_rj_strength_proposal_grid_size",
-        "structural_rj_strength_proposal_prior_weight",
-        "structural_rj_strength_proposal_sigma_fraction",
-        "structural_rj_split_merge_probability",
-        "structural_rj_split_global_position_probability",
-        "structural_rj_split_probability",
-        "structural_rj_strength_move_probability",
-        "structural_rj_surface_chart_max_edge_m",
-        "joint_strength_block_probability",
-        "joint_strength_block_log_sigma",
-        "joint_strength_block_batch_size",
-        "joint_cross_isotope_state_block_probability",
-    }
-)
-_DSS_PP_RUNTIME_KEYS = frozenset(
-    {
-        "augment_candidates",
-        "bearing_diversity_weight",
-        "coverage_floor_quantile",
-        "coverage_floor_weight",
-        "coverage_surface_quadrature_max_points",
-        "coverage_surface_max_hausdorff_m",
-        "coverage_radius_m",
-        "coverage_weight",
-        "detector_aperture_samples",
-        "diagnostic_ranked_node_limit",
-        "distance_weight",
-        "eig_weight",
-        "conditional_greedy_one_swap",
-        "exact_eig_action_limit",
-        "exact_eig_coverage_reserve",
-        "exact_eig_memory_budget_bytes",
-        "exact_eig_pose_max",
-        "exact_eig_pose_min",
-        "exact_eig_pose_limit",
-        "exact_eig_pose_step",
-        "exact_eig_program_diversity_reserve",
-        "elevation_angle_threshold_deg",
-        "elevation_condition_weight",
-        "elevation_pair_xy_scale_m",
-        "elevation_pair_z_scale_m",
-        "frontier_weight",
-        "horizontal_time_weight",
-        "local_orbit_sigma_m",
-        "local_orbit_weight",
-        "legacy_program_guard_enabled",
-        "mast_vertical_time_weight",
-        "max_augmented_candidates",
-        "max_modes_per_isotope",
-        "max_programs",
-        "measurement_time_weight",
-        "min_station_separation_m",
-        "mode_cluster_radius_m",
-        "planning_method",
-        "planning_particles",
-        "program_length",
-        "proxy_eig_samples",
-        "proxy_boundary_confidence",
-        "proxy_memory_budget_bytes",
-        "proxy_planning_particles",
-        "proxy_stability_refinement_pool",
-        "proxy_stability_replicates",
-        "proxy_top_k_jaccard_min",
-        "revisit_penalty_weight",
-        "rotation_weight",
-        "settling_time_weight",
-        "shield_program_search_policy",
-        "shield_view_count_shadow_candidate_counts",
-        "shield_view_count_shadow_enabled",
-        "shield_view_count_shadow_per_comparison_confidence",
-        "shield_view_count_shadow_retention_fraction",
-        "time_weight",
-        "turn_smoothness_weight",
-    }
-)
-_PURE_PF_NESTED_KEYS = {
-    "adaptive_stop": frozenset(
-        {
-            "assessment_start_station",
-            "enabled",
-            "innovation_confidence",
-            "maximum_surface_path_radius_95_m",
-            "maximum_upper_cardinality_mass",
-            "minimum_joint_map_cardinality_probability",
-            "required_consecutive_stations",
-        }
-    ),
-    "dss_pp": _DSS_PP_RUNTIME_KEYS,
-    "pf_buildup": frozenset({"fe_coeff", "pb_coeff", "obstacle_coeff"}),
-}
-_RETIRED_RUNTIME_KEYS = frozenset(
-    {
-        "adapt_cooldown_steps",
-        "adaptive_allow_low_signal_stop",
-        "adaptive_cardinality_min_live_s",
-        "adaptive_cardinality_min_bic_margin",
-        "adaptive_cardinality_condition_max",
-        "adaptive_cardinality_min_candidate_count",
-        "adaptive_low_signal_count_fraction",
-        "adaptive_low_signal_min_live_s",
-        "adaptive_low_signal_projected_live_factor",
-        "adaptive_low_signal_upper_sigma",
-        "adaptive_ready_allow_informative_low",
-        "adaptive_mission_stop",
-        "apply_incident_gamma_detector_response",
-        "birth_enable",
-        "birth_enabled",
-        "converge_enable",
-        "converge_ess_ratio_high",
-        "converge_ll_improve_eps",
-        "converge_map_move_eps_m",
-        "converge_min_stations",
-        "converge_min_steps",
-        "converge_require_all",
-        "converge_window",
-        "converge_cardinality_min_probability",
-        "converge_cardinality_var_max",
-        "converge_innovation_confidence",
-        "converge_max_cardinality_boundary_mass",
-        "converge_min_ess_ratio",
-        "continuous_surface_chart_max_edge_m",
-        "credible_surface_radius_threshold_m",
-        "coverage_grid_max_cells",
-        "response_backscatter_fraction",
-        "response_continuum_to_peak",
-        "response_efficiency_model",
-        "calibration_count_method",
-        "count_likelihood_model",
-        "detector_height_sampling_mode",
-        "ess_high",
-        "ess_low",
-        "fixed_cardinality_no_structural_moves",
-        "height_partner_reuse_shield_program",
-        "history_estimate_interval",
-        "init_grid_spacing_m",
-        "init_num_sources_max",
-        "init_num_sources_min",
-        "init_strength_log_mean",
-        "init_strength_log_sigma",
-        "init_strength_max",
-        "init_strength_min",
-        "init_strength_prior",
-        "joint_observation_update",
-        "joint_station_update",
-        "delayed_resample_update",
-        "max_particles",
-        "min_particles",
-        "min_strength",
-        "measurement_pose_clearance_enabled",
-        "orientation_selection_mode",
-        "path_planner",
-        "pf_count_likelihood",
-        "pose_selection_workers",
-        "position_min",
-        "python_worker_count",
-        "refit_after_moves",
-        "remaining_measurement_estimate",
-        "short_time_s",
-        "spectrum_count_method",
-        "source_position_prior",
-        "source_prior_mode",
-        "source_surface_prior",
-        "response_poisson_global_diagnostic_variance_enable",
-        "source_detector_exclusion_m",
-        "spectrum_likelihood_bin_chunk",
-        "structural_rj_patch_spacing_m",
-        "structural_rj_surface_chart_spacing_m",
-        "surface_observability_diagnostic_candidates",
-    }
-)
-_RETIRED_RUNTIME_PREFIXES = (
-    "adaptive_strength_prior",
-    "all_history_dictionary_proposal_",
-    "batch_fit_",
-    "birth_",
-    "candidate_verification_",
-    "cardinality_preserving_",
-    "contrast_",
-    "count_likelihood_",
-    "conditional_strength_",
-    "converge_cluster_",
-    "death_",
-    "deferred_resample_",
-    "delayed_resample_",
-    "display_pruned_",
-    "final_absent_",
-    "global_surface_",
-    "high_strength_split_",
-    "high_surface_",
-    "init_grid_",
-    "init_num_sources_",
-    "maximum_likelihood_",
-    "merge_",
-    "mission_stop_birth_residual_",
-    "mission_stop_min_convergence_",
-    "mission_stop_report_simple_",
-    "mission_stop_require_model_order_",
-    "mission_stop_require_no_unresolved_",
-    "mission_stop_require_pf_convergence_",
-    "mission_stop_require_quiet_birth_",
-    "mission_stop_soft_",
-    "mission_stop_unresolved_",
-    "mle_",
-    "mode_preserving_",
-    "online_absent_",
-    "precision_diagnostic_birth_candidate_",
-    "pseudo_source_",
-    "raw_count_residual_",
-    "recovery_",
-    "report_best_so_far_",
-    "report_cluster_",
-    "report_exclude_unverified_",
-    "report_mle_",
-    "report_model_order_",
-    "report_refit_",
-    "report_strength_",
-    "report_surface_",
-    "response_poisson_",
-    "residual_birth_",
-    "residual_decomposition_",
-    "roughening_",
-    "runtime_report_rescue_",
-    "soft_extension_",
-    "source_prune_",
-    "source_strength_",
-    "shield_contrast_",
-    "shield_view_ratio_",
-    "sparse_poisson_",
-    "spectrum_likelihood_",
-    "split_",
-    "strength_refit_",
-    "structural_proposal_",
-    "structural_trial_",
-    "structural_update_",
-    "surface_rejuvenation_",
-    "surface_map_",
-    "verification_",
-    "view_ratio_",
-    "weak_source_prune_",
-)
-_EXPERIMENT_ONLY_TOP_LEVEL_KEYS = frozenset(
-    {
-        "baseline_path_policy",
-        "baseline_shield_policy",
-        "metadata",
-    }
-)
-
-
-def _validate_allowed_keys(
-    name: str,
-    payload: Mapping[str, Any],
-    allowed: frozenset[str],
-) -> None:
-    """Reject unknown keys from one versioned pure-PF object."""
-    unknown = sorted(str(key) for key in payload if str(key) not in allowed)
-    if unknown:
-        raise ValueError(f"Unsupported {name} settings: " + ", ".join(unknown))
 
 
 def _require_mapping(
@@ -396,78 +184,144 @@ def _require_mapping(
     return value
 
 
-def _validate_nested_runtime_settings(
+def production_pf_config_values(
     runtime_config: Mapping[str, Any],
-) -> None:
-    """Validate every versioned nested pure-PF configuration block."""
-    for block_name, allowed in _PURE_PF_NESTED_KEYS.items():
-        if block_name not in runtime_config:
-            continue
-        block = _require_mapping(block_name, runtime_config[block_name])
-        _validate_allowed_keys(block_name, block, allowed)
-    if "pf_obstacle_mu_by_isotope" in runtime_config:
-        obstacle_mu = _require_mapping(
-            "pf_obstacle_mu_by_isotope",
-            runtime_config["pf_obstacle_mu_by_isotope"],
-        )
-        for isotope, value in obstacle_mu.items():
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or float(value) < 0.0
-            ):
-                raise ValueError(
-                    "pf_obstacle_mu_by_isotope values must be finite "
-                    f"nonnegative numbers; invalid value for {isotope!s}."
-                )
-
-
-def _validate_structural_runtime_values(
-    runtime_config: Mapping[str, Any],
-) -> None:
-    """Validate pure-PF cardinality fields before runtime construction."""
-    validate_cardinality_prior_policy(
-        runtime_config.get(
-            "structural_cardinality_prior_policy",
-            TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
-        ),
-        has_explicit_probabilities=(
-            runtime_config.get("structural_cardinality_prior_probs") is not None
-        ),
+    *,
+    position_max: tuple[float, float, float],
+) -> dict[str, Any]:
+    """Build the sole production PF dataclass payload without raw fallbacks."""
+    adaptive_stop = _require_mapping(
+        "adaptive_stop",
+        runtime_config["adaptive_stop"],
     )
-    if "variable_cardinality" in runtime_config and not isinstance(
-        runtime_config["variable_cardinality"],
-        bool,
-    ):
-        raise ValueError("variable_cardinality must be a boolean.")
-    if "pf_max_sources" in runtime_config:
-        value = runtime_config["pf_max_sources"]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError("pf_max_sources must be a positive integer.")
-    if "pf_hard_max_sources" in runtime_config:
-        hard_value = runtime_config["pf_hard_max_sources"]
-        if (
-            isinstance(hard_value, bool)
-            or not isinstance(hard_value, int)
-            or hard_value < 1
-        ):
-            raise ValueError("pf_hard_max_sources must be a positive integer.")
-        ordinary_value = runtime_config.get("pf_max_sources", hard_value)
-        if hard_value < ordinary_value:
-            raise ValueError("pf_hard_max_sources must be at least pf_max_sources.")
-    if "init_num_sources" in runtime_config:
-        value = runtime_config["init_num_sources"]
-        if (
-            not isinstance(value, (list, tuple))
-            or len(value) != 2
-            or any(
-                isinstance(item, bool) or not isinstance(item, int) for item in value
+    values = {
+        key: runtime_config[key]
+        for key in PRODUCTION_PF_SETTING_KEYS
+    }
+    values.update(PRODUCTION_FIXED_PF_VALUES)
+    values.update(production_compute_backend_values(runtime_config))
+    values["init_num_sources"] = (0, runtime_config["max_sources"])
+    for external_name, field_name in ADAPTIVE_STOP_TO_PF_FIELD.items():
+        values[field_name] = adaptive_stop[external_name]
+    values["position_max"] = position_max
+    return values
+
+
+def production_compute_backend_values(
+    runtime_config: Mapping[str, Any],
+) -> dict[str, object]:
+    """Resolve the explicit production compute-backend discriminated union."""
+    backend = _require_mapping("compute_backend", runtime_config["compute_backend"])
+    kind = backend.get("kind")
+    if kind == "cuda_float64":
+        expected = frozenset({"kind", "device"})
+        device = backend.get("device")
+        if not isinstance(device, str) or (
+            device != "cuda"
+            and not (
+                device.startswith("cuda:")
+                and device[5:].isdigit()
+                and str(int(device[5:])) == device[5:]
             )
         ):
             raise ValueError(
-                "init_num_sources must contain exactly two integer bounds."
+                "compute_backend.device must be 'cuda' or canonical 'cuda:N'."
             )
+        use_gpu = True
+    else:
+        raise ValueError("compute_backend.kind must be 'cuda_float64'.")
+    actual = frozenset(backend)
+    if actual != expected:
+        raise ValueError(
+            "compute_backend fields disagree with its kind: "
+            f"missing={sorted(expected - actual)}, "
+            f"unknown={sorted(actual - expected)}."
+        )
+    return {
+        "use_gpu": use_gpu,
+        "gpu_device": device,
+    }
+
+
+def _enforce_production_pf_invariants(config: RotatingShieldPFConfig) -> None:
+    """Reject production combinations that disable or hide declared kernels."""
+    active_probabilities = (
+        "structural_rj_move_probability",
+        "structural_rj_birth_probability",
+        "structural_rj_death_probability",
+        "structural_rj_position_move_probability",
+        "structural_rj_local_position_move_probability",
+        "structural_rj_strength_move_probability",
+        "structural_rj_split_merge_probability",
+        "structural_rj_block_independence_probability",
+        "structural_rj_multi_component_probability",
+        "structural_rj_split_probability",
+        "structural_rj_merge_probability",
+        "joint_strength_block_probability",
+        "joint_cross_isotope_state_block_probability",
+    )
+    for name in active_probabilities:
+        if float(getattr(config, name)) <= 0.0:
+            raise ValueError(f"Production {name} must be strictly positive.")
+    for left, right in (
+        ("structural_rj_birth_probability", "structural_rj_death_probability"),
+        ("structural_rj_split_probability", "structural_rj_merge_probability"),
+    ):
+        if float(getattr(config, left)) + float(getattr(config, right)) != 1.0:
+            raise ValueError(
+                f"Production {left} and {right} must sum exactly to 1."
+            )
+    for name in (
+        "structural_rj_position_proposal_prior_weight",
+        "structural_rj_strength_proposal_prior_weight",
+        "structural_rj_split_global_position_probability",
+        "structural_rj_merge_uniform_pair_probability",
+        "joint_guided_initialization_prior_row_probability",
+    ):
+        value = float(getattr(config, name))
+        if not 0.0 < value < 1.0:
+            raise ValueError(f"Production {name} must lie strictly in (0, 1).")
+    hard_max_sources = int(config.hard_max_sources)
+    if hard_max_sources <= int(config.max_sources):
+        raise ValueError(
+            "Production hard_max_sources must exceed max_sources so the fixed "
+            "geometric capacity tail is active."
+        )
+    if hard_max_sources < 3:
+        raise ValueError(
+            "Production hard_max_sources must be at least 3 for active "
+            "multi-component RJ moves."
+        )
+    if int(config.structural_rj_multi_component_max_group_size) > hard_max_sources:
+        raise ValueError(
+            "Production structural_rj_multi_component_max_group_size must not "
+            "exceed hard_max_sources."
+        )
+    for name in (
+        "joint_rejuvenation_min_state_change_weight_mass",
+        "joint_rejuvenation_min_surface_esjd_m2",
+        "joint_rejuvenation_min_log_strength_esjd",
+        "joint_rejuvenation_min_k_transition_weight_mass",
+    ):
+        if float(getattr(config, name)) <= 0.0:
+            raise ValueError(f"Production {name} must be strictly positive.")
+    if float(config.joint_rejuvenation_boundary_mass_threshold) >= 1.0:
+        raise ValueError(
+            "Production joint_rejuvenation_boundary_mass_threshold must be below 1."
+        )
+    if float(config.adaptive_stop_maximum_upper_cardinality_mass) >= 1.0:
+        raise ValueError(
+            "Production adaptive-stop upper-cardinality mass must be below 1."
+        )
+    guided_rows = (
+        float(config.joint_guided_initialization_prior_row_probability)
+        * int(config.num_particles)
+    )
+    if not guided_rows.is_integer():
+        raise ValueError(
+            "Production guided-initialization probability times num_particles "
+            "must be an exact integer."
+        )
 
 
 def resolve_estimator_profile(
@@ -539,71 +393,97 @@ def enforce_pure_runtime_settings(
     *,
     profile: EstimatorProfile | str | None = None,
 ) -> dict[str, Any]:
-    """Validate the pure-PF schema marker and strict estimator profile."""
+    """Validate the one complete schema-v2 production-live configuration."""
+    if not isinstance(runtime_config, Mapping) or any(
+        not isinstance(key, str) for key in runtime_config
+    ):
+        raise ValueError(
+            "Production live PF configuration must be a string-keyed object."
+        )
+    actual_top_level = frozenset(runtime_config)
+    missing_top_level = sorted(
+        PRODUCTION_LIVE_TOP_LEVEL_KEYS.difference(actual_top_level)
+    )
+    unknown_top_level = sorted(
+        actual_top_level.difference(PRODUCTION_LIVE_TOP_LEVEL_KEYS)
+    )
+    if missing_top_level or unknown_top_level:
+        raise ValueError(
+            "Production live PF schema-v2 keys differ from the exact contract: "
+            f"missing={missing_top_level}, unknown_or_retired={unknown_top_level}."
+        )
     schema_version = runtime_config.get("pure_pf_schema_version")
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
         or schema_version != PURE_PF_SCHEMA_VERSION
     ):
-        raise ValueError("Runtime configuration requires pure_pf_schema_version=1.")
-    experiment_only = sorted(
-        str(key)
-        for key in runtime_config
-        if str(key) in _EXPERIMENT_ONLY_TOP_LEVEL_KEYS
-    )
-    if experiment_only:
+        raise ValueError("Runtime configuration requires pure_pf_schema_version=2.")
+    if runtime_config["hard_max_sources"] is None:
         raise ValueError(
-            "Experiment-only fields must stay outside PF configuration: "
-            + ", ".join(experiment_only)
+            "Production live PF requires an explicit hard_max_sources capacity."
         )
-    retired_keys = sorted(
-        str(key)
-        for key in runtime_config
-        if str(key) in _RETIRED_RUNTIME_KEYS
-        or any(str(key).startswith(prefix) for prefix in _RETIRED_RUNTIME_PREFIXES)
+    adaptive_stop = _require_mapping(
+        "adaptive_stop",
+        runtime_config["adaptive_stop"],
     )
-    if retired_keys:
+    adaptive_keys = frozenset(str(key) for key in adaptive_stop)
+    missing_adaptive = sorted(PRODUCTION_ADAPTIVE_STOP_KEYS - adaptive_keys)
+    unknown_adaptive = sorted(adaptive_keys - PRODUCTION_ADAPTIVE_STOP_KEYS)
+    if missing_adaptive or unknown_adaptive:
         raise ValueError(
-            "Retired particle-filter settings are not supported: "
-            + ", ".join(retired_keys)
+            "adaptive_stop keys differ from the exact schema-v2 contract: "
+            f"missing={missing_adaptive}, unknown_or_retired={unknown_adaptive}."
         )
-    unknown_pf_keys = sorted(
-        str(key)
-        for key in runtime_config
-        if str(key).startswith("pf_") and str(key) not in _PURE_PF_RUNTIME_KEYS
+    for key in ("assessment_start_station", "required_consecutive_stations"):
+        value = adaptive_stop[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"adaptive_stop.{key} must be a positive integer.")
+    production_compute_backend_values(runtime_config)
+    strength_prior = _require_mapping(
+        "strength_prior",
+        runtime_config["strength_prior"],
     )
-    if unknown_pf_keys:
-        raise ValueError(
-            "Unsupported pure-PF runtime settings: " + ", ".join(unknown_pf_keys)
-        )
-    unknown_structural_keys = sorted(
-        str(key)
-        for key in runtime_config
-        if (
-            str(key).startswith("structural_rj_")
-            or str(key).startswith("structural_cardinality_")
-            or str(key).startswith("continuous_surface_")
-        )
-        and str(key) not in _PURE_PF_STRUCTURAL_RUNTIME_KEYS
+    if any(not isinstance(key, str) for key in strength_prior):
+        raise ValueError("strength_prior must be a string-keyed object.")
+    strength_prior_keys = frozenset(strength_prior)
+    missing_strength_prior = sorted(
+        PRODUCTION_SHIFTED_GAMMA_STRENGTH_PRIOR_KEYS - strength_prior_keys
     )
-    if unknown_structural_keys:
-        raise ValueError(
-            "Unsupported pure-PF structural settings: "
-            + ", ".join(unknown_structural_keys)
-        )
-    invalid_mapping_keys = sorted(
-        key
-        for key in _PURE_PF_RUNTIME_MAPPING_KEYS
-        if key in runtime_config and not isinstance(runtime_config[key], Mapping)
+    unknown_strength_prior = sorted(
+        strength_prior_keys - PRODUCTION_SHIFTED_GAMMA_STRENGTH_PRIOR_KEYS
     )
-    if invalid_mapping_keys:
+    if missing_strength_prior or unknown_strength_prior:
         raise ValueError(
-            "Pure-PF runtime settings must be objects: "
-            + ", ".join(invalid_mapping_keys)
+            "strength_prior keys differ from the exact production contract: "
+            f"missing={missing_strength_prior}, "
+            f"unknown_or_retired={unknown_strength_prior}."
         )
-    _validate_nested_runtime_settings(runtime_config)
-    _validate_structural_runtime_values(runtime_config)
+    if strength_prior["kind"] != "shifted_gamma":
+        raise ValueError(
+            "Production live PF requires strength_prior.kind='shifted_gamma'."
+        )
+    from planning.configuration import (
+        PRODUCTION_DSS_PP_SETTING_KEYS,
+        validate_production_dss_setting_values,
+    )
+
+    dss_pp = runtime_config["dss_pp"]
+    if dss_pp is not None:
+        production_dss_keys = PRODUCTION_DSS_PP_SETTING_KEYS
+        dss_pp = _require_mapping("dss_pp", dss_pp)
+        dss_keys = frozenset(str(key) for key in dss_pp)
+        missing_dss = sorted(production_dss_keys - dss_keys)
+        unknown_dss = sorted(dss_keys - production_dss_keys)
+        if missing_dss or unknown_dss:
+            raise ValueError(
+                "dss_pp keys differ from the exact schema-v2 contract: "
+                f"missing={missing_dss}, unknown_or_retired={unknown_dss}."
+            )
+        try:
+            validate_production_dss_setting_values(runtime_config)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid production dss_pp setting: {exc}") from exc
     configured_profile, _capabilities = resolve_estimator_profile(
         runtime_config.get("estimator_profile")
     )
@@ -613,31 +493,133 @@ def enforce_pure_runtime_settings(
             raise ValueError(
                 "Requested estimator profile differs from the runtime schema."
             )
+    for key in (
+        "cui_split_view",
+        "cui_split_view_save_step_history",
+        "cui_split_view_serve",
+    ):
+        if type(runtime_config[key]) is not bool:
+            raise ValueError(f"{key} must be a boolean.")
+    for key in (
+        "planner_audit_top_k",
+        "runtime_candidate_refinement_top_k",
+    ):
+        value = runtime_config[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{key} must be an integer >= 0.")
+    visual_particle_limit = runtime_config[
+        "cui_split_view_max_particles_per_isotope"
+    ]
+    if visual_particle_limit is not None and (
+        isinstance(visual_particle_limit, bool)
+        or not isinstance(visual_particle_limit, int)
+        or visual_particle_limit < 1
+    ):
+        raise ValueError(
+            "cui_split_view_max_particles_per_isotope must be null or a "
+            "positive integer."
+        )
+    if (
+        visual_particle_limit is not None
+        and isinstance(runtime_config["num_particles"], int)
+        and not isinstance(runtime_config["num_particles"], bool)
+        and visual_particle_limit > runtime_config["num_particles"]
+    ):
+        raise ValueError(
+            "cui_split_view_max_particles_per_isotope must not exceed "
+            "num_particles."
+        )
+    cui_enabled = runtime_config["cui_split_view"]
+    cui_served = runtime_config["cui_split_view_serve"]
+    if cui_served and not cui_enabled:
+        raise ValueError("cui_split_view_serve requires cui_split_view=true.")
+    if not cui_enabled:
+        if runtime_config["cui_split_view_save_step_history"] is not False:
+            raise ValueError(
+                "Disabled CUI requires cui_split_view_save_step_history=false."
+            )
+        if runtime_config["cui_split_view_max_particles_per_isotope"] is not None:
+            raise ValueError(
+                "Disabled CUI requires cui_split_view_max_particles_per_isotope=null."
+            )
+    if cui_served:
+        host = runtime_config["cui_split_view_host"]
+        if (
+            not isinstance(host, str)
+            or not host
+            or host != host.strip()
+            or (host.startswith("[") and host.endswith("]"))
+        ):
+            raise ValueError(
+                "cui_split_view_host must be a canonical nonempty host string."
+            )
+        port = runtime_config["cui_split_view_port"]
+        if (
+            isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError(
+                "cui_split_view_port must be an integer in [1, 65535]."
+            )
+        public_host = runtime_config["cui_split_view_public_host"]
+        if (
+            not isinstance(public_host, str)
+            or not public_host
+            or public_host != public_host.strip()
+            or (public_host.startswith("[") and public_host.endswith("]"))
+        ):
+            raise ValueError(
+                "cui_split_view_public_host must be a canonical host string."
+            )
+        if public_host == "auto":
+            raise ValueError(
+                "Production CUI requires an explicit public host; auto discovery "
+                "is not allowed."
+            )
+        try:
+            CUIDashboardConfig(
+                serve=True,
+                host=host,
+                port=port,
+                public_host=public_host,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid production CUI setting: {exc}") from exc
+    else:
+        for key in (
+            "cui_split_view_host",
+            "cui_split_view_port",
+            "cui_split_view_public_host",
+        ):
+            if runtime_config[key] is not None:
+                raise ValueError(
+                    f"A non-serving CUI requires {key}=null."
+                )
+    pf_values = production_pf_config_values(
+        runtime_config,
+        position_max=(1.0, 1.0, 1.0),
+    )
+    try:
+        pf_config = RotatingShieldPFConfig(**pf_values)
+        _enforce_production_pf_invariants(pf_config)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid production PF setting: {exc}") from exc
     result = dict(runtime_config)
     result["estimator_profile"] = configured_profile.value
-    result.setdefault(
-        "structural_cardinality_prior_policy",
-        TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
-    )
-    if (
-        result["structural_cardinality_prior_policy"]
-        == POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY
-    ):
-        result.setdefault(
-            "pf_hard_max_sources",
-            int(result.get("pf_max_sources", 5)),
-        )
-        result.setdefault("structural_cardinality_tail_ratio", 0.05)
     return result
 
 
 __all__ = [
     "PURE_PF_SCHEMA_VERSION",
+    "PRODUCTION_PF_SETTING_KEYS",
     "EstimatorCapabilities",
     "EstimatorProfile",
     "StructuralTransitionProvenance",
     "apply_profile_to_config",
     "enforce_pure_runtime_settings",
+    "production_compute_backend_values",
+    "production_pf_config_values",
     "resolve_estimator_profile",
     "resolve_structural_transition_provenance",
 ]

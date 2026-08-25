@@ -25,7 +25,9 @@ class ParticleTemperingMixin:
         from pf import gpu_utils
 
         if not self.config.use_gpu:
-            raise RuntimeError("GPU-only mode: enable use_gpu in PFConfig.")
+            raise RuntimeError(
+                "GPU-only mode: enable use_gpu in RotatingShieldPFConfig."
+            )
         gpu_utils.require_torch_compute_device(
             str(self.config.gpu_device),
             str(self.config.gpu_dtype),

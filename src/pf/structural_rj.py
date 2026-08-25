@@ -38,53 +38,6 @@ CARDINALITY_PRIOR_POLICIES = frozenset(
 )
 
 
-def cross_isotope_transfer_log_proposal(
-    *,
-    donor_cardinality: int,
-    receiver_cardinality: int,
-    group_size: int,
-    maximum_sources: int,
-    maximum_group_size: int,
-) -> float:
-    """Return the state-dependent part of an isotope-transfer proposal.
-
-    The ordered isotope pair and per-row attempt probabilities are uniform and
-    cancel in the reverse ratio.  Group size is uniform over every feasible
-    size, and the transferred subset is uniform over donor components.
-    """
-    donor = _positive_integer(
-        donor_cardinality,
-        name="donor_cardinality",
-        allow_zero=False,
-    )
-    receiver = _positive_integer(
-        receiver_cardinality,
-        name="receiver_cardinality",
-        allow_zero=True,
-    )
-    group = _positive_integer(
-        group_size,
-        name="group_size",
-        allow_zero=False,
-    )
-    capacity = _positive_integer(
-        maximum_sources,
-        name="maximum_sources",
-        allow_zero=False,
-    )
-    group_cap = _positive_integer(
-        maximum_group_size,
-        name="maximum_group_size",
-        allow_zero=False,
-    )
-    feasible_maximum = min(donor, capacity - receiver, group_cap)
-    if receiver > capacity or group > feasible_maximum:
-        return float("-inf")
-    return -math.log(float(feasible_maximum)) - math.log(
-        float(comb(donor, group))
-    )
-
-
 def shifted_log_strength_random_walk_log_reverse_ratio(
     current_strengths: ArrayLike,
     proposed_strengths: ArrayLike,
@@ -165,14 +118,13 @@ def validate_cardinality_prior_policy(
     has_explicit_probabilities: bool,
 ) -> str:
     """Validate that one named K-prior policy matches its parameterization."""
-    normalized = str(policy).strip()
-    if normalized not in CARDINALITY_PRIOR_POLICIES:
+    if not isinstance(policy, str) or policy not in CARDINALITY_PRIOR_POLICIES:
         raise ValueError(
             "structural_cardinality_prior_policy must be one of "
             f"{sorted(CARDINALITY_PRIOR_POLICIES)}."
         )
     if (
-        normalized
+        policy
         in {
             TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
             POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
@@ -184,14 +136,14 @@ def validate_cardinality_prior_policy(
             "structural_cardinality_prior_probs."
         )
     if (
-        normalized == EXPLICIT_CARDINALITY_PRIOR_POLICY
+        policy == EXPLICIT_CARDINALITY_PRIOR_POLICY
         and not has_explicit_probabilities
     ):
         raise ValueError(
             "The explicit cardinality-vector policy requires "
             "structural_cardinality_prior_probs."
         )
-    return normalized
+    return policy
 
 
 def poisson_geometric_tail_cardinality_probabilities(

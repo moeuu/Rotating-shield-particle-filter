@@ -1,15 +1,15 @@
-"""Provide PF-rooted wrappers around shared provenance helpers."""
+"""Provide PF-rooted strict provenance helpers for production artifacts."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 from runtime.provenance import (
-    canonical_json_bytes,
-    json_safe,
     repository_commit as _shared_repository_commit,
     repository_source_snapshot_sha256 as _shared_source_snapshot_sha256,
-    sha256_json,
+    strict_canonical_json_bytes,
+    strict_json_loads,
+    strict_sha256_json,
 )
 
 
@@ -37,9 +37,9 @@ def repository_source_snapshot_sha256(
 
 
 __all__ = [
-    "canonical_json_bytes",
-    "json_safe",
     "repository_commit",
     "repository_source_snapshot_sha256",
-    "sha256_json",
+    "strict_canonical_json_bytes",
+    "strict_json_loads",
+    "strict_sha256_json",
 ]

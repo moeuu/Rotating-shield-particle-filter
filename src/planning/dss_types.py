@@ -8,13 +8,11 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from measurement.detector_geometry import DEFAULT_PF_DETECTOR_APERTURE_SAMPLES
+from measurement.detector_geometry import DEFAULT_DETECTOR_APERTURE_SAMPLES
 from planning.program_types import ShieldProgram
 
 
 DEFAULT_DSS_PP_LIVE_TIME_S = 30.0
-DEFAULT_DSS_PP_ROBOT_SPEED_M_S = 0.5
-DEFAULT_DSS_PP_ROTATION_OVERHEAD_S = 0.5
 
 
 def estimate_lambda_cost(
@@ -63,7 +61,6 @@ class SignatureMode:
 class DSSPPConfig:
     """Configuration for Differential Shield-Signature Path Planning."""
 
-    max_programs: int = 40
     program_length: int = 2
     mode_cluster_radius_m: float = 1.5
     max_modes_per_isotope: int = 5
@@ -72,11 +69,9 @@ class DSSPPConfig:
     live_time_s: float = DEFAULT_DSS_PP_LIVE_TIME_S
     lambda_eig: float = 1.0
     lambda_distance: float | None = None
-    lambda_time: float = 0.0
-    lambda_horizontal_time: float | None = None
-    lambda_mast_vertical_time: float | None = None
-    lambda_settling_time: float | None = None
-    lambda_rotation: float = 0.0
+    lambda_horizontal_time: float = 0.0
+    lambda_mast_vertical_time: float = 0.0
+    lambda_settling_time: float = 0.0
     lambda_coverage: float = 0.0
     lambda_bearing_diversity: float = 0.0
     lambda_frontier: float = 0.0
@@ -85,34 +80,24 @@ class DSSPPConfig:
     lambda_elevation_condition: float = 0.0
     eta_revisit: float = 0.0
     coverage_radius_m: float = 3.0
-    coverage_surface_quadrature_max_points: int = 65536
-    coverage_surface_max_hausdorff_m: float = 0.75
+    coverage_surface_quadrature_max_points: int | None = 65536
+    coverage_surface_max_hausdorff_m: float | None = 0.75
     coverage_floor_quantile: float = 0.0
     coverage_floor_weight: float = 0.0
     min_station_separation_m: float = 0.0
-    detector_aperture_samples: int = DEFAULT_PF_DETECTOR_APERTURE_SAMPLES
-    robot_speed_m_s: float = DEFAULT_DSS_PP_ROBOT_SPEED_M_S
-    rotation_overhead_s: float = DEFAULT_DSS_PP_ROTATION_OVERHEAD_S
-    augment_candidates: bool = True
-    max_augmented_candidates: int = 256
+    detector_aperture_samples: int = DEFAULT_DETECTOR_APERTURE_SAMPLES
     ring_radii_m: tuple[float, ...] = (2.0, 3.5, 5.0)
-    ring_angles: int = 12
-    local_orbit_sigma_m: float = 0.75
-    elevation_pair_z_scale_m: float = 2.0
-    elevation_pair_xy_scale_m: float = 4.0
-    elevation_angle_threshold_deg: float = 15.0
+    local_orbit_sigma_m: float | None = 0.75
+    elevation_pair_z_scale_m: float | None = 2.0
+    elevation_pair_xy_scale_m: float | None = 4.0
+    elevation_angle_threshold_deg: float | None = 15.0
     forced_program_pair_ids: tuple[int, ...] | None = None
     diagnostic_ranked_node_limit: int = 64
-    exact_eig_pose_limit: int = 4
-    exact_eig_action_limit: int = 192
     exact_eig_coverage_reserve: int = 1
-    exact_eig_program_diversity_reserve: int = 0
     exact_eig_memory_budget_bytes: int = 4 * 1024 * 1024 * 1024
     proxy_memory_budget_bytes: int = 256 * 1024 * 1024
     proxy_planning_particles: int = 16
     proxy_eig_samples: int = 2
-    shield_program_search_policy: str = "predeclared_library"
-    legacy_program_guard_enabled: bool = True
     conditional_greedy_one_swap: bool = True
     exact_eig_pose_min: int = 8
     exact_eig_pose_max: int = 16
@@ -176,16 +161,9 @@ class DSSPPConfig:
             return resolved
 
         positive_integer_fields = {
-            "max_programs": self.max_programs,
             "program_length": self.program_length,
             "max_modes_per_isotope": self.max_modes_per_isotope,
-            "coverage_surface_quadrature_max_points": (
-                self.coverage_surface_quadrature_max_points
-            ),
             "detector_aperture_samples": self.detector_aperture_samples,
-            "max_augmented_candidates": self.max_augmented_candidates,
-            "exact_eig_pose_limit": self.exact_eig_pose_limit,
-            "exact_eig_action_limit": self.exact_eig_action_limit,
             "exact_eig_memory_budget_bytes": (self.exact_eig_memory_budget_bytes),
             "proxy_memory_budget_bytes": self.proxy_memory_budget_bytes,
             "proxy_eig_samples": self.proxy_eig_samples,
@@ -197,7 +175,12 @@ class DSSPPConfig:
         }
         for name, value in positive_integer_fields.items():
             _integer(value, name, minimum=1)
-        _integer(self.ring_angles, "ring_angles", minimum=4)
+        if self.coverage_surface_quadrature_max_points is not None:
+            _integer(
+                self.coverage_surface_quadrature_max_points,
+                "coverage_surface_quadrature_max_points",
+                minimum=1,
+            )
         _integer(
             self.proxy_planning_particles,
             "proxy_planning_particles",
@@ -206,9 +189,6 @@ class DSSPPConfig:
         for name, value in {
             "diagnostic_ranked_node_limit": self.diagnostic_ranked_node_limit,
             "exact_eig_coverage_reserve": self.exact_eig_coverage_reserve,
-            "exact_eig_program_diversity_reserve": (
-                self.exact_eig_program_diversity_reserve
-            ),
         }.items():
             _integer(value, name, minimum=0)
         if self.planning_particles is not None:
@@ -222,38 +202,18 @@ class DSSPPConfig:
                 "planning_method must be None, 'resample', or 'top_weight'."
             )
         for name, value in {
-            "augment_candidates": self.augment_candidates,
-            "legacy_program_guard_enabled": self.legacy_program_guard_enabled,
             "conditional_greedy_one_swap": self.conditional_greedy_one_swap,
             "shield_view_count_shadow_enabled": (self.shield_view_count_shadow_enabled),
         }.items():
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a boolean.")
-        if self.shield_program_search_policy not in {
-            "predeclared_library",
-            "conditional_greedy_shadow",
-            "conditional_greedy_all_pairs",
-        }:
-            raise ValueError(
-                "shield_program_search_policy must be predeclared_library, "
-                "conditional_greedy_shadow, or conditional_greedy_all_pairs."
-            )
-        conditional_search_enabled = self.shield_program_search_policy in {
-            "conditional_greedy_shadow",
-            "conditional_greedy_all_pairs",
-        }
-        predeclared_search_enabled = (
-            self.shield_program_search_policy == "predeclared_library"
-        )
-        legacy_execution_enabled = self.shield_program_search_policy in {
-            "predeclared_library",
-            "conditional_greedy_shadow",
-        }
+        conditional_search_enabled = self.forced_program_pair_ids is None
 
         nonnegative_fields = {
             "lambda_eig": self.lambda_eig,
-            "lambda_time": self.lambda_time,
-            "lambda_rotation": self.lambda_rotation,
+            "lambda_horizontal_time": self.lambda_horizontal_time,
+            "lambda_mast_vertical_time": self.lambda_mast_vertical_time,
+            "lambda_settling_time": self.lambda_settling_time,
             "lambda_coverage": self.lambda_coverage,
             "lambda_bearing_diversity": self.lambda_bearing_diversity,
             "lambda_frontier": self.lambda_frontier,
@@ -264,18 +224,9 @@ class DSSPPConfig:
             "coverage_radius_m": self.coverage_radius_m,
             "coverage_floor_weight": self.coverage_floor_weight,
             "min_station_separation_m": self.min_station_separation_m,
-            "rotation_overhead_s": self.rotation_overhead_s,
         }
         if self.lambda_distance is not None:
             nonnegative_fields["lambda_distance"] = self.lambda_distance
-        if self.lambda_horizontal_time is not None:
-            nonnegative_fields["lambda_horizontal_time"] = self.lambda_horizontal_time
-        if self.lambda_mast_vertical_time is not None:
-            nonnegative_fields["lambda_mast_vertical_time"] = (
-                self.lambda_mast_vertical_time
-            )
-        if self.lambda_settling_time is not None:
-            nonnegative_fields["lambda_settling_time"] = self.lambda_settling_time
         for name, value in nonnegative_fields.items():
             _number(value, name, minimum=0.0)
         if conditional_search_enabled and float(self.lambda_eig) <= 0.0:
@@ -286,31 +237,67 @@ class DSSPPConfig:
             raise ValueError(
                 "Conditional-greedy shield search requires proxy_eig_samples >= 2."
             )
-        if float(self.lambda_rotation) != 0.0:
-            raise ValueError(
-                "lambda_rotation is retired: shield programs must be selected "
-                "by exact EIG. Model a measured rotation duration through the "
-                "time-cost contract if it becomes physically material."
-            )
-
         positive_fields = {
             "mode_cluster_radius_m": self.mode_cluster_radius_m,
             "live_time_s": self.live_time_s,
-            "coverage_surface_max_hausdorff_m": (self.coverage_surface_max_hausdorff_m),
-            "robot_speed_m_s": self.robot_speed_m_s,
-            "local_orbit_sigma_m": self.local_orbit_sigma_m,
-            "elevation_pair_z_scale_m": self.elevation_pair_z_scale_m,
-            "elevation_pair_xy_scale_m": self.elevation_pair_xy_scale_m,
         }
         for name, value in positive_fields.items():
             _number(value, name, minimum=0.0, strict_minimum=True)
-        _number(
+        if self.coverage_surface_max_hausdorff_m is not None:
+            _number(
+                self.coverage_surface_max_hausdorff_m,
+                "coverage_surface_max_hausdorff_m",
+                minimum=0.0,
+                strict_minimum=True,
+            )
+        if (self.coverage_surface_quadrature_max_points is None) is not (
+            self.coverage_surface_max_hausdorff_m is None
+        ):
+            raise ValueError(
+                "Coverage surface quadrature fields must both be numeric or both null."
+            )
+        if self.local_orbit_sigma_m is not None:
+            _number(
+                self.local_orbit_sigma_m,
+                "local_orbit_sigma_m",
+                minimum=0.0,
+                strict_minimum=True,
+            )
+        elevation_parameters = (
+            self.elevation_pair_z_scale_m,
+            self.elevation_pair_xy_scale_m,
             self.elevation_angle_threshold_deg,
-            "elevation_angle_threshold_deg",
-            minimum=0.0,
-            maximum=180.0,
-            strict_minimum=True,
         )
+        if all(value is None for value in elevation_parameters):
+            if float(self.lambda_elevation_condition) != 0.0:
+                raise ValueError(
+                    "Disabled elevation parameters require "
+                    "lambda_elevation_condition=0."
+                )
+        elif any(value is None for value in elevation_parameters):
+            raise ValueError(
+                "Elevation parameters must be all numeric or all null."
+            )
+        else:
+            _number(
+                self.elevation_pair_z_scale_m,
+                "elevation_pair_z_scale_m",
+                minimum=0.0,
+                strict_minimum=True,
+            )
+            _number(
+                self.elevation_pair_xy_scale_m,
+                "elevation_pair_xy_scale_m",
+                minimum=0.0,
+                strict_minimum=True,
+            )
+            _number(
+                self.elevation_angle_threshold_deg,
+                "elevation_angle_threshold_deg",
+                minimum=0.0,
+                maximum=180.0,
+                strict_minimum=True,
+            )
         _number(
             self.coverage_floor_quantile,
             "coverage_floor_quantile",
@@ -365,10 +352,10 @@ class DSSPPConfig:
                 "increasing and unique."
             )
         if self.shield_view_count_shadow_enabled:
-            if self.shield_program_search_policy != "conditional_greedy_all_pairs":
+            if not conditional_search_enabled:
                 raise ValueError(
-                    "Shield view-count shadow audit requires "
-                    "conditional_greedy_all_pairs."
+                    "Shield view-count shadow audit requires the production "
+                    "conditional all-pairs planner."
                 )
             if shadow_counts != (2, 4, 8):
                 raise ValueError(
@@ -381,14 +368,31 @@ class DSSPPConfig:
                     "view count."
                 )
         if not self.ring_radii_m:
-            raise ValueError("ring_radii_m must not be empty.")
-        for index, radius in enumerate(self.ring_radii_m):
-            _number(
-                radius,
-                f"ring_radii_m[{index}]",
-                minimum=0.0,
-                strict_minimum=True,
-            )
+            if (
+                float(self.lambda_local_orbit) != 0.0
+                or self.local_orbit_sigma_m is not None
+            ):
+                raise ValueError(
+                    "Empty ring_radii_m requires lambda_local_orbit=0 and "
+                    "local_orbit_sigma_m=null."
+                )
+        else:
+            if self.local_orbit_sigma_m is None:
+                raise ValueError(
+                    "Nonempty ring_radii_m requires numeric local_orbit_sigma_m."
+                )
+            for index, radius in enumerate(self.ring_radii_m):
+                _number(
+                    radius,
+                    f"ring_radii_m[{index}]",
+                    minimum=0.0,
+                    strict_minimum=True,
+                )
+            normalized_radii = tuple(float(radius) for radius in self.ring_radii_m)
+            if tuple(sorted(set(normalized_radii))) != normalized_radii:
+                raise ValueError(
+                    "ring_radii_m must be strictly increasing and unique."
+                )
         if self.forced_program_pair_ids is not None:
             pair_ids = tuple(
                 _integer(value, "forced_program_pair_ids", minimum=0)
@@ -400,24 +404,6 @@ class DSSPPConfig:
                 )
             if len(set(pair_ids)) != len(pair_ids):
                 raise ValueError("forced_program_pair_ids must not contain duplicates.")
-        if predeclared_search_enabled and int(self.exact_eig_coverage_reserve) > int(
-            self.exact_eig_pose_limit
-        ):
-            raise ValueError(
-                "exact_eig_coverage_reserve must fit within exact_eig_pose_limit."
-            )
-        if int(self.exact_eig_program_diversity_reserve) != 0:
-            raise ValueError(
-                "exact_eig_program_diversity_reserve is retired because every "
-                "program is exactly evaluated at every shortlisted pose."
-            )
-        if legacy_execution_enabled and int(self.exact_eig_pose_limit) > int(
-            self.exact_eig_action_limit
-        ):
-            raise ValueError(
-                "exact_eig_action_limit must accommodate at least one program "
-                "for every shortlisted pose."
-            )
         if int(self.exact_eig_pose_max) < int(self.exact_eig_pose_min):
             raise ValueError("exact_eig_pose_max must be at least exact_eig_pose_min.")
         if int(self.exact_eig_pose_step) > int(self.exact_eig_pose_max):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from pf.provenance import json_safe
+from pf.provenance import strict_canonical_json_bytes, strict_json_loads
 from planning.dss_pp import (
     _conditional_pose_ambiguity_mask,
     _proxy_replica_scores_payload,
@@ -70,7 +70,7 @@ def test_pose_confirmation_mask_contains_leader_and_overlapping_pose_only() -> N
     assert lower[2] > 0.0
 
 
-def test_sparse_proxy_replica_diagnostics_are_json_safe() -> None:
+def test_sparse_proxy_replica_diagnostics_are_strict_json() -> None:
     """Unrefined poses must use JSON null instead of non-finite sentinels."""
     scores = np.asarray(
         [[3.0, 2.0, 1.0], [3.1, np.nan, np.nan], [2.9, np.nan, np.nan]],
@@ -80,7 +80,9 @@ def test_sparse_proxy_replica_diagnostics_are_json_safe() -> None:
     payload = _proxy_replica_scores_payload(scores, evaluated=True)
 
     assert payload == [[3.0, 2.0, 1.0], [3.1, None, None], [2.9, None, None]]
-    assert json_safe({"proxy_replica_scores": payload}) == {
+    assert strict_json_loads(
+        strict_canonical_json_bytes({"proxy_replica_scores": payload})
+    ) == {
         "proxy_replica_scores": payload
     }
 

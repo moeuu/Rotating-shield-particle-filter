@@ -19,8 +19,30 @@ from visualization.realtime_viz import (
     CUISplitPFVisualizer,
     PFFrame,
     atomic_copy_file,
+    build_frame_from_pf,
     pf_cui_panel_specs,
 )
+
+
+def test_frame_builder_rejects_legacy_estimate_interfaces() -> None:
+    """Visualization must require its one canonical estimator snapshot API."""
+
+    class LegacyOnlyPF:
+        """Expose only the retired visualization estimate method."""
+
+        filters: dict[str, object] = {}
+
+        def estimates(self) -> dict[str, object]:
+            """Return an empty retired estimate payload."""
+            return {}
+
+    with pytest.raises(TypeError, match="must implement visualization_estimates"):
+        build_frame_from_pf(
+            LegacyOnlyPF(),
+            0,
+            0.0,
+            detector_position=np.zeros(3, dtype=np.float64),
+        )
 
 
 def _route_record(
@@ -52,11 +74,10 @@ def _empty_frame(step_id: int, route: CUIRoute) -> PFFrame:
     return PFFrame(
         step_index=step_id,
         time=float(step_id),
-        robot_position=np.asarray(route.current_pose_xyz, dtype=np.float64),
-        robot_orientation=None,
-        RFe=np.asarray([1.0, 0.0, 0.0], dtype=np.float64),
-        RPb=np.asarray([0.0, 1.0, 0.0], dtype=np.float64),
-        duration=1.0,
+        robot_position=np.asarray(
+            route.current_detector_position_xyz,
+            dtype=np.float64,
+        ),
         particle_positions={"Cs-137": np.zeros((0, 3), dtype=np.float64)},
         particle_weights={"Cs-137": np.zeros(0, dtype=np.float64)},
         estimated_sources={"Cs-137": np.zeros((0, 3), dtype=np.float64)},
@@ -71,6 +92,59 @@ class _AliveProcess:
     def is_alive(self) -> bool:
         """Report that the synthetic renderer process is alive."""
         return True
+
+
+class _ControlledProcess:
+    """Provide deterministic process lifecycle hooks for protocol tests."""
+
+    def __init__(self, join_hook: object | None = None) -> None:
+        """Create a live process that can emit statuses while joining."""
+        self._alive = True
+        self.exitcode: int | None = None
+        self.join_hook = join_hook
+        self.terminate_calls = 0
+        self.join_calls = 0
+
+    def is_alive(self) -> bool:
+        """Return the synthetic process liveness state."""
+        return self._alive
+
+    def terminate(self) -> None:
+        """Record forced termination and expose a signal-like exit code."""
+        self.terminate_calls += 1
+        self._alive = False
+        self.exitcode = -15
+
+    def join(self, timeout: float | None = None) -> None:
+        """Complete the worker and invoke its deterministic status hook."""
+        del timeout
+        self.join_calls += 1
+        if not self._alive:
+            return
+        hook = self.join_hook
+        if callable(hook):
+            hook()
+        self._alive = False
+        self.exitcode = 0
+
+
+def _queue_only_async_visualizer() -> AsyncCUISplitPFVisualizer:
+    """Return a started synthetic async visualizer without a child process."""
+    visualizer = AsyncCUISplitPFVisualizer.__new__(AsyncCUISplitPFVisualizer)
+    visualizer._closed = False
+    visualizer._process = _ControlledProcess()
+    visualizer._queue = queue.Queue(maxsize=2)
+    visualizer._status_queue = queue.Queue()
+    visualizer._run_token = "test-run"
+    visualizer._next_operation_id = 0
+    visualizer._last_enqueued_operation_id = -1
+    visualizer._last_acknowledged_operation_id = -1
+    visualizer._operation_kinds = {}
+    visualizer._ready_acknowledged = True
+    visualizer._close_operation_id = None
+    visualizer._close_acknowledged = False
+    visualizer._worker_error = None
+    return visualizer
 
 
 def test_cui_truth_is_hidden_until_explicit_evaluation_update(
@@ -186,10 +260,6 @@ def test_cui_writes_plain_and_neighborhood_labeled_pf_images(
         step_index=3,
         time=120.0,
         robot_position=np.asarray([2.0, 2.0, 0.5], dtype=float),
-        robot_orientation=None,
-        RFe=np.asarray([1.0, 0.0, 0.0], dtype=float),
-        RPb=np.asarray([0.0, 1.0, 0.0], dtype=float),
-        duration=30.0,
         particle_positions={"Co-60": np.zeros((0, 3), dtype=float)},
         particle_weights={"Co-60": np.zeros(0, dtype=float)},
         estimated_sources={
@@ -369,13 +439,24 @@ def test_async_cui_frame_drop_retains_cumulative_route() -> None:
     visualizer._closed = False
     visualizer._process = _AliveProcess()
     visualizer._queue = queue.Queue(maxsize=1)
+    visualizer._status_queue = queue.Queue()
+    visualizer._run_token = "test-run"
+    visualizer._next_operation_id = 0
+    visualizer._last_enqueued_operation_id = -1
+    visualizer._last_acknowledged_operation_id = -1
+    visualizer._operation_kinds = {}
+    visualizer._ready_acknowledged = True
+    visualizer._close_operation_id = None
+    visualizer._close_acknowledged = False
+    visualizer._worker_error = None
 
     visualizer.update(_empty_frame(0, first_route))
     visualizer.update(_empty_frame(2, latest_route))
 
-    message, payload = visualizer._queue.get_nowait()
+    message, operation_id, payload = visualizer._queue.get_nowait()
     retained_frame = pickle.loads(payload)
     assert message == "frame"
+    assert operation_id == 1
     assert retained_frame.step_index == 2
     np.testing.assert_array_equal(
         retained_frame.cui_route.measurement_station_ids,
@@ -385,3 +466,176 @@ def test_async_cui_frame_drop_retains_cumulative_route() -> None:
         retained_frame.cui_route.measurement_visit_counts,
         np.asarray([2, 1], dtype=np.int64),
     )
+
+
+def test_async_cui_startup_rejects_mismatched_ack_and_reaps_worker() -> None:
+    """A malformed startup ACK must fail construction and reap the child."""
+    visualizer = AsyncCUISplitPFVisualizer.__new__(AsyncCUISplitPFVisualizer)
+    process = _ControlledProcess()
+    visualizer._closed = False
+    visualizer._process = process
+    visualizer._status_queue = queue.Queue()
+    visualizer._status_queue.put(("ready", -1, "wrong-phase", "test-run"))
+    visualizer._run_token = "test-run"
+    visualizer._ready_acknowledged = False
+    visualizer._operation_kinds = {}
+    visualizer._close_operation_id = None
+    visualizer._worker_error = None
+
+    with pytest.raises(RuntimeError, match="mismatched startup"):
+        visualizer._await_worker_ready(timeout_s=0.1)
+
+    assert visualizer._closed is True
+    assert process.terminate_calls == 1
+    assert process.join_calls == 1
+
+
+def test_async_cui_process_start_failure_reaps_a_partially_started_child(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A process-start exception must not leave a renderer child alive."""
+
+    class _FailingStartProcess(_ControlledProcess):
+        """Raise after exposing a synthetic child PID."""
+
+        pid = 12345
+
+        def start(self) -> None:
+            """Simulate a partially completed multiprocessing start."""
+            raise RuntimeError("synthetic renderer process start failure")
+
+    class _FailingStartContext:
+        """Construct deterministic queues and the failing process."""
+
+        def __init__(self, process: _FailingStartProcess) -> None:
+            """Retain the process inspected after construction fails."""
+            self.process = process
+
+        def Queue(self, maxsize: int = 0) -> queue.Queue[object]:
+            """Return an in-memory queue matching the requested capacity."""
+            return queue.Queue(maxsize=maxsize)
+
+        def Process(self, **kwargs: object) -> _FailingStartProcess:
+            """Return the one synthetic renderer process."""
+            del kwargs
+            return self.process
+
+    process = _FailingStartProcess()
+    context = _FailingStartContext(process)
+    monkeypatch.setattr(
+        "visualization.realtime_viz.mp.get_context",
+        lambda method: context,
+    )
+
+    with pytest.raises(RuntimeError, match="process start failure"):
+        AsyncCUISplitPFVisualizer(
+            isotopes=["Cs-137"],
+            output_dir=tmp_path,
+        )
+
+    assert process.terminate_calls == 1
+    assert process.join_calls == 1
+    assert process.is_alive() is False
+
+
+def test_async_cui_update_propagates_worker_render_failure() -> None:
+    """A child render error must fail before another frame can be accepted."""
+    route = cui_route_from_records(
+        (_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),)
+    )
+    visualizer = _queue_only_async_visualizer()
+    visualizer.update(_empty_frame(0, route))
+    visualizer._status_queue.put(
+        ("error", 0, "ValueError: synthetic render failure", "test-run")
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic render failure"):
+        visualizer.update(_empty_frame(1, route))
+
+    assert visualizer._next_operation_id == 1
+    assert visualizer._queue.qsize() == 1
+    assert visualizer._closed is True
+    assert visualizer._process.terminate_calls == 1
+
+
+def test_async_cui_update_rejects_mismatched_operation_ack() -> None:
+    """An ACK for the wrong operation kind must never advance CUI state."""
+    route = cui_route_from_records(
+        (_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),)
+    )
+    visualizer = _queue_only_async_visualizer()
+    visualizer.update(_empty_frame(0, route))
+    visualizer._status_queue.put(("ack", 0, "truth", "test-run"))
+
+    with pytest.raises(RuntimeError, match="mismatched operation"):
+        visualizer.update(_empty_frame(1, route))
+
+    assert visualizer.last_acknowledged_operation_id == -1
+    assert visualizer._closed is True
+    assert visualizer._process.terminate_calls == 1
+
+
+def test_async_cui_close_requires_latest_frame_ack() -> None:
+    """A close ACK cannot conceal an unacknowledged final render operation."""
+    route = cui_route_from_records(
+        (_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),)
+    )
+    visualizer = _queue_only_async_visualizer()
+    visualizer.update(_empty_frame(0, route))
+
+    def close_without_frame_ack() -> None:
+        """Acknowledge only close while omitting the queued frame ACK."""
+        while True:
+            try:
+                kind, operation_id, _payload = visualizer._queue.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "close":
+                visualizer._status_queue.put(
+                    ("closed", operation_id, "close", "test-run")
+                )
+
+    process = _ControlledProcess(close_without_frame_ack)
+    visualizer._process = process
+
+    with pytest.raises(RuntimeError, match="latest queued operation"):
+        visualizer.close(timeout_s=0.1)
+
+    assert visualizer._closed is True
+    assert visualizer._close_acknowledged is True
+    assert process.join_calls == 2
+
+
+def test_async_cui_close_rejects_mismatched_close_ack() -> None:
+    """A stale or future close ACK must fail even after the frame was rendered."""
+    route = cui_route_from_records(
+        (_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),)
+    )
+    visualizer = _queue_only_async_visualizer()
+    visualizer.update(_empty_frame(0, route))
+
+    def emit_mismatched_close_ack() -> None:
+        """Emit the valid frame ACK followed by a future close operation ID."""
+        while True:
+            try:
+                kind, operation_id, _payload = visualizer._queue.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "frame":
+                visualizer._status_queue.put(
+                    ("ack", operation_id, "frame", "test-run")
+                )
+            elif kind == "close":
+                visualizer._status_queue.put(
+                    ("closed", operation_id + 1, "close", "test-run")
+                )
+
+    process = _ControlledProcess(emit_mismatched_close_ack)
+    visualizer._process = process
+
+    with pytest.raises(RuntimeError, match="mismatched close"):
+        visualizer.close(timeout_s=0.1)
+
+    assert visualizer._closed is True
+    assert process.join_calls == 2

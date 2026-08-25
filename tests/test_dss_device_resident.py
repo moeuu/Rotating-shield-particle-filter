@@ -73,6 +73,7 @@ def _multi_isotope_estimator(
             planning_eig_samples=3,
         ),
         shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        detector_radius_m=0.025,
         line_mu_by_isotope=_line_mu_by_isotope(model),
         full_spectrum_generative_model=model,
         random_seed=9,
@@ -169,7 +170,12 @@ def test_multi_isotope_dss_components_remain_device_resident(
         assert tuple(device_value.shape) == expected_shape
         assert device_value.is_contiguous()
         if device_name == "cpu":
-            np.testing.assert_array_equal(device_value.numpy(), host_value)
+            np.testing.assert_allclose(
+                device_value.numpy(),
+                host_value,
+                rtol=1.0e-14,
+                atol=1.0e-14,
+            )
         else:
             np.testing.assert_allclose(
                 device_value.detach().cpu().numpy(),

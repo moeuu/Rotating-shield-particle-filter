@@ -1,7 +1,8 @@
-"""Compatibility tests for estimator algorithm-unit extraction boundaries."""
+"""Tests for estimator algorithm-unit extraction boundaries."""
 
 from __future__ import annotations
 
+import pf.estimator as estimator_module
 from pf.estimator import (
     RotatingShieldPFConfig as PublicRotatingShieldPFConfig,
 )
@@ -14,10 +15,6 @@ from pf.estimator import (
 from pf.estimator import (
     build_complete_surface_atlas_quadrature as public_build_surface_quadrature,
 )
-from pf.estimator import (
-    posterior_point_estimate_from_states as public_posterior_point_estimate,
-)
-from pf.estimator import systematic_resample as public_systematic_resample
 from pf.estimator import (
     _stratified_categorical_draws as public_stratified_categorical_draws,
 )
@@ -35,23 +32,22 @@ from pf.estimator_sampling import (
 from pf.estimator_structural import EstimatorStructuralProposalMixin
 from pf.estimator_surface import SurfaceAtlasQuadrature
 from pf.estimator_surface import build_complete_surface_atlas_quadrature
-from pf.posterior import posterior_point_estimate_from_states
-from pf.resampling import systematic_resample
+from pf.pure_estimator import PurePFEstimator
 
 
-def test_estimator_facade_reexports_extracted_types_and_sampling() -> None:
-    """Legacy estimator imports must retain the extracted object identities."""
+def test_estimator_module_exposes_only_owned_public_algorithm_types() -> None:
+    """The estimator module must not facade unrelated algorithm utilities."""
     assert PublicRotatingShieldPFConfig is RotatingShieldPFConfig
     assert PublicSurfaceAtlasQuadrature is SurfaceAtlasQuadrature
     assert public_build_surface_quadrature is build_complete_surface_atlas_quadrature
     assert public_stratified_categorical_draws is _stratified_categorical_draws
     assert public_joint_cardinality_draws is _stratified_joint_cardinality_draws
-    assert public_posterior_point_estimate is posterior_point_estimate_from_states
-    assert public_systematic_resample is systematic_resample
+    assert not hasattr(estimator_module, "posterior_point_estimate_from_states")
+    assert not hasattr(estimator_module, "systematic_resample")
 
 
-def test_estimator_facade_inherits_each_algorithm_unit_directly() -> None:
-    """The facade must expose the exact extracted algorithm implementations."""
+def test_estimator_inherits_each_algorithm_unit_directly() -> None:
+    """The estimator must expose the exact extracted implementations."""
     assert (
         RotatingShieldPFEstimator._joint_station_from_spectrum_records
         is JointLikelihoodMixin._joint_station_from_spectrum_records
@@ -68,3 +64,8 @@ def test_estimator_facade_inherits_each_algorithm_unit_directly() -> None:
         RotatingShieldPFEstimator.posterior_convergence_diagnostics
         is EstimatorReportingMixin.posterior_convergence_diagnostics
     )
+
+
+def test_pure_estimator_inherits_the_canonical_estimates_projection() -> None:
+    """Pure-PF reporting must not duplicate the canonical projection method."""
+    assert PurePFEstimator.estimates is EstimatorReportingMixin.estimates
