@@ -18,9 +18,21 @@ from runtime.measurement_log import (
     build_forward_model_manifest,
     write_measurement_log,
 )
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 from spectrum.response_matrix import (
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
 )
+from spectrum.detector_response_validation import (
+    DETECTOR_RESPONSE_MINIMUM_HISTORIES_PER_ENERGY,
+    DETECTOR_RESPONSE_REFERENCE_GEOMETRY_SHA256,
+    DETECTOR_RESPONSE_VALIDATION_CONTRACT_ID,
+    DETECTOR_RESPONSE_VALIDATION_CONTRACT_SHA256,
+    DETECTOR_RESPONSE_VALIDATION_METRIC_CONTRACT,
+    DETECTOR_RESPONSE_VALIDATION_SCHEMA_VERSION,
+    detector_response_validation_manifest_sha256,
+)
+from spectrum.geant4_physics import GEANT4_PHYSICS_CONTRACT_SHA256
+from spectrum.library import default_library
 from spectrum.physics_contracts import (
     OBSTACLE_MATERIAL_CONTRACT_SHA256,
     TRANSPORT_PHYSICS_TABLE_CONTRACT_SHA256,
@@ -46,6 +58,85 @@ from spectrum.transport_spectral import (
 
 TEST_COMMIT = "a" * 40
 TEST_ISOTOPES = ("Co-60", "Cs-137", "Eu-154")
+
+
+def _synthetic_detector_response_validation(
+    *,
+    runtime_config_sha256: str,
+    native_executable_sha256: str,
+    native_execution_environment_sha256: str,
+    implementation_bundle_sha256: str,
+) -> dict[str, object]:
+    """Return a passing test-only full-detector validation attestation."""
+    library = default_library()
+    lines = sorted(
+        (float(line.energy_keV), isotope)
+        for isotope in ("Cs-137", "Co-60", "Eu-154")
+        for line in library[isotope].lines
+        if float(line.intensity) > 0.0
+    )
+    line_results = [
+        {
+            "energy_keV": energy,
+            "isotope": isotope,
+            "total_variation": 0.0,
+            "observed_photopeak_fraction": 0.5,
+            "candidate_photopeak_fraction": 0.5,
+            "photopeak_fraction_absolute_error": 0.0,
+            "observed_conditional_mean_keV": energy,
+            "candidate_conditional_mean_keV": energy,
+            "conditional_mean_relative_error": 0.0,
+            "pulse_detection_fraction": 0.5,
+            "passed": True,
+        }
+        for energy, isotope in lines
+    ]
+    metrics = {
+        metric: {
+            "value": 0.0,
+            "comparison": comparison,
+            "threshold": float(threshold),
+            "passed": True,
+        }
+        for metric, (comparison, threshold) in (
+            DETECTOR_RESPONSE_VALIDATION_METRIC_CONTRACT.items()
+        )
+    }
+    return {
+        "schema_version": DETECTOR_RESPONSE_VALIDATION_SCHEMA_VERSION,
+        "validation_contract_id": DETECTOR_RESPONSE_VALIDATION_CONTRACT_ID,
+        "validation_contract_sha256": (
+            DETECTOR_RESPONSE_VALIDATION_CONTRACT_SHA256
+        ),
+        "detector_response_contract_sha256": (
+            NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "geant4_physics_contract_sha256": GEANT4_PHYSICS_CONTRACT_SHA256,
+        "reference_geometry_sha256": (
+            DETECTOR_RESPONSE_REFERENCE_GEOMETRY_SHA256
+        ),
+        "runtime_config_sha256": runtime_config_sha256,
+        "native_executable_sha256": native_executable_sha256,
+        "native_execution_environment_sha256": (
+            native_execution_environment_sha256
+        ),
+        "implementation_bundle_sha256": implementation_bundle_sha256,
+        "reference_scene_sha256": "1" * 64,
+        "reference_source_contract_sha256": "2" * 64,
+        "reference_detector_model_sha256": "3" * 64,
+        "reference_detector_scoring_mode": "full_transport",
+        "candidate_detector_scoring_mode": "incident_gamma_energy",
+        "evaluated_energy_keV": [energy for energy, _ in lines],
+        "histories_per_energy": (
+            DETECTOR_RESPONSE_MINIMUM_HISTORIES_PER_ENERGY
+        ),
+        "transport_seed": 123_456_789,
+        "dwell_time_s": STANDARD_ACQUISITION_LIVE_TIME_S,
+        "raw_corpus_sha256": "4" * 64,
+        "line_results": line_results,
+        "metrics": metrics,
+        "all_passed": True,
+    }
 
 
 def _synthetic_training_manifest() -> dict[str, object]:
@@ -109,8 +200,28 @@ def _synthetic_validation_manifest(
             "threshold": float(threshold),
             "passed": True,
         }
+    runtime_config_sha256 = sha256(
+        b"test-validation-runtime-config"
+    ).hexdigest()
+    native_executable_sha256 = sha256(
+        b"test-validation-native-executable"
+    ).hexdigest()
+    native_execution_environment_sha256 = sha256(
+        b"test-validation-native-execution-environment"
+    ).hexdigest()
+    implementation_bundle_sha256 = sha256(
+        b"test-validation-implementation-bundle"
+    ).hexdigest()
+    detector_response_validation = _synthetic_detector_response_validation(
+        runtime_config_sha256=runtime_config_sha256,
+        native_executable_sha256=native_executable_sha256,
+        native_execution_environment_sha256=(
+            native_execution_environment_sha256
+        ),
+        implementation_bundle_sha256=implementation_bundle_sha256,
+    )
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "validation_contract_sha256": (
             FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256
         ),
@@ -118,20 +229,20 @@ def _synthetic_validation_manifest(
         "acceptance_run_contract_sha256": sha256(
             b"test-validation-acceptance-run-contract"
         ).hexdigest(),
-        "runtime_config_sha256": sha256(
-            b"test-validation-runtime-config"
-        ).hexdigest(),
-        "native_executable_sha256": sha256(
-            b"test-validation-native-executable"
-        ).hexdigest(),
-        "native_execution_environment_sha256": sha256(
-            b"test-validation-native-execution-environment"
-        ).hexdigest(),
-        "implementation_bundle_sha256": sha256(
-            b"test-validation-implementation-bundle"
-        ).hexdigest(),
+        "runtime_config_sha256": runtime_config_sha256,
+        "native_executable_sha256": native_executable_sha256,
+        "native_execution_environment_sha256": (
+            native_execution_environment_sha256
+        ),
+        "implementation_bundle_sha256": implementation_bundle_sha256,
         "native_response_contract_sha256": (
             NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+        ),
+        "detector_response_validation": detector_response_validation,
+        "detector_response_validation_manifest_sha256": (
+            detector_response_validation_manifest_sha256(
+                detector_response_validation
+            )
         ),
         "additive_scatter_contract_sha256": str(
             additive_scatter_contract_hash
