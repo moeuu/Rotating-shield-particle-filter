@@ -40,11 +40,33 @@
 
 ## Scientific-paper skill policy
 
+- Project-scoped scientific skills are installed under `.agents/skills` and
+  pinned as the K-Dense `scientific-agent-skills` v2.65.0 bundle. The bundle
+  pin identifies the advisory source; individual skills may retain their own
+  component version metadata.
 - Repository-local scientific-writing, visualization, plotting, peer-review,
   and venue-template skills are advisory checklists, not project authority.
 - Use those skills to improve evidence traceability, claim--evidence alignment,
   reproducibility, accessibility, and rendered-artifact quality when preparing
   a paper.
+- For every RA-L manuscript figure task, explicitly load and follow both
+  `$scientific-visualization` and `$matplotlib`, and read both
+  `docs/ral_figure_quality_policy.md` and
+  `docs/ral_experiment_figure_policy.md` before changing or generating the
+  figure.
+- Do not use `$imagegen` or another generative raster-image skill for RA-L
+  manuscript figures. Construct them from authenticated source data, recorded
+  simulation artifacts, repository geometry, and deterministic plotting code.
+- Preserve figure source paths or artifact identifiers, transformations,
+  normalization and binning semantics, uncertainty definitions, missing-data
+  handling, and relevant random seeds. Produce review artifacts with recorded
+  provenance and inspect the rendered figure at its final manuscript size,
+  both standalone and on the compiled paper page, before reporting completion.
+- For RA-L manuscript text, internal manuscript review, or live venue-rule
+  work, explicitly load and follow `$scientific-writing`, `$peer-review`, and
+  `$venue-templates`. Treat an internal review as a claim--evidence audit, not
+  an editorial decision, and verify time-sensitive venue requirements against
+  the official source for the exact submission stage.
 - The user's explicit instructions, this `AGENTS.md`, verified repository
   artifacts, the implemented method, and current official venue rules remain
   authoritative when a skill conflicts with them.
@@ -113,8 +135,10 @@
 
 ## RA-L figure quality policy
 
-- Before creating or modifying RA-L manuscript figures, read
-  `docs/ral_figure_quality_policy.md`.
+- Before creating or modifying RA-L manuscript figures, load
+  `$scientific-visualization` and `$matplotlib`, then read
+  `docs/ral_figure_quality_policy.md` and
+  `docs/ral_experiment_figure_policy.md`.
 - After generating any manuscript figure, inspect the rendered image itself
   before reporting completion. Do not rely only on code, LaTeX source, or file
   existence.
