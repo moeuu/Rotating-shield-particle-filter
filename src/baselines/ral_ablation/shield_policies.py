@@ -48,20 +48,6 @@ def validate_baseline_shield_policy(
     if any(not isinstance(key, str) for key in policy_config):
         raise TypeError("baseline_shield_policy keys must be JSON strings.")
     name = policy_config.get("name")
-    if name == "fixed":
-        expected = {"name", "fixed_pair_id"}
-        actual = set(policy_config)
-        if actual != expected:
-            raise ValueError(
-                "fixed shield policy must contain exactly name and fixed_pair_id; "
-                f"missing={sorted(expected - actual)}, "
-                f"unknown={sorted(actual - expected)}."
-            )
-        fixed_pair_id = _nonnegative_json_integer(
-            policy_config["fixed_pair_id"],
-            field_name="baseline_shield_policy.fixed_pair_id",
-        )
-        return {"name": "fixed", "fixed_pair_id": fixed_pair_id}
     if name == "round_robin":
         expected = {"name", "start_pair_id", "advance_by_pose"}
         actual = set(policy_config)
@@ -87,7 +73,7 @@ def validate_baseline_shield_policy(
             "advance_by_pose": advance_by_pose,
         }
     raise ValueError(
-        "baseline_shield_policy.name must be exactly 'fixed' or 'round_robin'."
+        "baseline_shield_policy.name must be exactly 'round_robin'."
     )
 
 
@@ -116,20 +102,6 @@ def select_baseline_shield_program(
         )
         if current >= total:
             raise ValueError("current_pair_id must be smaller than total_pairs.")
-    if policy == "fixed":
-        fixed_pair = _nonnegative_json_integer(
-            validated_policy["fixed_pair_id"],
-            field_name="baseline_shield_policy.fixed_pair_id",
-        )
-        if not 0 <= fixed_pair < total:
-            raise ValueError(
-                "baseline_shield_policy.fixed_pair_id must be in "
-                "[0, total_pairs)."
-            )
-        return BaselineShieldProgram(
-            name=f"fixed_shield_{fixed_pair}",
-            pair_ids=tuple(fixed_pair for _ in range(length)),
-        )
     if policy == "round_robin":
         start = _nonnegative_json_integer(
             validated_policy["start_pair_id"],

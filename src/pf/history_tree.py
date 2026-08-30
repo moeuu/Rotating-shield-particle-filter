@@ -493,7 +493,6 @@ def run_tpht_hierarchical_exact_acceptance_torch(
     likelihood_exact = support & (evaluated_station_count == station_count)
     if bool(torch.any(active & ~likelihood_exact).item()):
         raise RuntimeError("TPHT refinement ended with unresolved active rows.")
-    exact_ratio = evaluated_delta + non_likelihood
     accepted = active & likelihood_exact & (
         log_refinement_uniform < refinement_delta
     )

@@ -38,6 +38,21 @@
   `main`.
 
 
+## Scientific-paper skill policy
+
+- Repository-local scientific-writing, visualization, plotting, peer-review,
+  and venue-template skills are advisory checklists, not project authority.
+- Use those skills to improve evidence traceability, claim--evidence alignment,
+  reproducibility, accessibility, and rendered-artifact quality when preparing
+  a paper.
+- The user's explicit instructions, this `AGENTS.md`, verified repository
+  artifacts, the implemented method, and current official venue rules remain
+  authoritative when a skill conflicts with them.
+- Do not import generic skill boilerplate, fabricate missing evidence, or let a
+  skill redefine the method, experiments, metrics, authorship, or submission
+  requirements. Record uncertainty and missing evidence explicitly instead.
+
+
 ## Generalization and anti-overfitting policy
 
 - Do not implement calibration, response correction, PF observation logic, or
@@ -75,7 +90,7 @@
   user explicitly asks for a camera-ready/non-anonymous version.
 - The current RA-L paper subset is four full-simulation runs on
   `mix9_multi_isotope_cardinality`:
-  `proposed`, `baseline_passive_equal_time_no_shield`, `round_robin_shield`,
+  `proposed`, `no_shield_native_path`, `round_robin_shield`,
   and `eig_only_path`. The task uses `4 Cs-137 + 3 Co-60 + 2 Eu-154` sources.
   Every variant uses `pure_pf_schema_version: 2`, the `pf_strict` profile, and
   the same exact reversible-jump PF; variants change only shield and planning

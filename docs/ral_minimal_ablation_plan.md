@@ -70,7 +70,7 @@ come only from the runtime candidate contract.
 Run only four closed-loop full-simulation variants for the main paper table:
 
 - `proposed`
-- `baseline_passive_equal_time_no_shield`
+- `no_shield_native_path`
 - `round_robin_shield`
 - `eig_only_path`
 
@@ -83,18 +83,26 @@ ground-truth source count in the task.
 
 ## Rationale
 
-The paper claim is multi-isotope source-term estimation with isotope-wise source
-cardinality, 3-D localization, strength estimation, and same-isotope ambiguity
-inside multiple radionuclide channels. The single MIX-9 task exercises all of
-these mechanisms in one expensive run.
+The paper claim is joint multi-isotope source-term estimation with unknown
+isotope-wise cardinality, 3-D localization, strength estimation, and
+posterior-adaptive attenuation coding. The single MIX-9 task exercises these
+mechanisms in one expensive run.
 
-- `proposed` is the reference method.
-- `baseline_passive_equal_time_no_shield` disables shield coding while
-  preserving the same per-station physical live-time budget. It tests whether
-  longer nondirectional dwell alone is sufficient.
+- `proposed` jointly uses the Fe/Pb pose-pair code in the full-spectrum SMC/RJ
+  likelihood and chooses each eight-view code and detector station from the
+  current posterior.
+- `no_shield_native_path` physically removes Fe/Pb attenuation while preserving
+  the exact native DSS-PP implementation, candidate contract, station budget,
+  eight views, and 20 s live time per view. It tests whether the directional
+  attenuation code adds information beyond movement and dwell. "Native path"
+  means the same planner algorithm, not forced equality of the resulting poses;
+  removing the shield changes the predictive distribution and can therefore
+  change the selected pose.
 - `round_robin_shield` keeps the Fe/Pb shield and the same posture budget but
-  removes posterior-adaptive shield-program selection. It tests whether the
-  hardware alone is sufficient.
+  injects an independently implemented deterministic round-robin eight-pair
+  code. Native DSS-PP still scores and selects detector poses using that forced
+  code. It tests whether posterior-adaptive code design adds value beyond the
+  hardware itself.
 - `eig_only_path` keeps active planning and shield programs but selects poses
   only by full-spectrum EIG minus the runtime-authored horizontal, mast, and
   settling-time costs. Its coverage score, coverage floor, coverage-reserved
@@ -104,8 +112,9 @@ these mechanisms in one expensive run.
   silently retained behind a zero weight.
 
 Every variant uses `pure_pf_schema_version: 2`, the `pf_strict` profile, and the
-same exact reversible-jump particle filter. Ablations vary only the declared
-shield and planning policies above.
+same shield-conditioned full-spectrum reversible-jump particle filter. The
+ablation interventions live in the RA-L-only adapter/config factory and do not
+add fallback branches to the proposed estimator.
 
 ## Generated Files
 
@@ -139,8 +148,9 @@ scenario path, truth payload, source profile, scene seed, or source RNG provenan
 Only the asynchronous renderer child reads the overlay endpoint; it labels truth in
 the CUI without placing truth in PF frames or controller results.
 
-Each control-policy file is an exact schema-version-1 document with no aliases,
-defaults, or unknown members. The private manifest records the SHA-256 digest of
+Each control-policy file is an exact schema-version-2 document with exactly
+`schema_version`, `variant`, and `shield_policy`; it has no aliases, defaults,
+or unknown members. The private manifest records the SHA-256 digest of
 its exact source bytes, and the session command must supply that digest back as
 `--expected-control-policy-sha256`. The controller validates the digest and the
 complete discriminated policy before opening the runtime socket. The same sealed
@@ -149,13 +159,10 @@ configuration hash, final posterior provenance, serialized PF state, and checkpo
 manifest. Replacing a policy file with another valid variant policy is therefore a
 hard preflight error.
 
-The passive fixed-path variant uses the planner-disabled discriminant
-`dss_pp = null`; it also requires `planning_eig_samples = null`,
-`runtime_candidate_refinement_top_k = 0`, and `planner_audit_top_k = 0`.
-Its live controller constructs only a minimal external-path contract from the
-runtime-authenticated views-per-station value and never constructs `DSSPPConfig`.
-Conversely, native-path and round-robin variants reject these null sentinels.
-Round-robin retains native pose planning but explicitly sets both
+All four variants require a complete native `DSSPPConfig` and
+`planning_eig_samples >= 2`; the retired fixed-path/null-planner lifecycle is
+not representable in the current policy schema. Round-robin retains native pose
+planning but explicitly sets both
 `shield_view_count_shadow_enabled = false` and
 `conditional_greedy_one_swap = false` because its shield program is externally
 forced. These are required inactive-mode sentinels rather than inherited defaults.
@@ -180,7 +187,7 @@ the dedicated single-response socket and is never serialized into controller sta
 
 Every generated private runtime configuration is a complete strict production
 document. Runtime-config inheritance and the retired weighted/capped-history
-controls are not emitted. The passive-shield ablation declares only
+controls are not emitted. The no-shield ablation declares only
 `shield_transmission_target = 1.0`; the shared shield geometry resolves that
 physical target to zero Fe/Pb thickness.
 
@@ -201,11 +208,26 @@ The experiment figure policy is recorded in
 the visual and logical QA checklist in `docs/ral_figure_quality_policy.md` and
 inspect the generated review PNGs.
 
-## Current Result Notes
+## Result Reporting Contract
 
-The current PDF may contain placeholder or old representative values while new
-MIX-9 experiments are pending. Treat those values as replaceable table entries;
-do not change the agreed experiment scope just to match an old result table.
+Do not place placeholder comparison numbers in the paper. Until the paired
+four-run MIX-9 batch is complete, an older completed run may appear only as a
+clearly labelled predecessor-code diagnostic. It may demonstrate plotting and
+failure analysis, but it cannot establish the proposed method's current
+accuracy or comparative advantage.
+
+Report the paired four-run batch with the fixed policy in
+`docs/post_run_cluster_accuracy_policy.md`. The main outcomes are true-source
+cluster recall; per-source 3-D position and relative strength error; the joint
+0.5 m/25% pass fraction; response-distinct remote-component count; hard-cap
+mass; and station/time to a stable pass. Raw RJ component count is diagnostic,
+not a success target, because nearby components may represent one physical
+source cluster. Also report mission motion time separately from the fixed
+2560 s detector live-time budget.
+
+The four variants share one scene within one fresh batch, so report paired
+descriptive differences. Do not treat nine sources as independent experiments
+or attach unsupported p-values to a single scene.
 
 Every variant uses the same immutable joint full-spectrum observation model.
 There is no shield-pair-specific variance inflation, isotope-count rescue, or

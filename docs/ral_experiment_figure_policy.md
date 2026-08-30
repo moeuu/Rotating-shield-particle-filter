@@ -25,16 +25,20 @@ Use the following four-panel grammar:
 2. A metric height projection (`y-z` or `x-z`, whichever better separates the
    sources) with 2 m tick spacing and equal axis scaling so wall, floor,
    obstacle, and high-surface errors are visible.
-3. An online diagnostic panel showing isotope-wise cardinality convergence
-   (`r_Cs`, `r_Co`, `r_Eu`) and, when available, the selected shield-time
-   maximum pairwise response correlation.
-4. A shield-time response matrix or signature heatmap for the most confusable
-   same-isotope pair, with posture rows and source-hypothesis columns.
+3. An online diagnostic panel showing isotope-wise cardinality posterior or MAP
+   evolution and the hard-cap threshold. Raw cardinality is diagnostic only.
+4. A per-true-source error panel showing 3-D position error and relative
+   strength error against the fixed 0.5 m and 25% thresholds. Identify sources
+   by isotope and stable truth index.
 
 The floor and height projections are the primary result panels. Together they
 make the 3-D localization error auditable at RA-L print scale without relying
 on a perspective view. A 3-D view can be added in supplementary material, but it
 should not displace the metric projections in the main paper.
+
+The attenuation-code response matrix belongs in the method figure, not the
+result figure. This gives it a distinct explanatory role and leaves enough
+result space for truth-estimate accuracy.
 
 Do not connect measurement stations with straight path lines. Draw route lines
 only from saved obstacle-aware path waypoints. A straight line between stations
@@ -51,21 +55,22 @@ occlusion, planning, and PF attenuation.
 
 ## Rebuild Command
 
-After paper-scope runs finish, regenerate the main figure with the MIX-9
-summary files:
+For the temporary predecessor-code diagnostic, regenerate the main figure
+directly from its completed durable run bundle:
 
 ```bash
 uv run python scripts/build_ral_figures.py \
-  --skip-concepts \
-  --summary-json results/result_summary_mix9_multi_isotope_cardinality_proposed_seed_2026050901.json \
-  --summary-json results/result_summary_mix9_multi_isotope_cardinality_baseline_passive_equal_time_no_shield_seed_2026050901.json \
-  --summary-json results/result_summary_mix9_multi_isotope_cardinality_round_robin_shield_seed_2026050901.json \
-  --summary-json results/result_summary_mix9_multi_isotope_cardinality_eig_only_path_seed_2026050901.json
+  --completed-run-dir ../Rotating-shield-simulation-runtime/private_runs/full_simulations/cs4_co3_20260827_175045
 ```
+
+After the fresh MIX-9 batch is complete, generate the main paper result from the
+four evaluator outputs for `proposed`, `no_shield_native_path`,
+`round_robin_shield`, and `eig_only_path`. Never mix result files from different
+opaque batch IDs.
 
 The output is written to:
 
-- `sections/05_experiments/figures/ral_result_overview.png`
+- `sections/05_experiments/figures/ral_result_overview.pdf`
 
 Run the same script without `--skip-concepts` whenever Fig. 1 or Fig. 2 needs
 to be refreshed:
@@ -79,7 +84,7 @@ Use these images for the mandatory visual QA pass.
 
 ## Supplementary Figures
 
-The main paper figure should focus on the MIX-9 multi-isotope task because it contains
+The final main paper figure should focus on the MIX-9 multi-isotope task because it contains
 spectral isotope separation, variable isotope-wise source cardinality, and
 same-isotope spatial ambiguity in one scene.
 

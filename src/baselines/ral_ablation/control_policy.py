@@ -9,19 +9,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-import numpy as np
-from numpy.typing import NDArray
 from runtime.provenance import strict_canonical_json_bytes, strict_json_loads
 
-from baselines.ral_ablation.path_policies import (
-    select_baseline_next_pose,
-    validate_baseline_path_policy,
-)
 from baselines.ral_ablation.shield_policies import (
     select_baseline_shield_program,
     validate_baseline_shield_policy,
 )
-from pf.control_policy import PFControlPolicyProvenance, PFExternalPathSelection
+from pf.control_policy import PFControlPolicyProvenance
 from planning.dss_pp import ShieldProgram
 
 
@@ -31,6 +25,22 @@ class RALControlPolicyError(ValueError):
 
 _RAL_CONTROL_POLICY_LOAD_TOKEN = object()
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
+RAL_CONTROL_VARIANTS = (
+    "proposed",
+    "no_shield_native_path",
+    "round_robin_shield",
+    "eig_only_path",
+)
+
+
+def _ral_variant(value: object) -> str:
+    """Return one exact current RA-L comparison variant name."""
+    if not isinstance(value, str) or value not in RAL_CONTROL_VARIANTS:
+        raise RALControlPolicyError(
+            "RA-L control-policy variant must be one of "
+            f"{list(RAL_CONTROL_VARIANTS)}."
+        )
+    return value
 
 
 def _sha256_digest(value: object, *, name: str) -> str:
@@ -49,33 +59,39 @@ def _sha256_digest(value: object, *, name: str) -> str:
 def validate_ral_control_policy_payload(
     payload: Mapping[str, Any],
 ) -> dict[str, object]:
-    """Validate and detach one exact version-1 RA-L policy document."""
+    """Validate and detach one exact version-2 RA-L policy document."""
     if not isinstance(payload, Mapping):
         raise TypeError("RA-L control policy must be a JSON object.")
     if any(not isinstance(key, str) for key in payload):
         raise TypeError("RA-L control-policy keys must be JSON strings.")
-    expected = {"schema_version", "path_policy", "shield_policy"}
+    expected = {"schema_version", "variant", "shield_policy"}
     actual = set(payload)
     if actual != expected:
         raise RALControlPolicyError(
-            "RA-L control policy must contain exactly schema_version, "
-            "path_policy, and shield_policy; "
+            "RA-L control policy must contain exactly schema_version, variant, "
+            "and shield_policy; "
             f"missing={sorted(expected - actual)}, unknown={sorted(actual - expected)}."
         )
     schema_version = payload["schema_version"]
-    if type(schema_version) is not int or schema_version != 1:
+    if type(schema_version) is not int or schema_version != 2:
         raise RALControlPolicyError(
-            "RA-L control policy schema_version must be the JSON integer 1."
+            "RA-L control policy schema_version must be the JSON integer 2."
         )
-    path_policy = validate_baseline_path_policy(payload["path_policy"])
+    variant = _ral_variant(payload["variant"])
     shield_policy = validate_baseline_shield_policy(payload["shield_policy"])
-    if path_policy is not None and shield_policy is None:
+    if variant == "round_robin_shield":
+        if shield_policy is None or shield_policy.get("name") != "round_robin":
+            raise RALControlPolicyError(
+                "round_robin_shield requires the independent round-robin shield "
+                "policy."
+            )
+    elif shield_policy is not None:
         raise RALControlPolicyError(
-            "A fixed RA-L path requires an explicit shield policy."
+            f"RA-L variant {variant!r} must not inject a shield policy."
         )
     return {
-        "schema_version": 1,
-        "path_policy": path_policy,
+        "schema_version": 2,
+        "variant": variant,
         "shield_policy": shield_policy,
     }
 
@@ -90,31 +106,13 @@ def validate_ral_control_policy_pf_settings(
     if not isinstance(settings, Mapping):
         raise TypeError("PF settings must be a mapping.")
     payload = policy.to_payload()
-    forced_shield = payload["shield_policy"] is not None
-    fixed_path = payload["path_policy"] is not None
+    variant = str(payload["variant"])
+    forced_shield = variant == "round_robin_shield"
     dss_pp = settings.get("dss_pp")
     planning_samples = settings.get("planning_eig_samples")
-    if fixed_path:
-        required_sentinels = {
-            "dss_pp": None,
-            "planning_eig_samples": None,
-            "runtime_candidate_refinement_top_k": 0,
-            "planner_audit_top_k": 0,
-        }
-        invalid = [
-            field
-            for field, sentinel in required_sentinels.items()
-            if settings.get(field) != sentinel
-        ]
-        if invalid:
-            raise RALControlPolicyError(
-                "A fixed RA-L path requires exact planner-disabled sentinels for "
-                f"inactive fields: {invalid}."
-            )
-        return
     if not isinstance(dss_pp, Mapping):
         raise RALControlPolicyError(
-            "Native-path RA-L control requires a complete dss_pp configuration."
+            "Every current RA-L variant requires the native DSS-PP path planner."
         )
     if (
         isinstance(planning_samples, bool)
@@ -135,20 +133,50 @@ def validate_ral_control_policy_pf_settings(
                 "Externally forced shield policies require explicit false sentinels "
                 f"for inactive planner fields: {active}."
             )
+    if variant == "eig_only_path":
+        required_values: dict[str, object] = {
+            "coverage_weight": 0.0,
+            "coverage_floor_quantile": 0.0,
+            "coverage_floor_weight": 0.0,
+            "coverage_surface_max_hausdorff_m": None,
+            "coverage_surface_quadrature_max_points": None,
+            "exact_eig_coverage_reserve": 0,
+            "bearing_diversity_weight": 0.0,
+            "frontier_weight": 0.0,
+            "local_orbit_weight": 0.0,
+            "local_orbit_ring_radii_m": [],
+            "local_orbit_sigma_m": None,
+            "elevation_condition_weight": 0.0,
+            "elevation_pair_xy_scale_m": None,
+            "elevation_pair_z_scale_m": None,
+            "elevation_angle_threshold_deg": None,
+            "revisit_penalty_weight": 0.0,
+            "turn_smoothness_weight": 0.0,
+        }
+        invalid = [
+            field
+            for field, expected_value in required_values.items()
+            if dss_pp.get(field) != expected_value
+        ]
+        if invalid:
+            raise RALControlPolicyError(
+                "eig_only_path requires exact inactive sentinels for every "
+                f"non-EIG spatial term: {invalid}."
+            )
 
 
 @dataclass(frozen=True, slots=True, init=False)
 class RALControlPolicy:
     """Execute loader-sealed RA-L baseline choices in the live controller."""
 
-    _path_policy: Mapping[str, Any] | None = field(repr=False)
+    _variant: str = field(repr=False)
     _shield_policy: Mapping[str, Any] | None = field(repr=False)
     _provenance: PFControlPolicyProvenance | None = field(repr=False)
 
     def __init__(
         self,
         *,
-        path_policy: Mapping[str, Any] | None,
+        variant: str,
         shield_policy: Mapping[str, Any] | None,
         _provenance: PFControlPolicyProvenance | None = None,
         _loader_token: object | None = None,
@@ -169,22 +197,14 @@ class RALControlPolicy:
             )
         validated = validate_ral_control_policy_payload(
             {
-                "schema_version": 1,
-                "path_policy": path_policy,
+                "schema_version": 2,
+                "variant": variant,
                 "shield_policy": shield_policy,
             }
         )
-        validated_path = validated["path_policy"]
+        validated_variant = str(validated["variant"])
         validated_shield = validated["shield_policy"]
-        object.__setattr__(
-            self,
-            "_path_policy",
-            (
-                None
-                if validated_path is None
-                else MappingProxyType(dict(validated_path))
-            ),
-        )
+        object.__setattr__(self, "_variant", validated_variant)
         object.__setattr__(
             self,
             "_shield_policy",
@@ -204,9 +224,9 @@ class RALControlPolicy:
         object.__setattr__(self, "_provenance", _provenance)
 
     @property
-    def has_fixed_path(self) -> bool:
-        """Return whether this RA-L variant bypasses DSS-PP path selection."""
-        return self._path_policy is not None
+    def variant(self) -> str:
+        """Return the exact sealed comparison variant."""
+        return self._variant
 
     @property
     def provenance(self) -> PFControlPolicyProvenance:
@@ -218,12 +238,10 @@ class RALControlPolicy:
         return self._provenance
 
     def to_payload(self) -> dict[str, object]:
-        """Return a detached exact version-1 policy payload."""
+        """Return a detached exact version-2 policy payload."""
         return {
-            "schema_version": 1,
-            "path_policy": (
-                None if self._path_policy is None else dict(self._path_policy)
-            ),
+            "schema_version": 2,
+            "variant": self._variant,
             "shield_policy": (
                 None if self._shield_policy is None else dict(self._shield_policy)
             ),
@@ -256,32 +274,6 @@ class RALControlPolicy:
             pair_ids=selection.pair_ids,
             kind="external_control",
         )
-
-    def select_path(
-        self,
-        *,
-        candidate_poses_xyz: NDArray[np.float64],
-        current_pose_xyz: NDArray[np.float64],
-        visited_poses_xyz: NDArray[np.float64],
-        bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]],
-    ) -> PFExternalPathSelection | None:
-        """Return the declared RA-L path baseline through the generic contract."""
-        selection = select_baseline_next_pose(
-            self._path_policy,
-            candidate_poses_xyz=candidate_poses_xyz,
-            current_pose_xyz=current_pose_xyz,
-            visited_poses_xyz=visited_poses_xyz,
-            bounds_xyz=bounds_xyz,
-        )
-        if selection is None:
-            return None
-        return PFExternalPathSelection(
-            next_pose=selection.next_pose,
-            candidate_index=selection.candidate_index,
-            score=selection.score,
-            policy_name=selection.name,
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class RALControlPolicyDocument:
@@ -344,9 +336,9 @@ class RALControlPolicyDocument:
     def policy(self) -> RALControlPolicy:
         """Return the immutable executable adapter for this exact document."""
         payload = self.payload()
-        path_policy = payload["path_policy"]
+        variant = payload["variant"]
         shield_policy = payload["shield_policy"]
-        assert path_policy is None or isinstance(path_policy, Mapping)
+        assert isinstance(variant, str)
         assert shield_policy is None or isinstance(shield_policy, Mapping)
         provenance = PFControlPolicyProvenance(
             policy_family="ral_ablation",
@@ -355,7 +347,7 @@ class RALControlPolicyDocument:
             canonical_policy_json=self.canonical_policy_json,
         )
         return RALControlPolicy(
-            path_policy=path_policy,
+            variant=variant,
             shield_policy=shield_policy,
             _provenance=provenance,
             _loader_token=_RAL_CONTROL_POLICY_LOAD_TOKEN,
@@ -422,6 +414,7 @@ def load_ral_control_policy(
 
 
 __all__ = [
+    "RAL_CONTROL_VARIANTS",
     "RALControlPolicy",
     "RALControlPolicyDocument",
     "RALControlPolicyError",

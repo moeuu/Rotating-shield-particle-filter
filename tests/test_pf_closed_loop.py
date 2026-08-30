@@ -516,9 +516,13 @@ def test_closed_loop_rejects_forged_policy_with_valid_provenance(
     policy_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
-                "path_policy": {"name": "passive_serpentine", "row_count": 2},
-                "shield_policy": {"name": "fixed", "fixed_pair_id": 0},
+                "schema_version": 2,
+                "variant": "round_robin_shield",
+                "shield_policy": {
+                    "name": "round_robin",
+                    "start_pair_id": 0,
+                    "advance_by_pose": True,
+                },
             }
         ),
         encoding="utf-8",
@@ -528,16 +532,10 @@ def test_closed_loop_rejects_forged_policy_with_valid_provenance(
     class ForgedPolicy:
         """Mimic the removed structural protocol while changing its behavior."""
 
-        has_fixed_path = True
         provenance = sealed.provenance
 
         def select_shield_program(self, **kwargs: object) -> None:
             """Pretend to provide a shield decision unrelated to provenance."""
-            del kwargs
-            return None
-
-        def select_path(self, **kwargs: object) -> None:
-            """Pretend to provide a path decision unrelated to provenance."""
             del kwargs
             return None
 
@@ -571,7 +569,7 @@ def test_closed_loop_rejects_forged_policy_with_valid_provenance(
 
 @pytest.mark.parametrize(
     "mode",
-    ("native_with_disabled_sentinels", "round_robin_with_disabled_sentinels", "passive_with_full_dss"),
+    ("native_with_disabled_sentinels", "round_robin_with_disabled_sentinels"),
 )
 def test_planner_mode_mismatch_fails_before_runtime_connection(
     mode: str,
@@ -589,23 +587,13 @@ def test_planner_mode_mismatch_fails_before_runtime_connection(
         settings["planning_eig_samples"] = None
     if mode == "round_robin_with_disabled_sentinels":
         policy_payload = {
-            "schema_version": 1,
-            "path_policy": None,
+            "schema_version": 2,
+            "variant": "round_robin_shield",
             "shield_policy": {
                 "name": "round_robin",
                 "start_pair_id": 0,
                 "advance_by_pose": True,
             },
-        }
-    elif mode == "passive_with_full_dss":
-        settings["dss_pp"]["shield_view_count_shadow_enabled"] = False
-        settings["dss_pp"]["conditional_greedy_one_swap"] = False
-        settings["runtime_candidate_refinement_top_k"] = 0
-        settings["planner_audit_top_k"] = 0
-        policy_payload = {
-            "schema_version": 1,
-            "path_policy": {"name": "passive_serpentine", "row_count": 2},
-            "shield_policy": {"name": "fixed", "fixed_pair_id": 0},
         }
     else:
         policy_payload = None
@@ -623,7 +611,7 @@ def test_planner_mode_mismatch_fails_before_runtime_connection(
 
     monkeypatch.setattr(closed_loop, "preflight_compute_backend", forbidden_preflight)
 
-    with pytest.raises(ValueError, match="(Native|fixed RA-L path)"):
+    with pytest.raises(ValueError, match="(?i)native"):
         run_pf_closed_loop(
             tmp_path / "runtime.sock",
             runtime_root=tmp_path,
@@ -1400,8 +1388,10 @@ def test_adaptive_stop_ready_streak_resets_after_one_failed_station() -> None:
     assert statuses[13]["stop_ready"] is True
 
 
-def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
-    """RA-L passive policy must bypass PF EIG for both action dimensions."""
+def test_round_robin_shield_keeps_native_dss_pose_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-robin may force only the shield code, never the native pose path."""
     from baselines.ral_ablation.control_policy import RALControlPolicy
     from pf import closed_loop
 
@@ -1410,9 +1400,14 @@ def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
     )
     settings = _production_settings()
     settings["dss_pp"]["shield_view_count_shadow_enabled"] = False
+    settings["dss_pp"]["conditional_greedy_one_swap"] = False
     policy = RALControlPolicy(
-        path_policy={"name": "passive_serpentine", "row_count": 2},
-        shield_policy={"name": "fixed", "fixed_pair_id": 0},
+        variant="round_robin_shield",
+        shield_policy={
+            "name": "round_robin",
+            "start_pair_id": 0,
+            "advance_by_pose": True,
+        },
     )
     contract = AcquisitionContract(
         max_stations=1,
@@ -1443,6 +1438,24 @@ def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
         settling_times_s=(0.0, 0.0, 0.0),
     )
 
+    selected = object()
+    call: dict[str, object] = {}
+
+    def capture_native_planner(
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        """Capture the standard DSS invocation and return one sentinel result."""
+        call["args"] = args
+        call["kwargs"] = kwargs
+        return selected
+
+    monkeypatch.setattr(
+        closed_loop,
+        "select_dss_pp_next_station",
+        capture_native_planner,
+    )
+
     result = closed_loop._plan(
         estimator,
         candidates,
@@ -1452,144 +1465,20 @@ def test_closed_loop_applies_declared_passive_path_and_fixed_shield() -> None:
         room_bounds=(np.asarray([0.0, 0.0, 0.5]), np.asarray([2.0, 2.0, 0.5])),
         planner=planner,
         rng=np.random.default_rng(7),
-        station_index=0,
+        station_index=3,
         control_policy=policy,
     )
 
-    assert result.next_pose_index == 0
-    assert result.shield_program.pair_ids == (0, 0)
-    assert result.sequence == ()
-    assert result.diagnostics == {
-        "selection_mode": "external_control_path",
-        "external_path_policy": "passive_serpentine",
-        "external_shield_program_name": "fixed_shield_0",
-    }
+    assert result is selected
+    assert call["args"][0] is estimator
+    active_planner = call["kwargs"]["config"]
+    assert isinstance(active_planner, DSSPPConfig)
+    assert active_planner.forced_program_pair_ids == (6, 7)
+    assert call["kwargs"]["candidate_motion_times_s"].tolist() == [1.0, 1.0, 0.0]
 
-
-def test_passive_fixed_path_completes_two_station_live_audit(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """The passive RA-L path must audit and finalize without fake DSS evidence."""
-    from baselines.ral_ablation.control_policy import load_ral_control_policy
-    from pf import closed_loop
-
-    class _TwoStationRuntimeClient(_FakeRuntimeClient):
-        """Expose a two-station runtime contract through the standard fake client."""
-
-        def read_event(self) -> dict[str, object]:
-            """Return a fresh handshake with room for two one-view stations."""
-            ready = super().read_event()
-            context = ready["context"]
-            assert isinstance(context, dict)
-            environment = context["environment"]
-            assert isinstance(environment, dict)
-            environment["acquisition_contract"] = AcquisitionContract(
-                max_stations=2,
-                views_per_station=1,
-                live_time_s=30.0,
-                max_measurements=2,
-                min_station_separation_m=3.0,
-                coverage_radius_m=3.0,
-            ).to_payload()
-            return ready
-
-    class _TwoStationLog(_FakeLog):
-        """Expose the two records finalized by the passive fake runtime."""
-
-        records = (
-            SimpleNamespace(station_id=0),
-            SimpleNamespace(station_id=1),
-        )
-
-        def station_view(self) -> SimpleNamespace:
-            """Return the exact two-station count."""
-            return SimpleNamespace(station_count=2)
-
-    config = tmp_path / "pf.json"
-    _write_one_station_production_config(config, cui_enabled=False)
-    passive_settings = json.loads(config.read_text(encoding="utf-8"))
-    passive_settings["dss_pp"] = None
-    passive_settings["planning_eig_samples"] = None
-    passive_settings["runtime_candidate_refinement_top_k"] = 0
-    passive_settings["planner_audit_top_k"] = 0
-    config.write_text(json.dumps(passive_settings), encoding="utf-8")
-    _stub_cuda_preflight(monkeypatch)
-    _FakePFLiveSession.next_estimator = _FakeEstimator()
-    fake_log = _TwoStationLog()
-    policy_path = tmp_path / "passive_control_policy.json"
-    policy_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "path_policy": {"name": "passive_serpentine", "row_count": 2},
-                "shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            }
-        ),
-        encoding="utf-8",
-    )
-    policy = load_ral_control_policy(policy_path)
-    monkeypatch.setattr(
-        closed_loop,
-        "AdaptiveRuntimeClient",
-        _TwoStationRuntimeClient,
-    )
-    def forbidden_dss_config(*args: object, **kwargs: object) -> object:
-        """Fail if a fixed path constructs the native DSS-PP configuration."""
-        del args, kwargs
-        raise AssertionError("fixed path must not construct DSSPPConfig")
-
-    monkeypatch.setattr(
-        closed_loop,
-        "dss_config_from_pf_settings",
-        forbidden_dss_config,
-    )
-    monkeypatch.setattr(closed_loop, "PFLiveSession", _FakePFLiveSession)
-    monkeypatch.setattr(closed_loop, "load_measurement_log", lambda path: fake_log)
-
-    result = run_pf_closed_loop(
-        tmp_path / "runtime.sock",
-        runtime_root=tmp_path,
-        pf_config_path=config,
-        output_dir=tmp_path / "output",
-        seed=17,
-        control_policy=policy,
-    )
-
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "output" / "planner_audit.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-    assert result.record_count == 2
-    assert result.station_count == 2
-    assert [row["selection_mode"] for row in rows] == [
-        "external_control_bootstrap",
-        "external_control_path",
-    ]
-    assert rows[1]["external_control_execution"] == {
-        "path_policy_name": "passive_serpentine",
-        "shield_program_name": "fixed_shield_0",
-    }
-    assert rows[1]["selected_program"]["pair_ids"] == [0]
-    assert {
-        "candidate_pose_count",
-        "exact_pose_count",
-        "proxy_subset_evaluation_count",
-        "exact_subset_evaluation_count",
-        "planning_particle_count",
-        "exact_eig_seed",
-        "selected_information_gain",
-        "planning_eig_shortlist",
-        "ranked_nodes",
-        "component_leaders",
-        "shield_view_count_shadow",
-    }.isdisjoint(rows[1])
-    client = _TwoStationRuntimeClient.instance
-    assert client is not None
-    assert len(client.requests) == 2
-    assert client.closed is True
+    bootstrap = _bootstrap_program(estimator, planner, policy)
+    assert bootstrap.pair_ids == (0, 1)
+    assert bootstrap.kind == "external_control"
 
 
 def test_pf_closed_loop_owns_budget_and_shield_program(

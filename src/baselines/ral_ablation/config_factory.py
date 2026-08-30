@@ -20,6 +20,7 @@ from sim.runtime import (
 
 from runtime.artifacts import atomic_write_json, atomic_write_text
 from baselines.ral_ablation.control_policy import (
+    RAL_CONTROL_VARIANTS,
     RALControlPolicy,
     load_ral_control_policy_document,
     validate_ral_control_policy_payload,
@@ -232,7 +233,6 @@ class AblationVariant:
     description: str
     pf_overrides: Mapping[str, Any]
     runtime_overrides: Mapping[str, Any]
-    path_policy: Mapping[str, Any] | None = None
     shield_policy: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -243,18 +243,14 @@ class AblationVariant:
             raise TypeError("AblationVariant.pf_overrides must be a mapping.")
         if not isinstance(self.runtime_overrides, Mapping):
             raise TypeError("AblationVariant.runtime_overrides must be a mapping.")
-        if self.path_policy is not None and not isinstance(self.path_policy, Mapping):
-            raise TypeError("AblationVariant.path_policy must be a mapping or null.")
         if self.shield_policy is not None and not isinstance(
             self.shield_policy, Mapping
         ):
             raise TypeError("AblationVariant.shield_policy must be a mapping or null.")
-        if self.path_policy is not None and self.shield_policy is None:
-            raise ValueError("A fixed path variant requires an explicit shield policy.")
         validate_ral_control_policy_payload(
             {
-                "schema_version": 1,
-                "path_policy": self.path_policy,
+                "schema_version": 2,
+                "variant": self.name,
                 "shield_policy": self.shield_policy,
             }
         )
@@ -302,24 +298,19 @@ RAL_RUNTIME_INTERVENTION_FIELDS = frozenset({"shield_transmission_target"})
 DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
     AblationVariant(
         name="proposed",
-        description="Full proposed temporal shield program and DSS-PP.",
+        description="Full attenuation-coded RJSMC and native DSS-PP.",
         pf_overrides={},
         runtime_overrides={},
     ),
     AblationVariant(
-        name="baseline_passive_equal_time_no_shield",
-        description="Passive equal-time path with physically absent shields.",
-        pf_overrides={
-            "dss_pp": None,
-            "planning_eig_samples": None,
-            "runtime_candidate_refinement_top_k": 0,
-            "planner_audit_top_k": 0,
-        },
+        name="no_shield_native_path",
+        description=(
+            "Physically absent shields with the same native DSS-PP path policy."
+        ),
+        pf_overrides={},
         runtime_overrides={
             "shield_transmission_target": 1.0,
         },
-        path_policy={"name": "passive_serpentine", "row_count": 8},
-        shield_policy={"name": "fixed", "fixed_pair_id": 0},
     ),
     AblationVariant(
         name="round_robin_shield",
@@ -365,6 +356,14 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
     ),
 )
 
+if tuple(variant.name for variant in DEFAULT_ABLATION_VARIANTS) != tuple(
+    RAL_CONTROL_VARIANTS
+):
+    raise RuntimeError(
+        "RA-L ablation declarations must exactly match the sealed control-policy "
+        "variant order."
+    )
+
 
 def _deep_update(
     base: Mapping[str, Any],
@@ -391,7 +390,7 @@ def _pf_config(
         profile="pf_strict",
     )
     policy = RALControlPolicy(
-        path_policy=variant.path_policy,
+        variant=variant.name,
         shield_policy=variant.shield_policy,
     )
     validate_ral_control_policy_pf_settings(policy, config)
@@ -402,10 +401,8 @@ def _control_policy(variant: AblationVariant) -> dict[str, object]:
     """Return the separate RA-L adapter policy for one experiment variant."""
     return validate_ral_control_policy_payload(
         {
-            "schema_version": 1,
-            "path_policy": (
-                None if variant.path_policy is None else dict(variant.path_policy)
-            ),
+            "schema_version": 2,
+            "variant": variant.name,
             "shield_policy": (
                 None if variant.shield_policy is None else dict(variant.shield_policy)
             ),

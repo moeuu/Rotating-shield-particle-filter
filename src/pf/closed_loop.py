@@ -154,25 +154,7 @@ class PFControlBudget:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class PFExternalFixedPathPlanner:
-    """Carry only the runtime view count needed by an external fixed path."""
-
-    program_length: int
-    shield_view_count_shadow_enabled: bool = False
-
-    def __post_init__(self) -> None:
-        """Reject anything other than an explicit planner-disabled contract."""
-        _exact_integer(
-            self.program_length,
-            name="PFExternalFixedPathPlanner.program_length",
-            minimum=1,
-        )
-        if self.shield_view_count_shadow_enabled is not False:
-            raise ValueError("External fixed-path shadow planning must be disabled.")
-
-
-PFPlannerConfig = DSSPPConfig | PFExternalFixedPathPlanner
+PFPlannerConfig = DSSPPConfig
 
 
 @dataclass(slots=True)
@@ -1075,37 +1057,6 @@ def _plan(
         pose_index=station_index,
         current_pair_id=candidates.current_pair_id,
     )
-    baseline_path = (
-        None
-        if control_policy is None
-        else control_policy.select_path(
-            candidate_poses_xyz=candidate_poses,
-            current_pose_xyz=current_pose,
-            visited_poses_xyz=visited_array,
-            bounds_xyz=room_bounds,
-        )
-    )
-    if baseline_path is not None:
-        if baseline_program is None:
-            raise ValueError(
-                "A baseline path policy requires an explicit baseline shield policy."
-            )
-        return DSSPPResult(
-            next_pose=baseline_path.next_pose,
-            next_pose_index=baseline_path.candidate_index,
-            shield_program=baseline_program,
-            score=baseline_path.score,
-            sequence=(),
-            diagnostics={
-                "selection_mode": "external_control_path",
-                "external_path_policy": baseline_path.policy_name,
-                "external_shield_program_name": baseline_program.name,
-            },
-        )
-    if isinstance(planner, PFExternalFixedPathPlanner):
-        raise RuntimeError(
-            "External fixed-path planner contract did not select an external path."
-        )
     active_planner = planner
     if baseline_program is not None:
         active_planner = replace(
@@ -1191,15 +1142,7 @@ def _planner_audit_for_mode(
     belief_after_station_id: int,
     posterior_health: Mapping[str, object] | None,
 ) -> dict[str, object]:
-    """Keep inactive DSS-only audit inputs out of external fixed-path records."""
-    if isinstance(planner, PFExternalFixedPathPlanner):
-        if posterior_health is not None:
-            raise ValueError("External fixed-path audit cannot carry shadow health.")
-        return build_planner_audit(
-            station_id=station_id,
-            result=result,
-            belief_after_station_id=belief_after_station_id,
-        )
+    """Build one native DSS-PP audit for the current RA-L control contract."""
     return build_planner_audit(
         station_id=station_id,
         result=result,
@@ -1227,9 +1170,7 @@ def _refine_and_replan(
     control_policy: object | None,
 ) -> tuple[AdaptiveCandidateSnapshot, DSSPPResult]:
     """Optionally request runtime-owned local poses and rerank them exactly."""
-    if refinement_top_k <= 0 or (
-        control_policy is not None and control_policy.has_fixed_path
-    ):
+    if refinement_top_k <= 0:
         return candidates, initial
     if not isinstance(initial.diagnostics, Mapping):
         raise TypeError("Candidate refinement requires planner diagnostics.")
@@ -1502,16 +1443,11 @@ def run_pf_closed_loop(
             control_policy_provenance=control_policy_provenance,
         )
         estimator = live_session.estimator
-        if control_policy is not None and control_policy.has_fixed_path:
-            planner: PFPlannerConfig = PFExternalFixedPathPlanner(
-                program_length=int(acquisition_contract.views_per_station),
-            )
-        else:
-            planner = dss_config_from_pf_settings(
-                settings,
-                acquisition_contract=acquisition_contract,
-                detector_aperture_samples=int(estimator.detector_aperture_samples),
-            )
+        planner: PFPlannerConfig = dss_config_from_pf_settings(
+            settings,
+            acquisition_contract=acquisition_contract,
+            detector_aperture_samples=int(estimator.detector_aperture_samples),
+        )
         budget = PFControlBudget.from_runtime_contract(
             settings,
             acquisition_contract,
@@ -1549,34 +1485,25 @@ def run_pf_closed_loop(
             record_count = live_session.record_count
             cui_elapsed_time_s = 0.0
             station_id = 0
-            if isinstance(planner, PFExternalFixedPathPlanner):
-                bootstrap_audit = build_bootstrap_planner_audit(
-                    station_id=0,
-                    pose_index=int(bootstrap.candidate_index),
-                    pose_xyz=current_pose,
-                    program=current_program,
-                    shadow_enabled=False,
-                )
-            else:
-                bootstrap_audit = build_bootstrap_planner_audit(
-                    station_id=0,
-                    pose_index=int(bootstrap.candidate_index),
-                    pose_xyz=current_pose,
-                    program=current_program,
-                    shadow_enabled=bool(
-                        planner.shield_view_count_shadow_enabled
-                        and current_program.kind != "external_control"
-                    ),
-                    candidate_view_counts=tuple(
-                        planner.shield_view_count_shadow_candidate_counts
-                    ),
-                    retention_fraction=float(
-                        planner.shield_view_count_shadow_retention_fraction
-                    ),
-                    per_comparison_confidence=float(
-                        planner.shield_view_count_shadow_per_comparison_confidence
-                    ),
-                )
+            bootstrap_audit = build_bootstrap_planner_audit(
+                station_id=0,
+                pose_index=int(bootstrap.candidate_index),
+                pose_xyz=current_pose,
+                program=current_program,
+                shadow_enabled=bool(
+                    planner.shield_view_count_shadow_enabled
+                    and current_program.kind != "external_control"
+                ),
+                candidate_view_counts=tuple(
+                    planner.shield_view_count_shadow_candidate_counts
+                ),
+                retention_fraction=float(
+                    planner.shield_view_count_shadow_retention_fraction
+                ),
+                per_comparison_confidence=float(
+                    planner.shield_view_count_shadow_per_comparison_confidence
+                ),
+            )
             planner_writer.append(bootstrap_audit)
         else:
             raise RuntimeError(

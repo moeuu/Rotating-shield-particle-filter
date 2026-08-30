@@ -552,112 +552,6 @@ def _required_nonnegative_integer(
     return resolved
 
 
-def _build_external_control_planner_audit(
-    *,
-    station_id: int,
-    belief_after_station_id: int | None,
-    result: DSSPPResult,
-    diagnostics: Mapping[str, object],
-) -> dict[str, object]:
-    """Build one exact audit record for a non-DSS external path decision."""
-    expected_diagnostics = {
-        "selection_mode",
-        "external_path_policy",
-        "external_shield_program_name",
-    }
-    actual_diagnostics = set(diagnostics)
-    if actual_diagnostics != expected_diagnostics:
-        raise ValueError(
-            "External-control planner diagnostics differ from the exact contract: "
-            f"missing={sorted(expected_diagnostics - actual_diagnostics)}, "
-            f"unknown={sorted(actual_diagnostics - expected_diagnostics)}."
-        )
-    if diagnostics["selection_mode"] != "external_control_path":
-        raise ValueError(
-            "External-control planner audit requires "
-            "selection_mode='external_control_path'."
-        )
-    path_policy = diagnostics["external_path_policy"]
-    if (
-        not isinstance(path_policy, str)
-        or not path_policy
-        or path_policy != path_policy.strip()
-    ):
-        raise ValueError("External path policy must be a canonical nonempty string.")
-    shield_program_name = diagnostics["external_shield_program_name"]
-    if shield_program_name != result.shield_program.name:
-        raise ValueError(
-            "External shield-program provenance differs from the selected program."
-        )
-    if (
-        not isinstance(shield_program_name, str)
-        or not shield_program_name
-        or shield_program_name != shield_program_name.strip()
-    ):
-        raise ValueError(
-            "External shield-program name must be a canonical nonempty string."
-        )
-    if result.shield_program.kind != "external_control":
-        raise ValueError(
-            "An external path decision requires an external-control shield program."
-        )
-    if result.sequence:
-        raise ValueError(
-            "An external path decision must not carry a synthetic DSS-PP sequence."
-        )
-    pose_index = result.next_pose_index
-    if isinstance(pose_index, bool) or not isinstance(
-        pose_index,
-        (int, np.integer),
-    ):
-        raise TypeError("External selected pose index must be an integer.")
-    if int(pose_index) < 0:
-        raise ValueError("External selected pose index must be nonnegative.")
-    pose = np.asarray(result.next_pose, dtype=np.float64)
-    if pose.shape != (3,) or np.any(~np.isfinite(pose)):
-        raise ValueError("External selected pose must be one finite 3-D point.")
-    score = result.score
-    if isinstance(score, (bool, np.bool_)) or not isinstance(
-        score,
-        (int, float, np.integer, np.floating),
-    ):
-        raise TypeError("External path-policy score must be a real number.")
-    path_score = float(score)
-    if not math.isfinite(path_score):
-        raise ValueError("External path-policy score must be finite.")
-    pair_ids = tuple(result.shield_program.pair_ids)
-    if (
-        not pair_ids
-        or any(
-            isinstance(value, (bool, np.bool_))
-            or not isinstance(value, (int, np.integer))
-            for value in pair_ids
-        )
-        or any(value < 0 or value >= 64 for value in pair_ids)
-    ):
-        raise ValueError(
-            "External shield-program pair IDs must be nonempty integers in [0, 63]."
-        )
-    return {
-        "schema_version": 3,
-        "station_id": int(station_id),
-        "belief_after_station_id": belief_after_station_id,
-        "selection_mode": "external_control_path",
-        "external_control_execution": {
-            "path_policy_name": path_policy,
-            "shield_program_name": shield_program_name,
-        },
-        "selected_pose_index": int(pose_index),
-        "selected_pose_xyz": [float(value) for value in pose],
-        "selected_program": {
-            "name": shield_program_name,
-            "kind": "external_control",
-            "pair_ids": [int(value) for value in pair_ids],
-        },
-        "selected_path_policy_score": path_score,
-    }
-
-
 def build_planner_audit(
     *,
     station_id: int,
@@ -687,17 +581,6 @@ def build_planner_audit(
         )
     diagnostics = _mapping(result.diagnostics, name="planner diagnostics")
     selection_mode = diagnostics.get("selection_mode")
-    if selection_mode == "external_control_path":
-        if posterior_health is not None:
-            raise ValueError(
-                "External-control planning cannot carry DSS-PP shadow health."
-            )
-        return _build_external_control_planner_audit(
-            station_id=station_id,
-            belief_after_station_id=belief_after_station_id,
-            result=result,
-            diagnostics=diagnostics,
-        )
     if selection_mode is not None:
         raise ValueError(f"Unsupported planner selection_mode {selection_mode!r}.")
     validated_health = (

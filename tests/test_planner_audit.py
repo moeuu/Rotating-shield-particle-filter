@@ -85,23 +85,6 @@ def _result() -> DSSPPResult:
     )
 
 
-def _external_control_result() -> DSSPPResult:
-    """Return one exact fixed-path decision without DSS-PP diagnostics."""
-    program = ShieldProgram("fixed_shield_0", (0, 0), "external_control")
-    return DSSPPResult(
-        next_pose=np.asarray([1.0, 2.0, 3.0]),
-        next_pose_index=2,
-        shield_program=program,
-        score=-0.25,
-        sequence=(),
-        diagnostics={
-            "selection_mode": "external_control_path",
-            "external_path_policy": "passive_serpentine",
-            "external_shield_program_name": program.name,
-        },
-    )
-
-
 def test_planner_audit_captures_compact_pose_and_eig_evidence() -> None:
     """The audit must keep scientific evidence without legacy action fields."""
     audit = build_planner_audit(
@@ -152,51 +135,16 @@ def test_planner_audit_captures_compact_pose_and_eig_evidence() -> None:
     assert removed.isdisjoint(audit)
 
 
-def test_external_control_audit_has_its_own_exact_discriminant() -> None:
-    """A fixed-path decision must not claim DSS-PP or EIG evidence."""
-    audit = build_planner_audit(
-        station_id=2,
-        belief_after_station_id=1,
-        result=_external_control_result(),
-    )
+def test_planner_audit_rejects_retired_external_path_selection() -> None:
+    """Retired fixed-path results must fail instead of entering native audits."""
+    result = _result()
+    result.diagnostics["selection_mode"] = "external_control_path"
 
-    assert audit == {
-        "schema_version": 3,
-        "station_id": 2,
-        "belief_after_station_id": 1,
-        "selection_mode": "external_control_path",
-        "external_control_execution": {
-            "path_policy_name": "passive_serpentine",
-            "shield_program_name": "fixed_shield_0",
-        },
-        "selected_pose_index": 2,
-        "selected_pose_xyz": [1.0, 2.0, 3.0],
-        "selected_program": {
-            "name": "fixed_shield_0",
-            "kind": "external_control",
-            "pair_ids": [0, 0],
-        },
-        "selected_path_policy_score": -0.25,
-    }
-
-
-def test_external_control_audit_rejects_fake_dss_evidence_or_shadow_health() -> None:
-    """External decisions must use only their dedicated exact audit contract."""
-    result = _external_control_result()
-    result.diagnostics["planning_eig_shortlist"] = {}
-
-    with pytest.raises(ValueError, match="exact contract"):
+    with pytest.raises(ValueError, match="Unsupported planner selection_mode"):
         build_planner_audit(
             station_id=2,
             belief_after_station_id=1,
             result=result,
-        )
-    with pytest.raises(ValueError, match="cannot carry DSS-PP shadow health"):
-        build_planner_audit(
-            station_id=2,
-            belief_after_station_id=1,
-            result=_external_control_result(),
-            posterior_health={},
         )
 
 

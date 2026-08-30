@@ -69,7 +69,11 @@ def test_resolved_session_hash_changes_with_only_control_policy() -> None:
     from pf.live_session import _live_session_hash_payload
 
     canonical_policy = strict_canonical_json_bytes(
-        {"schema_version": 1, "path_policy": None, "shield_policy": None}
+        {
+            "schema_version": 2,
+            "variant": "proposed",
+            "shield_policy": None,
+        }
     )
     external = PFControlPolicyProvenance(
         policy_family="ral_ablation",
@@ -1545,9 +1549,13 @@ def test_external_policy_provenance_matches_posterior_state_and_checkpoint(
     )
     canonical_policy = strict_canonical_json_bytes(
         {
-            "schema_version": 1,
-            "path_policy": {"name": "passive_serpentine", "row_count": 2},
-            "shield_policy": {"name": "fixed", "fixed_pair_id": 0},
+            "schema_version": 2,
+            "variant": "round_robin_shield",
+            "shield_policy": {
+                "name": "round_robin",
+                "start_pair_id": 0,
+                "advance_by_pose": True,
+            },
         }
     )
     control_provenance = PFControlPolicyProvenance(

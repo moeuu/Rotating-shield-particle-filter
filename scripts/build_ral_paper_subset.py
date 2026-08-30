@@ -402,10 +402,8 @@ def _validate_configs(
         expected_source_sha256=row["control_policy_sha256"],
     )
     expected_control = {
-        "schema_version": 1,
-        "path_policy": (
-            None if variant.path_policy is None else dict(variant.path_policy)
-        ),
+        "schema_version": 2,
+        "variant": variant.name,
         "shield_policy": (
             None if variant.shield_policy is None else dict(variant.shield_policy)
         ),

@@ -9,7 +9,6 @@ import json
 from pathlib import Path
 import stat
 
-import numpy as np
 import pytest
 from sim.runtime import load_production_runtime_config
 from sim.shield_geometry import resolve_shield_thickness_config
@@ -34,10 +33,6 @@ from baselines.ral_ablation.control_policy import (
 )
 from baselines.ral_ablation.live_controller import main as live_controller_main
 from baselines.ral_ablation.session_runner import _controller_command
-from baselines.ral_ablation.path_policies import (
-    resolve_rotation_limit_for_active_program,
-    select_baseline_next_pose,
-)
 from baselines.ral_ablation.shield_policies import select_baseline_shield_program
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.estimator import RotatingShieldPFConfig
@@ -52,22 +47,10 @@ def _production_pf_config() -> dict[str, object]:
     )
 
 
-def test_fixed_shield_policy_repeats_one_pair() -> None:
-    """Fixed-shield ablation should repeat the requested pair id."""
-    program = select_baseline_shield_program(
-        {"name": "fixed", "fixed_pair_id": 7},
-        total_pairs=64,
-        program_length=8,
-        pose_index=3,
-    )
-    assert program is not None
-    assert program.pair_ids == (7,) * 8
-
-
 @pytest.mark.parametrize(
     "policy",
     (
-        {"name": "fixed"},
+        {"name": "fixed", "fixed_pair_id": 7},
         {"name": "round_robin", "start_pair_id": 0},
         {"name": "round_robin", "start_pair_id": 0, "advance_by_pose": 1},
     ),
@@ -100,17 +83,17 @@ def test_round_robin_shield_policy_advances_by_pose() -> None:
 @pytest.mark.parametrize(
     "raw_policy",
     (
-        '{"schema_version":1,"schema_version":1,'
-        '"path_policy":null,"shield_policy":null}',
-        '{"schema_version":true,"path_policy":null,"shield_policy":null}',
-        '{"schema_version":1.0,"path_policy":null,"shield_policy":null}',
-        '{"schema_version":1,"path_policy":null,"shield_policy":NaN}',
-        '{"schema_version":1,"path_policy":null,'
-        '"shield_policy":{"name":"fixed"}}',
-        '{"schema_version":1,"path_policy":null,'
-        '"shield_policy":{"name":"fixed","fixed_pair_id":0,"legacy":true}}',
-        '{"schema_version":1,"path_policy":'
-        '{"name":"passive_serpentine","row_count":8},"shield_policy":null}',
+        '{"schema_version":2,"schema_version":2,'
+        '"variant":"proposed","shield_policy":null}',
+        '{"schema_version":true,"variant":"proposed","shield_policy":null}',
+        '{"schema_version":2.0,"variant":"proposed","shield_policy":null}',
+        '{"schema_version":2,"variant":"proposed","shield_policy":NaN}',
+        '{"schema_version":2,"variant":"retired_passive","shield_policy":null}',
+        '{"schema_version":2,"variant":"proposed",'
+        '"shield_policy":{"name":"round_robin","start_pair_id":0,'
+        '"advance_by_pose":true}}',
+        '{"schema_version":2,"variant":"round_robin_shield",'
+        '"shield_policy":null}',
     ),
 )
 def test_control_policy_loader_rejects_ambiguous_or_incomplete_json(
@@ -131,8 +114,9 @@ def test_control_policy_document_binds_source_and_canonical_bytes(
     """A loaded policy must retain exact bytes and a stable resolved identity."""
     policy_path = tmp_path / "policy.json"
     source = (
-        b'{ "schema_version": 1, "path_policy": null, '
-        b'"shield_policy": {"name":"fixed","fixed_pair_id":3} }\n'
+        b'{ "schema_version": 2, "variant": "round_robin_shield", '
+        b'"shield_policy": {"name":"round_robin","start_pair_id":3,'
+        b'"advance_by_pose":true} }\n'
     )
     policy_path.write_bytes(source)
 
@@ -146,8 +130,9 @@ def test_control_policy_document_binds_source_and_canonical_bytes(
         document.canonical_policy_json
     ).hexdigest()
     assert document.payload()["shield_policy"] == {
-        "name": "fixed",
-        "fixed_pair_id": 3,
+        "name": "round_robin",
+        "start_pair_id": 3,
+        "advance_by_pose": True,
     }
     assert document.policy().provenance.to_dict()["policy"] == document.payload()
 
@@ -158,9 +143,13 @@ def test_control_policy_cannot_self_attach_loader_provenance(tmp_path: Path) -> 
     policy_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
-                "path_policy": None,
-                "shield_policy": {"name": "fixed", "fixed_pair_id": 3},
+                "schema_version": 2,
+                "variant": "round_robin_shield",
+                "shield_policy": {
+                    "name": "round_robin",
+                    "start_pair_id": 3,
+                    "advance_by_pose": True,
+                },
             }
         ),
         encoding="utf-8",
@@ -169,8 +158,12 @@ def test_control_policy_cannot_self_attach_loader_provenance(tmp_path: Path) -> 
 
     with pytest.raises(RALControlPolicyError, match="loader token together"):
         RALControlPolicy(
-            path_policy=None,
-            shield_policy={"name": "fixed", "fixed_pair_id": 3},
+            variant="round_robin_shield",
+            shield_policy={
+                "name": "round_robin",
+                "start_pair_id": 3,
+                "advance_by_pose": True,
+            },
             _provenance=sealed.provenance,
         )
 
@@ -181,16 +174,20 @@ def test_expected_policy_digest_rejects_valid_policy_swap(tmp_path: Path) -> Non
     swapped_path = tmp_path / "swapped.json"
     expected_path.write_text(
         json.dumps(
-            {"schema_version": 1, "path_policy": None, "shield_policy": None}
+            {"schema_version": 2, "variant": "proposed", "shield_policy": None}
         ),
         encoding="utf-8",
     )
     swapped_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
-                "path_policy": None,
-                "shield_policy": {"name": "fixed", "fixed_pair_id": 0},
+                "schema_version": 2,
+                "variant": "round_robin_shield",
+                "shield_policy": {
+                    "name": "round_robin",
+                    "start_pair_id": 0,
+                    "advance_by_pose": True,
+                },
             }
         ),
         encoding="utf-8",
@@ -214,7 +211,7 @@ def test_live_controller_rejects_policy_swap_before_closed_loop(
     policy_path = tmp_path / "policy.json"
     policy_path.write_text(
         json.dumps(
-            {"schema_version": 1, "path_policy": None, "shield_policy": None}
+            {"schema_version": 2, "variant": "proposed", "shield_policy": None}
         ),
         encoding="utf-8",
     )
@@ -442,55 +439,6 @@ def test_ral_controller_process_receives_no_private_scene_inputs(
     assert "cui-truth.sock" in rendered
 
 
-def test_explicit_shield_program_rotation_limit_is_strict() -> None:
-    """Baseline shield programs should not be padded by adaptive selection."""
-    assert (
-        resolve_rotation_limit_for_active_program(
-            base_rotation_limit=8,
-            active_shield_program=(2, 3),
-            strict_planned_shield_program=False,
-            baseline_shield_policy={
-                "name": "round_robin",
-                "start_pair_id": 0,
-                "advance_by_pose": True,
-            },
-        )
-        == 2
-    )
-
-
-def test_passive_serpentine_selects_candidate_near_waypoint() -> None:
-    """Passive path baseline should select by geometry, not PF information."""
-    candidates = np.asarray(
-        [[9.0, 0.0, 0.5], [0.0, 10.0, 0.5], [8.0, 20.0, 0.5]],
-        dtype=float,
-    )
-    selection = select_baseline_next_pose(
-        {"name": "passive_serpentine", "row_count": 3},
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.asarray([1.0, 1.0, 0.5]),
-        visited_poses_xyz=np.asarray([[1.0, 1.0, 0.5]]),
-        bounds_xyz=(np.asarray([0.0, 0.0, 0.5]), np.asarray([10.0, 20.0, 0.5])),
-    )
-    assert selection is not None
-    assert selection.candidate_index == 1
-
-
-def test_passive_serpentine_requires_explicit_row_count() -> None:
-    """The passive policy must not inherit a hidden path-resolution default."""
-    with pytest.raises(ValueError, match="row_count"):
-        select_baseline_next_pose(
-            {"name": "passive_serpentine"},
-            candidate_poses_xyz=np.asarray([[0.0, 0.0, 0.5]]),
-            current_pose_xyz=np.asarray([0.0, 0.0, 0.5]),
-            visited_poses_xyz=np.empty((0, 3)),
-            bounds_xyz=(
-                np.asarray([0.0, 0.0, 0.5]),
-                np.asarray([1.0, 1.0, 0.5]),
-            ),
-        )
-
-
 def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) -> None:
     """The factory should emit four causal trials without local truth files."""
     output_dir = tmp_path / "public-results"
@@ -507,7 +455,7 @@ def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) ->
     )
     assert [entry.variant for entry in entries] == [
         "proposed",
-        "baseline_passive_equal_time_no_shield",
+        "no_shield_native_path",
         "round_robin_shield",
         "eig_only_path",
     ]
@@ -579,42 +527,48 @@ def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) ->
         assert "--full-simulation" not in entry.scenario_command
         assert "main.py" not in entry.session_command
 
-    passive_policy = json.loads(
-        by_variant[
-            "baseline_passive_equal_time_no_shield"
-        ].control_policy_path.read_text(encoding="utf-8")
+    no_shield_policy = json.loads(
+        by_variant["no_shield_native_path"].control_policy_path.read_text(
+            encoding="utf-8"
+        )
     )
-    assert passive_policy["path_policy"]["name"] == "passive_serpentine"
-    assert passive_policy["shield_policy"]["name"] == "fixed"
-    passive_document = load_ral_control_policy_document(
-        by_variant["baseline_passive_equal_time_no_shield"].control_policy_path
+    assert no_shield_policy == {
+        "schema_version": 2,
+        "shield_policy": None,
+        "variant": "no_shield_native_path",
+    }
+    no_shield_document = load_ral_control_policy_document(
+        by_variant["no_shield_native_path"].control_policy_path
     )
-    assert passive_document.source_sha256 == passive_document.canonical_sha256
+    assert no_shield_document.source_sha256 == no_shield_document.canonical_sha256
     load_ral_control_policy(
-        by_variant["baseline_passive_equal_time_no_shield"].control_policy_path,
-        expected_source_sha256=passive_document.source_sha256,
+        by_variant["no_shield_native_path"].control_policy_path,
+        expected_source_sha256=no_shield_document.source_sha256,
     )
-    passive_pf = json.loads(
-        by_variant[
-            "baseline_passive_equal_time_no_shield"
-        ].pf_config_path.read_text(encoding="utf-8")
+    no_shield_pf = json.loads(
+        by_variant["no_shield_native_path"].pf_config_path.read_text(
+            encoding="utf-8"
+        )
     )
-    assert passive_pf["dss_pp"] is None
-    assert passive_pf["planning_eig_samples"] is None
-    assert passive_pf["runtime_candidate_refinement_top_k"] == 0
-    assert passive_pf["planner_audit_top_k"] == 0
-    passive_runtime = load_production_runtime_config(
-        by_variant["baseline_passive_equal_time_no_shield"].runtime_config_path
+    proposed_pf = json.loads(
+        by_variant["proposed"].pf_config_path.read_text(encoding="utf-8")
     )
-    assert passive_runtime["shield_transmission_target"] == pytest.approx(1.0)
-    passive_shield = resolve_shield_thickness_config(passive_runtime)
-    assert passive_shield.thickness_scale == pytest.approx(0.0)
-    assert passive_shield.thickness_fe_cm == pytest.approx(0.0)
-    assert passive_shield.thickness_pb_cm == pytest.approx(0.0)
+    assert no_shield_pf == proposed_pf
+    assert isinstance(no_shield_pf["dss_pp"], dict)
+    assert no_shield_pf["planning_eig_samples"] >= 2
+    no_shield_runtime = load_production_runtime_config(
+        by_variant["no_shield_native_path"].runtime_config_path
+    )
+    assert no_shield_runtime["shield_transmission_target"] == pytest.approx(1.0)
+    no_shield_geometry = resolve_shield_thickness_config(no_shield_runtime)
+    assert no_shield_geometry.thickness_scale == pytest.approx(0.0)
+    assert no_shield_geometry.thickness_fe_cm == pytest.approx(0.0)
+    assert no_shield_geometry.thickness_pb_cm == pytest.approx(0.0)
 
     round_robin = json.loads(
         by_variant["round_robin_shield"].control_policy_path.read_text(encoding="utf-8")
     )
+    assert round_robin["variant"] == "round_robin_shield"
     assert round_robin["shield_policy"]["name"] == "round_robin"
     round_robin_pf = json.loads(
         by_variant["round_robin_shield"].pf_config_path.read_text(encoding="utf-8")

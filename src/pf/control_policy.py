@@ -6,19 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 
-import numpy as np
-from numpy.typing import NDArray
 from runtime.provenance import strict_canonical_json_bytes, strict_json_loads
-
-
-@dataclass(frozen=True, slots=True)
-class PFExternalPathSelection:
-    """Describe one externally selected candidate pose without experiment labels."""
-
-    next_pose: NDArray[np.float64]
-    candidate_index: int
-    score: float
-    policy_name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +112,5 @@ def validate_control_policy(
 
 __all__ = [
     "PFControlPolicyProvenance",
-    "PFExternalPathSelection",
     "validate_control_policy",
 ]

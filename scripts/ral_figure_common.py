@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 from pathlib import Path
 import shutil
@@ -11,6 +10,9 @@ from typing import Any, Iterable
 
 import matplotlib.pyplot as plt
 
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+
 ROOT = Path(__file__).resolve().parents[1]
 LATEX_ROOT = (
     ROOT.parent / "ai-latex-workspace" / "projects" / "ieee-ra-l-letter"
@@ -18,7 +20,7 @@ LATEX_ROOT = (
 FIG1_PATH = LATEX_ROOT / "sections/01_introduction/figures/ral_problem_shield_code.pdf"
 FIG2_PATH = LATEX_ROOT / "sections/03_system_model/figures/ral_method_loop.pdf"
 EXPERIMENT_FIG_PATH = (
-    LATEX_ROOT / "sections/05_experiments/figures/ral_result_overview.png"
+    LATEX_ROOT / "sections/05_experiments/figures/ral_result_overview.pdf"
 )
 REVIEW_DIR = ROOT / "results" / "ral_figure_review"
 ISAAC_FIGURE_DIR = ROOT / "results" / "ral_isaac_figures"
@@ -44,27 +46,6 @@ ISOTOPE_COLORS = {
 }
 
 
-@dataclass(frozen=True)
-class SummaryBundle:
-    """Parsed result summary and its filesystem context."""
-
-    path: Path
-    payload: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class AblationRow:
-    """Compact metrics for one ablation variant."""
-
-    label: str
-    spectra: int
-    true_positive: int
-    false_positive: int
-    false_negative: int
-    mean_position_error_m: float
-    mean_strength_error_pct: float
-
-
 def read_json(path: Path) -> dict[str, Any]:
     """Read one UTF-8 JSON file."""
     with Path(path).open("r", encoding="utf-8") as handle:
@@ -75,7 +56,13 @@ def save_figure(fig: plt.Figure, output_path: Path) -> Path:
     """Save a matplotlib figure to disk with deterministic layout settings."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, bbox_inches="tight", dpi=300)
+    fig.savefig(
+        output_path,
+        bbox_inches=None,
+        dpi=300,
+        facecolor="white",
+        transparent=False,
+    )
     plt.close(fig)
     return output_path
 
