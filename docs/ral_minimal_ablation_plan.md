@@ -48,7 +48,7 @@ meaningful test of separate-source recovery without screening locations for
 favourable visibility or response conditioning.
 
 The runtime is the single production source of the RA-L physical environment.
-`runtime.experiment_profiles.STANDARD_EXPERIMENT_PROFILE` in the sibling runtime
+`runtime.experiment_profiles.MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE` in the sibling runtime
 repository defines the 10 x 15 x 5 m room, and both the runtime scene and the
 truth-free environment payload are derived from that object. Estimator
 repositories must not redeclare those dimensions; they consume the environment
@@ -133,9 +133,11 @@ scenario and a separate private truth manifest keyed by opaque `run_id`. The
 command binds the experiment profile and `mix9` scene variant explicitly;
 runtime defaults are not part of the paper contract. It then
 starts the RA-L-only session adapter. The adapter gives the generic PF controller
-only an owner-only Unix socket, a truth-free PF config, and a separate RA-L control
-policy. The PF process receives no scenario path, source profile, scene seed, or
-source RNG provenance.
+an owner-only adaptive Unix socket, an opaque renderer-overlay endpoint, a
+truth-free PF config, and a separate RA-L control policy. The PF process receives no
+scenario path, truth payload, source profile, scene seed, or source RNG provenance.
+Only the asynchronous renderer child reads the overlay endpoint; it labels truth in
+the CUI without placing truth in PF frames or controller results.
 
 Each control-policy file is an exact schema-version-1 document with no aliases,
 defaults, or unknown members. The private manifest records the SHA-256 digest of
@@ -169,6 +171,12 @@ Post-run evaluation must call
 `evaluation.private_truth.load_private_truth_for_completed_result` with
 `closed_loop_result.json` and the corresponding private truth manifest. The
 loader rejects incomplete results and mismatched `run_id` values.
+The private session runner performs this join automatically after every
+successful acquisition, using the fixed cluster-accuracy policy in
+`docs/post_run_cluster_accuracy_policy.md`, and writes the detailed report to
+the sibling runtime's ignored `private_runs/ral_ablation/evaluations/`
+directory. The live truth payload is delivered only to the renderer child through
+the dedicated single-response socket and is never serialized into controller state.
 
 Every generated private runtime configuration is a complete strict production
 document. Runtime-config inheritance and the retired weighted/capped-history

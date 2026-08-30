@@ -77,7 +77,11 @@ class RotatingShieldPFConfig:
     structural_rj_proposal_chart_batch_size: int = 256
     structural_rj_proposal_score_cache_max_bytes: int = 268_435_456
     structural_rj_local_position_move_probability: float = 1.0
-    structural_rj_local_position_sigma_m: float = 0.5
+    structural_rj_local_position_scales_m: tuple[float, ...] | list[float] = (
+        0.03,
+        0.15,
+        0.5,
+    )
     structural_rj_strength_move_probability: float = 1.0
     structural_rj_split_merge_probability: float = 1.0
     structural_rj_block_independence_probability: float = 0.1
@@ -103,13 +107,12 @@ class RotatingShieldPFConfig:
     max_temper_steps: int = 256
     min_delta_beta: float = 1e-10
     joint_rejuvenation_min_sweeps: int = 1
-    joint_rejuvenation_max_sweeps: int = 2
     joint_rejuvenation_min_state_change_weight_mass: float = 0.10
     joint_rejuvenation_min_surface_esjd_m2: float = 1.0e-4
     joint_rejuvenation_min_log_strength_esjd: float = 1.0e-4
-    joint_rejuvenation_min_k_transition_weight_mass: float = 1.0e-4
-    joint_rejuvenation_boundary_mass_threshold: float = 0.05
-    joint_smc_rejuvenation_wall_time_limit_s: float = 1800.0
+    joint_lineage_recovery_min_surviving_weight_mass: float = 1.0e-4
+    # Emergency ceiling, not the normal per-station performance target.
+    joint_smc_rejuvenation_wall_time_limit_s: float = 14400.0
     joint_guided_initialization: bool = True
     joint_guided_initialization_prior_row_probability: float = 0.5
     joint_strength_block_probability: float = 0.0
@@ -168,11 +171,6 @@ class RotatingShieldPFConfig:
                 self.joint_rejuvenation_min_sweeps,
                 1,
             ),
-            (
-                "joint_rejuvenation_max_sweeps",
-                self.joint_rejuvenation_max_sweeps,
-                1,
-            ),
         )
         for name, value, minimum in integer_fields:
             resolved = _strict_nonnegative_integer(value, name=name)
@@ -226,7 +224,6 @@ class RotatingShieldPFConfig:
             "joint_strength_block_log_sigma",
             "joint_cross_isotope_state_block_probability",
             "structural_rj_surface_chart_max_edge_m",
-            "structural_rj_local_position_sigma_m",
             "structural_rj_position_proposal_prior_weight",
             "structural_rj_strength_proposal_prior_weight",
             "structural_rj_strength_proposal_sigma_fraction",
@@ -256,8 +253,7 @@ class RotatingShieldPFConfig:
             "joint_rejuvenation_min_state_change_weight_mass",
             "joint_rejuvenation_min_surface_esjd_m2",
             "joint_rejuvenation_min_log_strength_esjd",
-            "joint_rejuvenation_min_k_transition_weight_mass",
-            "joint_rejuvenation_boundary_mass_threshold",
+            "joint_lineage_recovery_min_surviving_weight_mass",
             "joint_smc_rejuvenation_wall_time_limit_s",
             "joint_guided_initialization_prior_row_probability",
         )
@@ -290,13 +286,6 @@ class RotatingShieldPFConfig:
         )
         if not 0.0 < min_delta_beta <= 1.0:
             raise ValueError("min_delta_beta must lie in (0, 1].")
-        if int(self.joint_rejuvenation_max_sweeps) < int(
-            self.joint_rejuvenation_min_sweeps
-        ):
-            raise ValueError(
-                "joint_rejuvenation_max_sweeps must be at least "
-                "joint_rejuvenation_min_sweeps."
-            )
         state_change_mass = _strict_config_number(
             self.joint_rejuvenation_min_state_change_weight_mass,
             name="joint_rejuvenation_min_state_change_weight_mass",
@@ -308,10 +297,18 @@ class RotatingShieldPFConfig:
         for name in (
             "joint_rejuvenation_min_surface_esjd_m2",
             "joint_rejuvenation_min_log_strength_esjd",
-            "joint_rejuvenation_min_k_transition_weight_mass",
         ):
             if _strict_config_number(getattr(self, name), name=name) < 0.0:
                 raise ValueError(f"{name} must be nonnegative.")
+        recovery_mass = _strict_config_number(
+            self.joint_lineage_recovery_min_surviving_weight_mass,
+            name="joint_lineage_recovery_min_surviving_weight_mass",
+        )
+        if not 0.0 <= recovery_mass <= 1.0:
+            raise ValueError(
+                "joint_lineage_recovery_min_surviving_weight_mass must lie "
+                "in [0, 1]."
+            )
         if (
             _strict_config_number(
                 self.joint_smc_rejuvenation_wall_time_limit_s,
@@ -346,14 +343,39 @@ class RotatingShieldPFConfig:
             or self.structural_rj_surface_chart_max_edge_m <= 0.0
         ):
             raise ValueError("structural_rj_surface_chart_max_edge_m must be positive.")
-        self.structural_rj_local_position_sigma_m = float(
-            self.structural_rj_local_position_sigma_m
+        if not isinstance(
+            self.structural_rj_local_position_scales_m,
+            (tuple, list),
+        ):
+            raise TypeError(
+                "structural_rj_local_position_scales_m must be a list or tuple."
+            )
+        position_scales = tuple(
+            _strict_config_number(
+                value,
+                name=f"structural_rj_local_position_scales_m[{index}]",
+            )
+            for index, value in enumerate(
+                self.structural_rj_local_position_scales_m
+            )
         )
         if (
-            not np.isfinite(self.structural_rj_local_position_sigma_m)
-            or self.structural_rj_local_position_sigma_m <= 0.0
+            len(position_scales) < 2
+            or any(value <= 0.0 for value in position_scales)
+            or any(
+                right <= left
+                for left, right in zip(
+                    position_scales[:-1],
+                    position_scales[1:],
+                    strict=True,
+                )
+            )
         ):
-            raise ValueError("structural_rj_local_position_sigma_m must be positive.")
+            raise ValueError(
+                "structural_rj_local_position_scales_m must contain at least "
+                "two strictly increasing positive scales."
+            )
+        self.structural_rj_local_position_scales_m = position_scales
         self.structural_rj_position_proposal_prior_weight = float(
             self.structural_rj_position_proposal_prior_weight
         )
@@ -583,7 +605,6 @@ class RotatingShieldPFConfig:
             ("adaptive_stop_minimum_joint_map_cardinality_probability", False),
             ("adaptive_stop_maximum_upper_cardinality_mass", True),
             ("adaptive_stop_innovation_confidence", False),
-            ("joint_rejuvenation_boundary_mass_threshold", True),
         ):
             probability = float(getattr(self, probability_field))
             lower_valid = probability >= 0.0 if lower_inclusive else probability > 0.0

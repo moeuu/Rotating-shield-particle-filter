@@ -98,6 +98,15 @@ class ParticleSurfaceMixin:
         atlas = self._structural_rj_surface_atlas
         if atlas is None:
             raise RuntimeError("The continuous surface atlas is unavailable.")
+        if bool(
+            getattr(
+                self,
+                "_structural_rj_device_state_authoritative",
+                False,
+            )
+        ):
+            self._validate_authoritative_continuous_surface_device_state()
+            return
         states = [particle.state for particle in self.continuous_particles]
         if not states:
             return
@@ -180,6 +189,66 @@ class ParticleSurfaceMixin:
                         "PF source states must remain in canonical chart/UV order."
                     )
 
+    def _validate_authoritative_continuous_surface_device_state(self) -> None:
+        """Validate the station-authoritative fixed-capacity Torch state."""
+        state = getattr(self, "_structural_rj_device_state", None)
+        if state is None:
+            raise RuntimeError(
+                "Authoritative continuous state is missing its Torch tensors."
+            )
+        import torch
+
+        particle_count = len(self.continuous_particles)
+        slot_count = int(self.config.hard_max_sources or 0)
+        expected_shapes = {
+            "positions": (particle_count, slot_count, 3),
+            "strengths": (particle_count, slot_count),
+            "mask": (particle_count, slot_count),
+            "chart_ids": (particle_count, slot_count),
+            "surface_uv": (particle_count, slot_count, 2),
+            "cardinalities": (particle_count,),
+        }
+        for name, shape in expected_shapes.items():
+            value = state.get(name)
+            if not torch.is_tensor(value) or tuple(value.shape) != shape:
+                raise RuntimeError(
+                    f"Authoritative continuous state tensor {name!r} is invalid."
+                )
+        mask = state["mask"]
+        cardinalities = state["cardinalities"]
+        slot_ids = torch.arange(
+            slot_count,
+            device=mask.device,
+            dtype=torch.long,
+        )[None, :]
+        expected_mask = slot_ids < cardinalities[:, None]
+        chart_ids = state["chart_ids"]
+        surface_uv = state["surface_uv"]
+        strengths = state["strengths"]
+        positions = state["positions"]
+        chart_count = int(self._structural_rj_surface_atlas.chart_count)
+        minimum = float(self._strength_prior.minimum)
+        maximum = float(self._strength_prior.support_maximum)
+        active_charts = torch.where(mask, chart_ids, torch.zeros_like(chart_ids))
+        status = torch.stack(
+            (
+                torch.all(cardinalities >= 0),
+                torch.all(cardinalities <= slot_count),
+                torch.all(mask == expected_mask),
+                torch.all(~mask | ((chart_ids >= 0) & (chart_ids < chart_count))),
+                torch.all(~mask[..., None] | torch.isfinite(surface_uv)),
+                torch.all(~mask[..., None] | ((surface_uv >= 0.0) & (surface_uv <= 1.0))),
+                torch.all(~mask | torch.isfinite(strengths)),
+                torch.all(~mask | ((strengths >= minimum) & (strengths <= maximum))),
+                torch.all(~mask[..., None] | torch.isfinite(positions)),
+                torch.all(active_charts >= 0),
+            )
+        )
+        if not bool(torch.all(status).item()):
+            raise ValueError(
+                "Station-authoritative PF surface state violates configured support."
+            )
+
     def continuous_state_positions(
         self,
         state: IsotopeState,
@@ -249,6 +318,40 @@ class ParticleSurfaceMixin:
         resampling and make conditional RJ overwrite another isotope's
         components.
         """
+        if bool(
+            getattr(
+                self,
+                "_structural_rj_device_state_authoritative",
+                False,
+            )
+        ):
+            state = getattr(self, "_structural_rj_device_state", None)
+            if state is None:
+                raise RuntimeError(
+                    "Authoritative continuous state is missing its Torch tensors."
+                )
+            self.validate_continuous_surface_states()
+            names = (
+                "positions",
+                "strengths",
+                "mask",
+                "chart_ids",
+                "surface_uv",
+            )
+            arrays = tuple(
+                state[name].detach().cpu().numpy() for name in names
+            )
+            diagnostics = self.last_structural_device_diagnostics
+            diagnostics["host_snapshot_calls"] = int(
+                diagnostics.get("host_snapshot_calls", 0)
+            ) + 1
+            return (
+                np.asarray(arrays[0], dtype=np.float64),
+                np.asarray(arrays[1], dtype=np.float64),
+                np.asarray(arrays[2], dtype=np.bool_),
+                np.asarray(arrays[3], dtype=np.int64),
+                np.asarray(arrays[4], dtype=np.float64),
+            )
         self.validate_continuous_surface_states()
         states = [particle.state for particle in self.continuous_particles]
         particle_count = len(states)
@@ -365,6 +468,13 @@ class ParticleSurfaceMixin:
             source_extent_radius_m=self.source_extent_radius_m,
             source_extent_samples=self.source_extent_samples,
             line_mu_by_isotope=self.line_mu_by_isotope,
+            strict_catalog_line_contract=self.strict_catalog_line_contract,
+            dry_air_total_attenuation_contract_id=(
+                self.dry_air_total_attenuation_contract_id
+            ),
+            dry_air_total_attenuation_contract_sha256=(
+                self.dry_air_total_attenuation_contract_sha256
+            ),
             additive_scatter_response=self.additive_scatter_response,
             **kernel_kwargs,
         )

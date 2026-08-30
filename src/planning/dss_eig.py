@@ -12,7 +12,6 @@ from measurement.continuous_kernels import ContinuousKernel
 from pf.estimator import RotatingShieldPFEstimator
 from pf.full_spectrum import (
     TorchPredictiveFullSpectrumModel,
-    validate_full_spectrum_model,
 )
 from planning.dss_modes import _normalise_weights
 from planning.dss_types import (
@@ -256,6 +255,108 @@ def _joint_program_action_layout(
     return flattened, pose_indices, pair_ids, view_mask, offsets
 
 
+def _validate_selected_transport_outputs(
+    outputs: dict[str, object],
+    *,
+    output_shape: tuple[int, int, int, int],
+    impact_phase_count: int,
+    device_resident: bool,
+) -> None:
+    """Fail closed on malformed runtime transport components."""
+    scalar_fields = (
+        "total_kernel",
+        "uncollided_kernel",
+        "tau_fe",
+        "tau_pb",
+        "tau_obstacle",
+        "tau_obstacle_compton",
+        "distance_m",
+    )
+    expected_impact_shape = output_shape + (int(impact_phase_count),)
+    if device_resident:
+        import torch
+
+        reference = outputs["uncollided_kernel"]
+        if not torch.is_tensor(reference):
+            raise TypeError("Device transport must return Torch tensors.")
+        if any(
+            not torch.is_tensor(outputs[field_name])
+            or outputs[field_name].dtype != torch.float64
+            or outputs[field_name].device != reference.device
+            or tuple(outputs[field_name].shape) != output_shape
+            for field_name in scalar_fields
+        ):
+            raise TypeError(
+                "Device transport components must be aligned float64 Torch "
+                "tensors on one device."
+            )
+        impact = outputs["uncollided_impact_fractions"]
+        if (
+            not torch.is_tensor(impact)
+            or impact.dtype != torch.float64
+            or impact.device != reference.device
+            or tuple(impact.shape) != expected_impact_shape
+        ):
+            raise TypeError(
+                "Device detector-impact fractions must be an aligned float64 "
+                "Torch tensor."
+            )
+        invalid_values = torch.stack(
+            tuple(
+                torch.any(~torch.isfinite(outputs[field_name]))
+                | torch.any(outputs[field_name] < 0.0)
+                for field_name in scalar_fields
+            )
+            + (
+                torch.any(~torch.isfinite(impact)),
+                torch.any(impact < 0.0),
+                torch.any(impact > 1.0),
+            )
+        ).any()
+        phase_sums = torch.sum(impact, dim=-1)
+        normalized = torch.isclose(
+            phase_sums,
+            torch.ones_like(phase_sums),
+            rtol=0.0,
+            atol=1.0e-10,
+        )
+        invalid_normalization = torch.any((reference > 0.0) & ~normalized)
+        if bool((invalid_values | invalid_normalization).item()):
+            raise RuntimeError(
+                "Runtime transport components or active detector-impact "
+                "probabilities violate the physical contract."
+            )
+        return
+
+    arrays = {
+        field_name: np.asarray(outputs[field_name], dtype=np.float64)
+        for field_name in scalar_fields
+    }
+    impact = np.asarray(
+        outputs["uncollided_impact_fractions"],
+        dtype=np.float64,
+    )
+    if (
+        any(array.shape != output_shape for array in arrays.values())
+        or impact.shape != expected_impact_shape
+        or any(
+            np.any(~np.isfinite(array)) or np.any(array < 0.0)
+            for array in arrays.values()
+        )
+        or np.any(~np.isfinite(impact))
+        or np.any(impact < 0.0)
+        or np.any(impact > 1.0)
+    ):
+        raise RuntimeError("Runtime transport components violate the physical contract.")
+    phase_sums = np.sum(impact, axis=-1)
+    normalized = np.isclose(phase_sums, 1.0, rtol=0.0, atol=1.0e-10)
+    if np.any((arrays["uncollided_kernel"] > 0.0) & ~normalized):
+        raise RuntimeError(
+            "Every positive direct transport component requires normalized "
+            "detector-impact probabilities."
+        )
+
+
 def _selected_program_transport_components(
     kernel: ContinuousKernel,
     *,
@@ -264,6 +365,7 @@ def _selected_program_transport_components(
     pair_ids_av: NDArray[np.int64],
     sources: NDArray[np.float64],
     positive_line_indices: NDArray[np.int64],
+    impact_parameter_edges_fraction: object,
     device_resident: bool = False,
     working_memory_budget_bytes: int | None = None,
 ) -> dict[str, object]:
@@ -284,6 +386,20 @@ def _selected_program_transport_components(
     pair_ids = np.asarray(pair_ids_av)
     source_positions = np.asarray(sources, dtype=np.float64)
     line_indices = np.asarray(positive_line_indices)
+    impact_edges = np.asarray(
+        impact_parameter_edges_fraction,
+        dtype=np.float64,
+    )
+    if (
+        impact_edges.ndim != 1
+        or impact_edges.size < 2
+        or np.any(~np.isfinite(impact_edges))
+        or impact_edges[0] != 0.0
+        or impact_edges[-1] != 1.0
+        or np.any(np.diff(impact_edges) <= 0.0)
+    ):
+        raise ValueError("Detector-impact edges must partition zero to one.")
+    impact_phase_count = int(impact_edges.size - 1)
     orientation_count = int(len(kernel.orientations))
     pair_count = orientation_count**2
     if (
@@ -348,6 +464,7 @@ def _selected_program_transport_components(
                 "pb_indices": pair_ids % orientation_count,
                 "positive_line_indices": line_indices,
                 "device_resident": True,
+                "impact_parameter_edges_fraction": impact_edges,
             }
             if working_memory_budget_bytes is not None:
                 pair_program_kwargs["working_memory_budget_bytes"] = int(
@@ -364,6 +481,7 @@ def _selected_program_transport_components(
                 "detector_positions": detectors,
                 "sources": source_positions,
                 "positive_line_indices": line_indices,
+                "impact_parameter_edges_fraction": impact_edges,
             }
             if working_memory_budget_bytes is not None:
                 all_pair_kwargs["working_memory_budget_bytes"] = int(
@@ -380,33 +498,22 @@ def _selected_program_transport_components(
             "tau_fe",
             "tau_pb",
             "tau_obstacle",
+            "tau_obstacle_compton",
             "distance_m",
         )
         outputs = {
             field_name: getattr(components, field_name)
             for field_name in field_names
         }
-        if device_resident:
-            import torch
-
-            if any(
-                not torch.is_tensor(value)
-                or value.dtype != torch.float64
-                or tuple(value.shape) != output_shape
-                for value in outputs.values()
-            ):
-                raise RuntimeError(
-                    "Dense device pair transport returned invalid components."
-                )
-        elif any(
-            np.asarray(value).shape != output_shape
-            or np.any(~np.isfinite(value))
-            or np.any(np.asarray(value) < 0.0)
-            for value in outputs.values()
-        ):
-            raise RuntimeError(
-                "Dense host pair transport returned invalid components."
-            )
+        outputs["uncollided_impact_fractions"] = (
+            components.uncollided_impact_fractions
+        )
+        _validate_selected_transport_outputs(
+            outputs,
+            output_shape=output_shape,
+            impact_phase_count=impact_phase_count,
+            device_resident=device_resident,
+        )
         return outputs
 
     _, sorted_first_indices, sorted_inverse = np.unique(
@@ -436,6 +543,7 @@ def _selected_program_transport_components(
         "tau_fe",
         "tau_pb",
         "tau_obstacle",
+        "tau_obstacle_compton",
         "distance_m",
     )
     outputs: dict[str, object] = {}
@@ -444,6 +552,10 @@ def _selected_program_transport_components(
             field_name: np.empty(output_shape, dtype=np.float64)
             for field_name in field_names
         }
+        outputs["uncollided_impact_fractions"] = np.empty(
+            output_shape + (impact_phase_count,),
+            dtype=np.float64,
+        )
     pair_column_lookup = np.full(
         detector_pair_mask.shape,
         -1,
@@ -476,6 +588,7 @@ def _selected_program_transport_components(
                 "detector_positions": unique_detectors[detector_ids],
                 "sources": source_positions,
                 "positive_line_indices": line_indices,
+                "impact_parameter_edges_fraction": impact_edges,
             }
             if working_memory_budget_bytes is not None:
                 all_pair_kwargs["working_memory_budget_bytes"] = int(
@@ -494,6 +607,7 @@ def _selected_program_transport_components(
                 "fe_indices": group_pair_ids // orientation_count,
                 "pb_indices": group_pair_ids % orientation_count,
                 "positive_line_indices": line_indices,
+                "impact_parameter_edges_fraction": impact_edges,
             }
             if device_resident:
                 pair_program_kwargs["device_resident"] = True
@@ -539,6 +653,11 @@ def _selected_program_transport_components(
                     )
                     for field_name in field_names
                 }
+                outputs["uncollided_impact_fractions"] = torch.empty(
+                    output_shape + (impact_phase_count,),
+                    device=reference.device,
+                    dtype=reference.dtype,
+                )
             selected_index = torch.as_tensor(
                 selected_actions,
                 device=reference.device,
@@ -590,24 +709,42 @@ def _selected_program_transport_components(
                     local_detector_rows[:, None],
                     local_pair_columns,
                 ]
-    if device_resident:
-        import torch
-
-        invalid = torch.stack(
-            tuple(
-                torch.any(~torch.isfinite(value)) | torch.any(value < 0.0)
-                for value in outputs.values()
+        raw_impact = components.uncollided_impact_fractions
+        if device_resident and (
+            not torch.is_tensor(raw_impact)
+            or raw_impact.device != reference.device
+            or raw_impact.dtype != torch.float64
+        ):
+            raise TypeError(
+                "Device-resident detector-impact fractions must be an aligned "
+                "float64 Torch tensor."
             )
-        ).any()
-        if bool(invalid.item()):
+        impact_values = (
+            raw_impact
+            if device_resident
+            else np.asarray(raw_impact, dtype=np.float64)
+        )
+        expected_impact_shape = expected_shape + (impact_phase_count,)
+        if tuple(impact_values.shape) != expected_impact_shape:
             raise RuntimeError(
-                "Pair-program transport components must be nonnegative."
+                "Pair-program transport returned an invalid detector-impact shape."
             )
-    elif any(
-        np.any(~np.isfinite(value)) or np.any(value < 0.0)
-        for value in outputs.values()
-    ):
-        raise RuntimeError("Pair-program transport components must be nonnegative.")
+        if device_resident:
+            outputs["uncollided_impact_fractions"][selected_index] = impact_values[
+                detector_index[:, None],
+                pair_index,
+            ]
+        else:
+            outputs["uncollided_impact_fractions"][selected_actions] = impact_values[
+                local_detector_rows[:, None],
+                local_pair_columns,
+            ]
+    _validate_selected_transport_outputs(
+        outputs,
+        output_shape=output_shape,
+        impact_phase_count=impact_phase_count,
+        device_resident=device_resident,
+    )
     return outputs
 
 
@@ -635,7 +772,7 @@ def _full_spectrum_information_gain(
     batching changes only the execution schedule, not any action's physics,
     likelihood, posterior sample, or random stream.
     """
-    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
+    model = estimator.authenticated_full_spectrum_model()
     if str(model.contract_hash_sha256) != str(components.contract_hash_sha256):
         raise RuntimeError("DSS spectrum components use a different model hash.")
     device_components = isinstance(
@@ -669,7 +806,8 @@ def _full_spectrum_information_gain(
     if (
         total.ndim != 5
         or tuple(uncollided.shape) != tuple(total.shape)
-        or tuple(features.shape) != tuple(total.shape) + (4,)
+        or tuple(features.shape)
+        != tuple(total.shape) + (len(tuple(model.transport_feature_order)),)
         or tuple(live_times.shape) != (int(total.shape[2]),)
     ):
         raise ValueError("DSS full-spectrum component shapes are inconsistent.")

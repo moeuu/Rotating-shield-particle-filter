@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from measurement.observation_model import RuntimeObservationModel
 from measurement.surface_charts import surface_chart_geometry_sha256
 from pf.estimator import (
     RotatingShieldPFConfig,
@@ -41,10 +42,103 @@ from pf.structural_rj import (
     validate_cardinality_prior_policy,
 )
 from pf.strength_prior import STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY
+from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+)
 
 
 class PurePFBoundaryError(RuntimeError):
     """Signal a violation of the sequential PF result contract."""
+
+
+def _require_observation_model_alignment(
+    observation_model: RuntimeObservationModel,
+    *,
+    isotopes: tuple[str, ...],
+    full_spectrum_model: object,
+) -> None:
+    """Require exact agreement across runtime transport and spectral lines."""
+    expected = set(isotopes)
+    line_table = observation_model.line_mu_by_isotope
+    if (
+        not isotopes
+        or len(expected) != len(isotopes)
+        or set(observation_model.mu_by_isotope) != expected
+        or not isinstance(line_table, dict)
+        or set(line_table) != expected
+    ):
+        raise ValueError(
+            "RuntimeObservationModel must exactly cover the configured "
+            "isotope set."
+        )
+    identity = getattr(full_spectrum_model, "line_identity", None)
+    if not isinstance(identity, tuple):
+        raise TypeError(
+            "The full-spectrum model must expose immutable line_identity."
+        )
+    model_rows: dict[str, list[object]] = {isotope: [] for isotope in isotopes}
+    for row in identity:
+        if not isinstance(row, dict) or row.get("isotope") not in expected:
+            raise ValueError(
+                "The full-spectrum line basis differs from the configured "
+                "isotope set."
+            )
+        model_rows[str(row["isotope"])].append(row)
+    for isotope in isotopes:
+        runtime_rows = tuple(line_table[isotope])
+        spectral_rows = tuple(model_rows[isotope])
+        if len(runtime_rows) != len(spectral_rows) or not runtime_rows:
+            raise ValueError(
+                f"Runtime and spectral line counts differ for {isotope!r}."
+            )
+        for index, (runtime_row, spectral_row) in enumerate(
+            zip(runtime_rows, spectral_rows, strict=True)
+        ):
+            if (
+                not isinstance(runtime_row, dict)
+                or not isinstance(spectral_row, dict)
+                or set(runtime_row) != {"energy_keV", "weight", "fe", "pb"}
+                or spectral_row.get("transport_line_index") != index
+            ):
+                raise ValueError(
+                    f"Runtime line identity is invalid for {isotope!r}."
+                )
+            comparisons = (
+                ("energy_keV", "energy_keV"),
+                ("weight", "branching_weight"),
+                ("fe", "mu_fe_cm_inv"),
+                ("pb", "mu_pb_cm_inv"),
+            )
+            if any(
+                not np.isclose(
+                    float(runtime_row[runtime_key]),
+                    float(spectral_row[spectral_key]),
+                    rtol=0.0,
+                    atol=1.0e-12,
+                )
+                for runtime_key, spectral_key in comparisons
+            ):
+                raise ValueError(
+                    f"Runtime and spectral line physics differ for "
+                    f"{isotope!r} line {index}."
+                )
+    observation_response = observation_model.additive_scatter_response
+    spectral_response = getattr(
+        full_spectrum_model,
+        "additive_scatter_response",
+        None,
+    )
+    if (
+        observation_response is None
+        or spectral_response is None
+        or getattr(observation_response, "contract_hash_sha256", None)
+        != getattr(spectral_response, "contract_hash_sha256", None)
+    ):
+        raise ValueError(
+            "RuntimeObservationModel and the full-spectrum transport "
+            "response must have one identical contract hash."
+        )
 
 
 def _resolved_cardinality_prior(
@@ -121,9 +215,98 @@ class PurePFEstimator(_PFEstimatorCore):
         resolved_config_hash: str,
         measurement_log_sha256: str,
         random_seed: int,
+        observation_model: RuntimeObservationModel,
         **kwargs: Any,
     ) -> None:
         """Initialize the PF and its immutable result provenance."""
+        if not isinstance(observation_model, RuntimeObservationModel):
+            raise TypeError(
+                "PurePFEstimator requires one RuntimeObservationModel."
+            )
+        duplicate_physics = sorted(
+            set(kwargs)
+            & {
+                "mu_by_isotope",
+                "shield_params",
+                "obstacle_height_m",
+                "obstacle_mu_by_isotope",
+                "obstacle_buildup_coeff",
+                "detector_radius_m",
+                "detector_aperture_radius_m",
+                "detector_aperture_samples",
+                "detector_aperture_sampling",
+                "source_extent_radius_m",
+                "source_extent_samples",
+                "line_mu_by_isotope",
+                "strict_catalog_line_contract",
+                "dry_air_total_attenuation_contract_id",
+                "dry_air_total_attenuation_contract_sha256",
+            }
+        )
+        if duplicate_physics:
+            raise TypeError(
+                "PurePFEstimator observation physics must come only from "
+                f"RuntimeObservationModel; duplicate fields={duplicate_physics}."
+            )
+        if observation_model.line_mu_by_isotope is None:
+            raise ValueError(
+                "PurePFEstimator requires exact catalog line transport."
+            )
+        if (
+            observation_model.dry_air_total_attenuation_contract_id,
+            observation_model.dry_air_total_attenuation_contract_sha256,
+        ) != (
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+        ):
+            raise ValueError(
+                "PurePFEstimator requires the authenticated XCOM dry-air "
+                "transport contract."
+            )
+        configured_isotopes = tuple(kwargs.get("isotopes", ()))
+        full_spectrum_model = kwargs.get("full_spectrum_generative_model")
+        _require_observation_model_alignment(
+            observation_model,
+            isotopes=configured_isotopes,
+            full_spectrum_model=full_spectrum_model,
+        )
+        kwargs.update(
+            {
+                "mu_by_isotope": observation_model.mu_by_isotope,
+                "shield_params": observation_model.shield_params,
+                "obstacle_height_m": observation_model.obstacle_height_m,
+                "obstacle_mu_by_isotope": (
+                    observation_model.obstacle_mu_by_isotope
+                ),
+                "obstacle_buildup_coeff": (
+                    observation_model.obstacle_buildup_coeff
+                ),
+                "detector_radius_m": (
+                    observation_model.detector_geometry.count_radius_m
+                ),
+                "detector_aperture_radius_m": (
+                    observation_model.detector_geometry.aperture_radius_m
+                ),
+                "detector_aperture_samples": (
+                    observation_model.detector_geometry.aperture_samples
+                ),
+                "detector_aperture_sampling": (
+                    observation_model.detector_geometry.aperture_sampling
+                ),
+                "source_extent_radius_m": (
+                    observation_model.source_extent_radius_m
+                ),
+                "source_extent_samples": observation_model.source_extent_samples,
+                "line_mu_by_isotope": observation_model.line_mu_by_isotope,
+                "strict_catalog_line_contract": True,
+                "dry_air_total_attenuation_contract_id": (
+                    observation_model.dry_air_total_attenuation_contract_id
+                ),
+                "dry_air_total_attenuation_contract_sha256": (
+                    observation_model.dry_air_total_attenuation_contract_sha256
+                ),
+            }
+        )
         pure_config = kwargs.get("pf_config")
         if pure_config is None:
             raise TypeError("PurePFEstimator requires an explicit pf_config.")
@@ -315,9 +498,9 @@ class PurePFEstimator(_PFEstimatorCore):
                 "transport_feature_order": list(spectrum_model.transport_feature_order),
                 "shared_background_owned_by_generative_model": True,
                 "station_assimilation_bridge": (
-                    "exact_shared_latent_view_prefix_marginals"
+                    "single_beta_bridge_over_complete_joint_station_likelihood"
                 ),
-                "final_prefix_target_equals_joint_station_likelihood": True,
+                "tempering_unit": "complete_station",
                 "full_spectrum_contract_hash_sha256": full_spectrum_hash,
             },
             "cardinality_prior": {
@@ -501,7 +684,8 @@ class PurePFEstimator(_PFEstimatorCore):
                     self.pf_config.structural_rj_local_position_move_probability
                 ),
                 "local_position_move_proposal": (
-                    "gaussian_tangent_geodesic_via_shared_edge_portals"
+                    "coupled_multiscale_gaussian_tangent_geodesic_"
+                    "with_integrated_response_preserving_strength"
                 ),
                 "local_position_reverse_correction": (
                     "log_source_chart_area_over_destination_chart_area"
@@ -510,8 +694,16 @@ class PurePFEstimator(_PFEstimatorCore):
                 "local_position_invalid_trace": (
                     "explicit_self_transition_without_redraw"
                 ),
-                "local_position_sigma_m": float(
-                    self.pf_config.structural_rj_local_position_sigma_m
+                "local_position_scales_m": [
+                    float(value)
+                    for value in (
+                        self.pf_config.structural_rj_local_position_scales_m
+                    )
+                ],
+                "local_position_scale_selection": "uniform_kernel_mixture",
+                "local_position_strength_map": (
+                    "preserve_all_history_integrated_unit_response_with_"
+                    "exact_strength_jacobian"
                 ),
                 "global_joint_position_strength_move_retained_for_irreducibility": True,
                 "strength_move_attempt_probability": float(
@@ -542,8 +734,8 @@ class PurePFEstimator(_PFEstimatorCore):
                     self.pf_config.structural_rj_split_global_position_probability
                 ),
                 "merge_pair_proposal": (
-                    "exact_same_or_one_portal_surface_distance_weighted_"
-                    "ordered_pair_with_uniform_global_support"
+                    "exact_intrinsic_distance_line_response_and_weak_donor_"
+                    "weighted_ordered_pair_with_uniform_global_support"
                 ),
                 "merge_position_proposal": (
                     "equal_mixture_of_local_chart_proposals_from_both_"
@@ -945,6 +1137,14 @@ class PurePFEstimator(_PFEstimatorCore):
         """Return canonical bytes for causality and determinism tests."""
         if self.filters:
             self._assert_joint_particle_alignment()
+            particle_count = len(
+                self.filters[self.joint_isotope_order()[0]].continuous_particles
+            )
+            recovery_masks = self._joint_lineage_recovery_masks(
+                particle_count=particle_count,
+            )
+        else:
+            recovery_masks = {}
         isotope_payload: dict[str, Any] = {}
         for isotope, filt in sorted(self.filters.items()):
             particles: list[dict[str, Any]] = []
@@ -1023,6 +1223,21 @@ class PurePFEstimator(_PFEstimatorCore):
                             dtype=np.int64,
                         ).tolist()
                     ),
+                },
+                "lineage_recovery_provenance": {
+                    "schema_version": 1,
+                    "active": bool(self._joint_lineage_recovery_active),
+                    "epoch": int(self._joint_lineage_recovery_epoch),
+                    "minimum_surviving_weight_mass": float(
+                        self.pf_config.joint_lineage_recovery_min_surviving_weight_mass
+                    ),
+                    "certified_row_indices_by_isotope": {
+                        isotope: np.flatnonzero(mask).astype(
+                            np.int64,
+                            copy=False,
+                        ).tolist()
+                        for isotope, mask in sorted(recovery_masks.items())
+                    },
                 },
                 "rng_provenance": self.rng_provenance,
                 "rng_states": {

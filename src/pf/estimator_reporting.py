@@ -767,7 +767,10 @@ class EstimatorReportingMixin:
                     self.last_joint_rejuvenation_mixing_incomplete
                 ),
                 "joint_structural_mixing_incomplete": bool(
-                    self.last_joint_structural_mixing_incomplete
+                    self.last_joint_structural_mixing_incomplete_by_isotope.get(
+                        str(iso),
+                        self.last_joint_structural_mixing_incomplete,
+                    )
                 ),
                 "joint_guided_initialization_ess": (
                     self.last_joint_guided_initialization_ess
@@ -776,8 +779,16 @@ class EstimatorReportingMixin:
                     self.last_joint_cross_isotope_state_rejection_diagnostics
                 ),
                 "joint_transport_cache": {
+                    "preflight": (
+                        None
+                        if self.joint_transport_cache_preflight is None
+                        else dict(self.joint_transport_cache_preflight)
+                    ),
                     "unit_hits": int(self.last_joint_structural_unit_cache_hits),
                     "unit_misses": int(self.last_joint_structural_unit_cache_misses),
+                    "staged_transport_commit_rows": int(
+                        self.last_joint_staged_transport_commit_rows
+                    ),
                     "accepted_state_reuses": int(
                         self.last_joint_persistent_cache_reuse_count
                     ),
@@ -787,15 +798,63 @@ class EstimatorReportingMixin:
                     "ancestor_reindexes": int(
                         self.last_joint_persistent_cache_reindex_count
                     ),
+                    "slot_overlay_likelihood_calls": int(
+                        self.last_joint_slot_overlay_likelihood_calls
+                    ),
+                    "full_history_clone_count": int(
+                        self.last_joint_full_history_clone_count
+                    ),
+                    "past_slab_recopy_count": 0,
+                    "station_likelihood_reuses": int(
+                        self.last_joint_station_likelihood_cache_reuse_count
+                    ),
+                    "station_likelihood_appends": int(
+                        self.last_joint_station_likelihood_append_count
+                    ),
+                    "station_likelihood_full_refreshes": int(
+                        self.last_joint_station_likelihood_full_refresh_count
+                    ),
+                    "last_slot_overlay": dict(
+                        getattr(
+                            self._full_spectrum_model(),
+                            "last_torch_slot_overlay_diagnostics",
+                            {},
+                        )
+                        or {}
+                    ),
+                    "valid_views": (
+                        int(
+                            self._joint_persistent_structural_transport_cache
+                            .valid_view_count
+                        )
+                        if hasattr(
+                            self._joint_persistent_structural_transport_cache,
+                            "valid_view_count",
+                        )
+                        else None
+                    ),
+                    "allocated_bytes": (
+                        int(
+                            self._joint_persistent_structural_transport_cache
+                            .allocated_bytes
+                        )
+                        if hasattr(
+                            self._joint_persistent_structural_transport_cache,
+                            "allocated_bytes",
+                        )
+                        else None
+                    ),
                     "resident_device": (
                         "cuda"
-                        if self._joint_persistent_structural_transport_cache is not None
+                        if self._joint_persistent_structural_transport_cache
+                        is not None
                         and hasattr(
                             self._joint_persistent_structural_transport_cache[0],
                             "detach",
                         )
                         else "cpu"
-                        if self._joint_persistent_structural_transport_cache is not None
+                        if self._joint_persistent_structural_transport_cache
+                        is not None
                         else None
                     ),
                 },
@@ -1499,7 +1558,8 @@ class EstimatorReportingMixin:
         joint_gates = {
             "joint_map_cardinality_probability": bool(
                 joint_map_probability
-                >= self.pf_config.adaptive_stop_minimum_joint_map_cardinality_probability
+                >= self.pf_config
+                .adaptive_stop_minimum_joint_map_cardinality_probability
             ),
             "full_spectrum_innovation": bool(joint_innovation["passed"]),
             **sampler_health,

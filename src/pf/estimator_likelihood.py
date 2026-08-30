@@ -16,8 +16,11 @@ from pf.estimator_config import (
 from pf.estimator_types import JointStationObservation
 from pf.full_spectrum import (
     FullSpectrumGenerativeModel,
+    TRANSPORT_FEATURE_ORDER,
+    catalog_line_layout_by_isotope,
     validate_observed_spectrum,
 )
+from pf.joint_transport_cache import JointTransportCache
 from pf.particle_filter import (
     IsotopeParticleFilter,
     StructuralGeometryBatch,
@@ -64,10 +67,7 @@ class JointLikelihoodMixin:
     ) -> int:
         """Return live tensor storage owned by one device mirror entry."""
         return int(
-            sum(
-                int(value.numel()) * int(value.element_size())
-                for value in components
-            )
+            sum(int(value.numel()) * int(value.element_size()) for value in components)
         )
 
     @property
@@ -98,14 +98,14 @@ class JointLikelihoodMixin:
             self._joint_device_unit_transport_cache = cache
         cached = cache.pop(cache_key, None)
         if cached is None:
-            self.last_joint_device_unit_cache_misses = int(
-                getattr(self, "last_joint_device_unit_cache_misses", 0)
-            ) + 1
+            self.last_joint_device_unit_cache_misses = (
+                int(getattr(self, "last_joint_device_unit_cache_misses", 0)) + 1
+            )
             return None
         cache[cache_key] = cached
-        self.last_joint_device_unit_cache_hits = int(
-            getattr(self, "last_joint_device_unit_cache_hits", 0)
-        ) + 1
+        self.last_joint_device_unit_cache_hits = (
+            int(getattr(self, "last_joint_device_unit_cache_hits", 0)) + 1
+        )
         return cached
 
     def _store_joint_device_unit_transport(
@@ -148,15 +148,19 @@ class JointLikelihoodMixin:
         local_line_count: int,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
         """Expand sparse active-source units into the fixed-slot layout."""
-        if len(unit_components) != 6:
-            raise RuntimeError("Unit transport must contain six physical components.")
+        component_count = 2 + len(TRANSPORT_FEATURE_ORDER)
+        if len(unit_components) != component_count:
+            raise RuntimeError(
+                "Unit transport does not contain the canonical physical "
+                "and detector-impact components."
+            )
         dense = np.zeros(
             (
                 particle_count,
                 slot_count,
                 view_count,
                 local_line_count,
-                6,
+                component_count,
             ),
             dtype=np.float64,
         )
@@ -190,7 +194,7 @@ class JointLikelihoodMixin:
 
     def _full_spectrum_model(self) -> FullSpectrumGenerativeModel:
         """Return the required independently validated generative model."""
-        return self.full_spectrum_generative_model
+        return self.authenticated_full_spectrum_model()
 
     def _joint_station_from_spectrum_records(
         self,
@@ -322,7 +326,11 @@ class JointLikelihoodMixin:
     ]:
         """Return global columns, isotope line indices, and branching weights."""
         model = self._full_spectrum_model()
-        line_identity = tuple(model.line_identity)
+        isotope_order = self.joint_isotope_order()
+        catalog_layout = catalog_line_layout_by_isotope(
+            model,
+            isotope_order,
+        )
         layout: dict[
             str,
             tuple[
@@ -331,77 +339,63 @@ class JointLikelihoodMixin:
                 NDArray[np.float64],
             ],
         ] = {}
-        for isotope in self.joint_isotope_order():
+        for isotope in isotope_order:
+            isotope_layout = catalog_layout[isotope]
             global_columns = np.asarray(
-                [
-                    column
-                    for column, payload in enumerate(line_identity)
-                    if str(payload["isotope"]) == isotope
-                ],
+                isotope_layout.global_columns,
                 dtype=np.int64,
             )
             local_indices = np.asarray(
-                [
-                    int(line_identity[int(column)]["transport_line_index"])
-                    for column in global_columns
-                ],
+                isotope_layout.transport_line_indices,
                 dtype=np.int64,
             )
             branching_weights = np.asarray(
-                [
-                    float(line_identity[int(column)]["branching_weight"])
-                    for column in global_columns
-                ],
+                isotope_layout.branching_weights,
                 dtype=np.float64,
             )
-            if (
-                global_columns.size == 0
-                or np.unique(local_indices).size != local_indices.size
-                or np.any(local_indices < 0)
-                or np.any(~np.isfinite(branching_weights))
-                or np.any(branching_weights <= 0.0)
-            ):
-                raise RuntimeError(
-                    f"Full-spectrum line layout is invalid for {isotope!r}."
-                )
-            configured_weights = self.filters[
-                isotope
-            ].continuous_kernel.line_branching_weights(
+            (
+                configured_weights,
+                configured_energies,
+                configured_mu_fe,
+                configured_mu_pb,
+            ) = self.filters[isotope].continuous_kernel.line_transport_contract(
                 isotope,
                 local_indices,
             )
-            if not np.allclose(
-                configured_weights,
-                branching_weights / float(np.sum(branching_weights)),
-                rtol=1.0e-12,
-                atol=1.0e-15,
+            expected_energies = np.asarray(
+                isotope_layout.energies_keV,
+                dtype=np.float64,
+            )
+            expected_mu_fe = np.asarray(
+                isotope_layout.mu_fe_cm_inv,
+                dtype=np.float64,
+            )
+            expected_mu_pb = np.asarray(
+                isotope_layout.mu_pb_cm_inv,
+                dtype=np.float64,
+            )
+            if not all(
+                np.allclose(
+                    actual,
+                    expected,
+                    rtol=1.0e-12,
+                    atol=1.0e-15,
+                )
+                for actual, expected in (
+                    (configured_weights, branching_weights),
+                    (configured_energies, expected_energies),
+                    (configured_mu_fe, expected_mu_fe),
+                    (configured_mu_pb, expected_mu_pb),
+                )
             ):
                 raise RuntimeError(
-                    "Full-spectrum branching weights differ from the physical "
-                    f"kernel for {isotope!r}."
+                    "Full-spectrum catalog energy, branching, or Fe/Pb mu "
+                    f"differs from the physical kernel for {isotope!r}."
                 )
             layout[isotope] = (
                 global_columns,
                 local_indices,
                 branching_weights,
-            )
-        covered = np.concatenate([value[0] for value in layout.values()])
-        active_names = frozenset(self.joint_isotope_order())
-        expected = np.asarray(
-            [
-                column
-                for column, payload in enumerate(line_identity)
-                if str(payload["isotope"]) in active_names
-            ],
-            dtype=np.int64,
-        )
-        if not np.array_equal(
-            np.sort(covered),
-            expected,
-        ):
-            raise RuntimeError(
-                "Full-spectrum line layout does not cover every active-isotope "
-                "global line."
             )
         return layout
 
@@ -654,6 +648,33 @@ class JointLikelihoodMixin:
         )
         return total, uncollided, features
 
+    def _validate_joint_station_slot_activity(
+        self,
+        components: tuple[object, object, object],
+    ) -> None:
+        """Require every inactive accepted source slot to remain exactly zero."""
+        masks = []
+        for isotope in self.joint_isotope_order():
+            _, _, mask, _, _ = self.filters[
+                isotope
+            ]._packed_continuous_surface_state_arrays()
+            masks.append(np.asarray(mask, dtype=np.bool_))
+        active_mask = np.concatenate(masks, axis=1)
+        if hasattr(components[0], "detach"):
+            import torch
+
+            active_mask_value: object = torch.as_tensor(
+                active_mask,
+                device=components[0].device,
+                dtype=torch.bool,
+            )
+        else:
+            active_mask_value = active_mask
+        JointTransportCache.validate_replacement_slot_activity(
+            components,
+            active_slot_mask=active_mask_value,
+        )
+
     def _joint_station_expected_means_np(
         self,
         station: JointStationObservation,
@@ -672,22 +693,59 @@ class JointLikelihoodMixin:
         station: JointStationObservation,
     ) -> "torch.Tensor":
         """Evaluate the sole joint full-spectrum likelihood for all particles."""
+        import torch
+
         model = self._full_spectrum_model()
-        total, uncollided, features = self._joint_station_transport_components_torch(
-            station
+        total, uncollided, features = (
+            self._joint_station_likelihood_transport_components_torch(station)
         )
-        result = model.log_likelihood_torch(
-            station.spectrum_vb,
+        total = torch.as_tensor(total, dtype=torch.float64)
+        uncollided = torch.as_tensor(
+            uncollided,
+            device=total.device,
+            dtype=total.dtype,
+        )
+        features = torch.as_tensor(
+            features,
+            device=total.device,
+            dtype=total.dtype,
+        )
+        observation_key = (
+            "station",
+            id(station),
+            str(total.device),
+            str(total.dtype),
+        )
+        prepared_observation = self._joint_torch_observation_context_cache.get(
+            observation_key
+        )
+        if prepared_observation is None:
+            observed = torch.as_tensor(
+                station.spectrum_vb,
+                device=total.device,
+                dtype=total.dtype,
+            ).unsqueeze(0)
+            prepared_observation = model.prepare_cross_observation_torch(
+                observed,
+                reference=total,
+            )
+            self._joint_torch_observation_context_cache[observation_key] = (
+                prepared_observation
+            )
+        else:
+            observed = prepared_observation.observed_asvb
+        result = model.cross_log_likelihood_torch(
+            observed,
             total,
             uncollided,
             features,
             station.live_times_s,
-        )
+            prepared_observation=prepared_observation,
+        )[0]
         if tuple(result.shape) != (int(total.shape[0]),):
             raise RuntimeError(
                 "Full-spectrum likelihood must return one value per particle."
             )
-        import torch
 
         status = (
             torch.stack(
@@ -712,53 +770,49 @@ class JointLikelihoodMixin:
             )
         return result
 
-    def _joint_station_prefix_log_likelihood_torch(
+    def _joint_station_likelihood_transport_components_torch(
         self,
         station: JointStationObservation,
-    ) -> "torch.Tensor":
-        """Evaluate exact shared-latent likelihoods for all view prefixes."""
-        model = self._full_spectrum_model()
-        total, uncollided, features = self._joint_station_transport_components_torch(
-            station
-        )
-        result = model.prefix_log_likelihood_torch(
-            station.spectrum_vb,
-            total,
-            uncollided,
-            features,
-            station.live_times_s,
-        )
-        expected_shape = (
-            int(station.fe_indices.size) + 1,
-            int(total.shape[0]),
-        )
-        if tuple(result.shape) != expected_shape:
-            raise RuntimeError(
-                "Full-spectrum prefix likelihood returned an invalid shape."
-            )
-        import torch
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        """Return the newest station slab, reusing the exact active cache.
 
-        status = (
-            torch.stack(
-                (
-                    torch.any(torch.isnan(result)),
-                    torch.any(torch.isinf(result) & (result > 0.0)),
-                    torch.all(result[0] == 0.0),
-                )
-            )
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        if bool(status[0]) or bool(status[1]):
+        Rejuvenation refreshes one history-wide transport cache after every
+        accepted state change.  Station tempering must consume that same slab
+        instead of rebuilding a parallel observation path.
+        """
+        cache = self._joint_structural_transport_cache
+        if cache is None:
+            return self._joint_station_transport_components_torch(station)
+        if not isinstance(cache, JointTransportCache):
             raise RuntimeError(
-                "Full-spectrum prefix likelihood is numerically invalid."
+                "Production station likelihood requires the fixed exact cache."
             )
-        if not bool(status[2]):
+        station_signature = self._joint_station_cache_signature(station)
+        persistent = self._joint_persistent_structural_transport_cache
+        state_sha256 = self._joint_structural_state_sha256()
+        if (
+            cache is not persistent
+            or not cache.station_signatures
+            or cache.station_signatures[-1] != station_signature
+            or cache.state_sha256 != state_sha256
+            or cache.row_generation != self._joint_row_generation
+        ):
             raise RuntimeError(
-                "The empty full-spectrum prefix must have zero log likelihood."
+                "Active station transport cache is stale or belongs to "
+                "another station history."
             )
-        return result
+        view_count = int(station.fe_indices.size)
+        if any(
+            int(values.shape[0]) != int(self.pf_config.num_particles)
+            or int(values.shape[1]) < view_count
+            for values in cache
+        ):
+            raise RuntimeError(
+                "Active station transport cache does not cover the newest "
+                "station."
+            )
+        self.last_joint_station_transport_cache_reuse_count += 1
+        return tuple(values[:, -view_count:, ...] for values in cache)
 
     def _joint_history_structural_geometry(
         self,
@@ -882,89 +936,110 @@ class JointLikelihoodMixin:
         self,
         stations: Sequence[JointStationObservation],
     ) -> None:
-        """Cache source-resolved transport components for conditional RJ.
-
-        CUDA runs retain the immutable station history on the device for the
-        whole Gibbs sweep.  Candidate states are much smaller than this cache,
-        so keeping the history resident removes repeated device-to-host and
-        host-to-device copies without changing any transport or likelihood
-        arithmetic.
-        """
+        """Maintain one fixed-capacity accepted-state transport cache."""
         for filt in self.filters.values():
             filt._clear_continuous_rj_device_state()
         active = tuple(stations)
+        if not active:
+            raise RuntimeError("Structural cache refresh has no station data.")
         station_signature = tuple(
             self._joint_station_cache_signature(station) for station in active
         )
         state_sha256 = self._joint_structural_state_sha256()
+        row_generation = self._joint_row_generation
         persistent = self._joint_persistent_structural_transport_cache
-        persistent_signature = self._joint_persistent_structural_station_signature
         if (
-            persistent is not None
-            and self._joint_persistent_structural_state_sha256 == state_sha256
-            and persistent_signature == station_signature
+            isinstance(persistent, JointTransportCache)
+            and persistent.state_sha256 == state_sha256
+            and persistent.row_generation == row_generation
+            and persistent.station_signatures == station_signature
         ):
             self._joint_structural_transport_cache = persistent
             self.last_joint_persistent_cache_reuse_count += 1
             return
         can_append = (
-            persistent is not None
-            and self._joint_persistent_structural_state_sha256 == state_sha256
-            and len(persistent_signature) < len(station_signature)
-            and station_signature[: len(persistent_signature)] == persistent_signature
+            isinstance(persistent, JointTransportCache)
+            and persistent.state_sha256 == state_sha256
+            and persistent.row_generation == row_generation
+            and persistent.station_count < len(station_signature)
+            and station_signature[: persistent.station_count]
+            == persistent.station_signatures
         )
-        pending_stations = active[len(persistent_signature) :] if can_append else active
-        station_components = [
-            self._joint_station_transport_components_torch(station)
-            for station in pending_stations
-        ]
-        if not station_components:
-            raise RuntimeError("Structural cache refresh has no station data.")
-        if self.pf_config.use_gpu:
-            import torch
-
-            appended = tuple(
-                torch.cat(
-                    [components[index] for components in station_components],
-                    dim=1,
-                ).contiguous()
-                for index in range(3)
-            )
-        else:
-            appended = tuple(
-                np.concatenate(
-                    [
-                        components[index]
-                        .detach()
+        if can_append:
+            for station, signature in zip(
+                active[persistent.station_count :],
+                station_signature[persistent.station_count :],
+                strict=True,
+            ):
+                components = self._joint_station_transport_components_torch(station)
+                self._validate_joint_station_slot_activity(components)
+                if not self.pf_config.use_gpu:
+                    components = tuple(
+                        value.detach()
                         .cpu()
                         .numpy()
                         .astype(np.float64, copy=False)
-                        for components in station_components
-                    ],
-                    axis=1,
-                )
-                for index in range(3)
-            )
-        if can_append:
-            if hasattr(persistent[0], "detach"):
-                import torch
-
-                refreshed = tuple(
-                    torch.cat((old, new), dim=1).contiguous()
-                    for old, new in zip(persistent, appended, strict=True)
-                )
-            else:
-                refreshed = tuple(
-                    np.concatenate((old, new), axis=1)
-                    for old, new in zip(persistent, appended, strict=True)
+                        for value in components
+                    )
+                persistent.append_station(
+                    components,
+                    station_signature=signature,
                 )
             self.last_joint_persistent_cache_append_count += 1
+            refreshed = persistent
         else:
-            refreshed = appended
+            if isinstance(persistent, JointTransportCache):
+                stale_is_cuda = bool(
+                    hasattr(persistent[0], "is_cuda")
+                    and persistent[0].is_cuda
+                )
+                self._joint_structural_transport_cache = None
+                self._joint_persistent_structural_transport_cache = None
+                del persistent
+                if stale_is_cuda:
+                    import gc
+                    import torch
+
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            first_components = self._joint_station_transport_components_torch(active[0])
+            self._validate_joint_station_slot_activity(first_components)
+            if not self.pf_config.use_gpu:
+                first_components = tuple(
+                    value.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64, copy=False)
+                    for value in first_components
+                )
+            refreshed = JointTransportCache.allocate(
+                first_components,
+                station_signature=station_signature[0],
+                state_sha256=state_sha256,
+                row_generation=row_generation,
+            )
+            for station, signature in zip(
+                active[1:],
+                station_signature[1:],
+                strict=True,
+            ):
+                components = self._joint_station_transport_components_torch(station)
+                self._validate_joint_station_slot_activity(components)
+                if not self.pf_config.use_gpu:
+                    components = tuple(
+                        value.detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float64, copy=False)
+                        for value in components
+                    )
+                refreshed.append_station(
+                    components,
+                    station_signature=signature,
+                    count_as_history_append=False,
+                )
         self._joint_structural_transport_cache = refreshed
         self._joint_persistent_structural_transport_cache = refreshed
-        self._joint_persistent_structural_station_signature = station_signature
-        self._joint_persistent_structural_state_sha256 = state_sha256
 
     def _joint_structural_state_sha256(self) -> str:
         """Hash compact accepted chart/UV/strength state without transport."""
@@ -987,9 +1062,12 @@ class JointLikelihoodMixin:
     def _joint_station_cache_signature(
         station: JointStationObservation,
     ) -> str:
-        """Return the immutable geometry signature of one station cache slab."""
+        """Return the immutable MeasurementLog signature of one cache slab."""
         digest = hashlib.sha256()
-        digest.update(b"joint_station_transport_geometry_v1")
+        digest.update(b"joint_station_transport_and_observation_v2")
+        digest.update(
+            str(station.generative_contract_hash_sha256).encode("ascii")
+        )
         digest.update(
             np.asarray(
                 station.detector_position_xyz_m,
@@ -997,16 +1075,19 @@ class JointLikelihoodMixin:
             ).tobytes()
         )
         for values in (
+            station.spectrum_vb,
+            station.energy_axis_keV,
             station.fe_indices,
             station.pb_indices,
             station.live_times_s,
         ):
             array = np.ascontiguousarray(values)
             digest.update(str(array.dtype).encode("ascii"))
+            digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
             digest.update(array.tobytes(order="C"))
         digest.update(
             np.asarray(
-                [int(station.station_sequence_id)],
+                [int(station.pose_idx), int(station.station_sequence_id)],
                 dtype=np.int64,
             ).tobytes()
         )
@@ -1093,6 +1174,50 @@ class JointLikelihoodMixin:
         slots_per_isotope = self.pf_config.cardinality_capacity
         slot_start = order.index(isotope_key) * slots_per_isotope
         slot_stop = slot_start + slots_per_isotope
+        if isinstance(cache, JointTransportCache):
+            _, _, active_mask, _, _ = self.filters[
+                isotope_key
+            ]._packed_continuous_surface_state_arrays()
+            selected_active_mask = np.asarray(
+                active_mask[indices],
+                dtype=np.bool_,
+            )
+            cache.replace_slot_rows(
+                rows=(
+                    torch.as_tensor(
+                        indices,
+                        device=cache[0].device,
+                        dtype=torch.long,
+                    )
+                    if cache_is_torch
+                    else indices
+                ),
+                slot_start=slot_start,
+                slot_stop=slot_stop,
+                replacement=refreshed,
+                active_slot_mask=(
+                    torch.as_tensor(
+                        selected_active_mask,
+                        device=cache[0].device,
+                        dtype=torch.bool,
+                    )
+                    if cache_is_torch
+                    else selected_active_mask
+                ),
+            )
+            state_sha256 = self._joint_structural_state_sha256()
+            cache.update_state_identity(
+                state_sha256=state_sha256,
+                row_generation=self._joint_row_generation,
+            )
+            self._joint_structural_transport_cache = cache
+            self.filters[isotope_key]._clear_continuous_rj_device_state()
+            station_signature = self._joint_station_cache_signatures(stations)
+            if station_signature is None:
+                self._joint_persistent_structural_transport_cache = None
+            else:
+                self._joint_persistent_structural_transport_cache = cache
+            return
         mutable_cache = list(cache)
         for cached_values, refreshed_values in zip(
             mutable_cache, refreshed, strict=True
@@ -1126,15 +1251,9 @@ class JointLikelihoodMixin:
         station_signature = self._joint_station_cache_signatures(stations)
         if station_signature is None:
             self._joint_persistent_structural_transport_cache = None
-            self._joint_persistent_structural_station_signature = ()
-            self._joint_persistent_structural_state_sha256 = None
         else:
             self._joint_persistent_structural_transport_cache = (
                 self._joint_structural_transport_cache
-            )
-            self._joint_persistent_structural_station_signature = station_signature
-            self._joint_persistent_structural_state_sha256 = (
-                self._joint_structural_state_sha256()
             )
 
     def _full_spectrum_log_likelihood_numpy(
@@ -1210,9 +1329,8 @@ class JointLikelihoodMixin:
         uncollided_nvsl: NDArray[np.float64],
         features_nvslf: NDArray[np.float64],
         target_beta: float,
-        newest_prefix_count: int | None = None,
     ) -> NDArray[np.float64]:
-        """Evaluate station-independent latent blocks on one batched action axis."""
+        """Evaluate complete-station latent blocks on one batched action axis."""
         beta = float(target_beta)
         if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
             raise ValueError("Joint history target_beta must lie in [0, 1].")
@@ -1235,20 +1353,9 @@ class JointLikelihoodMixin:
             )
         particle_count = int(total.shape[0])
         result = np.zeros(particle_count, dtype=np.float64)
-        prefix_count = None if newest_prefix_count is None else int(newest_prefix_count)
-        newest_view_count = int(stations[-1].fe_indices.size)
-        if prefix_count is not None and not (1 <= prefix_count <= newest_view_count):
-            raise ValueError(
-                "newest_prefix_count must identify a nonempty newest-station "
-                "view prefix."
-            )
-        layout_key = (
-            tuple(id(station) for station in stations),
-            bool(prefix_count is not None),
-        )
+        layout_key = tuple(id(station) for station in stations)
         cached_layout = self._joint_torch_history_layout_cache.get(layout_key)
         if cached_layout is None:
-            newest_slice: slice | None = None
             grouped_lists: dict[
                 tuple[int, bytes],
                 list[tuple[JointStationObservation, int, int, bool]],
@@ -1257,10 +1364,6 @@ class JointLikelihoodMixin:
             for station_index, station in enumerate(stations):
                 view_count = int(station.fe_indices.size)
                 view_stop = view_start + view_count
-                if prefix_count is not None and station_index == len(stations) - 1:
-                    newest_slice = slice(view_start, view_stop)
-                    view_start = view_stop
-                    continue
                 live_times = np.ascontiguousarray(
                     station.live_times_s,
                     dtype=np.float64,
@@ -1279,10 +1382,18 @@ class JointLikelihoodMixin:
                     )
                 )
                 view_start = view_stop
-            grouped = tuple(tuple(entries) for entries in grouped_lists.values())
-            cached_layout = (grouped, newest_slice, view_start)
+            grouped = tuple(
+                tuple(entries[start : start + JOINT_HISTORY_STATION_ACTION_BATCH_SIZE])
+                for entries in grouped_lists.values()
+                for start in range(
+                    0,
+                    len(entries),
+                    JOINT_HISTORY_STATION_ACTION_BATCH_SIZE,
+                )
+            )
+            cached_layout = (grouped, view_start)
             self._joint_torch_history_layout_cache[layout_key] = cached_layout
-        grouped, newest_slice, view_start = cached_layout
+        grouped, view_start = cached_layout
         if view_start != total_views:
             raise ValueError(
                 "Full-spectrum transport views differ from station history."
@@ -1405,60 +1516,6 @@ class JointLikelihoodMixin:
                 powers[:, None] * group_ll[:, 0, :],
                 axis=0,
             )
-        if prefix_count is not None:
-            if newest_slice is None:
-                raise RuntimeError("Newest-station prefix geometry was not selected.")
-            station = stations[-1]
-            if filt._can_use_gpu():
-                from pf import gpu_utils
-                import torch
-
-                device = gpu_utils.resolve_device(filt.config.gpu_device)
-                prefix_ll = (
-                    model.prefix_log_likelihood_torch(
-                        station.spectrum_vb,
-                        torch.as_tensor(
-                            total[:, newest_slice, ...],
-                            dtype=torch.float64,
-                            device=device,
-                        ),
-                        torch.as_tensor(
-                            uncollided[:, newest_slice, ...],
-                            dtype=torch.float64,
-                            device=device,
-                        ),
-                        torch.as_tensor(
-                            features[:, newest_slice, ...],
-                            dtype=torch.float64,
-                            device=device,
-                        ),
-                        station.live_times_s,
-                    )
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float64, copy=False)
-                )
-            else:
-                prefix_ll = np.asarray(
-                    model.prefix_log_likelihood_numpy(
-                        station.spectrum_vb,
-                        total[:, newest_slice, ...],
-                        uncollided[:, newest_slice, ...],
-                        features[:, newest_slice, ...],
-                        station.live_times_s,
-                    ),
-                    dtype=np.float64,
-                )
-            expected_prefix_shape = (
-                newest_view_count + 1,
-                particle_count,
-            )
-            if prefix_ll.shape != expected_prefix_shape:
-                raise RuntimeError("Newest-station prefix likelihood shape is invalid.")
-            result += (1.0 - beta) * prefix_ll[prefix_count - 1] + beta * prefix_ll[
-                prefix_count
-            ]
         if np.any(np.isnan(result)) or np.any(np.isposinf(result)):
             raise RuntimeError(
                 "Joint history conditional likelihood is numerically invalid."
@@ -1474,7 +1531,8 @@ class JointLikelihoodMixin:
         uncollided_nvsl: object,
         features_nvslf: object,
         target_beta: float,
-        newest_prefix_count: int | None = None,
+        return_station_log_likelihood: bool = False,
+        particle_indices: object | None = None,
     ) -> object:
         """Evaluate the station history while keeping all state arrays on Torch.
 
@@ -1517,26 +1575,55 @@ class JointLikelihoodMixin:
                 "Torch joint-history arrays must align with every station "
                 "view and configured transport feature."
             )
-        particle_count = int(total.shape[0])
+        source_particle_count = int(total.shape[0])
+        if particle_indices is None:
+            selected_indices = None
+            particle_count = source_particle_count
+        else:
+            if not torch.is_tensor(particle_indices):
+                raise TypeError(
+                    "Joint-history particle indices must be a Torch tensor."
+                )
+            selected_indices = particle_indices.reshape(-1)
+            if (
+                selected_indices.device != total.device
+                or selected_indices.dtype != torch.long
+                or int(selected_indices.numel()) == 0
+                or bool(
+                    torch.any(
+                        (selected_indices < 0)
+                        | (selected_indices >= source_particle_count)
+                    ).item()
+                )
+            ):
+                raise ValueError(
+                    "Joint-history particle indices changed device, dtype, or "
+                    "row support."
+                )
+            particle_count = int(selected_indices.numel())
         result = torch.zeros(
             particle_count,
             device=total.device,
             dtype=total.dtype,
         )
-        prefix_count = None if newest_prefix_count is None else int(newest_prefix_count)
-        newest_view_count = int(stations[-1].fe_indices.size)
-        if prefix_count is not None and not (1 <= prefix_count <= newest_view_count):
-            raise ValueError(
-                "newest_prefix_count must identify a nonempty newest-station "
-                "view prefix."
+        station_result = (
+            torch.full(
+                (particle_count, len(stations)),
+                float("nan"),
+                device=total.device,
+                dtype=total.dtype,
             )
-        layout_key = (
-            tuple(id(station) for station in stations),
-            bool(prefix_count is not None),
+            if return_station_log_likelihood
+            else None
         )
+        station_index_by_identity = (
+            {id(station): index for index, station in enumerate(stations)}
+            if return_station_log_likelihood
+            else {}
+        )
+        layout_key = tuple(id(station) for station in stations)
         cached_layout = self._joint_torch_history_layout_cache.get(layout_key)
         if cached_layout is None:
-            newest_slice = None
             grouped_lists: dict[
                 tuple[int, bytes],
                 list[tuple[JointStationObservation, int, int, bool]],
@@ -1545,10 +1632,6 @@ class JointLikelihoodMixin:
             for station_index, station in enumerate(stations):
                 view_count = int(station.fe_indices.size)
                 view_stop = view_start + view_count
-                if prefix_count is not None and station_index == len(stations) - 1:
-                    newest_slice = slice(view_start, view_stop)
-                    view_start = view_stop
-                    continue
                 live_times = np.ascontiguousarray(
                     station.live_times_s,
                     dtype=np.float64,
@@ -1567,10 +1650,18 @@ class JointLikelihoodMixin:
                     )
                 )
                 view_start = view_stop
-            grouped = tuple(tuple(entries) for entries in grouped_lists.values())
-            cached_layout = (grouped, newest_slice, view_start)
+            grouped = tuple(
+                tuple(entries[start : start + JOINT_HISTORY_STATION_ACTION_BATCH_SIZE])
+                for entries in grouped_lists.values()
+                for start in range(
+                    0,
+                    len(entries),
+                    JOINT_HISTORY_STATION_ACTION_BATCH_SIZE,
+                )
+            )
+            cached_layout = (grouped, view_start)
             self._joint_torch_history_layout_cache[layout_key] = cached_layout
-        grouped, newest_slice, view_start = cached_layout
+        grouped, view_start = cached_layout
         if view_start != total_views:
             raise ValueError(
                 "Full-spectrum transport views differ from station history."
@@ -1579,7 +1670,11 @@ class JointLikelihoodMixin:
             entries = tuple(
                 entry
                 for entry in grouped_entries
-                if not (bool(entry[3]) and beta == 0.0)
+                if not (
+                    bool(entry[3])
+                    and beta == 0.0
+                    and not return_station_log_likelihood
+                )
             )
             if not entries:
                 continue
@@ -1598,6 +1693,12 @@ class JointLikelihoodMixin:
                 trailing_shape = tuple(int(value) for value in tensor.shape[2:])
                 if contiguous:
                     block = tensor[:, first_start:last_stop, ...]
+                    if selected_indices is not None:
+                        block = torch.index_select(
+                            block,
+                            0,
+                            selected_indices,
+                        )
                     reshaped = block.reshape(
                         particle_count,
                         len(entries),
@@ -1607,7 +1708,15 @@ class JointLikelihoodMixin:
                     return torch.movedim(reshaped, 1, 0)
                 return torch.stack(
                     [
-                        tensor[:, int(entry[1]) : int(entry[2]), ...]
+                        (
+                            tensor[:, int(entry[1]) : int(entry[2]), ...]
+                            if selected_indices is None
+                            else torch.index_select(
+                                tensor[:, int(entry[1]) : int(entry[2]), ...],
+                                0,
+                                selected_indices,
+                            )
+                        )
                         for entry in entries
                     ],
                     dim=0,
@@ -1665,6 +1774,17 @@ class JointLikelihoodMixin:
             expected_shape = (len(entries), 1, particle_count)
             if tuple(group_ll.shape) != expected_shape:
                 raise RuntimeError("Torch station-history likelihood shape is invalid.")
+            if station_result is not None:
+                station_columns = torch.as_tensor(
+                    [station_index_by_identity[id(entry[0])] for entry in entries],
+                    device=total.device,
+                    dtype=torch.long,
+                )
+                station_result.index_copy_(
+                    1,
+                    station_columns,
+                    torch.transpose(group_ll[:, 0, :], 0, 1),
+                )
             powers = torch.as_tensor(
                 [beta if bool(entry[3]) else 1.0 for entry in entries],
                 device=total.device,
@@ -1674,34 +1794,6 @@ class JointLikelihoodMixin:
                 powers[:, None] * group_ll[:, 0, :],
                 dim=0,
             )
-        if prefix_count is not None:
-            if newest_slice is None:
-                raise RuntimeError("Newest-station prefix geometry was not selected.")
-            station = stations[-1]
-            prefix_ll = model.prefix_log_likelihood_torch(
-                station.spectrum_vb,
-                total[:, newest_slice, ...],
-                uncollided[:, newest_slice, ...],
-                features[:, newest_slice, ...],
-                station.live_times_s,
-            )
-            prefix_ll = torch.as_tensor(
-                prefix_ll,
-                device=total.device,
-                dtype=total.dtype,
-            )
-            expected_prefix_shape = (
-                newest_view_count + 1,
-                particle_count,
-            )
-            if tuple(prefix_ll.shape) != expected_prefix_shape:
-                raise RuntimeError(
-                    "Torch newest-station prefix likelihood shape is invalid."
-                )
-            result = result + (
-                (1.0 - beta) * prefix_ll[prefix_count - 1]
-                + beta * prefix_ll[prefix_count]
-            )
         invalid_result = torch.stack(
             (
                 torch.any(torch.isnan(result)),
@@ -1710,4 +1802,389 @@ class JointLikelihoodMixin:
         ).any()
         if bool(invalid_result.item()):
             raise RuntimeError("Torch joint-history likelihood is numerically invalid.")
+        if station_result is not None:
+            if bool(
+                torch.any(
+                    torch.isnan(station_result)
+                    | (torch.isinf(station_result) & (station_result > 0.0))
+                ).item()
+            ):
+                raise RuntimeError(
+                    "Torch per-station likelihood cache is incomplete or invalid."
+                )
+            return result, station_result
         return result
+
+    def _joint_history_slot_overlay_log_likelihood_torch(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        stations: Sequence[JointStationObservation],
+        accepted_total_nvsl: object,
+        accepted_uncollided_nvsl: object,
+        accepted_features_nvslf: object,
+        replacement_total_nvrl: object,
+        replacement_uncollided_nvrl: object,
+        replacement_features_nvrlf: object,
+        particle_indices: object,
+        slot_start: int,
+        slot_stop: int,
+        replacement_active_slot_mask: object,
+        target_beta: float,
+        return_station_log_likelihood: bool = False,
+    ) -> object:
+        """Evaluate a bounded exact history after one slot-block replacement."""
+        import torch
+
+        if not filt._can_use_gpu():
+            raise RuntimeError("Exact slot overlay requires the Torch backend.")
+        beta = float(target_beta)
+        if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
+            raise ValueError("Joint history target_beta must lie in [0, 1].")
+        model = self._full_spectrum_model()
+        overlay_likelihood = getattr(
+            model,
+            "cross_log_likelihood_replace_slots_torch",
+            None,
+        )
+        if not callable(overlay_likelihood):
+            raise RuntimeError(
+                "The authenticated full-spectrum model lacks exact slot overlay."
+            )
+        accepted_total = torch.as_tensor(accepted_total_nvsl)
+        accepted_uncollided = torch.as_tensor(accepted_uncollided_nvsl)
+        accepted_features = torch.as_tensor(accepted_features_nvslf)
+        replacement_total = torch.as_tensor(replacement_total_nvrl)
+        replacement_uncollided = torch.as_tensor(
+            replacement_uncollided_nvrl
+        )
+        replacement_features = torch.as_tensor(replacement_features_nvrlf)
+        tensors = (
+            accepted_uncollided,
+            accepted_features,
+            replacement_total,
+            replacement_uncollided,
+            replacement_features,
+        )
+        if any(
+            value.device != accepted_total.device
+            or value.dtype != accepted_total.dtype
+            for value in tensors
+        ):
+            raise ValueError(
+                "Joint-history slot-overlay arrays changed dtype or device."
+            )
+        if not torch.is_tensor(particle_indices):
+            raise TypeError("Slot-overlay particle rows must be a Torch tensor.")
+        indices = particle_indices.reshape(-1)
+        if (
+            indices.device != accepted_total.device
+            or indices.dtype != torch.long
+        ):
+            raise ValueError(
+                "Slot-overlay particle rows changed dtype or device."
+            )
+        feature_count = len(tuple(model.transport_feature_order))
+        total_views = sum(int(station.fe_indices.size) for station in stations)
+        replacement_slot_count = int(slot_stop) - int(slot_start)
+        line_count = int(accepted_total.shape[-1])
+        expected_replacement = (
+            int(indices.numel()),
+            total_views,
+            replacement_slot_count,
+            line_count,
+        )
+        if (
+            accepted_total.dtype != torch.float64
+            or accepted_total.ndim != 4
+            or tuple(accepted_uncollided.shape) != tuple(accepted_total.shape)
+            or tuple(accepted_features.shape)
+            != tuple(accepted_total.shape) + (feature_count,)
+            or int(accepted_total.shape[1]) != total_views
+            or tuple(replacement_total.shape) != expected_replacement
+            or tuple(replacement_uncollided.shape) != expected_replacement
+            or tuple(replacement_features.shape)
+            != expected_replacement + (feature_count,)
+        ):
+            raise ValueError("Joint-history slot-overlay arrays are misaligned.")
+        JointTransportCache.validate_replacement_slot_activity(
+            (
+                replacement_total,
+                replacement_uncollided,
+                replacement_features,
+            ),
+            active_slot_mask=replacement_active_slot_mask,
+        )
+        result = torch.zeros(
+            int(indices.numel()),
+            device=accepted_total.device,
+            dtype=accepted_total.dtype,
+        )
+        station_result = (
+            torch.full(
+                (int(indices.numel()), len(stations)),
+                float("nan"),
+                device=accepted_total.device,
+                dtype=accepted_total.dtype,
+            )
+            if return_station_log_likelihood
+            else None
+        )
+        station_index_by_identity = (
+            {id(station): index for index, station in enumerate(stations)}
+            if return_station_log_likelihood
+            else {}
+        )
+        layout_key = tuple(id(station) for station in stations)
+        cached_layout = self._joint_torch_history_layout_cache.get(layout_key)
+        if cached_layout is None:
+            grouped_lists: dict[
+                tuple[int, bytes],
+                list[tuple[JointStationObservation, int, int, bool]],
+            ] = {}
+            view_start = 0
+            for station_index, station in enumerate(stations):
+                view_count = int(station.fe_indices.size)
+                view_stop = view_start + view_count
+                live_times = np.ascontiguousarray(
+                    station.live_times_s,
+                    dtype=np.float64,
+                )
+                if live_times.shape != (view_count,):
+                    raise ValueError(
+                        "Joint-history station live times must align with views."
+                    )
+                key = (view_count, live_times.tobytes(order="C"))
+                grouped_lists.setdefault(key, []).append(
+                    (
+                        station,
+                        view_start,
+                        view_stop,
+                        station_index == len(stations) - 1,
+                    )
+                )
+                view_start = view_stop
+            grouped = tuple(
+                tuple(entries[start : start + JOINT_HISTORY_STATION_ACTION_BATCH_SIZE])
+                for entries in grouped_lists.values()
+                for start in range(
+                    0,
+                    len(entries),
+                    JOINT_HISTORY_STATION_ACTION_BATCH_SIZE,
+                )
+            )
+            cached_layout = (grouped, view_start)
+            self._joint_torch_history_layout_cache[layout_key] = cached_layout
+        grouped, layout_view_count = cached_layout
+        if int(layout_view_count) != total_views:
+            raise RuntimeError("Slot-overlay history layout has stale view bounds.")
+        for grouped_entries in grouped:
+            entries = tuple(
+                entry
+                for entry in grouped_entries
+                if not (
+                    bool(entry[3])
+                    and beta == 0.0
+                    and not return_station_log_likelihood
+                )
+            )
+            if not entries:
+                continue
+            view_count = int(entries[0][2] - entries[0][1])
+            first_start = int(entries[0][1])
+            last_stop = int(entries[-1][2])
+            contiguous = all(
+                int(entry[1]) == first_start + index * view_count
+                and int(entry[2]) == first_start + (index + 1) * view_count
+                for index, entry in enumerate(entries)
+            )
+
+            def _station_action_axis(values: object) -> object:
+                """Return station x state x view without leaving Torch."""
+                tensor = torch.as_tensor(values)
+                state_count = int(tensor.shape[0])
+                trailing_shape = tuple(int(value) for value in tensor.shape[2:])
+                if contiguous:
+                    block = tensor[:, first_start:last_stop, ...]
+                    reshaped = block.reshape(
+                        state_count,
+                        len(entries),
+                        view_count,
+                        *trailing_shape,
+                    )
+                    return torch.movedim(reshaped, 1, 0)
+                return torch.stack(
+                    [
+                        tensor[:, int(entry[1]) : int(entry[2]), ...]
+                        for entry in entries
+                    ],
+                    dim=0,
+                )
+
+            observation_key = (
+                tuple(id(entry[0]) for entry in entries),
+                str(accepted_total.device),
+                str(accepted_total.dtype),
+            )
+            prepared_observation = self._joint_torch_observation_context_cache.get(
+                observation_key
+            )
+            if prepared_observation is None:
+                observed = torch.as_tensor(
+                    np.stack(
+                        [
+                            np.asarray(entry[0].spectrum_vb, dtype=np.float64)
+                            for entry in entries
+                        ],
+                        axis=0,
+                    )[:, None, :, :],
+                    device=accepted_total.device,
+                    dtype=accepted_total.dtype,
+                )
+                prepared_observation = model.prepare_cross_observation_torch(
+                    observed,
+                    reference=accepted_total,
+                )
+                self._joint_torch_observation_context_cache[observation_key] = (
+                    prepared_observation
+                )
+            else:
+                observed = prepared_observation.observed_asvb
+            group_ll = overlay_likelihood(
+                observed,
+                _station_action_axis(accepted_total),
+                _station_action_axis(accepted_uncollided),
+                _station_action_axis(accepted_features),
+                _station_action_axis(replacement_total),
+                _station_action_axis(replacement_uncollided),
+                _station_action_axis(replacement_features),
+                entries[0][0].live_times_s,
+                particle_indices_n=indices,
+                slot_start=int(slot_start),
+                slot_stop=int(slot_stop),
+                action_chunk_size=min(
+                    len(entries),
+                    JOINT_HISTORY_STATION_ACTION_BATCH_SIZE,
+                ),
+                prepared_observation=prepared_observation,
+            )
+            group_ll = torch.as_tensor(
+                group_ll,
+                device=accepted_total.device,
+                dtype=accepted_total.dtype,
+            )
+            expected_shape = (len(entries), 1, int(indices.numel()))
+            if tuple(group_ll.shape) != expected_shape:
+                raise RuntimeError("Slot-overlay station likelihood shape is invalid.")
+            if station_result is not None:
+                station_columns = torch.as_tensor(
+                    [station_index_by_identity[id(entry[0])] for entry in entries],
+                    device=accepted_total.device,
+                    dtype=torch.long,
+                )
+                station_result.index_copy_(
+                    1,
+                    station_columns,
+                    torch.transpose(group_ll[:, 0, :], 0, 1),
+                )
+            powers = torch.as_tensor(
+                [beta if bool(entry[3]) else 1.0 for entry in entries],
+                device=accepted_total.device,
+                dtype=accepted_total.dtype,
+            )
+            result = result + torch.sum(
+                powers[:, None] * group_ll[:, 0, :],
+                dim=0,
+            )
+        if bool(
+            torch.any(
+                torch.isnan(result) | (torch.isinf(result) & (result > 0.0))
+            ).item()
+        ):
+            raise RuntimeError("Slot-overlay history likelihood is invalid.")
+        self.last_joint_slot_overlay_likelihood_calls = int(
+            getattr(self, "last_joint_slot_overlay_likelihood_calls", 0)
+        ) + 1
+        if station_result is not None:
+            if bool(
+                torch.any(
+                    torch.isnan(station_result)
+                    | (torch.isinf(station_result) & (station_result > 0.0))
+                ).item()
+            ):
+                raise RuntimeError(
+                    "Slot-overlay per-station likelihood is incomplete or invalid."
+                )
+            return result, station_result
+        return result
+
+    def _joint_initial_cached_history_target_torch(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        stations: Sequence[JointStationObservation],
+        cache: JointTransportCache,
+        target_beta: float,
+    ) -> object:
+        """Return the accepted target while evaluating only missing station LLs."""
+        import torch
+
+        if cache.station_count != len(stations) or cache.station_count == 0:
+            raise RuntimeError(
+                "Station likelihood cache and active history are misaligned."
+            )
+        station_values = cache.station_log_likelihood[
+            :, : cache.station_count
+        ]
+        missing = torch.isnan(station_values)
+        if not bool(torch.any(missing).item()):
+            self.last_joint_station_likelihood_cache_reuse_count += 1
+            return cache.weighted_target(newest_station_beta=target_beta)
+        newest_only_missing = bool(
+            cache.station_count > 1
+            and not torch.any(missing[:, :-1]).item()
+            and torch.all(missing[:, -1]).item()
+        )
+        if newest_only_missing:
+            view_start = int(cache.station_offsets[-2])
+            view_stop = int(cache.station_offsets[-1])
+            newest_result, newest_station_values = (
+                self._joint_history_log_likelihood_torch(
+                    filt=filt,
+                    stations=(stations[-1],),
+                    total_nvsl=cache[0][:, view_start:view_stop, ...],
+                    uncollided_nvsl=cache[1][:, view_start:view_stop, ...],
+                    features_nvslf=cache[2][:, view_start:view_stop, ...],
+                    target_beta=1.0,
+                    return_station_log_likelihood=True,
+                )
+            )
+            if not torch.allclose(
+                newest_result,
+                newest_station_values[:, 0],
+                rtol=0.0,
+                atol=0.0,
+            ):
+                raise RuntimeError(
+                    "Newest station likelihood cache is not internally exact."
+                )
+            cache.set_station_likelihood_column(
+                newest_station_values[:, 0],
+                station_index=cache.station_count - 1,
+            )
+            self.last_joint_station_likelihood_append_count += 1
+            return cache.weighted_target(newest_station_beta=target_beta)
+        full_result, full_station_values = (
+            self._joint_history_log_likelihood_torch(
+                filt=filt,
+                stations=stations,
+                total_nvsl=cache[0],
+                uncollided_nvsl=cache[1],
+                features_nvslf=cache[2],
+                target_beta=target_beta,
+                return_station_log_likelihood=True,
+            )
+        )
+        cache.set_station_likelihood(full_station_values)
+        self.last_joint_station_likelihood_full_refresh_count += 1
+        return full_result

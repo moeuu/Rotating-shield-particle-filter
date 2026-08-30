@@ -71,6 +71,8 @@ def build_full_spectrum_planning_estimator(
         ),
         shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
         detector_radius_m=0.025,
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         line_mu_by_isotope={isotope: line_mu},
         full_spectrum_generative_model=model,
         random_seed=9,

@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 
 import numpy as np
-from numpy.typing import NDArray
 
 from pf.particle_types import StructuralGeometryBatch
 
@@ -19,9 +18,30 @@ class StructuralRJSweepMixin:
         *,
         target_beta: float = 1.0,
         tempering_start_row: int | None = None,
-        current_target_log_likelihood: NDArray[np.float64] | None = None,
+        current_target_log_likelihood: object | None = None,
+        current_station_log_likelihood: object | None = None,
     ) -> None:
         """Apply continuous RJ/MH and always clear the tempered-target context."""
+        for name in (
+            "mh_acceptance_calls",
+            "mh_acceptance_rows",
+            "state_scatter_calls",
+            "state_scatter_rows",
+            "group_gather_calls",
+            "tpht_proposal_rows",
+            "tpht_refinement_bound_rejected_rows",
+            "tpht_first_stage_station_evaluations",
+            "tpht_first_stage_rejected_rows",
+            "tpht_full_history_rows",
+            "tpht_exact_rejected_rows",
+            "tpht_exact_station_evaluations",
+            "tpht_block_evaluation_calls",
+            "tpht_refinement_rounds",
+            "tpht_staged_replay_rows",
+            "tpht_maximum_block_level",
+            "tpht_debug_oracle_rows",
+        ):
+            self.last_structural_device_diagnostics[name] = 0
         self._structural_rj_tempering_start_row = tempering_start_row
         self._structural_rj_current_block_strength_centers = np.full(
             (
@@ -36,9 +56,11 @@ class StructuralRJSweepMixin:
             -1,
             dtype=np.int64,
         )
-        if current_target_log_likelihood is None:
-            self._structural_rj_current_target_log_likelihood = None
-        else:
+        self._structural_rj_current_target_log_likelihood = None
+        self._structural_rj_current_target_log_likelihood_device = None
+        self._structural_rj_current_station_log_likelihood_device = None
+        device_input = hasattr(current_target_log_likelihood, "detach")
+        if current_target_log_likelihood is not None and not device_input:
             current = np.asarray(
                 current_target_log_likelihood,
                 dtype=np.float64,
@@ -52,20 +74,126 @@ class StructuralRJSweepMixin:
                     "Current structural target must align with every particle."
                 )
             self._structural_rj_current_target_log_likelihood = current.copy()
+        self._structural_rj_torch_generator = None
+        self._structural_rj_tpht_generator = None
+        if self._continuous_rj_torch_enabled():
+            import torch
+
+            state = self._structural_rj_device_state
+            if state is None:
+                raise RuntimeError("Authoritative CUDA RJ state is missing.")
+            seed = int(
+                self._random_generator.integers(
+                    0,
+                    np.iinfo(np.int64).max,
+                    dtype=np.int64,
+                )
+            )
+            generator = torch.Generator(device=state["strengths"].device)
+            generator.manual_seed(seed)
+            self._structural_rj_torch_generator = generator
+            tpht_generator = torch.Generator(device=state["strengths"].device)
+            tpht_generator.manual_seed(seed ^ 0x2F4B6D183A5C7091)
+            self._structural_rj_tpht_generator = tpht_generator
+            if current_target_log_likelihood is not None:
+                if device_input:
+                    current_device = current_target_log_likelihood
+                    if (
+                        not torch.is_tensor(current_device)
+                        or current_device.device != state["strengths"].device
+                        or current_device.dtype != state["strengths"].dtype
+                    ):
+                        raise ValueError(
+                            "CUDA structural target must already use the "
+                            "authoritative state device and dtype."
+                        )
+                    current_device = current_device.reshape(-1)
+                else:
+                    current_device = torch.as_tensor(
+                        current_target_log_likelihood,
+                        device=state["strengths"].device,
+                        dtype=state["strengths"].dtype,
+                    ).reshape(-1)
+                if (
+                    tuple(current_device.shape)
+                    != (len(self.continuous_particles),)
+                    or bool(
+                        torch.any(
+                            torch.isnan(current_device)
+                            | torch.isposinf(current_device)
+                        ).item()
+                    )
+                ):
+                    raise ValueError(
+                        "CUDA structural target must align with every particle."
+                    )
+                self._structural_rj_current_target_log_likelihood_device = (
+                    current_device.clone()
+                )
+            if current_station_log_likelihood is not None:
+                station_device = torch.as_tensor(current_station_log_likelihood)
+                if (
+                    not device_input
+                    or not torch.is_tensor(station_device)
+                    or station_device.device != state["strengths"].device
+                    or station_device.dtype != state["strengths"].dtype
+                    or station_device.ndim != 2
+                    or int(station_device.shape[0])
+                    != len(self.continuous_particles)
+                    or bool(torch.any(~torch.isfinite(station_device)).item())
+                ):
+                    raise ValueError(
+                        "CUDA TPHT station targets must align with the "
+                        "authoritative particle state."
+                    )
+                self._structural_rj_current_station_log_likelihood_device = (
+                    station_device.clone()
+                )
+            elif self._joint_history_tree_evaluator is not None:
+                raise RuntimeError(
+                    "Joint production rejuvenation requires TPHT station targets."
+                )
+            self.last_structural_device_diagnostics["proposal_backend"] = "torch"
+        elif device_input:
+            raise ValueError(
+                "A Torch structural target requires station-authoritative CUDA state."
+            )
         try:
             self._apply_exact_structural_rj_moves_impl(
                 evidence_data,
                 target_beta=target_beta,
             )
         finally:
-            current = self._structural_rj_current_target_log_likelihood
-            self.last_structural_target_log_likelihood = (
-                None if current is None else current.copy()
+            current_device = (
+                self._structural_rj_current_target_log_likelihood_device
+            )
+            if current_device is not None:
+                self.last_structural_target_log_likelihood_device = (
+                    current_device.detach().clone()
+                )
+                self.last_structural_target_log_likelihood = None
+            else:
+                current = self._structural_rj_current_target_log_likelihood
+                self.last_structural_target_log_likelihood_device = None
+                self.last_structural_target_log_likelihood = (
+                    None if current is None else current.copy()
+                )
+            current_station = (
+                self._structural_rj_current_station_log_likelihood_device
+            )
+            self.last_structural_station_log_likelihood_device = (
+                None
+                if current_station is None
+                else current_station.detach().clone()
             )
             self._structural_rj_position_proposal = None
             self._structural_rj_strength_proposal = None
             self._structural_rj_tempering_start_row = None
             self._structural_rj_current_target_log_likelihood = None
+            self._structural_rj_current_target_log_likelihood_device = None
+            self._structural_rj_current_station_log_likelihood_device = None
+            self._structural_rj_torch_generator = None
+            self._structural_rj_tpht_generator = None
             self._structural_rj_current_block_strength_centers = None
             self._structural_rj_current_block_strength_cardinalities = None
             self._clear_continuous_rj_device_state()
@@ -106,6 +234,10 @@ class StructuralRJSweepMixin:
             "block_accepted": 0,
             "block_cardinality_changed": 0,
         }
+        self.last_structural_full_support_accepted_mask = np.zeros(
+            len(self.continuous_particles),
+            dtype=np.bool_,
+        )
         self._structural_mh_component_samples = {}
         response_start = time.perf_counter()
         self._structural_rj_position_proposal = (
@@ -343,13 +475,26 @@ class StructuralRJSweepMixin:
             "weights_preserved": float(outer_weight_array_equal),
         }
         device_diagnostics = self.last_structural_device_diagnostics
-        for name in (
+        diagnostic_names = (
             "mh_acceptance_calls",
             "mh_acceptance_rows",
             "state_scatter_calls",
             "state_scatter_rows",
             "group_gather_calls",
-        ):
+            "tpht_proposal_rows",
+            "tpht_refinement_bound_rejected_rows",
+            "tpht_first_stage_station_evaluations",
+            "tpht_first_stage_rejected_rows",
+            "tpht_full_history_rows",
+            "tpht_exact_rejected_rows",
+            "tpht_exact_station_evaluations",
+            "tpht_block_evaluation_calls",
+            "tpht_refinement_rounds",
+            "tpht_staged_replay_rows",
+            "tpht_maximum_block_level",
+            "tpht_debug_oracle_rows",
+        )
+        for name in diagnostic_names:
             self.last_structural_timing_s[f"device_{name}"] = float(
                 device_diagnostics.get(name, 0)
             )

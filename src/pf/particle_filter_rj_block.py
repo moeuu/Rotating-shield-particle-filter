@@ -31,6 +31,11 @@ class StructuralRJBlockIndependenceMixin:
         union of the continuous ``K``-source spaces and requires no implicit
         dimension-matching Jacobian.
         """
+        if self._continuous_rj_torch_enabled():
+            return self._apply_continuous_rj_block_independence_torch(
+                data,
+                target_beta=target_beta,
+            )
         probability = float(self.config.structural_rj_block_independence_probability)
         if probability <= 0.0:
             return 0, 0
@@ -48,13 +53,9 @@ class StructuralRJBlockIndependenceMixin:
             "block_attempted",
             attempted_indices,
         )
-        current_cardinalities = np.asarray(
-            [
-                self.continuous_particles[int(index)].state.num_sources
-                for index in attempted_indices
-            ],
-            dtype=np.int64,
-        )
+        current_cardinalities = self._continuous_rj_cardinalities_numpy()[
+            attempted_indices
+        ]
         proposed_cardinalities = self._random_generator.choice(
             cardinality_prior.probabilities.size,
             size=attempted_indices.size,
@@ -195,6 +196,7 @@ class StructuralRJBlockIndependenceMixin:
             )
             self._record_structural_mh_components(
                 "block_independence",
+                particle_indices=particle_indices,
                 delta_log_likelihood=_extended_log_target_ratio(
                     proposed_ll,
                     base_ll[rows],

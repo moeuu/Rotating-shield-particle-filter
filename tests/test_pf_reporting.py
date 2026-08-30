@@ -19,7 +19,10 @@ from pf.posterior_uncertainty import (
 )
 from pf.pure_estimator import PurePFEstimator
 from pf.state import IsotopeState
-from pure_pf_test_support import approved_full_spectrum_model
+from pure_pf_test_support import (
+    approved_full_spectrum_model,
+    runtime_observation_model,
+)
 
 
 def _canonical_scalar_eigenvectors(eigenvectors: np.ndarray) -> np.ndarray:
@@ -254,7 +257,9 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
             init_num_sources=(1, 1),
             use_gpu=False,
         ),
-        full_spectrum_generative_model=approved_full_spectrum_model(),
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
+        full_spectrum_generative_model=approved_full_spectrum_model(("Cs-137",)),
     )
     estimator.add_measurement_pose(np.asarray([2.5, 2.5, 0.5], dtype=float))
     estimator._ensure_kernel_cache()
@@ -345,12 +350,15 @@ def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
         grid_shape=(3, 3),
         blocked_cells=((1, 1),),
         transport_boxes_m=((1.2, 1.3, 0.4, 1.8, 1.9, 1.4),),
+        transport_mu_by_isotope={"Cs-137": (0.1,)},
+        transport_line_mu_by_isotope={"Cs-137": ((0.1,),)},
+        transport_line_compton_mu_by_isotope={"Cs-137": ((0.05,),)},
     )
     estimator = PurePFEstimator(
         isotopes=(isotope,),
         surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
         shield_normals=None,
-        mu_by_isotope={isotope: 0.0},
+        observation_model=runtime_observation_model((isotope,)),
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
             max_sources=1,
@@ -361,7 +369,7 @@ def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
             structural_rj_surface_chart_max_edge_m=0.5,
         ),
         obstacle_grid=obstacle_grid,
-        full_spectrum_generative_model=approved_full_spectrum_model(),
+        full_spectrum_generative_model=approved_full_spectrum_model((isotope,)),
         measurement_log_schema_version=2,
         config_hash="a" * 64,
         resolved_config_hash="b" * 64,

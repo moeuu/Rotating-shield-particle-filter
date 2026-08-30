@@ -12,6 +12,9 @@ definition, statistics, and observation path.
 - Private physical scenarios are authored by
   `rotating-shield-sim generate-scenario` and executed only by
   `rotating-shield-sim run-adaptive-session`.
+- Scenario authoring must explicitly select both its experiment profile and
+  private source variant. Production must not infer a default isotope set,
+  source composition, or environment when either selection is absent.
 - PF controls that session through `rotating-shield-pf-live`; this repository has
   no finalized-log batch inference command or compatibility shim.
 - Simulator backend and CUI/GUI mode selection belong exclusively to the shared
@@ -90,6 +93,19 @@ definition, statistics, and observation path.
   spectra, counts, or PF observations.
 - Separate planning heuristics, if they do not replace the runtime spectrum or
   transport calculation.
+
+## CUI Truth Isolation
+
+- Live evaluation truth may reach only the asynchronous CUI renderer through the
+  runtime's explicit, owner-only, single-response Unix socket. It must not be added
+  to a PF frame, estimator state, planner input, adaptive event, MeasurementLog, or
+  estimator result artifact.
+- The renderer labels each true source with its isotope-local source number and
+  full `(x, y, z)` coordinates in the top-down and labeled 3-D panels. The overview
+  keeps compact identifiers on its crowded elevation projection and prints the
+  complete numbered XYZ inventory beside it.
+- The estimator-facing adaptive client has no truth request API. Retired same-stream
+  overlay requests and responses fail closed instead of selecting a legacy path.
 
 ## Required Checks
 

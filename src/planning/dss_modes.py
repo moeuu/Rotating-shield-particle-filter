@@ -9,7 +9,6 @@ from numpy.typing import NDArray
 
 from measurement.continuous_kernels import ContinuousKernel
 from pf.estimator import JointPlanningParticles, RotatingShieldPFEstimator
-from pf.full_spectrum import validate_full_spectrum_model
 from pf.posterior import (
     validated_probability,
     validated_probability_distribution,
@@ -197,7 +196,7 @@ def _validate_eig_likelihood_contract(
             "Conditional-greedy shield search requires "
             "planning_eig_samples >= 2."
         )
-    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
+    model = estimator.authenticated_full_spectrum_model()
     if not callable(getattr(model, "cross_log_likelihood_numpy", None)):
         raise RuntimeError(
             "DSS EIG requires vectorized full-spectrum cross likelihoods."

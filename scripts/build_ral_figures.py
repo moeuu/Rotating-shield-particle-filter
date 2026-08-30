@@ -19,7 +19,7 @@ from matplotlib.collections import PatchCollection
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, FancyArrowPatch, Rectangle, Wedge
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
+from runtime.experiment_profiles import MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE
 
 try:
     from scripts.ral_figure_common import (
@@ -146,13 +146,20 @@ def _draw_schematic_obstacles(
 
 def _draw_problem_scene(ax: Axes, *, compact: bool = False) -> None:
     """Draw a compact multi-isotope surface-source scene for Fig. 1."""
-    room_x = float(STANDARD_EXPERIMENT_PROFILE.environment.size_x)
-    room_y = float(STANDARD_EXPERIMENT_PROFILE.environment.size_y)
+    room_x = float(MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment.size_x)
+    room_y = float(MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment.size_y)
     scale_x = room_x / 10.0
     scale_y = room_y / 20.0
     ax.add_patch(
-        Rectangle((0.0, 0.0), room_x, room_y, facecolor="#fbfbfb",
-                  edgecolor="#222222", lw=0.6, zorder=0)
+        Rectangle(
+            (0.0, 0.0),
+            room_x,
+            room_y,
+            facecolor="#fbfbfb",
+            edgecolor="#222222",
+            lw=0.6,
+            zorder=0,
+        )
     )
     _draw_schematic_obstacles(ax, scale_xy=(scale_x, scale_y))
     route = np.asarray(
@@ -173,11 +180,28 @@ def _draw_problem_scene(ax: Axes, *, compact: bool = False) -> None:
     for isotope, xy, label in sources:
         color = ISOTOPE_COLORS[isotope]
         scaled_xy = (xy[0] * scale_x, xy[1] * scale_y)
-        ax.scatter(scaled_xy[0], scaled_xy[1], marker="*", s=68, color=color,
-                   edgecolor="#222222", lw=0.35, zorder=6, clip_on=False)
+        ax.scatter(
+            scaled_xy[0],
+            scaled_xy[1],
+            marker="*",
+            s=68,
+            color=color,
+            edgecolor="#222222",
+            lw=0.35,
+            zorder=6,
+            clip_on=False,
+        )
         if not compact:
-            ax.text(scaled_xy[0] + 0.18, scaled_xy[1] + 0.18, label, fontsize=5.8,
-                    color=color, ha="left", va="bottom", zorder=7)
+            ax.text(
+                scaled_xy[0] + 0.18,
+                scaled_xy[1] + 0.18,
+                label,
+                fontsize=5.8,
+                color=color,
+                ha="left",
+                va="bottom",
+                zorder=7,
+            )
     ax.set_xlim(-0.3, room_x + 0.3)
     ax.set_ylim(-0.3, room_y + 0.3)
     ax.set_aspect("equal")
@@ -204,18 +228,46 @@ def _draw_detector_posture(
 ) -> None:
     """Draw one top-down Fe/Pb shield posture around a detector."""
     cx, cy = center
-    ax.add_patch(Circle((cx, cy), 0.16, facecolor="#33c4d8", edgecolor="#1d6f7a", lw=0.8))
-    ax.add_patch(Wedge((cx, cy), 0.44, fe_angle, fe_angle + 85, width=0.13,
-                       facecolor="#e28b2d", edgecolor="#8a4d00", lw=0.8, alpha=0.95))
-    ax.add_patch(Wedge((cx, cy), 0.62, pb_angle, pb_angle + 85, width=0.14,
-                       facecolor="#8d96a8", edgecolor="#4c5463", lw=0.8, alpha=0.95))
+    ax.add_patch(
+        Circle((cx, cy), 0.16, facecolor="#33c4d8", edgecolor="#1d6f7a", lw=0.8)
+    )
+    ax.add_patch(
+        Wedge(
+            (cx, cy),
+            0.44,
+            fe_angle,
+            fe_angle + 85,
+            width=0.13,
+            facecolor="#e28b2d",
+            edgecolor="#8a4d00",
+            lw=0.8,
+            alpha=0.95,
+        )
+    )
+    ax.add_patch(
+        Wedge(
+            (cx, cy),
+            0.62,
+            pb_angle,
+            pb_angle + 85,
+            width=0.14,
+            facecolor="#8d96a8",
+            edgecolor="#4c5463",
+            lw=0.8,
+            alpha=0.95,
+        )
+    )
     ax.text(cx, cy - 0.52, label, ha="center", va="top", fontsize=6.5)
     ax.annotate(
         "",
         xy=(cx + 0.54, cy + 0.20),
         xytext=(cx + 0.24, cy + 0.55),
-        arrowprops={"arrowstyle": "->", "lw": 0.9, "color": "#444444",
-                    "connectionstyle": "arc3,rad=-0.45"},
+        arrowprops={
+            "arrowstyle": "->",
+            "lw": 0.9,
+            "color": "#444444",
+            "connectionstyle": "arc3,rad=-0.45",
+        },
     )
 
 
@@ -347,9 +399,18 @@ def _draw_box(
     """Draw a labeled rounded-looking process box using a rectangle."""
     x0, y0 = xy
     ax.add_patch(
-        Rectangle((x0, y0), width, height, facecolor=facecolor, edgecolor="#333333", lw=0.8)
+        Rectangle(
+            (x0, y0), width, height, facecolor=facecolor, edgecolor="#333333", lw=0.8
+        )
     )
-    ax.text(x0 + width / 2.0, y0 + height / 2.0, text, ha="center", va="center", fontsize=fontsize)
+    ax.text(
+        x0 + width / 2.0,
+        y0 + height / 2.0,
+        text,
+        ha="center",
+        va="center",
+        fontsize=fontsize,
+    )
 
 
 def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
@@ -423,14 +484,19 @@ def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
     energy = np.linspace(0.0, 1.0, 120)
     spectrum = (
         0.10
-        + 0.35 * np.exp(-((energy - 0.24) / 0.055) ** 2)
-        + 0.48 * np.exp(-((energy - 0.50) / 0.070) ** 2)
-        + 0.28 * np.exp(-((energy - 0.76) / 0.050) ** 2)
+        + 0.35 * np.exp(-(((energy - 0.24) / 0.055) ** 2))
+        + 0.48 * np.exp(-(((energy - 0.50) / 0.070) ** 2))
+        + 0.28 * np.exp(-(((energy - 0.76) / 0.050) ** 2))
     )
     ax_spectrum.plot(energy, spectrum, color="#303030", lw=0.9)
     for center, isotope in zip((0.24, 0.50, 0.76), ("Cs-137", "Co-60", "Eu-154")):
-        ax_spectrum.axvspan(center - 0.025, center + 0.025,
-                            color=ISOTOPE_COLORS[isotope], alpha=0.22, lw=0)
+        ax_spectrum.axvspan(
+            center - 0.025,
+            center + 0.025,
+            color=ISOTOPE_COLORS[isotope],
+            alpha=0.22,
+            lw=0,
+        )
     ax_spectrum.set_xticks([])
     ax_spectrum.set_yticks([])
     for spine in ax_spectrum.spines.values():
@@ -438,18 +504,30 @@ def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
 
     ax_pf = fig.add_subplot(flow_grid[0, 1])
     ax_pf.set_title("isotope-wise PF support", fontsize=6.8, pad=1.5)
-    ax_pf.add_patch(Rectangle((0.10, 0.10), 0.80, 0.80, facecolor="#fbfbfb",
-                              edgecolor="#4e555b", lw=0.55))
-    ax_pf.add_patch(Rectangle((0.44, 0.10), 0.10, 0.80, facecolor="#d5d8dc",
-                              edgecolor="#8b8f94", lw=0.35))
+    ax_pf.add_patch(
+        Rectangle(
+            (0.10, 0.10), 0.80, 0.80, facecolor="#fbfbfb", edgecolor="#4e555b", lw=0.55
+        )
+    )
+    ax_pf.add_patch(
+        Rectangle(
+            (0.44, 0.10), 0.10, 0.80, facecolor="#d5d8dc", edgecolor="#8b8f94", lw=0.35
+        )
+    )
     particle_points = {
         "Cs-137": ([0.28, 0.37, 0.63, 0.73], [0.28, 0.36, 0.30, 0.35]),
         "Co-60": ([0.28, 0.37, 0.63, 0.73], [0.50, 0.58, 0.51, 0.60]),
         "Eu-154": ([0.28, 0.37, 0.63, 0.73], [0.74, 0.82, 0.73, 0.80]),
     }
     for isotope, (xs, ys) in particle_points.items():
-        ax_pf.scatter(xs, ys, s=[10, 26, 13, 22], color=ISOTOPE_COLORS[isotope],
-                      alpha=0.72, edgecolor="none")
+        ax_pf.scatter(
+            xs,
+            ys,
+            s=[10, 26, 13, 22],
+            color=ISOTOPE_COLORS[isotope],
+            alpha=0.72,
+            edgecolor="none",
+        )
     ax_pf.set_xlim(0.0, 1.0)
     ax_pf.set_ylim(0.0, 1.0)
     ax_pf.set_xticks([])
@@ -483,8 +561,15 @@ def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
     ax_corr.imshow(corr, cmap="Reds", vmin=0.0, vmax=1.0)
     for row in range(3):
         for col in range(3):
-            ax_corr.text(col, row, f"{corr[row, col]:.1f}", ha="center", va="center",
-                         fontsize=5.4, color="#202020")
+            ax_corr.text(
+                col,
+                row,
+                f"{corr[row, col]:.1f}",
+                ha="center",
+                va="center",
+                fontsize=5.4,
+                color="#202020",
+            )
     ax_corr.set_xticks([0, 1, 2], labels=["m1", "m2", "m3"], fontsize=5.4)
     ax_corr.set_yticks([0, 1, 2], labels=["m1", "m2", "m3"], fontsize=5.4)
     ax_corr.tick_params(length=0, pad=0.5)
@@ -506,15 +591,34 @@ def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
 
     ax_next = fig.add_subplot(decision_grid[0, 2])
     ax_next.set_title("next station/program", fontsize=6.8, pad=1.5)
-    ax_next.add_patch(Rectangle((0.04, 0.04), 0.92, 0.92, facecolor="#fbfbfb",
-                                edgecolor="#4e555b", lw=0.55))
-    ax_next.add_patch(Rectangle((0.36, 0.10), 0.16, 0.62, facecolor="#c6cbd1",
-                                edgecolor="#686e75", lw=0.35))
-    ax_next.plot([0.18, 0.42, 0.78], [0.18, 0.36, 0.72],
-                 color="#005bbb", lw=1.0, marker="o", ms=2.8)
+    ax_next.add_patch(
+        Rectangle(
+            (0.04, 0.04), 0.92, 0.92, facecolor="#fbfbfb", edgecolor="#4e555b", lw=0.55
+        )
+    )
+    ax_next.add_patch(
+        Rectangle(
+            (0.36, 0.10), 0.16, 0.62, facecolor="#c6cbd1", edgecolor="#686e75", lw=0.35
+        )
+    )
+    ax_next.plot(
+        [0.18, 0.42, 0.78],
+        [0.18, 0.36, 0.72],
+        color="#005bbb",
+        lw=1.0,
+        marker="o",
+        ms=2.8,
+    )
     ax_next.scatter([0.78], [0.72], marker="*", s=64, color="#005bbb", zorder=5)
-    ax_next.text(0.79, 0.20, "$g_{i+1}$", ha="center", va="center", fontsize=6.0,
-                 bbox={"fc": "white", "ec": "#777777", "alpha": 0.88, "pad": 0.8})
+    ax_next.text(
+        0.79,
+        0.20,
+        "$g_{i+1}$",
+        ha="center",
+        va="center",
+        fontsize=6.0,
+        bbox={"fc": "white", "ec": "#777777", "alpha": 0.88, "pad": 0.8},
+    )
     ax_next.set_xlim(0.0, 1.0)
     ax_next.set_ylim(0.0, 1.0)
     ax_next.set_xticks([])
@@ -529,7 +633,7 @@ def _summary_tag(summary_path: Path) -> str:
     """Return the output tag encoded in a result summary filename."""
     name = Path(summary_path).stem
     prefix = "result_summary_"
-    return name[len(prefix):] if name.startswith(prefix) else name
+    return name[len(prefix) :] if name.startswith(prefix) else name
 
 
 def _candidate_manifest_paths(summary: SummaryBundle) -> Iterable[Path]:
@@ -545,7 +649,9 @@ def _candidate_manifest_paths(summary: SummaryBundle) -> Iterable[Path]:
         usd_path = Path(str(config.get("usd_path", ""))).expanduser()
         if usd_path.suffix == ".usda":
             candidates.append(usd_path.with_suffix(".manifest.json"))
-    candidates.extend(sorted((ROOT / "results/blender_environments").glob(f"*{tag}*.manifest.json")))
+    candidates.extend(
+        sorted((ROOT / "results/blender_environments").glob(f"*{tag}*.manifest.json"))
+    )
     seen: set[Path] = set()
     for candidate in candidates:
         candidate = candidate.resolve()
@@ -574,7 +680,9 @@ def _draw_manifest_obstacles(ax: Axes, manifest: dict[str, Any]) -> None:
     ox, oy = float(origin[0]), float(origin[1])
     for cell in manifest.get("obstacle_cells", []):
         ix, iy = int(cell[0]), int(cell[1])
-        patches.append(Rectangle((ox + ix * cell_size, oy + iy * cell_size), cell_size, cell_size))
+        patches.append(
+            Rectangle((ox + ix * cell_size, oy + iy * cell_size), cell_size, cell_size)
+        )
     if patches:
         ax.add_collection(
             PatchCollection(
@@ -595,8 +703,11 @@ def _draw_manifest_obstacles(ax: Axes, manifest: dict[str, Any]) -> None:
             if width <= 0.0 or height <= 0.0:
                 continue
             component_patches.append(
-                Rectangle((float(center[0]) - width / 2.0, float(center[1]) - height / 2.0),
-                          width, height)
+                Rectangle(
+                    (float(center[0]) - width / 2.0, float(center[1]) - height / 2.0),
+                    width,
+                    height,
+                )
             )
     if component_patches:
         ax.add_collection(
@@ -611,7 +722,9 @@ def _draw_manifest_obstacles(ax: Axes, manifest: dict[str, Any]) -> None:
         )
 
 
-def _room_size(summary: SummaryBundle, manifest: dict[str, Any] | None) -> tuple[float, float, float]:
+def _room_size(
+    summary: SummaryBundle, manifest: dict[str, Any] | None
+) -> tuple[float, float, float]:
     """Return runtime-authored room dimensions without geometry inference."""
     environment = summary.payload.get("environment")
     raw_room: object | None = None
@@ -640,7 +753,9 @@ def _room_size(summary: SummaryBundle, manifest: dict[str, Any] | None) -> tuple
 
 def _load_trace_positions(summary: SummaryBundle) -> np.ndarray:
     """Load unique robot station positions from an intermediate trace JSONL."""
-    trace_path = summary.payload.get("output_paths", {}).get("intermediate_estimate_trace_jsonl")
+    trace_path = summary.payload.get("output_paths", {}).get(
+        "intermediate_estimate_trace_jsonl"
+    )
     if not trace_path:
         return np.zeros((0, 3), dtype=float)
     path = Path(trace_path)
@@ -662,7 +777,9 @@ def _load_trace_positions(summary: SummaryBundle) -> np.ndarray:
                 continue
             seen.add(key)
             stations.append(key)
-    return np.asarray(stations, dtype=float) if stations else np.zeros((0, 3), dtype=float)
+    return (
+        np.asarray(stations, dtype=float) if stations else np.zeros((0, 3), dtype=float)
+    )
 
 
 def _load_path_waypoints(summary: SummaryBundle) -> list[np.ndarray]:
@@ -682,7 +799,9 @@ def _load_path_waypoints(summary: SummaryBundle) -> list[np.ndarray]:
     return output
 
 
-def _load_final_particle_cloud(summary: SummaryBundle) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+def _load_final_particle_cloud(
+    summary: SummaryBundle,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """Load final PF particle source-slot positions and weights from a summary."""
     cloud = summary.payload.get("final_particle_cloud", {})
     if not isinstance(cloud, dict):
@@ -702,7 +821,9 @@ def _load_final_particle_cloud(summary: SummaryBundle) -> dict[str, tuple[np.nda
     return output
 
 
-def _particle_sizes(weights: np.ndarray, *, base: float = 3.0, scale: float = 16.0) -> np.ndarray:
+def _particle_sizes(
+    weights: np.ndarray, *, base: float = 3.0, scale: float = 16.0
+) -> np.ndarray:
     """Return readable marker sizes for weighted PF particles."""
     if weights.size == 0:
         return np.zeros(0, dtype=float)
@@ -720,7 +841,9 @@ def _plot_sources(ax: Axes, summary: SummaryBundle, *, elevation: bool = False) 
         for source in sources:
             pos = np.asarray(source["pos"], dtype=float)
             xy = (pos[0], pos[2]) if elevation else (pos[0], pos[1])
-            ax.scatter(*xy, marker="x", s=55, color=color, lw=1.6, zorder=6, clip_on=False)
+            ax.scatter(
+                *xy, marker="x", s=55, color=color, lw=1.6, zorder=6, clip_on=False
+            )
     for isotope, sources in summary.payload.get("estimated_sources", {}).items():
         color = ISOTOPE_COLORS.get(isotope, "#111111")
         for source in sources:
@@ -768,7 +891,9 @@ def _iter_match_pairs(
                 continue
             truth_pos = np.asarray(truth[gt_index]["pos"], dtype=float)
             estimate_pos = np.asarray(estimates[est_index]["pos"], dtype=float)
-            distance = float(match.get("distance", np.linalg.norm(truth_pos - estimate_pos)))
+            distance = float(
+                match.get("distance", np.linalg.norm(truth_pos - estimate_pos))
+            )
             yield isotope, truth_pos, estimate_pos, distance
 
 
@@ -806,7 +931,14 @@ def _draw_room_box_3d(ax: Axes, room: tuple[float, float, float]) -> None:
     """Draw a light 3-D room frame on an axes."""
     room_x, room_y, room_z = room
     floor = Poly3DCollection(
-        [[(0.0, 0.0, 0.0), (room_x, 0.0, 0.0), (room_x, room_y, 0.0), (0.0, room_y, 0.0)]],
+        [
+            [
+                (0.0, 0.0, 0.0),
+                (room_x, 0.0, 0.0),
+                (room_x, room_y, 0.0),
+                (0.0, room_y, 0.0),
+            ]
+        ],
         facecolors="#f5f6f7",
         edgecolors="none",
         alpha=0.18,
@@ -914,8 +1046,17 @@ def _plot_sources_3d(ax: Axes, summary: SummaryBundle) -> None:
         color = ISOTOPE_COLORS.get(isotope, "#111111")
         for source in sources:
             pos = np.asarray(source["pos"], dtype=float)
-            ax.scatter(pos[0], pos[1], pos[2], marker="x", s=48, color=color,
-                       linewidths=1.5, depthshade=False, zorder=10)
+            ax.scatter(
+                pos[0],
+                pos[1],
+                pos[2],
+                marker="x",
+                s=48,
+                color=color,
+                linewidths=1.5,
+                depthshade=False,
+                zorder=10,
+            )
     for isotope, sources in summary.payload.get("estimated_sources", {}).items():
         color = ISOTOPE_COLORS.get(isotope, "#111111")
         for index, source in enumerate(sources):
@@ -1012,7 +1153,9 @@ def _draw_projection_obstacles(
     obstacle_height = float(manifest.get("obstacle_height_m", 2.0) or 2.0)
     for cell in manifest.get("obstacle_cells", []):
         iy = int(cell[1])
-        patches.append(Rectangle((oy + iy * cell_size, 0.0), cell_size, obstacle_height))
+        patches.append(
+            Rectangle((oy + iy * cell_size, 0.0), cell_size, obstacle_height)
+        )
     for instance in manifest.get("obstacle_instances", []):
         for component in instance.get("components", []):
             center = component.get("center_xyz", [0.0, 0.0, 0.0])
@@ -1023,7 +1166,10 @@ def _draw_projection_obstacles(
                 continue
             patches.append(
                 Rectangle(
-                    (float(center[1]) - width / 2.0, max(0.0, float(center[2]) - height / 2.0)),
+                    (
+                        float(center[1]) - width / 2.0,
+                        max(0.0, float(center[2]) - height / 2.0),
+                    ),
                     width,
                     height,
                 )
@@ -1136,7 +1282,9 @@ def _plot_path_projection(
             [_source_axis_position(waypoint, projection) for waypoint in waypoints],
             dtype=float,
         )
-        ax.plot(coords[:, 0], coords[:, 1], color="#005bbb", lw=0.75, alpha=0.58, zorder=4)
+        ax.plot(
+            coords[:, 0], coords[:, 1], color="#005bbb", lw=0.75, alpha=0.58, zorder=4
+        )
 
 
 def _plot_result_projection(
@@ -1152,17 +1300,42 @@ def _plot_result_projection(
     room_x, room_y, room_z = _room_size(summary, manifest)
     if projection == "xy":
         ax.add_patch(
-            Rectangle((0.0, 0.0), room_x, room_y, facecolor="#fbfbfb",
-                      edgecolor="none", lw=0.0, zorder=-10)
+            Rectangle(
+                (0.0, 0.0),
+                room_x,
+                room_y,
+                facecolor="#fbfbfb",
+                edgecolor="none",
+                lw=0.0,
+                zorder=-10,
+            )
         )
         stations = _load_trace_positions(summary)
         if stations.size:
-            ax.scatter(stations[:, 0], stations[:, 1], s=7.0, color="#005bbb",
-                       alpha=0.58, zorder=4)
-            ax.scatter(stations[0, 0], stations[0, 1], s=20, color="#005bbb",
-                       marker="s", zorder=5)
-            ax.scatter(stations[-1, 0], stations[-1, 1], s=25, color="#111111",
-                       marker="*", zorder=5)
+            ax.scatter(
+                stations[:, 0],
+                stations[:, 1],
+                s=7.0,
+                color="#005bbb",
+                alpha=0.58,
+                zorder=4,
+            )
+            ax.scatter(
+                stations[0, 0],
+                stations[0, 1],
+                s=20,
+                color="#005bbb",
+                marker="s",
+                zorder=5,
+            )
+            ax.scatter(
+                stations[-1, 0],
+                stations[-1, 1],
+                s=25,
+                color="#111111",
+                marker="*",
+                zorder=5,
+            )
         _plot_path_projection(ax, summary, "xy")
         _draw_projection_obstacles(ax, manifest, "xy")
         _plot_particle_cloud_projection(ax, summary, "xy")
@@ -1176,13 +1349,26 @@ def _plot_result_projection(
         )
     elif projection == "yz":
         ax.add_patch(
-            Rectangle((0.0, 0.0), room_y, room_z, facecolor="#fbfbfb",
-                      edgecolor="none", lw=0.0, zorder=-10)
+            Rectangle(
+                (0.0, 0.0),
+                room_y,
+                room_z,
+                facecolor="#fbfbfb",
+                edgecolor="none",
+                lw=0.0,
+                zorder=-10,
+            )
         )
         stations = _load_trace_positions(summary)
         if stations.size:
-            ax.scatter(stations[:, 1], stations[:, 2], s=7.0, color="#005bbb",
-                       alpha=0.42, zorder=4)
+            ax.scatter(
+                stations[:, 1],
+                stations[:, 2],
+                s=7.0,
+                color="#005bbb",
+                alpha=0.42,
+                zorder=4,
+            )
         _plot_path_projection(ax, summary, "yz")
         _draw_projection_obstacles(ax, manifest, "yz")
         _plot_particle_cloud_projection(ax, summary, "yz")
@@ -1215,12 +1401,36 @@ def _plot_spatial_result_3d(
     _draw_manifest_obstacles_3d(ax, manifest)
     stations = _load_trace_positions(summary)
     if stations.size:
-        ax.scatter(stations[:, 0], stations[:, 1], stations[:, 2], s=10,
-                   color="#005bbb", alpha=0.72, depthshade=False, zorder=8)
-        ax.scatter(stations[0, 0], stations[0, 1], stations[0, 2], s=28,
-                   color="#005bbb", marker="s", depthshade=False, zorder=9)
-        ax.scatter(stations[-1, 0], stations[-1, 1], stations[-1, 2], s=34,
-                   color="#111111", marker="*", depthshade=False, zorder=9)
+        ax.scatter(
+            stations[:, 0],
+            stations[:, 1],
+            stations[:, 2],
+            s=10,
+            color="#005bbb",
+            alpha=0.72,
+            depthshade=False,
+            zorder=8,
+        )
+        ax.scatter(
+            stations[0, 0],
+            stations[0, 1],
+            stations[0, 2],
+            s=28,
+            color="#005bbb",
+            marker="s",
+            depthshade=False,
+            zorder=9,
+        )
+        ax.scatter(
+            stations[-1, 0],
+            stations[-1, 1],
+            stations[-1, 2],
+            s=34,
+            color="#111111",
+            marker="*",
+            depthshade=False,
+            zorder=9,
+        )
     _plot_path_3d(ax, summary)
     _plot_particle_cloud_3d(ax, summary)
     _plot_sources_3d(ax, summary)
@@ -1251,7 +1461,12 @@ def _plot_spatial_result_3d(
             va="bottom",
             fontsize=FIG_PANEL_SIZE,
             fontweight="bold",
-            bbox={"boxstyle": "round,pad=0.14", "fc": "white", "ec": "none", "alpha": 0.9},
+            bbox={
+                "boxstyle": "round,pad=0.14",
+                "fc": "white",
+                "ec": "none",
+                "alpha": 0.9,
+            },
             clip_on=False,
         )
 
@@ -1259,32 +1474,87 @@ def _plot_spatial_result_3d(
 def _map_legend_handles(summary: SummaryBundle) -> list[Line2D]:
     """Return compact legend handles for map source and station symbols."""
     handles: list[Line2D] = [
-        Line2D([0], [0], marker="o", color="none", markerfacecolor="#005bbb",
-               markeredgecolor="#005bbb", markersize=4.5, label="station"),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="none",
+            markerfacecolor="#005bbb",
+            markeredgecolor="#005bbb",
+            markersize=4.5,
+            label="station",
+        ),
         Line2D([0, 1], [0, 0], color="#005bbb", lw=0.9, label="saved route"),
-        Line2D([0], [0], marker=".", color="#777777", linestyle="none",
-               markersize=5.0, alpha=0.55, label="PF particle"),
-        Line2D([0], [0], marker="s", color="none", markerfacecolor="#005bbb",
-               markeredgecolor="#005bbb", markersize=5.0, label="first station"),
-        Line2D([0], [0], marker="*", color="none", markerfacecolor="#111111",
-               markeredgecolor="#111111", markersize=6.0, label="last station"),
-        Line2D([0], [0], marker="x", color="#111111", linestyle="none",
-               markersize=6.0, markeredgewidth=1.2, label="truth"),
-        Line2D([0], [0], marker="o", color="#111111", linestyle="none",
-               markerfacecolor="white", markersize=5.5, markeredgewidth=1.2,
-               label="estimate"),
+        Line2D(
+            [0],
+            [0],
+            marker=".",
+            color="#777777",
+            linestyle="none",
+            markersize=5.0,
+            alpha=0.55,
+            label="PF particle",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="s",
+            color="none",
+            markerfacecolor="#005bbb",
+            markeredgecolor="#005bbb",
+            markersize=5.0,
+            label="first station",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="*",
+            color="none",
+            markerfacecolor="#111111",
+            markeredgecolor="#111111",
+            markersize=6.0,
+            label="last station",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="x",
+            color="#111111",
+            linestyle="none",
+            markersize=6.0,
+            markeredgewidth=1.2,
+            label="truth",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="#111111",
+            linestyle="none",
+            markerfacecolor="white",
+            markersize=5.5,
+            markeredgewidth=1.2,
+            label="estimate",
+        ),
     ]
     isotopes = [
-        isotope for isotope in ("Cs-137", "Co-60", "Eu-154")
+        isotope
+        for isotope in ("Cs-137", "Co-60", "Eu-154")
         if isotope in summary.payload.get("ground_truth_sources", {})
         or isotope in summary.payload.get("estimated_sources", {})
     ]
     for isotope in isotopes:
         handles.append(
-            Line2D([0], [0], marker="s", color="none",
-                   markerfacecolor=ISOTOPE_COLORS.get(isotope, "#111111"),
-                   markeredgecolor=ISOTOPE_COLORS.get(isotope, "#111111"),
-                   markersize=4.5, label=isotope)
+            Line2D(
+                [0],
+                [0],
+                marker="s",
+                color="none",
+                markerfacecolor=ISOTOPE_COLORS.get(isotope, "#111111"),
+                markeredgecolor=ISOTOPE_COLORS.get(isotope, "#111111"),
+                markersize=4.5,
+                label=isotope,
+            )
         )
     return handles[:9]
 
@@ -1306,10 +1576,16 @@ def _combined_legend_handles(summaries: Iterable[SummaryBundle]) -> list[Line2D]
         if isotope not in all_isotopes or isotope in labels:
             continue
         handles.append(
-            Line2D([0], [0], marker="s", color="none",
-                   markerfacecolor=ISOTOPE_COLORS[isotope],
-                   markeredgecolor=ISOTOPE_COLORS[isotope],
-                   markersize=4.5, label=isotope)
+            Line2D(
+                [0],
+                [0],
+                marker="s",
+                color="none",
+                markerfacecolor=ISOTOPE_COLORS[isotope],
+                markeredgecolor=ISOTOPE_COLORS[isotope],
+                markersize=4.5,
+                label=isotope,
+            )
         )
     handles.append(
         Line2D([0, 1], [0, 0], color="#555555", lw=0.9, label="match segment")
@@ -1321,11 +1597,9 @@ def _extract_ablation_row(summary: SummaryBundle) -> AblationRow:
     """Extract compact ablation metrics from one result summary."""
     tag = _summary_tag(summary.path)
     label = tag
-    for prefix in (
-        "mix9_multi_isotope_cardinality_",
-    ):
+    for prefix in ("mix9_multi_isotope_cardinality_",):
         if label.startswith(prefix):
-            label = label[len(prefix):]
+            label = label[len(prefix) :]
     label = label.replace("_seed_2026050901", "")
     label = label.replace("baseline_passive_equal_time_no_shield", "passive equal-time")
     label = label.replace("baseline_passive_no_shield", "passive no-shield")
@@ -1339,7 +1613,9 @@ def _extract_ablation_row(summary: SummaryBundle) -> AblationRow:
     strength_errors: list[float] = []
     for metrics in isotope_metrics.values():
         item_counts = metrics.get("counts", {})
-        counts["assigned"] += int(item_counts.get("assigned", item_counts.get("tp", 0)) or 0)
+        counts["assigned"] += int(
+            item_counts.get("assigned", item_counts.get("tp", 0)) or 0
+        )
         counts["fp"] += int(item_counts.get("fp", 0) or 0)
         counts["fn"] += int(item_counts.get("fn", 0) or 0)
         position = metrics.get("position_error", {}).get("mean")
@@ -1354,8 +1630,12 @@ def _extract_ablation_row(summary: SummaryBundle) -> AblationRow:
         true_positive=counts["assigned"],
         false_positive=counts["fp"],
         false_negative=counts["fn"],
-        mean_position_error_m=float(np.mean(position_errors)) if position_errors else float("nan"),
-        mean_strength_error_pct=float(np.mean(strength_errors)) if strength_errors else float("nan"),
+        mean_position_error_m=float(np.mean(position_errors))
+        if position_errors
+        else float("nan"),
+        mean_strength_error_pct=float(np.mean(strength_errors))
+        if strength_errors
+        else float("nan"),
     )
 
 
@@ -1370,18 +1650,41 @@ def _plot_spatial_result(
 ) -> None:
     """Plot the metric top-down result map."""
     room_x, room_y, _ = _room_size(summary, manifest)
-    ax.add_patch(Rectangle((0.0, 0.0), room_x, room_y, facecolor="#f9fafb",
-                           edgecolor="#222222", lw=0.9, zorder=0))
+    ax.add_patch(
+        Rectangle(
+            (0.0, 0.0),
+            room_x,
+            room_y,
+            facecolor="#f9fafb",
+            edgecolor="#222222",
+            lw=0.9,
+            zorder=0,
+        )
+    )
     if manifest is not None:
         _draw_manifest_obstacles(ax, manifest)
     stations = _load_trace_positions(summary)
     if stations.size:
-        ax.scatter(stations[:, 0], stations[:, 1], s=8, color="#005bbb",
-                   alpha=0.68, label="stations", zorder=4)
-        ax.scatter(stations[0, 0], stations[0, 1], s=22, color="#005bbb",
-                   marker="s", zorder=5)
-        ax.scatter(stations[-1, 0], stations[-1, 1], s=26, color="#111111",
-                   marker="*", zorder=5)
+        ax.scatter(
+            stations[:, 0],
+            stations[:, 1],
+            s=8,
+            color="#005bbb",
+            alpha=0.68,
+            label="stations",
+            zorder=4,
+        )
+        ax.scatter(
+            stations[0, 0], stations[0, 1], s=22, color="#005bbb", marker="s", zorder=5
+        )
+        ax.scatter(
+            stations[-1, 0],
+            stations[-1, 1],
+            s=26,
+            color="#111111",
+            marker="*",
+            zorder=5,
+        )
     _plot_sources(ax, summary, elevation=False)
     ax.set_xlim(0, room_x)
     ax.set_ylim(0, room_y)
@@ -1409,20 +1712,40 @@ def _plot_spatial_result(
     _panel_label(ax, panel)
 
 
-def _plot_elevation(ax: Axes, summary: SummaryBundle, manifest: dict[str, Any] | None) -> None:
+def _plot_elevation(
+    ax: Axes, summary: SummaryBundle, manifest: dict[str, Any] | None
+) -> None:
     """Plot an x-z elevation projection with metric scale."""
     room_x, _, room_z = _room_size(summary, manifest)
-    ax.add_patch(Rectangle((0.0, 0.0), room_x, room_z, facecolor="#fbfbfb",
-                           edgecolor="#222222", lw=0.8, zorder=0))
+    ax.add_patch(
+        Rectangle(
+            (0.0, 0.0),
+            room_x,
+            room_z,
+            facecolor="#fbfbfb",
+            edgecolor="#222222",
+            lw=0.8,
+            zorder=0,
+        )
+    )
     if manifest is not None:
         obstacle_height = float(manifest.get("obstacle_height_m", 0.0))
         for cell in manifest.get("obstacle_cells", []):
             cell_size = float(manifest.get("obstacle_cell_size_m", 1.0))
             origin = manifest.get("obstacle_origin_xy", [0.0, 0.0])
             x0 = float(origin[0]) + int(cell[0]) * cell_size
-            ax.add_patch(Rectangle((x0, 0.0), cell_size, obstacle_height,
-                                   facecolor="#d5d8dc", edgecolor="#9aa0a6",
-                                   lw=0.15, alpha=0.18, zorder=1))
+            ax.add_patch(
+                Rectangle(
+                    (x0, 0.0),
+                    cell_size,
+                    obstacle_height,
+                    facecolor="#d5d8dc",
+                    edgecolor="#9aa0a6",
+                    lw=0.15,
+                    alpha=0.18,
+                    zorder=1,
+                )
+            )
     _plot_sources(ax, summary, elevation=True)
     ax.set_xlim(0, room_x)
     ax.set_ylim(0, room_z)
@@ -1491,12 +1814,12 @@ def _plot_signature_heatmap(
     panel: str = "(d)",
 ) -> None:
     """Plot the selected shield-time response matrix for a confusable pair."""
-    matrix, row_labels, col_labels, title, rho_text = _extract_signature_heatmap(summary)
+    matrix, row_labels, col_labels, title, rho_text = _extract_signature_heatmap(
+        summary
+    )
     ax.set_title(title, fontsize=FIG_TITLE_SIZE)
     if matrix is None:
-        isotope_metrics = (
-            summary.payload.get("match_metrics", {}).get("isotopes", {})
-        )
+        isotope_metrics = summary.payload.get("match_metrics", {}).get("isotopes", {})
         rows: list[list[str]] = []
         row_labels: list[str] = []
         for isotope in ("Cs-137", "Co-60", "Eu-154"):
@@ -1574,7 +1897,9 @@ def _plot_signature_heatmap(
     _panel_label(ax, panel)
 
 
-def _plot_ablation(ax: Axes, summaries: list[SummaryBundle], *, panel: str = "(d)") -> None:
+def _plot_ablation(
+    ax: Axes, summaries: list[SummaryBundle], *, panel: str = "(d)"
+) -> None:
     """Plot a compact ablation comparison from result summaries."""
     rows = [_extract_ablation_row(summary) for summary in summaries]
     labels = [row.label for row in rows]
@@ -1620,7 +1945,9 @@ def _select_summary(
     """Select one summary for a task."""
     matches = [summary for summary in summaries if _task_name(summary) == task_name]
     if proposed_only:
-        proposed = [summary for summary in matches if "proposed" in _summary_tag(summary.path)]
+        proposed = [
+            summary for summary in matches if "proposed" in _summary_tag(summary.path)
+        ]
         if proposed:
             return proposed[0]
     return matches[0] if matches else None
@@ -1628,19 +1955,33 @@ def _select_summary(
 
 def _plot_mixed_isotope_errors(ax: Axes, summary: SummaryBundle | None) -> None:
     """Plot isotope-wise mixed-cardinality errors and TP/FP/FN labels."""
-    ax.set_title("Proposed mixed-cardinality: isotope-wise report",
-                 fontsize=FIG_TITLE_SIZE)
+    ax.set_title(
+        "Proposed mixed-cardinality: isotope-wise report", fontsize=FIG_TITLE_SIZE
+    )
     if summary is None:
-        ax.text(0.5, 0.5, "mixed-cardinality\nsummary not available",
-                transform=ax.transAxes, ha="center", va="center", fontsize=FIG_TITLE_SIZE)
+        ax.text(
+            0.5,
+            0.5,
+            "mixed-cardinality\nsummary not available",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=FIG_TITLE_SIZE,
+        )
         ax.axis("off")
         _panel_label(ax, "(d)")
         return
 
-    isotopes = [iso for iso in ("Cs-137", "Co-60", "Eu-154")
-                if iso in summary.payload.get("match_metrics", {}).get("isotopes", {})]
+    isotopes = [
+        iso
+        for iso in ("Cs-137", "Co-60", "Eu-154")
+        if iso in summary.payload.get("match_metrics", {}).get("isotopes", {})
+    ]
     metrics = summary.payload.get("match_metrics", {}).get("isotopes", {})
-    values = [float(metrics[iso].get("position_error", {}).get("mean", np.nan)) for iso in isotopes]
+    values = [
+        float(metrics[iso].get("position_error", {}).get("mean", np.nan))
+        for iso in isotopes
+    ]
     colors = [ISOTOPE_COLORS.get(iso, "#666666") for iso in isotopes]
     x = np.arange(len(isotopes))
     ax.bar(x, values, color=colors, alpha=0.86)
@@ -1651,8 +1992,14 @@ def _plot_mixed_isotope_errors(ax: Axes, summary: SummaryBundle | None) -> None:
             f"{int(counts.get('fp', 0))}/"
             f"{int(counts.get('fn', 0))}"
         )
-        ax.text(index, values[index] + 0.05, label, ha="center", va="bottom",
-                fontsize=FIG_TICK_SIZE)
+        ax.text(
+            index,
+            values[index] + 0.05,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=FIG_TICK_SIZE,
+        )
     ax.set_xticks(x)
     ax.set_xticklabels(isotopes, fontsize=FIG_TICK_SIZE)
     ax.set_ylabel("mean 3-D error [m]", fontsize=FIG_LABEL_SIZE)
@@ -1676,16 +2023,26 @@ def _plot_map_symbol_legend(ax: Axes, summaries: list[SummaryBundle]) -> None:
         | set(summary.payload.get("estimated_sources", {}))
     }
     handles = [
-        handle for handle in handles
-        if handle.get_label() not in ISOTOPE_COLORS or handle.get_label() in all_isotopes
+        handle
+        for handle in handles
+        if handle.get_label() not in ISOTOPE_COLORS
+        or handle.get_label() in all_isotopes
     ]
     for isotope in ("Co-60", "Eu-154"):
-        if isotope in all_isotopes and isotope not in [handle.get_label() for handle in handles]:
+        if isotope in all_isotopes and isotope not in [
+            handle.get_label() for handle in handles
+        ]:
             handles.append(
-                Line2D([0], [0], marker="s", color="none",
-                       markerfacecolor=ISOTOPE_COLORS[isotope],
-                       markeredgecolor=ISOTOPE_COLORS[isotope],
-                       markersize=4.5, label=isotope)
+                Line2D(
+                    [0],
+                    [0],
+                    marker="s",
+                    color="none",
+                    markerfacecolor=ISOTOPE_COLORS[isotope],
+                    markeredgecolor=ISOTOPE_COLORS[isotope],
+                    markersize=4.5,
+                    label=isotope,
+                )
             )
     ax.legend(
         handles=handles,
@@ -1697,8 +2054,15 @@ def _plot_map_symbol_legend(ax: Axes, summaries: list[SummaryBundle]) -> None:
         handletextpad=0.35,
         labelspacing=0.24,
     )
-    ax.text(0.5, 0.98, "map legend", transform=ax.transAxes,
-            ha="center", va="top", fontsize=FIG_LABEL_SIZE)
+    ax.text(
+        0.5,
+        0.98,
+        "map legend",
+        transform=ax.transAxes,
+        ha="center",
+        va="top",
+        fontsize=FIG_LABEL_SIZE,
+    )
 
 
 def render_experiment_summary(
@@ -1708,7 +2072,10 @@ def render_experiment_summary(
     """Render the main proposed-method PF result figure from summaries."""
     if not summary_paths:
         raise ValueError("At least one summary JSON is required.")
-    bundles = [SummaryBundle(path=Path(path), payload=read_json(Path(path))) for path in summary_paths]
+    bundles = [
+        SummaryBundle(path=Path(path), payload=read_json(Path(path)))
+        for path in summary_paths
+    ]
     mix9 = _select_summary(bundles, "mix9")
     if mix9 is not None:
         manifest = _find_environment_manifest(mix9)
@@ -1762,7 +2129,9 @@ def default_paper_summaries() -> list[Path]:
         "result_summary_mix9_multi_isotope_cardinality_round_robin_shield_seed_2026050901.json",
         "result_summary_mix9_multi_isotope_cardinality_eig_only_path_seed_2026050901.json",
     ]
-    return [ROOT / "results" / name for name in names if (ROOT / "results" / name).exists()]
+    return [
+        ROOT / "results" / name for name in names if (ROOT / "results" / name).exists()
+    ]
 
 
 def parse_args() -> argparse.Namespace:
@@ -1816,7 +2185,9 @@ def main() -> None:
         print(f"Wrote {fig1}")
         print(f"Wrote {fig2}")
     if not args.skip_experiment:
-        summary_paths = list(args.summary_json) if args.summary_json else default_paper_summaries()
+        summary_paths = (
+            list(args.summary_json) if args.summary_json else default_paper_summaries()
+        )
         if not summary_paths:
             raise FileNotFoundError(
                 "No summary JSON files were provided and the default MIX-9 summaries were not found."

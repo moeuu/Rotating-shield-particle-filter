@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -36,12 +37,63 @@ from pf.structural_rj import (
 )
 
 
+def test_full_support_acceptance_mask_matches_scalar_row_oracle() -> None:
+    """Batched accepted-row markers must equal a scalar Boolean oracle."""
+    filt = object.__new__(IsotopeParticleFilter)
+    filt.continuous_particles = [
+        SimpleNamespace(log_weight=-math.log(4.0))
+        for _ in range(4)
+    ]
+    filt._structural_rj_move_counts = {}
+    filt.last_structural_transition_weight_mass = {}
+    filt.last_structural_full_support_accepted_mask = np.zeros(
+        4,
+        dtype=np.bool_,
+    )
+    attempted = np.asarray([0, 1, 3], dtype=np.int64)
+    accepted = np.asarray([True, False, True], dtype=np.bool_)
+    filt._continuous_rj_transition_mass(
+        "global_position_accepted",
+        attempted,
+        accepted,
+    )
+    filt._continuous_rj_transition_mass(
+        "block_accepted",
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([True, False], dtype=np.bool_),
+    )
+    filt._continuous_rj_transition_mass(
+        "birth_accepted",
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([False, True], dtype=np.bool_),
+    )
+    scalar = np.zeros(4, dtype=np.bool_)
+    for row, is_accepted in zip(attempted.tolist(), accepted.tolist(), strict=True):
+        if is_accepted:
+            scalar[row] = True
+    scalar[1] = True
+    scalar[2] = True
+
+    np.testing.assert_array_equal(
+        filt.last_structural_full_support_accepted_mask,
+        scalar,
+    )
+
+
 def test_structural_rejection_diagnostics_decompose_exact_mh_terms() -> None:
     """Rejected structure moves must expose likelihood, prior, q, and J."""
     filt = object.__new__(IsotopeParticleFilter)
+    filt.config = SimpleNamespace(max_sources=4)
+    filt.continuous_particles = [
+        SimpleNamespace(log_weight=math.log(0.5)),
+        SimpleNamespace(log_weight=math.log(0.5)),
+    ]
+    filt._structural_rj_move_counts = {}
+    filt.last_structural_transition_weight_mass = {}
     filt._structural_mh_component_samples = {}
     filt._record_structural_mh_components(
         "multi_merge",
+        particle_indices=np.asarray([0, 1], dtype=np.int64),
         delta_log_likelihood=np.asarray([-100.0, 3.0]),
         delta_log_prior=np.asarray([1.0, -2.0]),
         log_reverse_minus_forward=np.asarray([0.5, -0.25]),
@@ -70,6 +122,18 @@ def test_structural_rejection_diagnostics_decompose_exact_mh_terms() -> None:
         "median"
     ] == pytest.approx(-98.5)
     assert summary["by_cardinality_transition"]["4->3"]["attempted"] == 2
+    assert filt.last_structural_transition_weight_mass[
+        "ordinary_boundary_inward_attempted_weight_mass"
+    ] == pytest.approx(1.0)
+    assert filt.last_structural_transition_weight_mass[
+        "ordinary_boundary_inward_supported_weight_mass"
+    ] == pytest.approx(0.5)
+    assert filt.last_structural_transition_weight_mass[
+        "ordinary_boundary_inward_finite_weight_mass"
+    ] == pytest.approx(0.5)
+    assert filt.last_structural_transition_weight_mass[
+        "ordinary_boundary_inward_accepted_weight_mass"
+    ] == 0.0
 
 
 def test_poisson_geometric_tail_keeps_five_typical_but_six_possible() -> None:

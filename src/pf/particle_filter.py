@@ -21,6 +21,16 @@ from pf.particle_filter_rj_proposal import StructuralRJProposalMixin
 from pf.particle_filter_rj_runtime import StructuralRJSweepMixin
 from pf.particle_filter_rj_split_merge import StructuralRJSplitMergeMixin
 from pf.particle_filter_rj_target import StructuralRJTargetMixin
+from pf.particle_filter_rj_torch_basic import StructuralRJTorchBasicMoveMixin
+from pf.particle_filter_rj_torch_block import (
+    StructuralRJTorchBlockIndependenceMixin,
+)
+from pf.particle_filter_rj_torch_multi import (
+    StructuralRJTorchMultiComponentMixin,
+)
+from pf.particle_filter_rj_torch_split_merge import (
+    StructuralRJTorchSplitMergeMixin,
+)
 from pf.particle_filter_surface import ParticleSurfaceMixin
 from pf.particle_filter_tempering import ParticleTemperingMixin
 from pf.posterior import posterior_point_estimate_from_states
@@ -188,6 +198,10 @@ class IsotopeParticleFilter(
     ParticleTemperingMixin,
     StructuralRJProposalMixin,
     StructuralRJTargetMixin,
+    StructuralRJTorchBasicMoveMixin,
+    StructuralRJTorchBlockIndependenceMixin,
+    StructuralRJTorchMultiComponentMixin,
+    StructuralRJTorchSplitMergeMixin,
     StructuralRJSweepMixin,
     StructuralRJBasicMoveMixin,
     StructuralRJMultiComponentMixin,
@@ -209,9 +223,13 @@ class IsotopeParticleFilter(
         detector_aperture_radius_m: float | None = None,
         detector_aperture_samples: int = 1,
         detector_aperture_sampling: str = "solid_angle_cone",
+        detector_impact_parameter_edges_fraction: object | None = None,
         source_extent_radius_m: float = 0.0,
         source_extent_samples: int = 1,
         line_mu_by_isotope: dict[str, object] | None = None,
+        strict_catalog_line_contract: bool = False,
+        dry_air_total_attenuation_contract_id: str | None = None,
+        dry_air_total_attenuation_contract_sha256: str | None = None,
         additive_scatter_response: (AdditiveNoncollidedTransportResponse | None) = None,
         random_seed: int = 0,
     ) -> None:
@@ -230,9 +248,40 @@ class IsotopeParticleFilter(
         self.detector_aperture_radius_m = max(float(detector_aperture_radius_m), 0.0)
         self.detector_aperture_samples = max(int(detector_aperture_samples), 1)
         self.detector_aperture_sampling = str(detector_aperture_sampling)
+        if detector_impact_parameter_edges_fraction is None:
+            self.detector_impact_parameter_edges_fraction = None
+        else:
+            impact_edges = np.asarray(
+                detector_impact_parameter_edges_fraction,
+                dtype=np.float64,
+            )
+            if (
+                impact_edges.ndim != 1
+                or impact_edges.size < 2
+                or np.any(~np.isfinite(impact_edges))
+                or impact_edges[0] != 0.0
+                or impact_edges[-1] != 1.0
+                or np.any(np.diff(impact_edges) <= 0.0)
+            ):
+                raise ValueError(
+                    "detector_impact_parameter_edges_fraction must be a "
+                    "strict finite partition from zero to one."
+                )
+            self.detector_impact_parameter_edges_fraction = (
+                np.ascontiguousarray(impact_edges)
+            )
         self.source_extent_radius_m = max(float(source_extent_radius_m), 0.0)
         self.source_extent_samples = max(int(source_extent_samples), 1)
         self.line_mu_by_isotope = line_mu_by_isotope
+        if not isinstance(strict_catalog_line_contract, bool):
+            raise TypeError("strict_catalog_line_contract must be a boolean.")
+        self.strict_catalog_line_contract = strict_catalog_line_contract
+        self.dry_air_total_attenuation_contract_id = (
+            dry_air_total_attenuation_contract_id
+        )
+        self.dry_air_total_attenuation_contract_sha256 = (
+            dry_air_total_attenuation_contract_sha256
+        )
         self.additive_scatter_response = additive_scatter_response
         self.random_seed = normalize_pf_random_seed(random_seed)
         self._random_generator = isotope_random_generator(
@@ -268,8 +317,24 @@ class IsotopeParticleFilter(
         self._structural_rj_current_target_log_likelihood: (
             NDArray[np.float64] | None
         ) = None
+        self._structural_rj_current_target_log_likelihood_device: (
+            "torch.Tensor" | None
+        ) = None
+        self._structural_rj_current_station_log_likelihood_device: (
+            "torch.Tensor" | None
+        ) = None
+        self._structural_rj_torch_generator: "torch.Generator" | None = None
+        self._structural_rj_tpht_generator: "torch.Generator" | None = None
+        self._structural_rj_device_constants: dict[str, "torch.Tensor"] = {}
         self.last_structural_target_log_likelihood: NDArray[np.float64] | None = None
+        self.last_structural_target_log_likelihood_device: (
+            "torch.Tensor" | None
+        ) = None
+        self.last_structural_station_log_likelihood_device: (
+            "torch.Tensor" | None
+        ) = None
         self._joint_target_evaluator: Callable[..., NDArray[np.float64]] | None = None
+        self._joint_history_tree_evaluator: Callable[..., object] | None = None
         self._joint_strength_grid_target_evaluator: (
             Callable[..., NDArray[np.float64]] | None
         ) = None
@@ -280,7 +345,9 @@ class IsotopeParticleFilter(
             NDArray[np.int64] | None
         ) = None
         self._structural_rj_device_state: dict[str, "torch.Tensor"] | None = None
-        self.last_structural_device_diagnostics: dict[str, int | str] = {}
+        self._structural_rj_device_state_authoritative = False
+        self._structural_rj_device_state_dirty = False
+        self.last_structural_device_diagnostics: dict[str, object] = {}
         self._joint_proposal_evaluator: (
             Callable[
                 ...,
@@ -324,6 +391,9 @@ class IsotopeParticleFilter(
         self.last_source_event_diagnostics: list[dict[str, object]] = []
         self.last_structural_timing_s: dict[str, float] = {}
         self.last_structural_transition_weight_mass: dict[str, float] = {}
+        self.last_structural_full_support_accepted_mask: NDArray[np.bool_] = (
+            np.zeros(0, dtype=np.bool_)
+        )
         self.last_structural_rejection_diagnostics: dict[str, object] = {}
         self._structural_mh_component_samples: dict[
             str,
@@ -332,6 +402,10 @@ class IsotopeParticleFilter(
         self.last_runtime_likelihood_route = "joint_full_spectrum_generative"
         self._resample_count_in_observation = 0
         self._init_continuous_particles()
+        self.last_structural_full_support_accepted_mask = np.zeros(
+            len(self.continuous_particles),
+            dtype=np.bool_,
+        )
 
     def _variable_cardinality_enabled(self) -> bool:
         """Return whether exact birth/death dimension changes are active."""
@@ -545,7 +619,8 @@ class IsotopeParticleFilter(
         *,
         target_beta: float = 1.0,
         tempering_start_row: int | None = None,
-        current_target_log_likelihood: NDArray[np.float64] | None = None,
+        current_target_log_likelihood: object | None = None,
+        current_station_log_likelihood: object | None = None,
     ) -> None:
         """Apply exact continuous-surface MH/RJ rejuvenation when evidence exists."""
         if not self.continuous_particles:
@@ -562,6 +637,7 @@ class IsotopeParticleFilter(
             target_beta=target_beta,
             tempering_start_row=tempering_start_row,
             current_target_log_likelihood=current_target_log_likelihood,
+            current_station_log_likelihood=current_station_log_likelihood,
         )
 
     def estimate(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:

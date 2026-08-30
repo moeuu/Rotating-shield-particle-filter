@@ -71,7 +71,7 @@ PRODUCTION_PF_SETTING_KEYS = frozenset(
         "structural_rj_block_independence_probability",
         "structural_rj_multi_component_probability",
         "structural_rj_multi_component_max_group_size",
-        "structural_rj_local_position_sigma_m",
+        "structural_rj_local_position_scales_m",
         "structural_rj_merge_probability",
         "structural_rj_split_global_position_probability",
         "structural_rj_merge_uniform_pair_probability",
@@ -88,12 +88,10 @@ PRODUCTION_PF_SETTING_KEYS = frozenset(
         "max_temper_steps",
         "min_delta_beta",
         "joint_rejuvenation_min_sweeps",
-        "joint_rejuvenation_max_sweeps",
         "joint_rejuvenation_min_state_change_weight_mass",
         "joint_rejuvenation_min_surface_esjd_m2",
         "joint_rejuvenation_min_log_strength_esjd",
-        "joint_rejuvenation_min_k_transition_weight_mass",
-        "joint_rejuvenation_boundary_mass_threshold",
+        "joint_lineage_recovery_min_surviving_weight_mass",
         "joint_smc_rejuvenation_wall_time_limit_s",
         "joint_guided_initialization_prior_row_probability",
         "joint_strength_block_probability",
@@ -301,14 +299,10 @@ def _enforce_production_pf_invariants(config: RotatingShieldPFConfig) -> None:
         "joint_rejuvenation_min_state_change_weight_mass",
         "joint_rejuvenation_min_surface_esjd_m2",
         "joint_rejuvenation_min_log_strength_esjd",
-        "joint_rejuvenation_min_k_transition_weight_mass",
+        "joint_lineage_recovery_min_surviving_weight_mass",
     ):
         if float(getattr(config, name)) <= 0.0:
             raise ValueError(f"Production {name} must be strictly positive.")
-    if float(config.joint_rejuvenation_boundary_mass_threshold) >= 1.0:
-        raise ValueError(
-            "Production joint_rejuvenation_boundary_mass_threshold must be below 1."
-        )
     if float(config.adaptive_stop_maximum_upper_cardinality_mass) >= 1.0:
         raise ValueError(
             "Production adaptive-stop upper-cardinality mass must be below 1."

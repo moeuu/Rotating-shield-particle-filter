@@ -10,7 +10,7 @@ import pytest
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.observation_model import (
-    build_runtime_observation_model,
+    build_nonproduction_observation_model,
     continuous_kernel_from_observation_model,
 )
 from runtime.forward_conformance import ForwardConformanceFixture
@@ -64,10 +64,10 @@ def _scalar_response_oracle(payload: Mapping[str, Any]) -> np.ndarray:
     """Evaluate the former scalar case ordering as a test-only oracle."""
     isotopes = tuple(str(value) for value in payload["isotopes"])
     fixture = ForwardConformanceFixture.from_payload(payload)
-    model = build_runtime_observation_model(
+    model = build_nonproduction_observation_model(
         {
             "source_rate_model": "detector_cps_1m",
-            "pf_line_resolved_shield_attenuation": True,
+            "line_resolved_shield_attenuation": True,
         },
         isotopes=isotopes,
     )

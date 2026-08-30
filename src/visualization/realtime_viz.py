@@ -615,7 +615,8 @@ class CUISplitPFVisualizer:
         ax.add_collection3d(collection)
 
     def _plot_true_sources_2d(self, ax: plt.Axes) -> None:
-        """Plot true source positions on the 2D robot view when available."""
+        """Plot numbered true sources and XYZ labels on a top-down view."""
+        xmin, xmax, ymin, ymax, _, _ = self.world_bounds
         for iso, positions in self.true_sources.items():
             pos = np.asarray(positions, dtype=float)
             if pos.size == 0:
@@ -630,7 +631,37 @@ class CUISplitPFVisualizer:
                 edgecolor="white",
                 linewidth=0.6,
                 label=f"true {iso}",
+                zorder=18,
             )
+            for index, position in enumerate(pos):
+                offset_x, offset_y, horizontal_alignment, vertical_alignment = (
+                    self._inward_annotation_offset(
+                        float(position[0]),
+                        float(position[1]),
+                        x_bounds=(float(xmin), float(xmax)),
+                        y_bounds=(float(ymin), float(ymax)),
+                        index=index,
+                    )
+                )
+                ax.annotate(
+                    self._truth_source_label(iso, index, position),
+                    xy=(float(position[0]), float(position[1])),
+                    xytext=(offset_x, offset_y),
+                    textcoords="offset points",
+                    ha=horizontal_alignment,
+                    va=vertical_alignment,
+                    fontsize=6.2,
+                    fontweight="bold",
+                    color=self.colors.get(iso, "black"),
+                    bbox={
+                        "boxstyle": "round,pad=0.16",
+                        "facecolor": "white",
+                        "edgecolor": self.colors.get(iso, "black"),
+                        "linewidth": 0.55,
+                        "alpha": 0.86,
+                    },
+                    zorder=20,
+                )
 
     def _plot_estimated_sources_2d(self, ax: plt.Axes, frame: PFFrame) -> None:
         """Plot estimated source positions on a 2D map view."""
@@ -687,7 +718,8 @@ class CUISplitPFVisualizer:
                 used_label = True
 
     def _plot_true_sources_xz(self, ax: plt.Axes) -> None:
-        """Plot true source positions in an x-z elevation projection."""
+        """Plot numbered true sources and XYZ labels in x-z projection."""
+        xmin, xmax, _, _, zmin, zmax = self.world_bounds
         for iso, positions in self.true_sources.items():
             pos = np.asarray(positions, dtype=float)
             if pos.size == 0:
@@ -702,8 +734,37 @@ class CUISplitPFVisualizer:
                 edgecolor="white",
                 linewidth=0.6,
                 label=f"true {iso}",
-                zorder=10,
+                zorder=18,
             )
+            for index, position in enumerate(pos):
+                offset_x, offset_y, horizontal_alignment, vertical_alignment = (
+                    self._inward_annotation_offset(
+                        float(position[0]),
+                        float(position[2]),
+                        x_bounds=(float(xmin), float(xmax)),
+                        y_bounds=(float(zmin), float(zmax)),
+                        index=index,
+                    )
+                )
+                ax.annotate(
+                    self._truth_source_id_label(iso, index),
+                    xy=(float(position[0]), float(position[2])),
+                    xytext=(offset_x, offset_y),
+                    textcoords="offset points",
+                    ha=horizontal_alignment,
+                    va=vertical_alignment,
+                    fontsize=5.8,
+                    fontweight="bold",
+                    color=self.colors.get(iso, "black"),
+                    bbox={
+                        "boxstyle": "round,pad=0.14",
+                        "facecolor": "white",
+                        "edgecolor": self.colors.get(iso, "black"),
+                        "linewidth": 0.5,
+                        "alpha": 0.84,
+                    },
+                    zorder=20,
+                )
 
     def _plot_estimated_sources_xz(self, ax: plt.Axes, frame: PFFrame) -> None:
         """Plot estimated source positions in an x-z elevation projection."""
@@ -800,6 +861,7 @@ class CUISplitPFVisualizer:
                 linewidth=0.7,
                 depthshade=False,
                 label=f"true {iso}",
+                zorder=25,
             )
 
     @staticmethod
@@ -807,6 +869,71 @@ class CUISplitPFVisualizer:
         """Return a compact isotope prefix for per-source plot labels."""
         prefix = str(isotope).split("-", maxsplit=1)[0].strip()
         return prefix or str(isotope)
+
+    @staticmethod
+    def _inward_annotation_offset(
+        x: float,
+        y: float,
+        *,
+        x_bounds: tuple[float, float],
+        y_bounds: tuple[float, float],
+        index: int,
+    ) -> tuple[int, int, str, str]:
+        """Return an annotation offset directed toward the plot interior."""
+        x_midpoint = 0.5 * (float(x_bounds[0]) + float(x_bounds[1]))
+        y_midpoint = 0.5 * (float(y_bounds[0]) + float(y_bounds[1]))
+        horizontal_offset = -5 if float(x) >= x_midpoint else 5
+        vertical_magnitude = 5 + 4 * (int(index) % 2)
+        vertical_offset = (
+            -vertical_magnitude if float(y) >= y_midpoint else vertical_magnitude
+        )
+        return (
+            horizontal_offset,
+            vertical_offset,
+            "right" if horizontal_offset < 0 else "left",
+            "top" if vertical_offset < 0 else "bottom",
+        )
+
+    @classmethod
+    def _truth_source_label(
+        cls,
+        isotope: str,
+        source_index: int,
+        position_xyz_m: NDArray[np.float64],
+    ) -> str:
+        """Return one numbered truth label with its full XYZ coordinates."""
+        position = np.asarray(position_xyz_m, dtype=np.float64).reshape(3)
+        return (
+            f"{cls._truth_source_id_label(isotope, source_index)}\n"
+            f"({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}) m"
+        )
+
+    @classmethod
+    def _truth_source_id_label(cls, isotope: str, source_index: int) -> str:
+        """Return one compact isotope-local truth-source identifier."""
+        prefix = cls._isotope_source_prefix(isotope)
+        return f"{prefix}-{int(source_index) + 1} T"
+
+    def _truth_inventory_text(self) -> str:
+        """Return the complete numbered XYZ truth inventory for an overview."""
+        if not self.true_sources:
+            return "True sources: hidden"
+        lines = ["True sources (evaluation overlay)"]
+        for isotope in self.isotopes:
+            raw_positions = np.asarray(
+                self.true_sources.get(isotope, np.zeros((0, 3), dtype=float)),
+                dtype=float,
+            )
+            if raw_positions.size == 0:
+                continue
+            for index, position in enumerate(raw_positions.reshape((-1, 3))):
+                lines.append(
+                    self._truth_source_label(isotope, index, position).replace(
+                        "\n",
+                        "  ",
+                    )
+                )
+        return "\n".join(lines)
 
     def _source_label_entries(
         self,
@@ -847,7 +974,7 @@ class CUISplitPFVisualizer:
             else np.zeros((0, 3), dtype=float)
         )
         truth_entries = [
-            (position, f"{prefix}-{index + 1} T")
+            (position, self._truth_source_label(isotope, index, position))
             for index, position in enumerate(truth)
         ]
         if not self.true_sources:
@@ -914,13 +1041,20 @@ class CUISplitPFVisualizer:
                     *position,
                     ax.get_proj(),
                 )
+                offset_x = -4 if projected_x >= 0.0 else 4
+                offset_y_magnitude = 5 + 3 * (index % 2)
+                offset_y = (
+                    -offset_y_magnitude
+                    if projected_y >= 0.0
+                    else offset_y_magnitude
+                )
                 annotation = ax.annotate(
                     label,
                     xy=(projected_x, projected_y),
-                    xytext=(4, 5 + 3 * (index % 2)),
+                    xytext=(offset_x, offset_y),
                     textcoords="offset points",
-                    ha="left",
-                    va="bottom",
+                    ha="right" if offset_x < 0 else "left",
+                    va="top" if offset_y < 0 else "bottom",
                     fontsize=6.2,
                     fontweight="bold",
                     color=color,
@@ -1197,6 +1331,15 @@ class CUISplitPFVisualizer:
                 fontsize=7,
                 frameon=True,
             )
+        info_ax.text(
+            0.0,
+            0.52,
+            self._truth_inventory_text(),
+            ha="left",
+            va="top",
+            fontsize=7.2,
+            transform=info_ax.transAxes,
+        )
         info_ax.text(
             0.0,
             0.02,
@@ -1581,7 +1724,19 @@ def _async_cui_split_worker(
     """Render CUI split-view frames in a dedicated worker process."""
     operation_id = -1
     try:
+        truth_overlay_socket_path = config.pop(
+            "truth_overlay_socket_path",
+            None,
+        )
         visualizer = CUISplitPFVisualizer(**config)
+        if truth_overlay_socket_path is not None:
+            from runtime.cui_truth_overlay import load_cui_truth_overlay
+
+            overlay = load_cui_truth_overlay(truth_overlay_socket_path)
+            visualizer.set_truth(
+                dict(overlay.true_sources),
+                dict(overlay.true_strengths),
+            )
         status_queue.put(("ready", operation_id, "startup", run_token))
         last_frame: PFFrame | None = None
         while True:
@@ -1634,6 +1789,7 @@ class AsyncCUISplitPFVisualizer:
         obstacle_grid: ObstacleGrid | None = None,
         max_particles_per_isotope: int | None = None,
         source_label_neighborhood_m: float = 1.0,
+        truth_overlay_socket_path: str | Path | None = None,
         queue_size: int = 2,
         save_step_history: bool = False,
     ) -> None:
@@ -1677,6 +1833,11 @@ class AsyncCUISplitPFVisualizer:
             "obstacle_grid": obstacle_grid,
             "max_particles_per_isotope": max_particles_per_isotope,
             "source_label_neighborhood_m": source_label_neighborhood_m,
+            "truth_overlay_socket_path": (
+                None
+                if truth_overlay_socket_path is None
+                else Path(truth_overlay_socket_path).expanduser().resolve()
+            ),
             "save_step_history": save_step_history,
         }
         self._process = self._ctx.Process(

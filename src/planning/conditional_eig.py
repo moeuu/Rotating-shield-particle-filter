@@ -12,7 +12,6 @@ from pf.full_spectrum import (
     PreparedSubsetCrossLikelihood,
     SubsetCrossLikelihoodFullSpectrumModel,
     TorchPredictiveFullSpectrumModel,
-    validate_full_spectrum_model,
 )
 from pf.randomness import named_random_generator, named_stream_seed
 from planning.dss_modes import _normalise_weights
@@ -56,7 +55,7 @@ def prepare_conditional_observation_cache(
     """
     import torch
 
-    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
+    model = estimator.authenticated_full_spectrum_model()
     if not isinstance(model, TorchPredictiveFullSpectrumModel):
         raise RuntimeError(
             "Conditional DSS requires the runtime Torch predictive sampler."
@@ -127,7 +126,8 @@ def prepare_conditional_observation_cache(
     if (
         total.ndim != 5
         or tuple(uncollided.shape) != tuple(total.shape)
-        or tuple(features.shape) != tuple(total.shape) + (4,)
+        or tuple(features.shape)
+        != tuple(total.shape) + (len(tuple(model.transport_feature_order)),)
         or tuple(live_times.shape) != (int(total.shape[2]),)
         or int(total.shape[0]) != int(detectors.shape[0])
     ):

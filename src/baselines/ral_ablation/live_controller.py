@@ -16,6 +16,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-socket", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
+    parser.add_argument("--cui-truth-overlay-socket", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--control-policy", type=Path, required=True)
     parser.add_argument("--expected-control-policy-sha256", required=True)
@@ -30,6 +31,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = run_pf_closed_loop(
         args.session_socket,
         runtime_root=args.runtime_root,
+        cui_truth_overlay_socket_path=args.cui_truth_overlay_socket,
         pf_config_path=args.config,
         output_dir=args.output_dir,
         profile=args.profile,

@@ -82,6 +82,13 @@ class ParticleTemperingMixin:
             )
         if self.kernel is None:
             raise RuntimeError("Continuous line transport requires PF poses.")
+        impact_edges = self.detector_impact_parameter_edges_fraction
+        if impact_edges is None:
+            raise RuntimeError(
+                "Full-spectrum line transport requires an authenticated "
+                "detector-impact partition."
+            )
+        impact_phase_count = int(np.asarray(impact_edges).size - 1)
         self.validate_continuous_surface_states()
         device = (
             gpu_utils.resolve_device(self.config.gpu_device)
@@ -105,7 +112,11 @@ class ParticleTemperingMixin:
             slot_count,
             line_count,
         )
-        arrays = [np.zeros(output_shape, dtype=np.float64) for _ in range(6)]
+        arrays = [np.zeros(output_shape, dtype=np.float64) for _ in range(7)]
+        impact_fractions = np.zeros(
+            output_shape + (impact_phase_count,),
+            dtype=np.float64,
+        )
         if np.any(mask):
             active_positions = self._surface_transport_positions(
                 positions[mask],
@@ -131,6 +142,7 @@ class ParticleTemperingMixin:
                     fe_indices=fe_arr.reshape(1, view_count),
                     pb_indices=pb_arr.reshape(1, view_count),
                     positive_line_indices=line_indices,
+                    impact_parameter_edges_fraction=impact_edges,
                 )
             )
             component_total = np.asarray(
@@ -158,6 +170,7 @@ class ParticleTemperingMixin:
                     components.tau_fe,
                     components.tau_pb,
                     components.tau_obstacle,
+                    components.tau_obstacle_compton,
                     components.distance_m,
                 ),
             ):
@@ -169,9 +182,17 @@ class ParticleTemperingMixin:
                     component_values[:, inverse, :],
                     (1, 0, 2),
                 )
+            component_impact = np.asarray(
+                components.uncollided_impact_fractions,
+                dtype=np.float64,
+            )[0]
+            impact_fractions[particle_ids, :, source_slots, :, :] = np.transpose(
+                component_impact[:, inverse, :, :],
+                (1, 0, 2, 3),
+            )
         tensors = [
             torch.as_tensor(value, dtype=torch.float64, device=device)
-            for value in arrays
+            for value in (*arrays, impact_fractions)
         ]
         return TorchLineTransportComponents(*tensors)
 

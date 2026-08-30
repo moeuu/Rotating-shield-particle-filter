@@ -8,12 +8,37 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.continuous_kernels import LineTransportComponents
+from pf.history_tree import (
+    TPHT_LOG_PROBABILITY_UPPER_BOUND,
+    TPHT_RECENT_EXACT_STATIONS,
+    TPHTProposalDecision,
+)
 from pf.particle_types import StructuralGeometryBatch, TorchLineTransportComponents
 from pf.state import IsotopeState
 
 
 class StructuralRJTargetMixin:
     """Evaluate exact-RJ targets and commit accepted batched state rows."""
+
+    def _continuous_rj_cardinalities_numpy(self) -> NDArray[np.int64]:
+        """Return current cardinalities without reading stale Python states."""
+        state = self._structural_rj_device_state
+        if state is not None:
+            return (
+                state["cardinalities"]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.int64, copy=False)
+            )
+        return np.fromiter(
+            (
+                int(particle.state.num_sources)
+                for particle in self.continuous_particles
+            ),
+            dtype=np.int64,
+            count=len(self.continuous_particles),
+        )
 
     def _continuous_rj_line_transport_component_columns(
         self,
@@ -50,6 +75,10 @@ class StructuralRJTargetMixin:
         requested_transport = self._surface_transport_positions(
             requested,
             chart_ids=requested_chart_ids,
+        )
+        impact_edges = self.detector_impact_parameter_edges_fraction
+        impact_phase_count = (
+            0 if impact_edges is None else int(np.asarray(impact_edges).size - 1)
         )
         measurement_count = data.row_count
         line_indices = np.asarray(
@@ -140,6 +169,7 @@ class StructuralRJTargetMixin:
                         pb_indices=pb_program,
                         positive_line_indices=line_indices,
                         device_resident=device_resident,
+                        impact_parameter_edges_fraction=impact_edges,
                     )
                 )
                 row_view_indices = np.empty(
@@ -156,6 +186,15 @@ class StructuralRJTargetMixin:
                     int(view_counts[0]),
                     int(requested_transport.shape[0]),
                     int(line_indices.size),
+                )
+                expected_impact_shape = expected_program_shape + (
+                    impact_phase_count,
+                )
+                expected_selected_impact_shape = (
+                    measurement_count,
+                    int(requested_transport.shape[0]),
+                    int(line_indices.size),
+                    impact_phase_count,
                 )
 
                 if device_resident:
@@ -183,6 +222,15 @@ class StructuralRJTargetMixin:
                             )
                         return values[sequence_index, view_index]
 
+                    def _selected_device_impact() -> "torch.Tensor":
+                        """Restore phase-resolved rows without leaving the GPU."""
+                        values = program_components.uncollided_impact_fractions
+                        if tuple(values.shape) != expected_impact_shape:
+                            raise RuntimeError(
+                                "Pair-program detector-impact shape is invalid."
+                            )
+                        return values[sequence_index, view_index]
+
                     components = TorchLineTransportComponents(
                         total_kernel=_selected_device_component("total_kernel"),
                         uncollided_kernel=_selected_device_component(
@@ -191,7 +239,11 @@ class StructuralRJTargetMixin:
                         tau_fe=_selected_device_component("tau_fe"),
                         tau_pb=_selected_device_component("tau_pb"),
                         tau_obstacle=_selected_device_component("tau_obstacle"),
+                        tau_obstacle_compton=_selected_device_component(
+                            "tau_obstacle_compton"
+                        ),
                         distance_m=_selected_device_component("distance_m"),
+                        uncollided_impact_fractions=_selected_device_impact(),
                     )
                 else:
 
@@ -223,7 +275,21 @@ class StructuralRJTargetMixin:
                             "tau_obstacle_compton"
                         ),
                         distance_m=_selected_component("distance_m"),
+                        uncollided_impact_fractions=np.asarray(
+                            program_components.uncollided_impact_fractions[
+                                sequence_inverse,
+                                row_view_indices,
+                            ],
+                            dtype=np.float64,
+                        ),
                     )
+                    if (
+                        components.uncollided_impact_fractions.shape
+                        != expected_selected_impact_shape
+                    ):
+                        raise RuntimeError(
+                            "Pair-program detector-impact component shape is invalid."
+                        )
             else:
                 if device_resident:
                     raise RuntimeError(
@@ -242,6 +308,7 @@ class StructuralRJTargetMixin:
                         detector_positions=unique_detectors,
                         sources=requested_transport,
                         positive_line_indices=line_indices,
+                        impact_parameter_edges_fraction=impact_edges,
                     )
                 )
                 expected_all_pair_shape = (
@@ -277,6 +344,13 @@ class StructuralRJTargetMixin:
                     tau_obstacle=_selected_component("tau_obstacle"),
                     tau_obstacle_compton=_selected_component("tau_obstacle_compton"),
                     distance_m=_selected_component("distance_m"),
+                    uncollided_impact_fractions=np.asarray(
+                        all_pair_components.uncollided_impact_fractions[
+                            detector_inverse,
+                            pair_indices,
+                        ],
+                        dtype=np.float64,
+                    ),
                 )
         else:
             if device_resident:
@@ -290,6 +364,7 @@ class StructuralRJTargetMixin:
                     fe_indices=fe_indices,
                     pb_indices=pb_indices,
                     positive_line_indices=line_indices,
+                    impact_parameter_edges_fraction=impact_edges,
                 )
             )
         if isinstance(components, TorchLineTransportComponents):
@@ -318,6 +393,10 @@ class StructuralRJTargetMixin:
                 dtype=np.float64,
             ),
             distance_m=np.asarray(components.distance_m, dtype=np.float64),
+            uncollided_impact_fractions=np.asarray(
+                components.uncollided_impact_fractions,
+                dtype=np.float64,
+            ),
         )
 
     def _continuous_rj_group_arrays(
@@ -458,6 +537,467 @@ class StructuralRJTargetMixin:
             strengths.astype(np.float64, copy=False),
         )
 
+    def _continuous_rj_torch_enabled(self) -> bool:
+        """Return whether the station-authoritative CUDA RJ path is active."""
+        state = self._structural_rj_device_state
+        return bool(
+            self._structural_rj_device_state_authoritative
+            and state is not None
+            and bool(state["strengths"].is_cuda)
+        )
+
+    def _continuous_rj_torch_generator_required(self) -> object:
+        """Return the sweep-local CUDA generator or fail closed."""
+        generator = self._structural_rj_torch_generator
+        if generator is None or not self._continuous_rj_torch_enabled():
+            raise RuntimeError(
+                "A station-authoritative CUDA RJ sweep has no Torch generator."
+            )
+        return generator
+
+    def _continuous_rj_tpht_generator_required(self) -> object:
+        """Return the independent CUDA generator for TPHT refinement tests."""
+        generator = self._structural_rj_tpht_generator
+        if generator is None or not self._continuous_rj_torch_enabled():
+            raise RuntimeError(
+                "A station-authoritative CUDA RJ sweep has no TPHT generator."
+            )
+        return generator
+
+    def _continuous_rj_atlas_tensors(self) -> dict[str, object]:
+        """Return immutable atlas geometry tensors on the RJ state device."""
+        state = self._structural_rj_device_state
+        atlas = self._structural_rj_surface_atlas
+        if state is None or atlas is None:
+            raise RuntimeError("CUDA RJ atlas tensors require active surface state.")
+        import torch
+
+        reference = state["strengths"]
+        cached = self._structural_rj_device_constants
+        cache_valid = bool(cached) and all(
+            value.device == reference.device and value.dtype == reference.dtype
+            for name, value in cached.items()
+            if name not in {"chart_ids", "portal_neighbor_ids"}
+        )
+        if cache_valid:
+            return cached
+        vertices = torch.tensor(
+            np.asarray(atlas.geometry.vertices_xyz, dtype=np.float64),
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        cached = {
+            "origins": vertices[:, 0],
+            "u_edges": vertices[:, 1] - vertices[:, 0],
+            "v_edges": vertices[:, 3] - vertices[:, 0],
+            "chart_probabilities": torch.tensor(
+                atlas.chart_probabilities,
+                device=reference.device,
+                dtype=reference.dtype,
+            ),
+            "log_chart_probabilities": torch.tensor(
+                atlas.log_chart_probabilities,
+                device=reference.device,
+                dtype=reference.dtype,
+            ),
+        }
+        self._structural_rj_device_constants = cached
+        return cached
+
+    def _continuous_rj_positions_torch(
+        self,
+        chart_ids: object,
+        surface_uv: object,
+    ) -> object:
+        """Map device chart/UV coordinates to XYZ without a host round trip."""
+        import torch
+
+        if not torch.is_tensor(chart_ids) or not torch.is_tensor(surface_uv):
+            raise TypeError("CUDA surface coordinates must be Torch tensors.")
+        constants = self._continuous_rj_atlas_tensors()
+        flat_ids = chart_ids.reshape(-1)
+        flat_uv = surface_uv.reshape(-1, 2)
+        positions = (
+            constants["origins"][flat_ids]
+            + flat_uv[:, :1] * constants["u_edges"][flat_ids]
+            + flat_uv[:, 1:] * constants["v_edges"][flat_ids]
+        )
+        return positions.reshape(tuple(chart_ids.shape) + (3,))
+
+    def _continuous_rj_group_tensors(
+        self,
+        particle_indices: object,
+        cardinality: int,
+    ) -> tuple[object, object, object, object, object]:
+        """Gather one equal-cardinality group from authoritative CUDA state."""
+        import torch
+
+        state = self._structural_rj_device_state
+        if state is None or not self._continuous_rj_torch_enabled():
+            raise RuntimeError("CUDA RJ group gather requires authoritative state.")
+        indices = torch.as_tensor(
+            particle_indices,
+            device=state["strengths"].device,
+            dtype=torch.long,
+        ).reshape(-1)
+        source_count = int(cardinality)
+        selected_cardinalities = torch.index_select(
+            state["cardinalities"],
+            0,
+            indices,
+        )
+        if bool(torch.any(selected_cardinalities != source_count).item()):
+            raise ValueError("CUDA continuous RJ group mixes cardinalities.")
+        charts = torch.index_select(state["chart_ids"], 0, indices)[
+            :, :source_count
+        ]
+        uv = torch.index_select(state["surface_uv"], 0, indices)[
+            :, :source_count
+        ]
+        positions = torch.index_select(state["positions"], 0, indices)[
+            :, :source_count
+        ]
+        strengths = torch.index_select(state["strengths"], 0, indices)[
+            :, :source_count
+        ]
+        diagnostics = self.last_structural_device_diagnostics
+        diagnostics["device_group_gather_calls"] = int(
+            diagnostics.get("device_group_gather_calls", 0)
+        ) + 1
+        return indices, charts, uv, positions, strengths
+
+    def _continuous_rj_canonicalize_tensors(
+        self,
+        chart_ids: object,
+        surface_uv: object,
+        positions: object,
+        strengths: object,
+    ) -> tuple[object, object, object, object]:
+        """Canonicalize device source rows by chart, U, and V."""
+        import torch
+
+        if not all(
+            torch.is_tensor(value)
+            for value in (chart_ids, surface_uv, positions, strengths)
+        ):
+            raise TypeError("CUDA RJ canonical state values must be tensors.")
+        if (
+            chart_ids.ndim != 2
+            or surface_uv.shape != tuple(chart_ids.shape) + (2,)
+            or positions.shape != tuple(chart_ids.shape) + (3,)
+            or strengths.shape != chart_ids.shape
+        ):
+            raise ValueError("CUDA RJ canonical arrays have invalid shapes.")
+        derived = self._continuous_rj_positions_torch(chart_ids, surface_uv)
+        if bool(
+            torch.any(
+                ~torch.isclose(
+                    positions,
+                    derived,
+                    rtol=0.0,
+                    atol=1.0e-10,
+                )
+            ).item()
+        ):
+            raise ValueError(
+                "CUDA transient RJ XYZ must equal the chart/UV image."
+            )
+        if int(chart_ids.shape[1]) <= 1:
+            return chart_ids, surface_uv, derived, strengths
+        order = torch.argsort(surface_uv[:, :, 1], dim=1, stable=True)
+        ordered_u = torch.gather(surface_uv[:, :, 0], 1, order)
+        next_order = torch.argsort(ordered_u, dim=1, stable=True)
+        order = torch.gather(order, 1, next_order)
+        ordered_charts = torch.gather(chart_ids, 1, order)
+        next_order = torch.argsort(ordered_charts, dim=1, stable=True)
+        order = torch.gather(order, 1, next_order)
+        return (
+            torch.gather(chart_ids, 1, order),
+            torch.gather(surface_uv, 1, order[..., None].expand(-1, -1, 2)),
+            torch.gather(derived, 1, order[..., None].expand(-1, -1, 3)),
+            torch.gather(strengths, 1, order),
+        )
+
+    def _continuous_rj_strength_support_torch(self, values: object) -> object:
+        """Return the configured strength-prior support on Torch."""
+        import torch
+
+        if not torch.is_tensor(values):
+            raise TypeError("CUDA RJ strengths must be a Torch tensor.")
+        support = torch.isfinite(values) & (values >= self._strength_prior.minimum)
+        maximum = float(self._strength_prior.support_maximum)
+        if np.isfinite(maximum):
+            support &= values <= maximum
+        return support
+
+    def _continuous_rj_strength_log_prior_torch(self, values: object) -> object:
+        """Evaluate the normalized physical strength prior on Torch."""
+        import torch
+
+        if not torch.is_tensor(values):
+            raise TypeError("CUDA RJ strengths must be a Torch tensor.")
+        support = self._continuous_rj_strength_support_torch(values)
+        if self._strength_prior.family == "bounded_uniform":
+            density = -float(
+                np.log(
+                    self._strength_prior.maximum
+                    - self._strength_prior.minimum
+                )
+            )
+            return torch.where(
+                support,
+                torch.full_like(values, density),
+                torch.full_like(values, float("-inf")),
+            )
+        shifted = values - self._strength_prior.minimum
+        safe = torch.clamp(shifted, min=torch.finfo(values.dtype).tiny)
+        log_density = (
+            (self._strength_prior.gamma_shape - 1.0) * torch.log(safe)
+            - shifted / self._strength_prior.gamma_scale
+            - torch.lgamma(
+                torch.as_tensor(
+                    self._strength_prior.gamma_shape,
+                    device=values.device,
+                    dtype=values.dtype,
+                )
+            )
+            - self._strength_prior.gamma_shape
+            * np.log(self._strength_prior.gamma_scale)
+        )
+        positive = support & (shifted > 0.0)
+        boundary_density = (
+            -np.log(self._strength_prior.gamma_scale)
+            if self._strength_prior.gamma_shape == 1.0
+            else float("-inf")
+        )
+        result = torch.where(
+            positive,
+            log_density,
+            torch.full_like(values, float("-inf")),
+        )
+        return torch.where(
+            support & (shifted == 0.0),
+            torch.full_like(values, boundary_density),
+            result,
+        )
+
+    def _continuous_rj_sample_strength_prior_torch(
+        self,
+        shape: tuple[int, ...],
+        *,
+        generator: object | None = None,
+    ) -> object:
+        """Draw physical-prior strengths with the sweep-local CUDA generator."""
+        import torch
+
+        state = self._structural_rj_device_state
+        if state is None:
+            raise RuntimeError("CUDA strength sampling requires device state.")
+        reference = state["strengths"]
+        active_generator = (
+            self._continuous_rj_torch_generator_required()
+            if generator is None
+            else generator
+        )
+        if not isinstance(active_generator, torch.Generator):
+            raise TypeError("CUDA strength sampling requires a Torch generator.")
+        if self._strength_prior.family == "bounded_uniform":
+            unit = torch.rand(
+                shape,
+                device=reference.device,
+                dtype=reference.dtype,
+                generator=active_generator,
+            )
+            return self._strength_prior.minimum + unit * (
+                self._strength_prior.maximum - self._strength_prior.minimum
+            )
+        concentration = torch.full(
+            shape,
+            self._strength_prior.gamma_shape,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        gamma = torch._standard_gamma(
+            concentration,
+            generator=active_generator,
+        )
+        return (
+            self._strength_prior.minimum
+            + self._strength_prior.gamma_scale * gamma
+        )
+
+    def _continuous_rj_sample_surface_torch(
+        self,
+        sample_count: int,
+        *,
+        chart_probabilities: object | None = None,
+    ) -> tuple[object, object, object]:
+        """Draw chart IDs and UV values entirely on the RJ CUDA device."""
+        import torch
+
+        constants = self._continuous_rj_atlas_tensors()
+        probabilities = (
+            constants["chart_probabilities"]
+            if chart_probabilities is None
+            else torch.as_tensor(
+                chart_probabilities,
+                device=constants["chart_probabilities"].device,
+                dtype=constants["chart_probabilities"].dtype,
+            )
+        )
+        count = int(sample_count)
+        if count < 0:
+            raise ValueError("CUDA surface sample_count must be non-negative.")
+        generator = self._continuous_rj_torch_generator_required()
+        if count == 0:
+            ids = torch.zeros(
+                0,
+                device=probabilities.device,
+                dtype=torch.long,
+            )
+            uv = torch.zeros(
+                (0, 2),
+                device=probabilities.device,
+                dtype=probabilities.dtype,
+            )
+            return ids, uv, self._continuous_rj_positions_torch(ids, uv)
+        ids = torch.multinomial(
+            probabilities,
+            count,
+            replacement=True,
+            generator=generator,
+        )
+        uv = torch.rand(
+            (count, 2),
+            device=probabilities.device,
+            dtype=probabilities.dtype,
+            generator=generator,
+        )
+        return ids, uv, self._continuous_rj_positions_torch(ids, uv)
+
+    def _continuous_rj_position_proposal_log_density_torch(
+        self,
+        chart_ids: object,
+    ) -> object:
+        """Evaluate the active full-support chart proposal on CUDA."""
+        import torch
+
+        if not torch.is_tensor(chart_ids):
+            raise TypeError("CUDA proposal chart IDs must be a tensor.")
+        proposal = self._active_continuous_rj_position_proposal()
+        log_probabilities = torch.tensor(
+            proposal.log_chart_probabilities,
+            device=chart_ids.device,
+            dtype=self._structural_rj_device_state["strengths"].dtype,
+        )
+        return log_probabilities[chart_ids]
+
+    def _continuous_rj_strength_proposal_log_density_torch(
+        self,
+        chart_ids: object,
+        strengths: object,
+    ) -> object:
+        """Evaluate the active chart-conditional strength proposal on CUDA."""
+        import torch
+
+        if not torch.is_tensor(chart_ids) or not torch.is_tensor(strengths):
+            raise TypeError("CUDA strength proposal inputs must be tensors.")
+        proposal = self._active_continuous_rj_strength_proposal()
+        prior_log_density = self._continuous_rj_strength_log_prior_torch(strengths)
+        support = self._continuous_rj_strength_support_torch(strengths)
+        if (
+            not proposal.data_informative
+            or proposal.prior_component_probability >= 1.0
+        ):
+            return torch.where(
+                support,
+                prior_log_density,
+                torch.full_like(strengths, float("-inf")),
+            )
+        locations_table = torch.tensor(
+            proposal.data_locations_by_chart,
+            device=strengths.device,
+            dtype=strengths.dtype,
+        )
+        locations = locations_table[chart_ids]
+        lower_z = (proposal.minimum - locations) / proposal.data_sigma
+        if proposal.prior_family == "bounded_uniform":
+            upper_z = (proposal.maximum - locations) / proposal.data_sigma
+            upper_cdf = torch.special.ndtr(upper_z)
+        else:
+            upper_cdf = torch.ones_like(locations)
+        lower_cdf = torch.special.ndtr(lower_z)
+        normalization = upper_cdf - lower_cdf
+        standardized = (strengths - locations) / proposal.data_sigma
+        data_log_density = (
+            -0.5 * standardized.square()
+            - np.log(np.sqrt(2.0 * np.pi) * proposal.data_sigma)
+            - torch.log(normalization)
+        )
+        mixture = torch.logaddexp(
+            np.log(proposal.prior_component_probability) + prior_log_density,
+            np.log1p(-proposal.prior_component_probability) + data_log_density,
+        )
+        return torch.where(
+            support,
+            mixture,
+            torch.full_like(strengths, float("-inf")),
+        )
+
+    def _continuous_rj_sample_strength_proposal_torch(
+        self,
+        chart_ids: object,
+    ) -> object:
+        """Draw the active chart-conditional strength mixture on CUDA."""
+        import torch
+
+        if not torch.is_tensor(chart_ids):
+            raise TypeError("CUDA strength-proposal chart IDs must be a tensor.")
+        proposal = self._active_continuous_rj_strength_proposal()
+        result = self._continuous_rj_sample_strength_prior_torch(
+            tuple(chart_ids.shape)
+        )
+        if (
+            not proposal.data_informative
+            or proposal.prior_component_probability >= 1.0
+        ):
+            return result
+        generator = self._continuous_rj_torch_generator_required()
+        use_data = torch.rand(
+            chart_ids.shape,
+            device=chart_ids.device,
+            dtype=result.dtype,
+            generator=generator,
+        ) >= proposal.prior_component_probability
+        locations = torch.tensor(
+            proposal.data_locations_by_chart,
+            device=chart_ids.device,
+            dtype=result.dtype,
+        )[chart_ids]
+        lower_cdf = torch.special.ndtr(
+            (proposal.minimum - locations) / proposal.data_sigma
+        )
+        if proposal.prior_family == "bounded_uniform":
+            upper_cdf = torch.special.ndtr(
+                (proposal.maximum - locations) / proposal.data_sigma
+            )
+        else:
+            upper_cdf = torch.ones_like(locations)
+        uniforms = lower_cdf + torch.rand(
+            chart_ids.shape,
+            device=chart_ids.device,
+            dtype=result.dtype,
+            generator=generator,
+        ) * (upper_cdf - lower_cdf)
+        eps = torch.finfo(result.dtype).eps
+        data_sample = locations + proposal.data_sigma * torch.special.ndtri(
+            torch.clamp(uniforms, min=eps, max=1.0 - eps)
+        )
+        data_sample = torch.clamp(data_sample, min=proposal.minimum)
+        if proposal.prior_family == "bounded_uniform":
+            data_sample = torch.clamp(data_sample, max=proposal.maximum)
+        return torch.where(use_data, data_sample, result)
+
     def _continuous_rj_group_log_likelihood(
         self,
         data: StructuralGeometryBatch,
@@ -543,6 +1083,157 @@ class StructuralRJTargetMixin:
             "joint-isotope target evaluator."
         )
 
+    def _continuous_rj_group_log_likelihood_torch(
+        self,
+        data: StructuralGeometryBatch,
+        positions: object,
+        strengths: object,
+        *,
+        chart_ids: object,
+        particle_indices: object,
+        target_beta: float = 1.0,
+        tempering_start_row: int | None = None,
+    ) -> object:
+        """Evaluate one equal-cardinality candidate group on its CUDA device."""
+        import torch
+
+        if not all(
+            torch.is_tensor(value)
+            for value in (positions, strengths, chart_ids, particle_indices)
+        ):
+            raise TypeError("CUDA RJ target inputs must all be Torch tensors.")
+        active_start = self._structural_rj_tempering_start_row
+        if (
+            tempering_start_row is not None
+            and active_start is not None
+            and int(tempering_start_row) != int(active_start)
+        ):
+            raise ValueError(
+                "Continuous RJ likelihood evaluation changed the active "
+                "tempering station boundary."
+            )
+        resolved_start = (
+            active_start
+            if tempering_start_row is None
+            else int(tempering_start_row)
+        )
+        if (
+            positions.ndim != 3
+            or positions.shape[2] != 3
+            or strengths.shape != positions.shape[:2]
+            or chart_ids.shape != strengths.shape
+            or chart_ids.dtype != torch.long
+            or int(particle_indices.numel()) != int(positions.shape[0])
+        ):
+            raise ValueError(
+                "CUDA RJ chart, position, strength, and row arrays are misaligned."
+            )
+        if self._joint_target_evaluator is None:
+            raise RuntimeError(
+                "Continuous exact-RJ moves require the estimator-owned full "
+                "joint-isotope target evaluator."
+            )
+        result = self._joint_target_evaluator(
+            filt=self,
+            data=data,
+            positions_pks=positions,
+            chart_ids_pk=chart_ids,
+            strengths_pk=strengths,
+            particle_indices=particle_indices,
+            target_beta=float(target_beta),
+            tempering_start_row=resolved_start,
+        )
+        if not torch.is_tensor(result):
+            raise RuntimeError("CUDA RJ target evaluator returned a host array.")
+        result = result.reshape(-1)
+        invalid = torch.isnan(result) | torch.isposinf(result)
+        if int(result.numel()) != int(positions.shape[0]) or bool(
+            torch.any(invalid).item()
+        ):
+            raise ValueError(
+                "CUDA RJ target must return one finite or negative-infinity "
+                "value per row."
+            )
+        return result
+
+    def _continuous_rj_recent_proposal_log_likelihood_torch(
+        self,
+        data: StructuralGeometryBatch,
+        positions: object,
+        strengths: object,
+        *,
+        chart_ids: object,
+        particle_indices: object,
+        target_beta: float,
+    ) -> object:
+        """Evaluate the exact recent window used only to guide a proposal.
+
+        This density is evaluated symmetrically in both proposal directions.
+        It changes proposal efficiency only; the certified history scheduler
+        still makes the final decision with the ordinary exact-MH ratio.
+        """
+        import torch
+
+        if self._joint_target_evaluator is None:
+            raise RuntimeError("TPHT proposal guide requires the joint evaluator.")
+        current_station = (
+            self._structural_rj_current_station_log_likelihood_device
+        )
+        if current_station is None or current_station.ndim != 2:
+            if self._joint_history_tree_evaluator is not None:
+                raise RuntimeError(
+                    "Production TPHT proposal guide requires the station cache."
+                )
+            # Directly constructed filters are the explicit small test oracle.
+            return self._continuous_rj_group_log_likelihood_torch(
+                data,
+                positions,
+                strengths,
+                chart_ids=chart_ids,
+                particle_indices=particle_indices,
+                target_beta=float(target_beta),
+            )
+        station_count = int(current_station.shape[1])
+        beta = float(target_beta)
+        if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
+            raise ValueError("TPHT proposal-guide target_beta must lie in [0, 1].")
+        row_count = int(positions.shape[0])
+        recent_start = max(0, station_count - TPHT_RECENT_EXACT_STATIONS)
+        _, station_values = self._joint_target_evaluator(
+            filt=self,
+            data=data,
+            positions_pks=positions,
+            chart_ids_pk=chart_ids,
+            strengths_pk=strengths,
+            particle_indices=particle_indices,
+            target_beta=beta,
+            tempering_start_row=self._structural_rj_tempering_start_row,
+            station_start=recent_start,
+            station_stop=station_count,
+            return_station_log_likelihood=True,
+            stage_unit_transport=False,
+        )
+        station_values = torch.as_tensor(
+            station_values,
+            device=positions.device,
+            dtype=positions.dtype,
+        )
+        recent_count = station_count - recent_start
+        if tuple(station_values.shape) != (row_count, recent_count) or bool(
+            torch.any(torch.isnan(station_values)).item()
+            or torch.any(
+                station_values > TPHT_LOG_PROBABILITY_UPPER_BOUND + 1.0e-8
+            ).item()
+        ):
+            raise RuntimeError("TPHT proposal guide violates its PMF contract.")
+        powers = torch.ones(
+            recent_count,
+            device=positions.device,
+            dtype=positions.dtype,
+        )
+        powers[-1] = beta
+        return torch.sum(station_values * powers[None, :], dim=1)
+
     def _continuous_rj_current_log_likelihood(
         self,
         data: StructuralGeometryBatch,
@@ -555,6 +1246,27 @@ class StructuralRJTargetMixin:
     ) -> NDArray[np.float64]:
         """Return cached current-target values or evaluate an uncached group."""
         indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        device_cached = self._structural_rj_current_target_log_likelihood_device
+        if device_cached is not None:
+            import torch
+
+            index_tensor = torch.as_tensor(
+                indices,
+                device=device_cached.device,
+                dtype=torch.long,
+            )
+            result = (
+                torch.index_select(device_cached, 0, index_tensor)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64, copy=False)
+            )
+            if np.any(np.isnan(result)) or np.any(np.isposinf(result)):
+                raise RuntimeError(
+                    "Continuous RJ CUDA current-target cache is invalid."
+                )
+            return result
         cached = self._structural_rj_current_target_log_likelihood
         if cached is None:
             return self._continuous_rj_group_log_likelihood(
@@ -578,6 +1290,38 @@ class StructuralRJTargetMixin:
             )
         return result.copy()
 
+    def _continuous_rj_current_log_likelihood_torch(
+        self,
+        data: StructuralGeometryBatch,
+        positions: object,
+        strengths: object,
+        *,
+        chart_ids: object,
+        particle_indices: object,
+        target_beta: float,
+    ) -> object:
+        """Return cached current-target values without leaving CUDA."""
+        import torch
+
+        if not torch.is_tensor(particle_indices):
+            raise TypeError("CUDA current-target indices must be a tensor.")
+        cached = self._structural_rj_current_target_log_likelihood_device
+        if cached is None:
+            return self._continuous_rj_group_log_likelihood_torch(
+                data,
+                positions,
+                strengths,
+                chart_ids=chart_ids,
+                particle_indices=particle_indices,
+                target_beta=target_beta,
+            )
+        if tuple(cached.shape) != (len(self.continuous_particles),):
+            raise RuntimeError("CUDA RJ current-target cache is misaligned.")
+        result = torch.index_select(cached, 0, particle_indices)
+        if bool(torch.any(torch.isnan(result) | torch.isposinf(result)).item()):
+            raise RuntimeError("CUDA RJ current-target cache is invalid.")
+        return result
+
     def _update_continuous_rj_current_log_likelihood(
         self,
         particle_indices: NDArray[np.int64],
@@ -586,7 +1330,8 @@ class StructuralRJTargetMixin:
     ) -> None:
         """Commit accepted candidate target values to the sweep-local cache."""
         cached = self._structural_rj_current_target_log_likelihood
-        if cached is None:
+        device_cached = self._structural_rj_current_target_log_likelihood_device
+        if cached is None and device_cached is None:
             return
         indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
         acceptance = np.asarray(accepted, dtype=bool).reshape(-1)
@@ -598,12 +1343,264 @@ class StructuralRJTargetMixin:
             indices.size != acceptance.size
             or proposed.size != indices.size
             or np.any(indices < 0)
-            or np.any(indices >= cached.size)
+            or np.any(indices >= len(self.continuous_particles))
             or np.any(np.isnan(proposed[acceptance]))
             or np.any(np.isposinf(proposed[acceptance]))
         ):
             raise RuntimeError("Accepted continuous RJ target values are invalid.")
-        cached[indices[acceptance]] = proposed[acceptance]
+        if cached is not None:
+            cached[indices[acceptance]] = proposed[acceptance]
+        if device_cached is not None:
+            import torch
+
+            selected_indices = torch.as_tensor(
+                indices[acceptance],
+                device=device_cached.device,
+                dtype=torch.long,
+            )
+            selected_values = torch.as_tensor(
+                proposed[acceptance],
+                device=device_cached.device,
+                dtype=device_cached.dtype,
+            )
+            device_cached.index_copy_(0, selected_indices, selected_values)
+
+    def _update_continuous_rj_current_log_likelihood_torch(
+        self,
+        particle_indices: object,
+        accepted: object,
+        proposed_log_likelihood: object,
+        proposed_station_log_likelihood: object | None = None,
+    ) -> None:
+        """Commit accepted CUDA target and station values to sweep-local caches."""
+        import torch
+
+        cached = self._structural_rj_current_target_log_likelihood_device
+        if cached is None:
+            return
+        if not all(
+            torch.is_tensor(value)
+            for value in (particle_indices, accepted, proposed_log_likelihood)
+        ):
+            raise TypeError("CUDA target-cache updates require Torch tensors.")
+        indices = particle_indices.reshape(-1)
+        acceptance = accepted.reshape(-1)
+        proposed = proposed_log_likelihood.reshape(-1)
+        if (
+            int(indices.numel()) != int(acceptance.numel())
+            or int(proposed.numel()) != int(indices.numel())
+        ):
+            raise RuntimeError("CUDA RJ target-cache update is misaligned.")
+        selected_indices = indices[acceptance]
+        selected_values = proposed[acceptance]
+        if bool(
+            torch.any(torch.isnan(selected_values) | torch.isposinf(selected_values)).item()
+        ):
+            raise RuntimeError("Accepted CUDA RJ target values are invalid.")
+        cached.index_copy_(0, selected_indices, selected_values)
+        station_cached = (
+            self._structural_rj_current_station_log_likelihood_device
+        )
+        if station_cached is None:
+            if proposed_station_log_likelihood is not None:
+                raise RuntimeError(
+                    "A TPHT station proposal exists without its current cache."
+                )
+            return
+        if proposed_station_log_likelihood is None or not torch.is_tensor(
+            proposed_station_log_likelihood
+        ):
+            raise RuntimeError("TPHT accepted rows require per-station targets.")
+        station_proposed = proposed_station_log_likelihood
+        if (
+            station_proposed.device != station_cached.device
+            or station_proposed.dtype != station_cached.dtype
+            or tuple(station_proposed.shape)
+            != (int(indices.numel()), int(station_cached.shape[1]))
+        ):
+            raise RuntimeError("TPHT station-target update is misaligned.")
+        selected_station = station_proposed[acceptance]
+        if bool(torch.any(~torch.isfinite(selected_station)).item()):
+            raise RuntimeError("Accepted TPHT station targets are invalid.")
+        station_cached.index_copy_(0, selected_indices, selected_station)
+
+    def _continuous_rj_history_tree_decision_torch(
+        self,
+        data: StructuralGeometryBatch,
+        proposed_positions: object,
+        proposed_strengths: object,
+        *,
+        proposed_chart_ids: object,
+        particle_indices: object,
+        base_log_likelihood: object,
+        log_non_likelihood_ratio: object,
+        support: object,
+        target_beta: float,
+        move_family: str,
+    ) -> TPHTProposalDecision:
+        """Return an exact batched MH decision through the active history tree."""
+        import torch
+
+        values = (
+            proposed_positions,
+            proposed_strengths,
+            proposed_chart_ids,
+            particle_indices,
+            base_log_likelihood,
+            log_non_likelihood_ratio,
+            support,
+        )
+        if not all(torch.is_tensor(value) for value in values):
+            raise TypeError("CUDA TPHT decisions require Torch tensors.")
+        base = base_log_likelihood.reshape(-1)
+        non_likelihood = log_non_likelihood_ratio.reshape(-1)
+        feasible = support.to(dtype=torch.bool).reshape(-1)
+        row_count = int(base.numel())
+        if (
+            row_count <= 0
+            or int(particle_indices.numel()) != row_count
+            or int(proposed_positions.shape[0]) != row_count
+            or tuple(non_likelihood.shape) != (row_count,)
+            or tuple(feasible.shape) != (row_count,)
+        ):
+            raise ValueError("CUDA TPHT decision arrays are not row aligned.")
+        generator = self._continuous_rj_torch_generator_required()
+        uniforms = torch.rand(
+            (row_count,),
+            device=base.device,
+            dtype=base.dtype,
+            generator=generator,
+        )
+        log_uniform = torch.log(uniforms)
+        refinement_uniform = torch.rand(
+            (row_count,),
+            device=base.device,
+            dtype=base.dtype,
+            generator=self._continuous_rj_tpht_generator_required(),
+        )
+        log_refinement_uniform = torch.log(refinement_uniform)
+        diagnostics = self.last_structural_device_diagnostics
+        diagnostics["mh_acceptance_calls"] = int(
+            diagnostics.get("mh_acceptance_calls", 0)
+        ) + 1
+        diagnostics["mh_acceptance_rows"] = int(
+            diagnostics.get("mh_acceptance_rows", 0)
+        ) + row_count
+        evaluator = self._joint_history_tree_evaluator
+        current_station = (
+            self._structural_rj_current_station_log_likelihood_device
+        )
+        if evaluator is None:
+            # A directly constructed filter is the explicit small test oracle.
+            # The production estimator always installs both joint evaluators;
+            # that wiring is asserted independently by contract tests.
+            proposed_target = self._continuous_rj_group_log_likelihood_torch(
+                data,
+                proposed_positions,
+                proposed_strengths,
+                chart_ids=proposed_chart_ids,
+                particle_indices=particle_indices,
+                target_beta=target_beta,
+            )
+            delta = proposed_target - base
+            ratio = delta + non_likelihood
+            accepted = feasible & (log_uniform < ratio)
+            exact = torch.ones_like(accepted)
+            diagnostics["tpht_debug_oracle_rows"] = int(
+                diagnostics.get("tpht_debug_oracle_rows", 0)
+            ) + row_count
+            return TPHTProposalDecision(
+                accepted=accepted,
+                proposed_target_log_likelihood=proposed_target,
+                proposed_station_log_likelihood=None,
+                diagnostic_delta_log_likelihood=delta,
+                diagnostic_log_acceptance_ratio=ratio,
+                likelihood_exact=exact,
+                evaluated_station_count=torch.zeros_like(
+                    particle_indices,
+                    dtype=torch.long,
+                ),
+                early_rejected=torch.zeros_like(accepted),
+                block_evaluation_count=1,
+                maximum_block_level=0,
+                refinement_round_count=1,
+                refinement_bound_rejected=torch.zeros_like(accepted),
+                exact_rejected=feasible & ~accepted,
+                staged_replay_row_count=0,
+                first_stage_station_count=torch.zeros_like(
+                    particle_indices,
+                    dtype=torch.long,
+                ),
+                first_stage_rejected=torch.zeros_like(accepted),
+            )
+        if current_station is None:
+            raise RuntimeError(
+                "The production TPHT evaluator has no current station cache."
+            )
+        indices = particle_indices.reshape(-1)
+        current_station_rows = torch.index_select(
+            current_station,
+            0,
+            indices,
+        )
+        decision = evaluator(
+            filt=self,
+            data=data,
+            positions_pks=proposed_positions,
+            chart_ids_pk=proposed_chart_ids,
+            strengths_pk=proposed_strengths,
+            particle_indices=indices,
+            current_station_log_likelihood_ps=current_station_rows,
+            base_target_log_likelihood_p=base,
+            log_non_likelihood_ratio_p=non_likelihood,
+            log_uniform_p=log_uniform,
+            log_refinement_uniform_p=log_refinement_uniform,
+            support_p=feasible,
+            target_beta=float(target_beta),
+            tempering_start_row=self._structural_rj_tempering_start_row,
+            move_family=str(move_family),
+        )
+        if not isinstance(decision, TPHTProposalDecision):
+            raise RuntimeError("TPHT evaluator returned an invalid decision.")
+        evaluated = decision.evaluated_station_count
+        exact = decision.likelihood_exact
+        diagnostics["tpht_proposal_rows"] = int(
+            diagnostics.get("tpht_proposal_rows", 0)
+        ) + row_count
+        diagnostics["tpht_refinement_bound_rejected_rows"] = int(
+            diagnostics.get("tpht_refinement_bound_rejected_rows", 0)
+        ) + int(
+            torch.count_nonzero(decision.refinement_bound_rejected).item()
+        )
+        diagnostics["tpht_full_history_rows"] = int(
+            diagnostics.get("tpht_full_history_rows", 0)
+        ) + int(torch.count_nonzero(exact).item())
+        diagnostics["tpht_exact_rejected_rows"] = int(
+            diagnostics.get("tpht_exact_rejected_rows", 0)
+        ) + int(torch.count_nonzero(decision.exact_rejected).item())
+        diagnostics["tpht_exact_station_evaluations"] = int(
+            diagnostics.get("tpht_exact_station_evaluations", 0)
+        ) + int(torch.sum(evaluated).item())
+        diagnostics["tpht_first_stage_station_evaluations"] = int(
+            diagnostics.get("tpht_first_stage_station_evaluations", 0)
+        ) + int(torch.sum(decision.first_stage_station_count).item())
+        diagnostics["tpht_first_stage_rejected_rows"] = int(
+            diagnostics.get("tpht_first_stage_rejected_rows", 0)
+        ) + int(torch.count_nonzero(decision.first_stage_rejected).item())
+        diagnostics["tpht_block_evaluation_calls"] = int(
+            diagnostics.get("tpht_block_evaluation_calls", 0)
+        ) + int(decision.block_evaluation_count)
+        diagnostics["tpht_refinement_rounds"] = int(
+            diagnostics.get("tpht_refinement_rounds", 0)
+        ) + int(decision.refinement_round_count)
+        diagnostics["tpht_staged_replay_rows"] = int(
+            diagnostics.get("tpht_staged_replay_rows", 0)
+        ) + int(decision.staged_replay_row_count)
+        diagnostics["tpht_maximum_block_level"] = max(
+            int(diagnostics.get("tpht_maximum_block_level", 0)),
+            int(decision.maximum_block_level),
+        )
+        return decision
 
     def set_joint_target_evaluator(
         self,
@@ -613,6 +1610,15 @@ class StructuralRJTargetMixin:
         if evaluator is not None and not callable(evaluator):
             raise TypeError("Joint target evaluator must be callable or None.")
         self._joint_target_evaluator = evaluator
+
+    def set_joint_history_tree_evaluator(
+        self,
+        evaluator: Callable[..., TPHTProposalDecision] | None,
+    ) -> None:
+        """Attach the estimator-owned certified TPHT evaluator."""
+        if evaluator is not None and not callable(evaluator):
+            raise TypeError("Joint history-tree evaluator must be callable or None.")
+        self._joint_history_tree_evaluator = evaluator
 
     def set_joint_strength_grid_target_evaluator(
         self,
@@ -719,11 +1725,31 @@ class StructuralRJTargetMixin:
 
         if not torch.is_tensor(reference):
             raise TypeError("RJ device-state reference must be a Torch tensor.")
+        device = reference.device
+        dtype = reference.dtype
+        existing = self._structural_rj_device_state
+        if (
+            existing is not None
+            and bool(self._structural_rj_device_state_authoritative)
+        ):
+            if (
+                existing["strengths"].device != device
+                or existing["strengths"].dtype != dtype
+                or int(existing["strengths"].shape[0])
+                != len(self.continuous_particles)
+            ):
+                raise RuntimeError(
+                    "Station-authoritative RJ state changed device, dtype, or rows."
+                )
+            self._refresh_continuous_rj_device_cache_snapshot()
+            diagnostics = self.last_structural_device_diagnostics
+            diagnostics["state_reuse_calls"] = int(
+                diagnostics.get("state_reuse_calls", 0)
+            ) + 1
+            return True
         positions, strengths, mask, chart_ids, surface_uv = (
             self._packed_continuous_surface_state_arrays()
         )
-        device = reference.device
-        dtype = reference.dtype
         current = {
             "positions": torch.as_tensor(
                 positions,
@@ -773,11 +1799,168 @@ class StructuralRJTargetMixin:
             "state_scatter_calls": 0,
             "state_scatter_rows": 0,
             "group_gather_calls": 0,
+            "host_snapshot_calls": 0,
+            "state_reuse_calls": 0,
+            "deferred_clear_calls": 0,
+            "materialization_calls": 0,
+            "resample_reindex_calls": 0,
         }
         return True
 
+    def _refresh_continuous_rj_device_cache_snapshot(self) -> None:
+        """Freeze the accepted state used by one structural transport sweep."""
+        state = self._structural_rj_device_state
+        if state is None:
+            raise RuntimeError("Cannot snapshot a missing RJ device state.")
+        primary_names = (
+            "positions",
+            "strengths",
+            "mask",
+            "chart_ids",
+            "surface_uv",
+        )
+        for name in tuple(state):
+            if name.startswith("cache_"):
+                del state[name]
+        state.update(
+            {f"cache_{name}": state[name].clone() for name in primary_names}
+        )
+
+    def _begin_continuous_rj_station_device_state(
+        self,
+        reference: object,
+    ) -> bool:
+        """Make a fixed-capacity CUDA state authoritative for one station."""
+        if not hasattr(reference, "detach"):
+            return False
+        import torch
+
+        if not torch.is_tensor(reference) or not bool(reference.is_cuda):
+            return False
+        if bool(self._structural_rj_device_state_authoritative):
+            raise RuntimeError("RJ station device authority is already active.")
+        initialized = self._initialize_continuous_rj_device_state(reference)
+        if not initialized or self._structural_rj_device_state is None:
+            raise RuntimeError("CUDA RJ state failed to initialize.")
+        self._structural_rj_device_state_authoritative = True
+        self._structural_rj_device_state_dirty = False
+        self.last_structural_device_diagnostics["authority"] = "station"
+        return True
+
+    def _reindex_continuous_rj_device_state(
+        self,
+        indices: NDArray[np.int64],
+    ) -> None:
+        """Apply one joint-resampling ancestor vector to all device state rows."""
+        if not bool(self._structural_rj_device_state_authoritative):
+            return
+        state = self._structural_rj_device_state
+        if state is None:
+            raise RuntimeError("Authoritative RJ device state is missing.")
+        import torch
+
+        raw = np.asarray(indices)
+        particle_count = len(self.continuous_particles)
+        if (
+            raw.dtype != np.int64
+            or raw.shape != (particle_count,)
+            or np.any(raw < 0)
+            or np.any(raw >= particle_count)
+        ):
+            raise RuntimeError("RJ device resampling indices are invalid.")
+        index_tensor = torch.as_tensor(
+            raw,
+            device=state["strengths"].device,
+            dtype=torch.long,
+        )
+        for name, value in tuple(state.items()):
+            state[name] = torch.index_select(value, 0, index_tensor).contiguous()
+        self._structural_rj_device_state_dirty = True
+        diagnostics = self.last_structural_device_diagnostics
+        diagnostics["resample_reindex_calls"] = int(
+            diagnostics.get("resample_reindex_calls", 0)
+        ) + 1
+
+    def _materialize_continuous_rj_device_state(self) -> None:
+        """Convert the authoritative fixed-capacity state to Python particles."""
+        if not bool(self._structural_rj_device_state_authoritative):
+            return
+        state = self._structural_rj_device_state
+        if state is None:
+            raise RuntimeError("Authoritative RJ device state is missing.")
+        import torch
+
+        self.validate_continuous_surface_states()
+        dtype = state["strengths"].dtype
+        payload = torch.cat(
+            (
+                state["positions"],
+                state["strengths"][..., None],
+                state["surface_uv"],
+                state["chart_ids"][..., None].to(dtype=dtype),
+                state["mask"][..., None].to(dtype=dtype),
+            ),
+            dim=2,
+        ).detach().cpu().numpy()
+        cardinalities = np.sum(payload[..., 7] != 0.0, axis=1, dtype=np.int64)
+        for row, particle in enumerate(self.continuous_particles):
+            cardinality = int(cardinalities[row])
+            particle.state = IsotopeState(
+                num_sources=cardinality,
+                surface_chart_ids=np.asarray(
+                    payload[row, :cardinality, 6],
+                    dtype=np.int64,
+                ),
+                surface_uv=np.asarray(
+                    payload[row, :cardinality, 4:6],
+                    dtype=np.float64,
+                ),
+                strengths=np.asarray(
+                    payload[row, :cardinality, 3],
+                    dtype=np.float64,
+                ),
+            )
+        self._structural_rj_device_state_dirty = False
+        diagnostics = self.last_structural_device_diagnostics
+        diagnostics["materialization_calls"] = int(
+            diagnostics.get("materialization_calls", 0)
+        ) + 1
+
+    def _end_continuous_rj_station_device_state(self) -> None:
+        """Materialize and release station-authoritative CUDA state exactly once."""
+        if not bool(self._structural_rj_device_state_authoritative):
+            return
+        try:
+            self._materialize_continuous_rj_device_state()
+            target = self.last_structural_target_log_likelihood_device
+            if target is not None:
+                self.last_structural_target_log_likelihood = (
+                    target.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64, copy=False)
+                    .copy()
+                )
+                self.last_structural_target_log_likelihood_device = None
+        finally:
+            self._structural_rj_device_state_authoritative = False
+            self._structural_rj_device_state_dirty = False
+            self._structural_rj_device_state = None
+
     def _clear_continuous_rj_device_state(self) -> None:
-        """Release the sweep-local fixed-capacity Torch state mirror."""
+        """Release a sweep mirror or defer release of station authority."""
+        if bool(self._structural_rj_device_state_authoritative):
+            state = self._structural_rj_device_state
+            if state is None:
+                raise RuntimeError("Authoritative RJ device state is missing.")
+            for name in tuple(state):
+                if name.startswith("cache_"):
+                    del state[name]
+            diagnostics = self.last_structural_device_diagnostics
+            diagnostics["deferred_clear_calls"] = int(
+                diagnostics.get("deferred_clear_calls", 0)
+            ) + 1
+            return
         self._structural_rj_device_state = None
 
     def _continuous_rj_mh_acceptance_mask(
@@ -945,16 +2128,129 @@ class StructuralRJTargetMixin:
             diagnostics["state_scatter_rows"] = (
                 int(diagnostics.get("state_scatter_rows", 0)) + row_count
             )
+            self._structural_rj_device_state_dirty = True
         # All numerical proposal and acceptance work is batched. This loop only
         # commits variable-length state objects for the accepted particle rows.
-        for row in accepted_rows.tolist():
-            self.continuous_particles[int(indices[row])].state = IsotopeState(
-                num_sources=cardinality,
-                surface_chart_ids=charts[row],
-                surface_uv=uv[row],
-                strengths=q[row],
-            )
+        if not bool(self._structural_rj_device_state_authoritative):
+            for row in accepted_rows.tolist():
+                self.continuous_particles[int(indices[row])].state = IsotopeState(
+                    num_sources=cardinality,
+                    surface_chart_ids=charts[row],
+                    surface_uv=uv[row],
+                    strengths=q[row],
+                )
         return int(accepted_rows.size)
+
+    def _commit_continuous_rj_state_tensors(
+        self,
+        particle_indices: object,
+        accepted: object,
+        chart_ids: object,
+        surface_uv: object,
+        positions: object,
+        strengths: object,
+    ) -> int:
+        """Commit accepted fixed-cardinality candidate rows directly on CUDA."""
+        import torch
+
+        state = self._structural_rj_device_state
+        if state is None or not self._continuous_rj_torch_enabled():
+            raise RuntimeError("CUDA RJ commit requires authoritative device state.")
+        if not all(
+            torch.is_tensor(value)
+            for value in (
+                particle_indices,
+                accepted,
+                chart_ids,
+                surface_uv,
+                positions,
+                strengths,
+            )
+        ):
+            raise TypeError("CUDA RJ commit values must all be Torch tensors.")
+        indices = particle_indices.reshape(-1)
+        acceptance = accepted.to(dtype=torch.bool).reshape(-1)
+        charts, uv, xyz, q = self._continuous_rj_canonicalize_tensors(
+            chart_ids,
+            surface_uv,
+            positions,
+            strengths,
+        )
+        if int(acceptance.numel()) != int(indices.numel()) or int(
+            charts.shape[0]
+        ) != int(indices.numel()):
+            raise ValueError("CUDA RJ commit arrays must share particle rows.")
+        accepted_rows = torch.nonzero(acceptance, as_tuple=False).reshape(-1)
+        accepted_count = int(accepted_rows.numel())
+        if accepted_count == 0:
+            return 0
+        accepted_indices = indices[accepted_rows]
+        cardinality = int(charts.shape[1])
+        maximum = int(self.config.hard_max_sources or 0)
+        if cardinality > maximum:
+            raise ValueError("CUDA RJ candidate exceeds fixed source capacity.")
+        row_count = accepted_count
+        device = state["strengths"].device
+        dtype = state["strengths"].dtype
+        padded_positions = torch.zeros(
+            (row_count, maximum, 3),
+            device=device,
+            dtype=dtype,
+        )
+        padded_strengths = torch.zeros(
+            (row_count, maximum),
+            device=device,
+            dtype=dtype,
+        )
+        padded_mask = torch.zeros(
+            (row_count, maximum),
+            device=device,
+            dtype=torch.bool,
+        )
+        padded_charts = torch.zeros(
+            (row_count, maximum),
+            device=device,
+            dtype=torch.long,
+        )
+        padded_uv = torch.zeros(
+            (row_count, maximum, 2),
+            device=device,
+            dtype=dtype,
+        )
+        if cardinality:
+            padded_positions[:, :cardinality] = xyz[accepted_rows]
+            padded_strengths[:, :cardinality] = q[accepted_rows]
+            padded_mask[:, :cardinality] = True
+            padded_charts[:, :cardinality] = charts[accepted_rows]
+            padded_uv[:, :cardinality] = uv[accepted_rows]
+        for name, values in (
+            ("positions", padded_positions),
+            ("strengths", padded_strengths),
+            ("mask", padded_mask),
+            ("chart_ids", padded_charts),
+            ("surface_uv", padded_uv),
+        ):
+            state[name].index_copy_(0, accepted_indices, values)
+        state["cardinalities"].index_fill_(
+            0,
+            accepted_indices,
+            cardinality,
+        )
+        center_cache = self._structural_rj_current_block_strength_centers
+        cardinality_cache = self._structural_rj_current_block_strength_cardinalities
+        if center_cache is not None and cardinality_cache is not None:
+            changed = accepted_indices.detach().cpu().numpy()
+            center_cache[changed] = float("nan")
+            cardinality_cache[changed] = -1
+        diagnostics = self.last_structural_device_diagnostics
+        diagnostics["state_scatter_calls"] = int(
+            diagnostics.get("state_scatter_calls", 0)
+        ) + 1
+        diagnostics["state_scatter_rows"] = int(
+            diagnostics.get("state_scatter_rows", 0)
+        ) + row_count
+        self._structural_rj_device_state_dirty = True
+        return accepted_count
 
     def _continuous_rj_transition_mass(
         self,
@@ -980,11 +2276,214 @@ class StructuralRJTargetMixin:
         self.last_structural_transition_weight_mass[key] = (
             float(self.last_structural_transition_weight_mass.get(key, 0.0)) + mass
         )
+        if name in {
+            "birth_accepted",
+            "global_position_accepted",
+            "block_accepted",
+        }:
+            marker = np.asarray(
+                self.last_structural_full_support_accepted_mask,
+                dtype=np.bool_,
+            ).reshape(-1)
+            if marker.shape != weights.shape:
+                raise RuntimeError(
+                    "Full-support acceptance markers do not match PF rows."
+                )
+            marker[selected] = True
+            self.last_structural_full_support_accepted_mask = marker
+
+    def _continuous_rj_transition_mass_torch(
+        self,
+        name: str,
+        particle_indices: object,
+        accepted: object | None = None,
+    ) -> None:
+        """Accumulate transition mass after one compact device-to-host copy."""
+        import torch
+
+        if not torch.is_tensor(particle_indices):
+            raise TypeError("CUDA transition indices must be a Torch tensor.")
+        indices = particle_indices.detach().cpu().numpy().astype(
+            np.int64,
+            copy=False,
+        )
+        acceptance = None
+        if accepted is not None:
+            if not torch.is_tensor(accepted):
+                raise TypeError("CUDA transition acceptance must be a tensor.")
+            acceptance = accepted.detach().cpu().numpy().astype(
+                np.bool_,
+                copy=False,
+            )
+        self._continuous_rj_transition_mass(
+            name,
+            indices,
+            acceptance,
+        )
+
+    def _record_structural_mh_components_torch(
+        self,
+        move: str,
+        *,
+        particle_indices: object,
+        delta_log_likelihood: object,
+        delta_log_prior: object,
+        log_reverse_minus_forward: object,
+        log_jacobian: object,
+        support_feasible: object,
+        accepted: object,
+        current_cardinality: object = -1,
+        proposed_cardinality: object = -1,
+        geometry_support_feasible: object | None = None,
+        strength_support_feasible: object | None = None,
+        log_acceptance_ratio: object | None = None,
+        likelihood_exact: object | None = None,
+    ) -> None:
+        """Transfer one fused diagnostic matrix after a CUDA MH decision.
+
+        ``likelihood_exact`` distinguishes fully evaluated proposals from
+        certified early rejections. For an early rejection the supplied ratio
+        is the rigorous unresolved-history upper bound, not an exact ratio.
+        """
+        import torch
+
+        if not torch.is_tensor(delta_log_likelihood):
+            raise TypeError("CUDA MH diagnostics require tensor likelihoods.")
+        reference = delta_log_likelihood.reshape(-1)
+        row_count = int(reference.numel())
+
+        def _column(value: object, *, dtype: object) -> object:
+            """Broadcast one diagnostic value on the reference device."""
+            tensor = torch.as_tensor(
+                value,
+                device=reference.device,
+                dtype=dtype,
+            ).reshape(-1)
+            if int(tensor.numel()) == 1 and row_count != 1:
+                tensor = tensor.expand(row_count)
+            if int(tensor.numel()) != row_count:
+                raise ValueError("CUDA MH diagnostic columns must align.")
+            return tensor
+
+        geometry = (
+            support_feasible
+            if geometry_support_feasible is None
+            else geometry_support_feasible
+        )
+        strength = (
+            support_feasible
+            if strength_support_feasible is None
+            else strength_support_feasible
+        )
+        exact = True if likelihood_exact is None else likelihood_exact
+        ratio = (
+            reference
+            + _column(delta_log_prior, dtype=reference.dtype)
+            + _column(log_reverse_minus_forward, dtype=reference.dtype)
+            + _column(log_jacobian, dtype=reference.dtype)
+            if log_acceptance_ratio is None
+            else _column(log_acceptance_ratio, dtype=reference.dtype)
+        )
+        matrix = torch.stack(
+            (
+                _column(particle_indices, dtype=reference.dtype),
+                reference,
+                _column(delta_log_prior, dtype=reference.dtype),
+                _column(log_reverse_minus_forward, dtype=reference.dtype),
+                _column(log_jacobian, dtype=reference.dtype),
+                _column(support_feasible, dtype=reference.dtype),
+                _column(accepted, dtype=reference.dtype),
+                _column(current_cardinality, dtype=reference.dtype),
+                _column(proposed_cardinality, dtype=reference.dtype),
+                _column(geometry, dtype=reference.dtype),
+                _column(strength, dtype=reference.dtype),
+                ratio,
+                _column(exact, dtype=reference.dtype),
+            ),
+            dim=1,
+        ).detach().cpu().numpy()
+        self._record_structural_mh_components(
+            move,
+            particle_indices=matrix[:, 0].astype(np.int64),
+            delta_log_likelihood=matrix[:, 1],
+            delta_log_prior=matrix[:, 2],
+            log_reverse_minus_forward=matrix[:, 3],
+            log_jacobian=matrix[:, 4],
+            support_feasible=matrix[:, 5].astype(np.bool_),
+            accepted=matrix[:, 6].astype(np.bool_),
+            current_cardinality=matrix[:, 7].astype(np.int64),
+            proposed_cardinality=matrix[:, 8].astype(np.int64),
+            geometry_support_feasible=matrix[:, 9].astype(np.bool_),
+            strength_support_feasible=matrix[:, 10].astype(np.bool_),
+            log_acceptance_ratio=matrix[:, 11],
+            likelihood_exact=matrix[:, 12].astype(np.bool_),
+        )
+
+    def _record_source_events_torch(
+        self,
+        event: str,
+        *,
+        positions: object,
+        strengths: object,
+        source_columns: object,
+        accepted: object,
+        reason: str,
+        extras: dict[str, object] | None = None,
+    ) -> None:
+        """Record accepted source events from CUDA values, not Python particles."""
+        import torch
+
+        if not all(
+            torch.is_tensor(value)
+            for value in (positions, strengths, source_columns, accepted)
+        ):
+            raise TypeError("CUDA source-event values must be tensors.")
+        accepted_rows = torch.nonzero(accepted, as_tuple=False).reshape(-1)
+        if int(accepted_rows.numel()) == 0:
+            return
+        columns = source_columns[accepted_rows].to(torch.long)
+        selected_positions = positions[accepted_rows, columns]
+        selected_strengths = strengths[accepted_rows, columns]
+        payload = torch.cat(
+            (
+                columns[:, None].to(dtype=selected_positions.dtype),
+                selected_positions,
+                selected_strengths[:, None],
+            ),
+            dim=1,
+        ).detach().cpu().numpy()
+        extra_payload: dict[str, object] = {}
+        for name, value in (extras or {}).items():
+            if torch.is_tensor(value):
+                extra_payload[name] = value[accepted_rows].detach().cpu().numpy()
+            else:
+                extra_payload[name] = value
+        for row, values in enumerate(payload):
+            record: dict[str, object] = {
+                "event": str(event),
+                "isotope": str(self.isotope),
+                "reason": str(reason),
+                "source_index": int(values[0]),
+                "position": [float(value) for value in values[1:4]],
+                "strength": float(values[4]),
+            }
+            for name, value in extra_payload.items():
+                if isinstance(value, np.ndarray):
+                    selected = value[row]
+                    record[name] = (
+                        selected.tolist()
+                        if np.asarray(selected).ndim
+                        else np.asarray(selected).item()
+                    )
+                else:
+                    record[name] = value
+            self.last_source_event_diagnostics.append(record)
 
     def _record_structural_mh_components(
         self,
         move: str,
         *,
+        particle_indices: NDArray[np.int64],
         delta_log_likelihood: NDArray[np.float64],
         delta_log_prior: NDArray[np.float64],
         log_reverse_minus_forward: NDArray[np.float64],
@@ -996,8 +2495,9 @@ class StructuralRJTargetMixin:
         geometry_support_feasible: NDArray[np.bool_] | bool | None = None,
         strength_support_feasible: NDArray[np.bool_] | bool | None = None,
         log_acceptance_ratio: NDArray[np.float64] | None = None,
+        likelihood_exact: NDArray[np.bool_] | bool = True,
     ) -> None:
-        """Accumulate batched exact-MH terms for rejection diagnosis."""
+        """Accumulate batched MH terms and their exactness for diagnosis."""
         likelihood = np.asarray(
             delta_log_likelihood,
             dtype=np.float64,
@@ -1071,6 +2571,11 @@ class StructuralRJTargetMixin:
                 dtype=np.bool_,
                 name="accepted",
             ),
+            "likelihood_exact": _broadcast(
+                likelihood_exact,
+                dtype=np.bool_,
+                name="likelihood_exact",
+            ),
             "current_cardinality": _broadcast(
                 current_cardinality,
                 dtype=np.int64,
@@ -1085,6 +2590,53 @@ class StructuralRJTargetMixin:
         lengths = {int(value.size) for value in arrays.values()}
         if len(lengths) != 1:
             raise ValueError("Structural MH diagnostic arrays must align.")
+        indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        if indices.size != row_count:
+            raise ValueError(
+                "Structural MH particle_indices must align with proposal rows."
+            )
+        particle_count = len(self.continuous_particles)
+        if np.any(indices < 0) or np.any(indices >= particle_count):
+            raise ValueError("Structural MH particle_indices are out of range.")
+        ordinary_maximum = int(self.config.max_sources or 0)
+        current = np.asarray(arrays["current_cardinality"], dtype=np.int64)
+        proposed = np.asarray(arrays["proposed_cardinality"], dtype=np.int64)
+        inward_attempted = (
+            (current >= ordinary_maximum)
+            & (proposed >= 0)
+            & (proposed < current)
+        )
+        inward_supported = inward_attempted & np.asarray(
+            arrays["support_feasible"],
+            dtype=np.bool_,
+        )
+        inward_finite = inward_supported & np.isfinite(
+            np.asarray(arrays["log_acceptance_ratio"], dtype=np.float64)
+        )
+        inward_accepted = inward_supported & np.asarray(
+            arrays["accepted"],
+            dtype=np.bool_,
+        )
+        self._continuous_rj_transition_mass(
+            "ordinary_boundary_inward_attempted",
+            indices,
+            inward_attempted,
+        )
+        self._continuous_rj_transition_mass(
+            "ordinary_boundary_inward_supported",
+            indices,
+            inward_supported,
+        )
+        self._continuous_rj_transition_mass(
+            "ordinary_boundary_inward_finite",
+            indices,
+            inward_finite,
+        )
+        self._continuous_rj_transition_mass(
+            "ordinary_boundary_inward_accepted",
+            indices,
+            inward_accepted,
+        )
         self._structural_mh_component_samples.setdefault(str(move), []).append(arrays)
 
     def _summarize_structural_mh_components(self) -> dict[str, object]:
@@ -1125,6 +2677,13 @@ class StructuralRJTargetMixin:
                     combined["accepted"],
                     dtype=bool,
                 )[mask]
+                likelihood_exact = np.asarray(
+                    combined.get(
+                        "likelihood_exact",
+                        np.ones_like(combined["accepted"], dtype=np.bool_),
+                    ),
+                    dtype=bool,
+                )[mask]
                 finite_all = feasible.copy()
                 quantiles: dict[str, dict[str, float | int] | None] = {}
                 for name in numeric_names:
@@ -1155,6 +2714,12 @@ class StructuralRJTargetMixin:
                 return {
                     "attempted": int(feasible.size),
                     "accepted": int(np.count_nonzero(accepted)),
+                    "likelihood_exact": int(
+                        np.count_nonzero(likelihood_exact)
+                    ),
+                    "tpht_certified_early_rejected": int(
+                        np.count_nonzero(feasible & ~likelihood_exact)
+                    ),
                     "support_rejected": int(np.count_nonzero(~feasible)),
                     "geometry_support_rejected": int(np.count_nonzero(~geometry)),
                     "strength_support_rejected": int(
@@ -1165,7 +2730,12 @@ class StructuralRJTargetMixin:
                     ),
                     "nonfinite_rejected": int(np.count_nonzero(feasible & ~finite_all)),
                     "mh_random_rejected": int(
-                        np.count_nonzero(feasible & finite_all & ~accepted)
+                        np.count_nonzero(
+                            feasible
+                            & finite_all
+                            & likelihood_exact
+                            & ~accepted
+                        )
                     ),
                     "component_quantiles": quantiles,
                 }

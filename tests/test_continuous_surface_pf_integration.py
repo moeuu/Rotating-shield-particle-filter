@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import math
 
 import numpy as np
@@ -15,9 +16,83 @@ from pf.particle_filter import (
     IsotopeParticleFilter,
     StructuralGeometryBatch,
 )
-from pf.particle_filter_math import extended_log_target_ratio
+from pf.particle_filter_math import (
+    extended_log_target_ratio,
+    extended_log_target_ratio_torch,
+)
 from pf.state import IsotopeState
 from pf.strength_prior import BoundedUniformStrengthPriorTestConfig
+from pf.strength_prior import StrengthPrior
+
+
+def _install_response_proposal_oracles(filt: IsotopeParticleFilter) -> None:
+    """Install deterministic physics-neutral proposal oracles for kernel tests."""
+
+    def _integrated_response(
+        data: StructuralGeometryBatch,
+        positions: np.ndarray,
+        chart_ids: np.ndarray,
+    ) -> np.ndarray:
+        """Return equal unit response so coupled strength remains unchanged."""
+        del data, chart_ids
+        return np.ones(np.asarray(positions).reshape(-1, 3).shape[0])
+
+    def _response_signatures(
+        data: StructuralGeometryBatch,
+        *,
+        chart_ids: np.ndarray,
+        positions: np.ndarray,
+    ) -> np.ndarray:
+        """Return equal normalized signatures for response-aware selectors."""
+        del positions
+        charts = np.asarray(chart_ids, dtype=np.int64)
+        value = 1.0 / math.sqrt(float(data.row_count))
+        return np.full(charts.shape + (data.row_count,), value, dtype=np.float64)
+
+    filt._continuous_rj_integrated_unit_response = _integrated_response
+    filt._continuous_rj_source_response_signatures = _response_signatures
+
+
+def _install_torch_response_proposal_oracles(
+    filt: IsotopeParticleFilter,
+) -> None:
+    """Install deterministic CUDA proposal responses for structural tests."""
+    torch = pytest.importorskip("torch")
+
+    def _integrated_response(
+        data: StructuralGeometryBatch,
+        positions: object,
+        chart_ids: object,
+    ) -> object:
+        """Return equal device responses for every proposed source."""
+        del data, chart_ids
+        if not torch.is_tensor(positions):
+            raise TypeError("Torch response oracle requires tensor positions.")
+        return torch.ones(
+            int(positions.reshape(-1, 3).shape[0]),
+            device=positions.device,
+            dtype=positions.dtype,
+        )
+
+    def _response_signatures(
+        data: StructuralGeometryBatch,
+        *,
+        chart_ids: object,
+        positions: object,
+    ) -> object:
+        """Return equal normalized device response signatures."""
+        del positions
+        if not torch.is_tensor(chart_ids):
+            raise TypeError("Torch signature oracle requires tensor charts.")
+        return torch.full(
+            tuple(chart_ids.shape) + (int(data.row_count),),
+            1.0 / math.sqrt(float(data.row_count)),
+            device=chart_ids.device,
+            dtype=torch.float64,
+        )
+
+    filt._continuous_rj_integrated_unit_response_torch = _integrated_response
+    filt._continuous_rj_source_response_signatures_torch = _response_signatures
 
 
 def _fixed_one_source_filter() -> IsotopeParticleFilter:
@@ -62,6 +137,7 @@ def _fixed_one_source_filter() -> IsotopeParticleFilter:
             False,
         )
     )
+    _install_response_proposal_oracles(filt)
     return filt
 
 
@@ -150,6 +226,7 @@ def _split_merge_filter(
             False,
         )
     )
+    _install_response_proposal_oracles(filt)
     return filt
 
 
@@ -444,6 +521,60 @@ def test_torch_mh_and_fixed_capacity_state_scatter_match_numpy(
     assert diagnostics["mh_acceptance_calls"] == 1
     assert diagnostics["state_scatter_rows"] == int(np.count_nonzero(accepted))
 
+
+def test_cuda_station_state_reindexes_and_materializes_only_at_boundary() -> None:
+    """CUDA state must remain authoritative through moves and resampling."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    filt = _split_merge_filter(cardinality=1)
+    rows = np.arange(len(filt.continuous_particles), dtype=np.int64)
+    charts, uv, positions, strengths = filt._continuous_rj_group_arrays(rows, 1)
+    python_strengths_before = np.asarray(
+        [particle.state.strengths[0] for particle in filt.continuous_particles],
+        dtype=np.float64,
+    )
+    reference = torch.zeros(1, device="cuda", dtype=torch.float64)
+    assert filt._begin_continuous_rj_station_device_state(reference)
+
+    accepted = (rows % 2) == 0
+    proposed_strengths = strengths.copy()
+    proposed_strengths[accepted, 0] += 0.25
+    filt._commit_continuous_rj_states(
+        rows,
+        accepted,
+        charts,
+        uv,
+        positions,
+        proposed_strengths,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(
+            [particle.state.strengths[0] for particle in filt.continuous_particles]
+        ),
+        python_strengths_before,
+    )
+    expected = strengths.copy()
+    expected[accepted] = proposed_strengths[accepted]
+    ancestors = np.arange(rows.size - 1, -1, -1, dtype=np.int64)
+    filt._reindex_continuous_rj_device_state(ancestors)
+    filt._clear_continuous_rj_device_state()
+    assert filt._structural_rj_device_state is not None
+
+    filt._end_continuous_rj_station_device_state()
+
+    np.testing.assert_array_equal(
+        np.asarray(
+            [particle.state.strengths[0] for particle in filt.continuous_particles]
+        ),
+        expected[ancestors, 0],
+    )
+    assert filt._structural_rj_device_state is None
+    diagnostics = filt.last_structural_device_diagnostics
+    assert diagnostics["resample_reindex_calls"] == 1
+    assert diagnostics["deferred_clear_calls"] == 1
+    assert diagnostics["materialization_calls"] == 1
+
 def test_split_merge_skips_cardinality_with_no_reversible_direction() -> None:
     """K=Kmax=1 has neither split nor merge and must be a self-transition."""
     filt = _fixed_one_source_filter()
@@ -500,6 +631,11 @@ def test_block_independence_crosses_multiple_cardinalities_exactly() -> None:
     )
     assert filt._structural_rj_move_counts["block_attempted"] == 12
     assert filt._structural_rj_move_counts["block_accepted"] == 12
+    assert int(
+        np.count_nonzero(
+            filt.last_structural_full_support_accepted_mask,
+        )
+    ) == accepted
 
 
 def test_block_density_uses_canonical_unordered_state_measure() -> None:
@@ -697,6 +833,13 @@ def test_global_kernel_jointly_moves_position_and_strength() -> None:
     assert accepted == len(filt.continuous_particles)
     assert np.all(after_strengths != before_strengths)
     assert after_coordinates != before_coordinates
+    assert filt.last_structural_transition_weight_mass[
+        "global_position_attempted_weight_mass"
+    ] == pytest.approx(1.0)
+    assert filt.last_structural_transition_weight_mass[
+        "global_position_accepted_weight_mass"
+    ] == pytest.approx(1.0)
+    assert np.all(filt.last_structural_full_support_accepted_mask)
 
 
 def test_transient_xyz_cannot_override_authoritative_chart_coordinates() -> None:
@@ -795,6 +938,7 @@ def test_rj_likelihood_evaluates_air_side_transport_position(
             tau_obstacle=zeros,
             tau_obstacle_compton=zeros,
             distance_m=ones,
+            uncollided_impact_fractions=np.empty(shape + (0,), dtype=np.float64),
         )
 
     monkeypatch.setattr(
@@ -867,6 +1011,10 @@ def test_rj_gpu_components_deduplicate_pose_and_select_all_pairs(
             tau_obstacle=values + 500.0,
             tau_obstacle_compton=values + 600.0,
             distance_m=values + 700.0,
+            uncollided_impact_fractions=np.empty(
+                shape + (0,),
+                dtype=np.float64,
+            ),
         )
 
     monkeypatch.setattr(filt, "_can_use_gpu", lambda: True)
@@ -909,6 +1057,7 @@ def test_multi_merge_group_selection_uses_physical_response_columns(
 ) -> None:
     """Response-equivalent components must outrank a distant spectral shape."""
     filt = _split_merge_filter(cardinality=4, max_sources=5)
+    del filt._continuous_rj_source_response_signatures
     filt.config.structural_rj_merge_distance_sigma_m = 1.0e9
     filt.config.structural_rj_merge_response_sigma = 0.05
     filt.config.structural_rj_merge_uniform_pair_probability = 0.1
@@ -953,6 +1102,10 @@ def test_multi_merge_group_selection_uses_physical_response_columns(
             tau_obstacle=zeros,
             tau_obstacle_compton=zeros,
             distance_m=ones,
+            uncollided_impact_fractions=np.empty(
+                total.shape + (0,),
+                dtype=np.float64,
+            ),
         )
 
     monkeypatch.setattr(
@@ -1010,3 +1163,224 @@ def test_multi_component_direction_support_respects_cardinality_boundaries(
     assert merge_sizes == (3, 4)
     assert split_probability == 0.0
     assert merge_probability == 1.0
+
+
+@pytest.mark.parametrize("device_name", ("cpu", "cuda"))
+def test_extended_target_ratio_torch_matches_numpy(device_name: str) -> None:
+    """Torch extended-real target arithmetic must equal the NumPy oracle."""
+    torch = pytest.importorskip("torch")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    proposed = np.asarray(
+        [3.0, -2.0, -np.inf, 4.0, -np.inf],
+        dtype=np.float64,
+    )
+    current = np.asarray(
+        [1.0, -np.inf, 5.0, 4.0, -np.inf],
+        dtype=np.float64,
+    )
+    expected = extended_log_target_ratio(proposed, current)
+
+    actual = extended_log_target_ratio_torch(
+        torch.tensor(proposed, device=device_name, dtype=torch.float64),
+        torch.tensor(current, device=device_name, dtype=torch.float64),
+    )
+
+    np.testing.assert_array_equal(actual.detach().cpu().numpy(), expected)
+
+
+@pytest.mark.parametrize("device_name", ("cpu", "cuda"))
+def test_shifted_gamma_log_prior_torch_matches_numpy(device_name: str) -> None:
+    """Production shifted-gamma density must use the exact Torch formula."""
+    torch = pytest.importorskip("torch")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    filt = _split_merge_filter(cardinality=3, max_sources=4)
+    filt._strength_prior = StrengthPrior(
+        minimum=1.0,
+        maximum=25.0,
+        family="shifted_gamma",
+        gamma_shape=2.5,
+        gamma_scale=3.0,
+    )
+    values = np.asarray(
+        [[1.0, 1.25, 4.0], [2.0, 7.0, 31.0]],
+        dtype=np.float64,
+    )
+    expected = np.asarray(filt._strength_prior.log_prob(values))
+
+    actual = filt._continuous_rj_strength_log_prior_torch(
+        torch.tensor(values, device=device_name, dtype=torch.float64)
+    )
+
+    np.testing.assert_allclose(
+        actual.detach().cpu().numpy(),
+        expected,
+        rtol=2.0e-13,
+        atol=2.0e-13,
+    )
+
+
+def test_cuda_structural_sweep_keeps_all_moves_device_resident() -> None:
+    """All production structural moves must avoid station-internal materialization."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    filt = _split_merge_filter(cardinality=3, max_sources=4)
+    filt.config = replace(
+        filt.config,
+        structural_rj_multi_component_probability=1.0,
+        structural_rj_block_independence_probability=1.0,
+    )
+
+    def _target(*, positions_pks: object, **_: object) -> object:
+        """Return a neutral target on the candidate input backend."""
+        if torch.is_tensor(positions_pks):
+            return torch.zeros(
+                int(positions_pks.shape[0]),
+                device=positions_pks.device,
+                dtype=positions_pks.dtype,
+            )
+        return np.zeros(
+            int(np.asarray(positions_pks).shape[0]),
+            dtype=np.float64,
+        )
+
+    filt.set_joint_target_evaluator(_target)
+    _install_torch_response_proposal_oracles(filt)
+    python_state_ids = tuple(
+        id(particle.state) for particle in filt.continuous_particles
+    )
+    reference = torch.zeros(1, device="cuda", dtype=torch.float64)
+    assert filt._begin_continuous_rj_station_device_state(reference)
+
+    filt.apply_structural_moves(
+        _one_row_geometry(),
+        current_target_log_likelihood=torch.zeros(
+            filt.N,
+            device="cuda",
+            dtype=torch.float64,
+        ),
+    )
+
+    diagnostics = filt.last_structural_device_diagnostics
+    assert diagnostics["proposal_backend"] == "torch"
+    assert diagnostics["materialization_calls"] == 0
+    assert diagnostics["group_gather_calls"] == 0
+    assert filt.last_structural_target_log_likelihood is None
+    assert filt.last_structural_target_log_likelihood_device is not None
+    assert filt.last_structural_target_log_likelihood_device.is_cuda
+    assert tuple(id(particle.state) for particle in filt.continuous_particles) == (
+        python_state_ids
+    )
+    assert filt.last_structural_timing_s["rj_block_attempted"] == filt.N
+    assert (
+        filt.last_structural_timing_s["rj_multi_split_attempted"]
+        + filt.last_structural_timing_s["rj_multi_merge_attempted"]
+        > 0
+    )
+
+    filt._end_continuous_rj_station_device_state()
+
+    assert diagnostics["materialization_calls"] == 1
+    assert filt.last_structural_target_log_likelihood is not None
+    assert filt.last_structural_target_log_likelihood_device is None
+
+
+def test_cuda_response_aware_selectors_match_numpy_oracles() -> None:
+    """CUDA pair/group probabilities and priors must equal NumPy formulas."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    filt = _split_merge_filter(cardinality=3, max_sources=4)
+    _install_torch_response_proposal_oracles(filt)
+    geometry = _one_row_geometry()
+    reference = torch.zeros(1, device="cuda", dtype=torch.float64)
+    assert filt._begin_continuous_rj_station_device_state(reference)
+    filt._structural_rj_torch_generator = torch.Generator(device="cuda")
+    filt._structural_rj_torch_generator.manual_seed(40_917)
+    filt._structural_rj_position_proposal = (
+        filt._build_continuous_rj_position_proposal(
+            geometry,
+            target_beta=1.0,
+        )
+    )
+    indices = torch.arange(filt.N, device="cuda", dtype=torch.long)
+    _, charts, uv, positions, strengths = filt._continuous_rj_group_tensors(
+        indices,
+        3,
+    )
+    charts_np = charts.detach().cpu().numpy()
+    uv_np = uv.detach().cpu().numpy()
+    positions_np = positions.detach().cpu().numpy()
+    strengths_np = strengths.detach().cpu().numpy()
+
+    expected_pair = filt._continuous_rj_ordered_pair_probabilities(
+        geometry,
+        charts_np,
+        uv_np,
+        positions_np,
+        strengths_np,
+    )
+    actual_pair = filt._continuous_rj_ordered_pair_probabilities_torch(
+        geometry,
+        charts,
+        uv,
+        positions,
+        strengths,
+    )
+    expected_group = filt._continuous_rj_multi_group_probabilities(
+        geometry,
+        charts_np,
+        uv_np,
+        positions_np,
+        group_size=3,
+    )
+    actual_group = filt._continuous_rj_multi_group_probabilities_torch(
+        geometry,
+        charts,
+        uv,
+        positions,
+        group_size=3,
+    )
+    expected_prior = filt._continuous_rj_block_log_densities(
+        charts_np,
+        strengths_np,
+    )[0]
+    actual_prior = filt._continuous_rj_block_log_prior_torch(
+        charts,
+        strengths,
+    )
+
+    np.testing.assert_array_equal(
+        actual_pair[0].detach().cpu().numpy(),
+        expected_pair[0],
+    )
+    np.testing.assert_array_equal(
+        actual_pair[1].detach().cpu().numpy(),
+        expected_pair[1],
+    )
+    np.testing.assert_allclose(
+        actual_pair[2].detach().cpu().numpy(),
+        expected_pair[2],
+        rtol=2.0e-12,
+        atol=2.0e-14,
+    )
+    np.testing.assert_array_equal(
+        actual_group[0].detach().cpu().numpy(),
+        expected_group[0],
+    )
+    np.testing.assert_allclose(
+        actual_group[1].detach().cpu().numpy(),
+        expected_group[1],
+        rtol=2.0e-12,
+        atol=2.0e-14,
+    )
+    np.testing.assert_allclose(
+        actual_prior.detach().cpu().numpy(),
+        expected_prior,
+        rtol=2.0e-12,
+        atol=2.0e-12,
+    )
+    filt._structural_rj_torch_generator = None
+    filt._end_continuous_rj_station_device_state()

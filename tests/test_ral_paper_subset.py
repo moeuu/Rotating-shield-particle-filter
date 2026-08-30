@@ -93,6 +93,7 @@ def _manifest_row(
             f"uv run --directory {root} python -m "
             f"baselines.ral_ablation.session_runner "
             f"--runtime-root {runtime_root} --scenario {scenario} "
+            f"--truth-manifest {truth_manifest} "
             f"--pf-config {pf_config} --control-policy {control_policy} "
             f"--expected-control-policy-sha256 {'a' * 64} "
             f"--pf-output-dir {pf_output} --pf-seed {TEST_PF_SEED}"

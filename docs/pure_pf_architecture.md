@@ -72,10 +72,12 @@ continuous physical response kernel. Missing or inconsistent chart
 coordinates fail instead of being reconstructed or projected.
 
 Birth and global-position proposals include chart mass and continuous UV
-density. Local moves draw a symmetric physical tangent displacement and unfold
-it across valid shared-edge portals; the coordinate-area ratio is included in
-the MH proposal ratio. All target responses are evaluated at continuous XYZ,
-without patch-center interpolation.
+density. Local moves uniformly select one predeclared 3 cm, 15 cm, or 50 cm
+physical tangent scale and unfold the displacement across valid shared-edge
+portals. They jointly map source strength to preserve the source's integrated
+all-history response, including the coordinate-area ratio and strength-map
+Jacobian in the exact MH ratio. All target responses are evaluated at
+continuous XYZ, without patch-center interpolation.
 
 ## Joint SMC and exact structural moves
 
@@ -92,13 +94,16 @@ diagnostic run. Finite strength grids are proposal design points only and never
 truncate the PF state space.
 
 Same-isotope pair and multi-component split/merge kernels remain reversible.
-Multi-merge anchor selection mixes frozen data-informed evidence with a positive
-uniform component, and the complete normalized selector is included in the RJ
-ratio.  A separate all-isotope strength block changes every active strength in
-one batched likelihood evaluation.  It imposes no conservation law between
-isotopes: simultaneous increases and decreases are merely proposals judged by
-the shared mixed-spectrum posterior. The retired scalar isotope-identity
-transfer kernel is not present in the production package.
+Pair merge selection favors a near-floor donor and a receiver with similar
+all-history line response as well as short intrinsic surface distance.
+Multi-merge anchor selection mixes frozen data-informed evidence with a
+positive uniform component. Every complete normalized selector is included in
+the RJ ratio, so distant or strong donors retain positive support. A separate
+all-isotope strength block changes every active strength in one batched
+likelihood evaluation. It imposes no conservation law between isotopes:
+simultaneous increases and decreases are merely proposals judged by the shared
+mixed-spectrum posterior. The retired scalar isotope-identity transfer kernel
+is not present in the production package.
 
 The standard cardinality policy is
 `independent_poisson_with_thin_geometric_capacity_tail_v1`: independently for
@@ -113,12 +118,23 @@ checked against PF support before any external Geant4 process starts. The
 policy remains subject to the designated independent holdout acceptance gate;
 a failed holdout does not authorize retuning it on that holdout.
 
-Each station is tempered to `beta = 1`. If a partial likelihood would cross the
-target ESS, the PF applies only the admissible increment, resamples all isotope
-states with one ancestor vector, and rejuvenates at the current intermediate
-target before continuing. Reaching a temper-step safety bound before
-`beta = 1`, or finishing below the ESS contract, is an error rather than a
-forced likelihood application.
+Each complete station joint likelihood is tempered from `beta = 0` to
+`beta = 1` through one bridge. Views are never assimilated as ordered prefixes
+and cannot trigger intermediate view-order-dependent resampling. If a beta
+increment would cross the target ESS, the PF applies only the admissible
+increment, resamples all isotope states with one ancestor vector, and
+rejuvenates at the current intermediate target before continuing. Reaching a
+temper-step safety bound before `beta = 1`, or finishing below the ESS contract,
+is an error rather than a forced likelihood application.
+
+Exact-RJ history evaluation uses the fixed-capacity, source-resolved CUDA cache
+described in [Fixed-horizon exact transport cache](joint_exact_transport_cache.md).
+It replaces changed isotope slot blocks without copying unchanged history and
+uses the [Transition-Preserving History Tree](transition_preserving_history_tree.md)
+to test the actual latest-station factor first and progressively evaluate exact
+dyadic child blocks for surviving proposals. The full acquired history remains
+the posterior target; no station represents another station, and no spectrum is
+weighted, averaged, or discarded.
 
 Within each intermediate target, conditional isotope moves evaluate the full
 joint spectrum with all other isotope states held fixed. The reversible-jump
@@ -159,7 +175,24 @@ surviving station-start ancestors, and attempted/accepted posterior weight mass
 for every structural move. Rejections also retain quantiles of the likelihood,
 prior, reverse-minus-forward proposal, Jacobian, support, nonfinite, and MH
 random terms. Counts of unweighted moved particles are retained only as
-secondary diagnostics.
+secondary diagnostics. Structural mixing is gated independently per isotope;
+motion in Co-60 cannot satisfy a stalled Cs-137 boundary transition. Hard-cap
+saturation and unavailable diversity evidence abort the live lifecycle instead
+of being published only as warnings. A cumulative-lineage collapse starts one
+persistent recovery epoch. Exact full-support moves certify only rows whose
+isotope state actually changed, and those certificates follow the same batched
+ancestor vector through later resampling. Planning may resume only while every
+isotope retains the configured certified posterior-weight mass and the joint
+state population meets the ESS-derived distinct-state floor. The PF does not
+require an unrelated fresh global acceptance at every later station; loss or
+malformed provenance still fails closed.
+
+Accepted birth moves count as full-support recovery evidence because their
+position and strength proposal retains a positive physical-prior component over
+the complete configured support. Rejuvenation has no independent fixed sweep
+ceiling: it continues until the movement and lineage gates pass or the explicit
+emergency wall-time contract aborts the station. This avoids a second, much
+shorter timeout silently overriding the declared wall-time policy.
 
 ## Posterior reporting and stopping
 

@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 from runtime.adaptive_client import AdaptiveCandidateSnapshot, AdaptiveStepRequest
+from runtime.assets import simulation_runtime_root
 from runtime.measurement_log import load_measurement_log
 from runtime.prefix import measurement_records_digest
 from runtime.provenance import DigestIdentity, strict_canonical_json_bytes
@@ -43,9 +44,21 @@ def _production_live_config() -> dict[str, Any]:
     return payload
 
 
-def _validated_test_config(path: Path) -> ValidatedProductionPFConfig:
+def _validated_test_config(
+    path: Path,
+    *,
+    num_particles: int | None = None,
+) -> ValidatedProductionPFConfig:
     """Write and load one complete provenance-bound production config."""
-    path.write_text(json.dumps(_production_live_config()), encoding="utf-8")
+    payload = _production_live_config()
+    if num_particles is not None:
+        payload["num_particles"] = num_particles
+        payload["dss_pp"]["planning_particles"] = max(
+            2,
+            num_particles // 2,
+        )
+        payload["dss_pp"]["proxy_planning_particles"] = 2
+    path.write_text(json.dumps(payload), encoding="utf-8")
     return load_production_live_pf_config(path, profile="pf_strict")
 
 
@@ -182,6 +195,61 @@ def test_live_builder_uses_run_context_without_synthetic_log(
         "measurement_runtime_config_sha256": "a" * 64,
         "control_policy_provenance": control_provenance,
     }
+
+
+def test_live_builder_preserves_exact_runtime_observation_contract(
+    tmp_path: Path,
+) -> None:
+    """The production PF must consume one unmodified runtime physics object."""
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            runtime_overrides={
+                "fe_shield_thickness_cm": 1.25,
+                "pb_shield_thickness_cm": 1.5,
+                "buildup": {
+                    "fe_coeff": 0.125,
+                    "pb_coeff": 0.25,
+                    "obstacle_coeff": 0.375,
+                },
+            },
+        )
+    )
+    config = _validated_test_config(
+        tmp_path / "pf.json",
+        num_particles=16,
+    )
+
+    estimator = build_live_estimator(
+        log.context,
+        config,
+        profile="pf_strict",
+        seed=17,
+        runtime_root=simulation_runtime_root(),
+        control_policy_provenance=PFControlPolicyProvenance.native_dss_pp(),
+    )
+    kernel = estimator.continuous_kernel(use_gpu=False)
+
+    assert estimator.shield_params.thickness_fe_cm == 1.25
+    assert estimator.shield_params.thickness_pb_cm == 1.5
+    assert estimator.shield_params.inner_radius_fe_cm == 3.95
+    assert estimator.shield_params.inner_radius_pb_cm == 5.2
+    assert estimator.shield_params.buildup_fe_coeff == 0.125
+    assert estimator.shield_params.buildup_pb_coeff == 0.25
+    assert estimator.obstacle_buildup_coeff == 0.375
+    assert kernel.shield_params == estimator.shield_params
+    assert kernel.strict_catalog_line_contract is True
+    assert kernel.dry_air_total_attenuation_contract_id is not None
+    assert kernel.dry_air_total_attenuation_contract_sha256 is not None
+    assert estimator.joint_transport_cache_preflight is not None
+    assert (
+        estimator.joint_transport_cache_preflight["allocated_bytes"]
+        == estimator.joint_transport_cache_preflight["cache_required_bytes"]
+    )
+    assert (
+        estimator.joint_transport_cache_preflight["required_bytes"]
+        > estimator.joint_transport_cache_preflight["allocated_bytes"]
+    )
 
 
 def test_context_energy_dimensions_require_exact_identity() -> None:
@@ -495,8 +563,15 @@ class _SpyEstimator:
     def posterior_point_estimate(self) -> dict[str, SimpleNamespace]:
         """Return one existing PF summary contract for the planning DTO."""
         self.posterior_summary_calls += 1
-        return {
-            isotope: SimpleNamespace(
+        estimates: dict[str, SimpleNamespace] = {}
+        for isotope in self.isotopes:
+            mode = SimpleNamespace(
+                label_index=0,
+                position_medoid_xyz=(0.1, 0.2, 0.3),
+                strength_representative_cps_1m=2.0,
+            )
+            estimates[isotope] = SimpleNamespace(
+                modes=(mode,),
                 to_dict=lambda isotope=isotope: {
                     "map_cardinality": 1,
                     "cardinality_distribution": {"0": 0.1, "1": 0.9},
@@ -520,10 +595,27 @@ class _SpyEstimator:
                         }
                     ],
                     "isotope": isotope,
-                }
+                },
             )
-            for isotope in self.isotopes
-        }
+        return estimates
+
+    def source_response_signatures(
+        self,
+        isotope: str,
+        positions_xyz_m: np.ndarray,
+    ) -> np.ndarray:
+        """Return normalized truth-free response signatures for test modes."""
+        assert isotope in self.isotopes
+        positions = np.asarray(positions_xyz_m, dtype=np.float64).reshape(-1, 3)
+        if positions.shape[0] == 0:
+            return np.zeros((2, 0), dtype=np.float64)
+        signatures = np.vstack(
+            (
+                1.0 + positions[:, 0],
+                1.0 + positions[:, 1],
+            )
+        )
+        return signatures / np.linalg.norm(signatures, axis=0, keepdims=True)
 
     def serialized_state(self) -> bytes:
         """Return state bytes depending only on completed station updates."""
@@ -1547,6 +1639,7 @@ def test_bound_facade_publishes_package_owned_result_bundle(
     assert published.checkpoint_path.is_file()
     assert published.checkpoint_state_path.is_file()
     assert published.particle_snapshot_path.is_file()
+    assert published.post_run_evaluation_input_path.is_file()
     assert published.diagnostics_path.is_file()
     inventory_path = published.root / "pf_artifact_inventory.json"
     assert inventory_path.is_file()
@@ -1566,6 +1659,13 @@ def test_bound_facade_publishes_package_owned_result_bundle(
     )
     assert "measurement_log_sha256" not in diagnostics
     assert "config" not in diagnostics
+    evaluation_input = json.loads(
+        published.post_run_evaluation_input_path.read_text(encoding="utf-8")
+    )
+    assert evaluation_input["schema_version"] == 1
+    assert evaluation_input["source_run_id"] == log.run_id
+    assert evaluation_input["measurement_log_sha256"] == log.log_sha256
+    assert evaluation_input["truth_read"] is False
     assert not (published.root / "pf_trace.jsonl").exists()
     assert len(published.result_sha256) == 64
     assert len(estimator.update_calls) == update_count

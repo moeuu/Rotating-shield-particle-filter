@@ -31,6 +31,7 @@ from runtime.artifacts import (
     publish_artifact_manifest,
 )
 from runtime.forward_context import ResolvedForwardContext
+from runtime.experiment_profiles import acquisition_contract_from_environment
 from runtime.measurement_log import (
     MeasurementLog,
     MeasurementLogRecord,
@@ -44,7 +45,15 @@ from scipy.spatial import cKDTree
 
 from pf.estimator_types import JointPlanningParticles
 from pf.control_policy import PFControlPolicyProvenance
-from pf.gpu_utils import preflight_compute_backend
+from pf.gpu_utils import (
+    preflight_compute_backend,
+    preflight_cuda_allocation_capacity,
+)
+from pf.joint_transport_cache import (
+    JOINT_EXACT_MAX_STATIONS,
+    JOINT_EXACT_MAX_VIEWS,
+    JointTransportCache,
+)
 from pf.configuration import PFConfigDocument, load_pf_config
 from pf.profiles import (
     apply_profile_to_config,
@@ -331,7 +340,9 @@ class PFExternalSurfaceGuidanceReceipt:
             minimum=1,
         )
         if self.target_preserving is not True or self.direct_weight_update is not False:
-            raise ValueError("Surface guidance must preserve the target and PF weights.")
+            raise ValueError(
+                "Surface guidance must preserve the target and PF weights."
+            )
         object.__setattr__(self, "guidance_sha256", guidance_sha256)
         object.__setattr__(self, "source_run_id", source_run_id)
         object.__setattr__(self, "record_count", record_count)
@@ -392,6 +403,7 @@ class PFPublishedLiveResult:
     checkpoint_path: Path
     checkpoint_state_path: Path
     particle_snapshot_path: Path
+    post_run_evaluation_input_path: Path
     posterior_sha256: str
     checkpoint_sha256: str
     result_sha256: str
@@ -801,6 +813,74 @@ def _build_live_estimator_from_forward_context(
     except (TypeError, ValueError) as exc:
         raise PFLiveSessionError("External PF configuration is incompatible.") from exc
     observation_model = forward.observation_model
+    acquisition_contract = acquisition_contract_from_environment(
+        forward.environment_payload
+    )
+    if (
+        acquisition_contract.max_stations > JOINT_EXACT_MAX_STATIONS
+        or acquisition_contract.max_measurements > JOINT_EXACT_MAX_VIEWS
+    ):
+        raise PFLiveSessionError(
+            "The runtime acquisition contract exceeds the fixed 16-station/"
+            "128-view exact PF capacity."
+        )
+    source_capacity = pf_config.cardinality_capacity
+    if (
+        isinstance(source_capacity, bool)
+        or not isinstance(source_capacity, int)
+        or source_capacity <= 0
+    ):
+        raise PFLiveSessionError(
+            "Production PF requires a positive fixed source-slot capacity."
+        )
+    model = forward.spectral_model
+    required_cache_bytes = JointTransportCache.required_storage_bytes(
+        particle_count=int(pf_config.num_particles),
+        max_views=JOINT_EXACT_MAX_VIEWS,
+        source_slots=len(isotopes) * source_capacity,
+        line_count=len(tuple(model.line_identity)),
+        feature_count=len(tuple(model.transport_feature_order)),
+        max_stations=JOINT_EXACT_MAX_STATIONS,
+        dtype_bytes=8,
+    )
+    minimum_state_chunk = min(32, int(pf_config.num_particles))
+    minimum_likelihood_workspace_bytes = int(
+        model.estimate_cross_likelihood_working_set_bytes(
+            num_actions=acquisition_contract.max_stations,
+            num_samples=1,
+            num_particles=int(pf_config.num_particles),
+            num_isotopes=len(isotopes) * source_capacity,
+            num_views=acquisition_contract.views_per_station,
+            state_chunk_size=minimum_state_chunk,
+            dtype_bytes=8,
+        )
+    )
+    minimum_overlay_scratch_bytes = int(
+        acquisition_contract.max_stations
+        * minimum_state_chunk
+        * acquisition_contract.views_per_station
+        * len(isotopes)
+        * source_capacity
+        * len(tuple(model.line_identity))
+        * (2 + len(tuple(model.transport_feature_order)))
+        * 8
+    )
+    minimum_overlay_workspace_bytes = (
+        minimum_likelihood_workspace_bytes + minimum_overlay_scratch_bytes
+    )
+    required_live_cuda_bytes = (
+        required_cache_bytes + 2 * minimum_overlay_workspace_bytes
+    )
+    try:
+        cache_preflight = preflight_cuda_allocation_capacity(
+            device=str(pf_config.gpu_device),
+            required_bytes=required_live_cuda_bytes,
+            allocation_name="fixed cache and minimum exact overlay workspace",
+        )
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise PFLiveSessionError(
+            "The fixed joint exact transport cache failed CUDA preflight."
+        ) from exc
     obstacle_grid = forward.obstacle_grid
     obstacle_enabled = forward.obstacle_attenuation_enabled
     if obstacle_grid is not None and not obstacle_enabled:
@@ -834,27 +914,9 @@ def _build_live_estimator_from_forward_context(
         isotopes=isotopes,
         surface_diagnostic_points=surface_diagnostic_points,
         shield_normals=generate_octant_orientations(),
-        mu_by_isotope=observation_model.mu_by_isotope,
         pf_config=pf_config,
+        observation_model=observation_model,
         obstacle_grid=pf_obstacle_grid,
-        obstacle_height_m=observation_model.obstacle_height_m,
-        obstacle_mu_by_isotope=observation_model.obstacle_mu_by_isotope,
-        obstacle_buildup_coeff=(
-            observation_model.obstacle_buildup_coeff if obstacle_enabled else 0.0
-        ),
-        detector_radius_m=observation_model.detector_geometry.count_radius_m,
-        detector_aperture_radius_m=(
-            observation_model.detector_geometry.aperture_radius_m
-        ),
-        detector_aperture_samples=(
-            observation_model.detector_geometry.aperture_samples
-        ),
-        detector_aperture_sampling=(
-            observation_model.detector_geometry.aperture_sampling
-        ),
-        source_extent_radius_m=observation_model.source_extent_radius_m,
-        source_extent_samples=observation_model.source_extent_samples,
-        line_mu_by_isotope=observation_model.line_mu_by_isotope,
         full_spectrum_generative_model=forward.spectral_model,
         measurement_log_schema_version=schema_version,
         config_hash=input_config_sha256,
@@ -862,10 +924,34 @@ def _build_live_estimator_from_forward_context(
         measurement_log_sha256=pending_log_digest,
         random_seed=session_seed,
     )
+    estimator.joint_transport_cache_preflight = dict(cache_preflight)
+    estimator.joint_transport_cache_preflight.update(
+        {
+            "cache_required_bytes": int(required_cache_bytes),
+            "minimum_state_chunk": int(minimum_state_chunk),
+            "minimum_overlay_workspace_bytes": int(
+                minimum_overlay_workspace_bytes
+            ),
+        }
+    )
     environment = forward.environment
     assert environment.detector_position is not None
     initial_pose = np.asarray(environment.detector_position, dtype=np.float64)
     estimator.add_measurement_pose(initial_pose, reset_filters=False)
+    try:
+        allocated_cache_bytes = estimator.initialize_joint_exact_transport_cache()
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise PFLiveSessionError(
+            "The fixed joint exact transport cache could not be reserved "
+            "before acquisition."
+        ) from exc
+    if allocated_cache_bytes != required_cache_bytes:
+        raise PFLiveSessionError(
+            "Allocated joint transport cache bytes differ from preflight."
+        )
+    estimator.joint_transport_cache_preflight["allocated_bytes"] = int(
+        allocated_cache_bytes
+    )
     return estimator
 
 
@@ -1259,7 +1345,9 @@ def _immutable_particle_snapshot(
         )
     isotope_order = tuple(particles.isotope_order)
     if not isotope_order or len(set(isotope_order)) != len(isotope_order):
-        raise PFLiveSessionError("PF planning isotope order must be unique and nonempty.")
+        raise PFLiveSessionError(
+            "PF planning isotope order must be unique and nonempty."
+        )
     weights = _readonly_array(
         particles.weights_n,
         dtype=np.dtype(np.float64),
@@ -1486,6 +1574,96 @@ def live_posterior_summary(estimator: object) -> dict[str, object]:
     }
 
 
+def _post_run_evaluation_input_payload(
+    estimator: object,
+    *,
+    source_run_id: str,
+    measurement_log_sha256: str,
+) -> dict[str, object]:
+    """Build truth-free response signatures for standardized post-run scoring."""
+    point_estimate_method = getattr(estimator, "posterior_point_estimate", None)
+    signature_method = getattr(estimator, "source_response_signatures", None)
+    config = getattr(estimator, "pf_config", None)
+    if (
+        not callable(point_estimate_method)
+        or not callable(signature_method)
+        or config is None
+    ):
+        raise PFLiveSessionError(
+            "PF estimator cannot build standardized post-run evaluation input."
+        )
+    estimates = point_estimate_method()
+    if not isinstance(estimates, Mapping) or not estimates:
+        raise PFLiveSessionError("Post-run evaluation requires isotope estimates.")
+    isotope_payload: dict[str, object] = {}
+    for isotope, estimate in estimates.items():
+        modes = tuple(getattr(estimate, "modes", ()))
+        positions = np.asarray(
+            [getattr(mode, "position_medoid_xyz") for mode in modes],
+            dtype=np.float64,
+        ).reshape(len(modes), 3)
+        strengths = np.asarray(
+            [getattr(mode, "strength_representative_cps_1m") for mode in modes],
+            dtype=np.float64,
+        )
+        labels = np.asarray(
+            [getattr(mode, "label_index") for mode in modes],
+            dtype=np.int64,
+        )
+        signatures = np.asarray(
+            signature_method(str(isotope), positions),
+            dtype=np.float64,
+        )
+        if (
+            signatures.ndim != 2
+            or signatures.shape[1] != len(modes)
+            or np.any(~np.isfinite(signatures))
+            or np.any(signatures < 0.0)
+            or strengths.shape != (len(modes),)
+            or np.any(~np.isfinite(strengths))
+            or np.any(strengths <= 0.0)
+            or labels.shape != (len(modes),)
+            or np.any(labels < 0)
+            or np.unique(labels).size != labels.size
+        ):
+            raise PFLiveSessionError(
+                f"Post-run response signatures are invalid for {isotope}."
+            )
+        signature_norms = np.linalg.norm(signatures, axis=0)
+        if len(modes) and not np.allclose(
+            signature_norms,
+            1.0,
+            rtol=0.0,
+            atol=1.0e-10,
+        ):
+            raise PFLiveSessionError(
+                f"Post-run response signatures are not normalized for {isotope}."
+            )
+        isotope_payload[str(isotope)] = {
+            "mode_label_indices": [int(value) for value in labels],
+            "mode_positions_xyz_m": positions.tolist(),
+            "mode_strengths_cps_1m": strengths.tolist(),
+            "normalized_response_signatures_measurement_by_mode": (
+                signatures.tolist()
+            ),
+        }
+    hard_max_sources = getattr(config, "cardinality_capacity", None)
+    if isinstance(hard_max_sources, bool) or not isinstance(hard_max_sources, int):
+        raise PFLiveSessionError("PF cardinality capacity is unavailable.")
+    return {
+        "schema_version": 1,
+        "artifact_family": "pf_post_run_cluster_evaluation_input",
+        "source_run_id": str(source_run_id),
+        "measurement_log_sha256": str(measurement_log_sha256),
+        "hard_max_sources_per_isotope": int(hard_max_sources),
+        "response_signature_semantics": (
+            "normalized_same_isotope_expected_count_by_completed_measurement"
+        ),
+        "truth_read": False,
+        "isotopes": isotope_payload,
+    }
+
+
 def register_persisted_station_pose(
     estimator: PurePFEstimator,
     records: Sequence[MeasurementLogRecord],
@@ -1639,7 +1817,8 @@ def assimilate_persisted_station(
         )
         if evaluated_isotopes != expected_isotopes:
             raise RuntimeError(
-                "PF station update did not evaluate external guidance for every isotope."
+                "PF station update did not evaluate external guidance for "
+                "every isotope."
             )
         receipt = PFExternalSurfaceGuidanceReceipt(
             guidance_sha256=surface_guidance.guidance_sha256,
@@ -2088,9 +2267,13 @@ class PFLiveSession:
             raise PFLiveSessionError(
                 "receive_persisted_station requires MeasurementLogRecord values."
             )
-        if self._records and self._records[-1].metadata.get("station_complete") is not True:
+        if (
+            self._records
+            and self._records[-1].metadata.get("station_complete") is not True
+        ):
             raise PFLiveSessionError(
-                "receive_persisted_station cannot continue a partially buffered station."
+                "receive_persisted_station cannot continue a partially "
+                "buffered station."
             )
         if len({record.station_id for record in rows}) != 1:
             raise PFLiveSessionError(
@@ -2157,7 +2340,9 @@ class PFLiveSession:
             return self._completed_state
         self._ensure_receiving()
         if not self._records:
-            raise PFLiveSessionError("A PF live session cannot complete without records.")
+            raise PFLiveSessionError(
+                "A PF live session cannot complete without records."
+            )
         view = self._validated_view(self._records)
         stations = view.station_view()
         if stations.complete_station_count != stations.station_count or (
@@ -2344,6 +2529,7 @@ class PFLiveSession:
             "pf_particles.npz",
             "pf_checkpoint.json",
             "pf_artifact_inventory.json",
+            "pf_post_run_evaluation_input.json",
         }
         conflicts = sorted(name for name in owned_names if (target / name).exists())
         if conflicts:
@@ -2425,6 +2611,21 @@ class PFLiveSession:
             target / "pf_particles.npz",
             particle_buffer.getvalue(),
         )
+        evaluation_input_path = atomic_write_bytes(
+            target / "pf_post_run_evaluation_input.json",
+            _strict_live_artifact_json_bytes(
+                _post_run_evaluation_input_payload(
+                    self._estimator,
+                    source_run_id=bound.completed.source_run_id,
+                    measurement_log_sha256=bound.measurement_log_sha256,
+                ),
+                artifact_name="PF post-run evaluation input",
+            ),
+        )
+        if evaluation_input_path.parent != target:
+            raise PFLiveSessionError(
+                "PF post-run evaluation input escaped the publication root."
+            )
         resolved_config_sha256 = provenance.get("resolved_config_sha256")
         estimator_commit = provenance.get("estimator_commit")
         random_seed = provenance.get("random_seed")
@@ -2492,6 +2693,7 @@ class PFLiveSession:
             checkpoint_path=checkpoint_path,
             checkpoint_state_path=checkpoint_state_path,
             particle_snapshot_path=particle_snapshot_path,
+            post_run_evaluation_input_path=evaluation_input_path,
             posterior_sha256=bound.posterior_sha256,
             checkpoint_sha256=_strict_live_artifact_sha256(
                 checkpoint_manifest,
@@ -2518,6 +2720,9 @@ class PFLiveSession:
             checkpoint_path=target / staged.checkpoint_path.name,
             checkpoint_state_path=target / staged.checkpoint_state_path.name,
             particle_snapshot_path=target / staged.particle_snapshot_path.name,
+            post_run_evaluation_input_path=(
+                target / staged.post_run_evaluation_input_path.name
+            ),
             posterior_sha256=staged.posterior_sha256,
             checkpoint_sha256=staged.checkpoint_sha256,
             result_sha256=inventory.sha256,

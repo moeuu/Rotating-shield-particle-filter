@@ -12,8 +12,10 @@ import pytest
 from measurement.obstacles import ObstacleGrid
 from runtime.cui import CUIRoute, cui_route_from_records
 from runtime.cui_components import write_cui_index
+from runtime.cui_truth_overlay import CUITruthOverlaySocketServer
 from runtime.measurement_log import MeasurementLogRecord
 
+from visualization import realtime_viz
 from visualization.realtime_viz import (
     AsyncCUISplitPFVisualizer,
     CUISplitPFVisualizer,
@@ -206,6 +208,84 @@ def test_cui_truth_is_hidden_until_explicit_evaluation_update(
     )
 
 
+def test_async_renderer_loads_truth_directly_from_owner_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The renderer worker must consume truth without a PF-frame message."""
+    endpoint = tmp_path / "cui-truth.sock"
+    server = CUITruthOverlaySocketServer(
+        endpoint,
+        {
+            "schema_version": 1,
+            "semantics": "evaluation_cui_overlay_only_not_estimator_input",
+            "true_sources": {"Cs-137": [[1.0, 2.0, 0.5]]},
+            "true_strengths": {"Cs-137": [400_000.0]},
+        },
+    )
+    instances: list[object] = []
+
+    class _RendererProbe:
+        """Capture private truth received inside the renderer worker."""
+
+        def __init__(self, **kwargs: object) -> None:
+            """Record truth-free renderer construction arguments."""
+            self.kwargs = dict(kwargs)
+            self.true_sources: dict[str, np.ndarray] = {}
+            self.true_strengths: dict[str, np.ndarray] = {}
+            instances.append(self)
+
+        def set_truth(
+            self,
+            true_sources: dict[str, np.ndarray],
+            true_strengths: dict[str, np.ndarray],
+        ) -> None:
+            """Record the overlay attached directly by the worker."""
+            self.true_sources = dict(true_sources)
+            self.true_strengths = dict(true_strengths)
+
+    monkeypatch.setattr(realtime_viz, "CUISplitPFVisualizer", _RendererProbe)
+    frame_queue: queue.Queue[tuple[str, int, object]] = queue.Queue()
+    status_queue: queue.Queue[tuple[str, int, str, str]] = queue.Queue()
+    frame_queue.put(("close", 0, None))
+    try:
+        realtime_viz._async_cui_split_worker(
+            {
+                "isotopes": ["Cs-137"],
+                "output_dir": tmp_path / "cui",
+                "truth_overlay_socket_path": endpoint,
+            },
+            frame_queue,
+            status_queue,
+            "renderer-run",
+        )
+    finally:
+        server.close()
+
+    probe = instances[0]
+    assert "truth_overlay_socket_path" not in probe.kwargs
+    np.testing.assert_array_equal(
+        probe.true_sources["Cs-137"],
+        np.asarray([[1.0, 2.0, 0.5]]),
+    )
+    np.testing.assert_array_equal(
+        probe.true_strengths["Cs-137"],
+        np.asarray([400_000.0]),
+    )
+    assert status_queue.get_nowait() == (
+        "ready",
+        -1,
+        "startup",
+        "renderer-run",
+    )
+    assert status_queue.get_nowait() == (
+        "closed",
+        0,
+        "close",
+        "renderer-run",
+    )
+
+
 def test_cui_scene_preserves_asymmetric_obstacle_xy_order(tmp_path: Path) -> None:
     """Canonical scene footprints must not transpose asymmetric grid cells."""
     obstacle_grid = ObstacleGrid(
@@ -289,12 +369,43 @@ def test_cui_writes_plain_and_neighborhood_labeled_pf_images(
         frame,
         "Co-60",
     )
-    assert [label for _, label in truth_entries] == ["Co-1 T", "Co-2 T"]
+    assert [label for _, label in truth_entries] == [
+        "Co-1 T\n(1.00, 1.00, 0.50) m",
+        "Co-2 T\n(5.00, 5.00, 0.50) m",
+    ]
     assert [label for _, label in estimate_entries] == [
         "Co-1 E1",
         "Co-1 E2",
         "Co remote-1",
     ]
+
+    figure, axis = plt.subplots()
+    try:
+        visualizer._plot_true_sources_2d(axis)
+        assert [value.get_text() for value in axis.texts] == [
+            "Co-1 T\n(1.00, 1.00, 0.50) m",
+            "Co-2 T\n(5.00, 5.00, 0.50) m",
+        ]
+        assert [
+            (value.get_ha(), value.get_va()) for value in axis.texts
+        ] == [("left", "bottom"), ("right", "top")]
+    finally:
+        plt.close(figure)
+
+    figure, axis = plt.subplots()
+    try:
+        visualizer._plot_true_sources_xz(axis)
+        assert [value.get_text() for value in axis.texts] == [
+            "Co-1 T",
+            "Co-2 T",
+        ]
+    finally:
+        plt.close(figure)
+    assert visualizer._truth_inventory_text() == (
+        "True sources (evaluation overlay)\n"
+        "Co-1 T  (1.00, 1.00, 0.50) m\n"
+        "Co-2 T  (5.00, 5.00, 0.50) m"
+    )
 
     visualizer.update(frame)
 

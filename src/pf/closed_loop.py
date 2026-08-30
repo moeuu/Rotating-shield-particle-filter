@@ -287,9 +287,9 @@ def _obstacle_grid(context: object) -> ObstacleGrid | None:
     raw = environment.get("obstacle_grid")
     if raw is None:
         return None
-    if not isinstance(raw, dict):
+    if not isinstance(raw, Mapping):
         raise TypeError("context.environment.obstacle_grid must be an object.")
-    return ObstacleGrid.from_dict(raw)
+    return ObstacleGrid.from_dict(dict(raw))
 
 
 def _bounds(context: object) -> tuple[np.ndarray, np.ndarray]:
@@ -399,11 +399,16 @@ def _start_cui_split_view(
     isotopes: Sequence[str],
     room_bounds: tuple[np.ndarray, np.ndarray],
     obstacle_grid: ObstacleGrid | None,
+    truth_overlay_socket_path: str | Path | None,
     server_handle: CUIServerHandle | None,
     output_hook: Any,
 ) -> AsyncCUISplitPFVisualizer | None:
     """Start the renderer after context resolution and a successful server bind."""
     if not resolve_cui_split_view_enabled(settings):
+        if truth_overlay_socket_path is not None:
+            raise ValueError(
+                "A CUI truth overlay socket requires cui_split_view=true."
+            )
         if server_handle is not None:
             raise RuntimeError("Disabled CUI unexpectedly owns a server handle.")
         return None
@@ -430,6 +435,7 @@ def _start_cui_split_view(
                 float(upper[2]),
             ),
             obstacle_grid=obstacle_grid,
+            truth_overlay_socket_path=truth_overlay_socket_path,
             max_particles_per_isotope=settings[
                 "cui_split_view_max_particles_per_isotope"
             ],
@@ -577,6 +583,17 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
             "structural_transition_weight_mass": (
                 aggregate_transition_mass or None
             ),
+            "sampler_health": {
+                "smc_rejuvenation_wall_time_respected": bool(
+                    values["joint_smc_wall_time_limit_exceeded"] is False
+                ),
+                "rejuvenation_mixing_complete": bool(
+                    values["joint_rejuvenation_mixing_incomplete"] is False
+                ),
+                "structural_mixing_complete": bool(
+                    values["joint_structural_mixing_incomplete"] is False
+                ),
+            },
         }
         isotopes[isotope] = {
             key: value for key, value in compact.items() if value is not None
@@ -593,6 +610,141 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         for values in retained.values()
         if values.get("cumulative_unique_ancestor_count") is not None
     ]
+    lineage_collapsed = bool(ancestry_counts and min(ancestry_counts) <= 1)
+    rejuvenation_records = getattr(
+        estimator,
+        "last_joint_rejuvenation_diagnostics",
+        (),
+    )
+    final_rejuvenation = (
+        rejuvenation_records[-1]
+        if isinstance(rejuvenation_records, Sequence)
+        and not isinstance(rejuvenation_records, (str, bytes))
+        and rejuvenation_records
+        and isinstance(rejuvenation_records[-1], Mapping)
+        else None
+    )
+
+    def _finite_binary_diagnostic(value: object) -> bool:
+        """Return whether a diagnostic is a strict finite numeric zero or one."""
+        return bool(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and np.isfinite(float(value))
+            and float(value) in (0.0, 1.0)
+        )
+
+    recovery_by_isotope: dict[str, dict[str, object]] = {}
+    recovery_record_complete = bool(final_rejuvenation is not None)
+    if final_rejuvenation is not None:
+        configured_recovery_mass = float(
+            estimator.pf_config.joint_lineage_recovery_min_surviving_weight_mass
+        )
+        recorded_recovery_mass = final_rejuvenation.get(
+            "lineage_recovery_min_surviving_weight_mass"
+        )
+        recovery_epoch = final_rejuvenation.get("lineage_recovery_epoch")
+        distinct_joint_states = final_rejuvenation.get(
+            "distinct_joint_state_count"
+        )
+        minimum_distinct_joint_states = final_rejuvenation.get(
+            "minimum_distinct_joint_states"
+        )
+        expected_minimum_distinct_joint_states = int(
+            np.ceil(target_ratio * configured_count)
+        )
+        distinct_state_record_valid = bool(
+            isinstance(distinct_joint_states, (int, float))
+            and not isinstance(distinct_joint_states, bool)
+            and np.isfinite(float(distinct_joint_states))
+            and float(distinct_joint_states).is_integer()
+            and 0.0 <= float(distinct_joint_states) <= configured_count
+        )
+        minimum_state_record_valid = bool(
+            isinstance(minimum_distinct_joint_states, (int, float))
+            and not isinstance(minimum_distinct_joint_states, bool)
+            and np.isfinite(float(minimum_distinct_joint_states))
+            and float(minimum_distinct_joint_states).is_integer()
+            and float(minimum_distinct_joint_states)
+            == expected_minimum_distinct_joint_states
+        )
+        recovery_record_complete = bool(
+            recovery_record_complete
+            and distinct_state_record_valid
+            and minimum_state_record_valid
+            and float(distinct_joint_states)
+            >= float(minimum_distinct_joint_states)
+            and isinstance(recorded_recovery_mass, (int, float))
+            and not isinstance(recorded_recovery_mass, bool)
+            and np.isfinite(float(recorded_recovery_mass))
+            and float(recorded_recovery_mass) == configured_recovery_mass
+            and isinstance(recovery_epoch, (int, float))
+            and not isinstance(recovery_epoch, bool)
+            and np.isfinite(float(recovery_epoch))
+            and float(recovery_epoch).is_integer()
+            and float(recovery_epoch) >= (1.0 if lineage_collapsed else 0.0)
+        )
+        for isotope in expected_isotopes:
+            certified_count = final_rejuvenation.get(
+                f"lineage_recovery_certified_row_count.{isotope}"
+            )
+            surviving_mass = final_rejuvenation.get(
+                f"lineage_recovery_surviving_weight_mass.{isotope}"
+            )
+            sufficient = final_rejuvenation.get(
+                f"lineage_recovery_sufficient.{isotope}"
+            )
+            row_complete = bool(
+                isinstance(certified_count, (int, float))
+                and not isinstance(certified_count, bool)
+                and np.isfinite(float(certified_count))
+                and float(certified_count).is_integer()
+                and 0.0 <= float(certified_count) <= configured_count
+                and isinstance(surviving_mass, (int, float))
+                and not isinstance(surviving_mass, bool)
+                and np.isfinite(float(surviving_mass))
+                and 0.0 <= float(surviving_mass) <= 1.0 + 1.0e-12
+                and _finite_binary_diagnostic(sufficient)
+            )
+            expected_sufficient = bool(
+                row_complete
+                and float(certified_count) > 0.0
+                and float(surviving_mass) >= configured_recovery_mass
+            )
+            row_complete = bool(
+                row_complete
+                and bool(sufficient == 1.0) is expected_sufficient
+            )
+            recovery_record_complete = recovery_record_complete and row_complete
+            recovery_by_isotope[isotope] = {
+                "certified_row_count": certified_count,
+                "surviving_weight_mass": surviving_mass,
+                "sufficient": bool(sufficient == 1.0),
+            }
+    recovery_required_recorded = bool(
+        final_rejuvenation is not None
+        and _finite_binary_diagnostic(
+            final_rejuvenation.get("lineage_recovery_required")
+        )
+        and float(final_rejuvenation["lineage_recovery_required"]) == 1.0
+    )
+    recovery_sufficient_recorded = bool(
+        final_rejuvenation is not None
+        and _finite_binary_diagnostic(
+            final_rejuvenation.get("lineage_recovery_sufficient")
+        )
+        and float(final_rejuvenation["lineage_recovery_sufficient"]) == 1.0
+    )
+    recovery_complete = bool(
+        lineage_collapsed
+        and recovery_record_complete
+        and recovery_required_recorded
+        and recovery_sufficient_recorded
+        and all(
+            row["sufficient"] is True
+            for row in recovery_by_isotope.values()
+        )
+    )
     evidence = {
         "configured_particle_count": configured_count,
         "target_ess_ratio": target_ratio,
@@ -603,10 +755,28 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
             None if not ancestry_counts else int(min(ancestry_counts))
         ),
         "diversity_evidence_available": bool(guided_ratios or ancestry_counts),
+        "genealogical_collapse_detected": lineage_collapsed,
+        "lineage_recovery_required": lineage_collapsed,
+        "lineage_recovery_complete": recovery_complete,
+        "lineage_recovery_by_isotope": recovery_by_isotope,
+        "distinct_joint_state_count": (
+            None
+            if final_rejuvenation is None
+            else final_rejuvenation.get("distinct_joint_state_count")
+        ),
+        "minimum_distinct_joint_states": (
+            None
+            if final_rejuvenation is None
+            else final_rejuvenation.get("minimum_distinct_joint_states")
+        ),
         "diversity_warning": bool(
             (not guided_ratios and not ancestry_counts)
-            or (guided_ratios and min(guided_ratios) < target_ratio)
-            or (ancestry_counts and min(ancestry_counts) <= 1)
+            or (lineage_collapsed and not recovery_complete)
+            or (
+                not ancestry_counts
+                and guided_ratios
+                and min(guided_ratios) < target_ratio
+            )
         ),
     }
     evidence = {
@@ -650,6 +820,13 @@ def _require_plannable_sampler_health(
     if any(type(raw_health[name]) is not bool for name in expected):
         raise TypeError("PF sampler-health gates must be booleans.")
     failed = sorted(name for name in expected if raw_health[name] is not True)
+    assessment = particle_adequacy.get("assessment")
+    if not isinstance(assessment, Mapping):
+        raise TypeError("PF particle diagnostics must contain diversity assessment.")
+    if assessment.get("diversity_evidence_available") is not True:
+        failed.append("particle_diversity_evidence_unavailable")
+    elif assessment.get("diversity_warning") is not False:
+        failed.append("particle_diversity_warning")
     if failed:
         raise RuntimeError(
             "PF sampler health forbids further live planning: "
@@ -693,11 +870,24 @@ def _shield_view_count_shadow_health(
         raise TypeError(
             "posterior sampler_health must contain exactly three Boolean gates."
         )
-    if set(innovation) != {"available", "passed"} or any(
+    expected_innovation_keys = {
+        "available",
+        "passed",
+        "view_count",
+        "dimension",
+        "renewal_total_max_abs_z",
+        "renewal_total_within_confidence",
+        "conditional_mark_pearson",
+        "conditional_mark_degrees_of_freedom",
+        "conditional_mark_tail_probability",
+        "conditional_mark_upper_tail_probability",
+        "confidence",
+    }
+    if set(innovation) != expected_innovation_keys or any(
         type(innovation[name]) is not bool for name in ("available", "passed")
     ):
         raise TypeError(
-            "posterior innovation must contain exactly available/passed booleans."
+            "posterior innovation must match the exact model-native schema."
         )
     particle_isotopes = particle_adequacy.get("isotopes")
     if not isinstance(particle_isotopes, Mapping) or not particle_isotopes:
@@ -1105,6 +1295,127 @@ def _completion_diagnostics_extensions(
     }
 
 
+def _last_station_trace_posterior(path: Path) -> dict[str, object] | None:
+    """Return the latest valid truth-free posterior from a station trace."""
+    if path.is_symlink() or not path.is_file():
+        return None
+    for raw_line in reversed(path.read_text(encoding="utf-8").splitlines()):
+        if not raw_line.strip():
+            continue
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, Mapping):
+            continue
+        posterior = record.get("posterior_snapshot")
+        if (
+            isinstance(posterior, dict)
+            and posterior.get("publishable") is False
+            and isinstance(posterior.get("isotopes"), Mapping)
+        ):
+            return posterior
+    return None
+
+
+def _failure_truth_free_posterior(
+    estimator: object | None,
+    *,
+    station_trace_path: Path,
+) -> tuple[dict[str, object], str]:
+    """Return the current or last completed truth-free failure posterior."""
+    current_error: BaseException | None = None
+    if estimator is not None:
+        try:
+            return _live_posterior_summary(estimator), "current_estimator_state"
+        except BaseException as exc:
+            current_error = exc
+    fallback = _last_station_trace_posterior(station_trace_path)
+    if fallback is not None:
+        return fallback, "last_completed_station"
+    message = "No truth-free PF posterior was available for failure diagnosis."
+    if current_error is not None:
+        raise RuntimeError(message) from current_error
+    raise RuntimeError(message)
+
+
+def _publish_failure_diagnostics(
+    *,
+    target: Path,
+    staging_dir: Path,
+    stage_suffix: str,
+    estimator: object | None,
+    primary_error: BaseException,
+) -> Path:
+    """Atomically publish a diagnostic-only bundle for a failed live run."""
+    if staging_dir.is_symlink() or not staging_dir.is_dir():
+        raise FileNotFoundError(
+            f"PF failure staging directory is unavailable: {staging_dir}"
+        )
+    diagnostic_target = target.with_name(
+        f"{target.name}.failure-diagnostics-{stage_suffix}"
+    )
+    station_trace_path = staging_dir / "pf_station_trace.jsonl"
+    posterior, posterior_source = _failure_truth_free_posterior(
+        estimator,
+        station_trace_path=station_trace_path,
+    )
+    planner_audit_path = staging_dir / "planner_audit.jsonl"
+    cui_image_path = staging_dir / "cui_live" / "latest_pf_3d.png"
+    planner_available = bool(
+        planner_audit_path.is_file() and not planner_audit_path.is_symlink()
+    )
+    station_trace_available = bool(
+        station_trace_path.is_file() and not station_trace_path.is_symlink()
+    )
+    cui_image_available = bool(
+        cui_image_path.is_file() and not cui_image_path.is_symlink()
+    )
+    with AtomicBundlePublisher(
+        diagnostic_target,
+        policy="create",
+    ) as publisher:
+        publisher.write_bytes(
+            "truth_free_posterior.json",
+            _strict_live_artifact_json_bytes(
+                posterior,
+                artifact_name="PF failure truth-free posterior",
+            ),
+        )
+        if planner_available:
+            publisher.copy_file(planner_audit_path, "planner_audit.jsonl")
+        else:
+            publisher.write_bytes("planner_audit.jsonl", b"")
+        if station_trace_available:
+            publisher.copy_file(station_trace_path, "pf_station_trace.jsonl")
+        else:
+            publisher.write_bytes("pf_station_trace.jsonl", b"")
+        if cui_image_available:
+            publisher.copy_file(cui_image_path, "last_cui_pf_3d.png")
+        publisher.write_bytes(
+            "failure_manifest.json",
+            _strict_live_artifact_json_bytes(
+                {
+                    "schema_version": 1,
+                    "artifact_family": "pure_pf_failure_diagnostics",
+                    "status": "failed",
+                    "success_result": False,
+                    "truth_read": False,
+                    "posterior_publishable": False,
+                    "posterior_source": posterior_source,
+                    "planner_audit_available": planner_available,
+                    "station_trace_available": station_trace_available,
+                    "last_cui_image_available": cui_image_available,
+                    "error_type": type(primary_error).__name__,
+                    "message": str(primary_error),
+                },
+                artifact_name="PF failure diagnostic manifest",
+            ),
+        )
+        publisher.publish()
+    return diagnostic_target
+
+
 def run_pf_closed_loop(
     session_socket: str | Path,
     *,
@@ -1112,6 +1423,7 @@ def run_pf_closed_loop(
     pf_config_path: str | Path,
     output_dir: str | Path,
     seed: int,
+    cui_truth_overlay_socket_path: str | Path | None = None,
     profile: str = "pf_strict",
     control_policy: object | None = None,
     output_hook: Any = print,
@@ -1214,6 +1526,7 @@ def run_pf_closed_loop(
             isotopes=getattr(context, "isotopes"),
             room_bounds=room_bounds,
             obstacle_grid=obstacle_grid,
+            truth_overlay_socket_path=cui_truth_overlay_socket_path,
             server_handle=cui_server_handle,
             output_hook=output_hook,
         )
@@ -1546,14 +1859,40 @@ def run_pf_closed_loop(
                 )
             else:
                 cui_server_handle = None
+        failure_diagnostics_path: Path | None = None
+        if staging_dir is not None:
+            try:
+                failure_diagnostics_path = _publish_failure_diagnostics(
+                    target=target,
+                    staging_dir=staging_dir,
+                    stage_suffix=stage_suffix,
+                    estimator=estimator,
+                    primary_error=exc,
+                )
+            except BaseException as diagnostics_exc:
+                secondary_failures.append(
+                    {
+                        "operation": "failure_diagnostics_publish",
+                        "error_type": type(diagnostics_exc).__name__,
+                        "message": str(diagnostics_exc),
+                    }
+                )
         try:
             atomic_write_bytes(
                 failure_receipt_path,
                 _strict_live_artifact_json_bytes(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "status": "failed",
                         "output_bundle_published": target.exists(),
+                        "failure_diagnostics_published": (
+                            failure_diagnostics_path is not None
+                        ),
+                        "failure_diagnostics_dir": (
+                            None
+                            if failure_diagnostics_path is None
+                            else failure_diagnostics_path.as_posix()
+                        ),
                         "error_type": type(exc).__name__,
                         "message": str(exc),
                         "secondary_failures": secondary_failures,
@@ -1596,6 +1935,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-socket", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
+    parser.add_argument("--cui-truth-overlay-socket", type=Path, default=None)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--profile", choices=("pf_strict",), default="pf_strict")
@@ -1604,6 +1944,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = run_pf_closed_loop(
         args.session_socket,
         runtime_root=args.runtime_root,
+        cui_truth_overlay_socket_path=args.cui_truth_overlay_socket,
         pf_config_path=args.config,
         output_dir=args.output_dir,
         profile=args.profile,

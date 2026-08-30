@@ -10,6 +10,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from pf.estimator_types import JointStationObservation
+from pf.full_spectrum import DETECTOR_IMPACT_PHASE_COUNT
+from pf.history_tree import (
+    TPHTProposalDecision,
+    run_tpht_hierarchical_exact_acceptance_torch,
+)
+from pf.joint_transport_cache import (
+    JointTransportCache,
+)
 from pf.particle_filter import IsotopeParticleFilter, StructuralGeometryBatch
 from pf.strength_prior import STRENGTH_PROPOSAL_UPPER_QUANTILE_PROBABILITY
 
@@ -34,8 +42,82 @@ JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES = (
     "tau_fe",
     "tau_pb",
     "tau_obstacle",
+    "tau_obstacle_compton",
     "distance_m",
+    *tuple(
+        f"uncollided_impact_fraction_{index}"
+        for index in range(DETECTOR_IMPACT_PHASE_COUNT)
+    ),
 )
+
+
+def _structural_unit_component_array(
+    components: object,
+    field_name: str,
+) -> NDArray[np.float64]:
+    """Return one scalar line component from a transport result."""
+    prefix = "uncollided_impact_fraction_"
+    if field_name.startswith(prefix):
+        phase_index = int(field_name.removeprefix(prefix))
+        values = np.asarray(
+            getattr(components, "uncollided_impact_fractions"),
+            dtype=np.float64,
+        )
+        if (
+            values.ndim < 1
+            or values.shape[-1] != DETECTOR_IMPACT_PHASE_COUNT
+        ):
+            raise RuntimeError(
+                "Transport result lacks the authenticated detector-impact axis."
+            )
+        return values[..., phase_index]
+    return np.asarray(getattr(components, field_name), dtype=np.float64)
+
+
+def _transport_features_numpy(components: object) -> NDArray[np.float64]:
+    """Return canonical phase-resolved NumPy transport features."""
+    base = np.stack(
+        (
+            np.asarray(getattr(components, "tau_fe"), dtype=np.float64),
+            np.asarray(getattr(components, "tau_pb"), dtype=np.float64),
+            np.asarray(getattr(components, "tau_obstacle"), dtype=np.float64),
+            np.asarray(
+                getattr(components, "tau_obstacle_compton"),
+                dtype=np.float64,
+            ),
+            np.asarray(getattr(components, "distance_m"), dtype=np.float64),
+        ),
+        axis=-1,
+    )
+    impact = np.asarray(
+        getattr(components, "uncollided_impact_fractions"),
+        dtype=np.float64,
+    )
+    if impact.shape != base.shape[:-1] + (DETECTOR_IMPACT_PHASE_COUNT,):
+        raise RuntimeError("Transport detector-impact features are misaligned.")
+    return np.concatenate((base, impact), axis=-1)
+
+
+def _transport_features_torch(components: object) -> "torch.Tensor":
+    """Return canonical phase-resolved Torch transport features."""
+    import torch
+
+    base = torch.stack(
+        (
+            getattr(components, "tau_fe"),
+            getattr(components, "tau_pb"),
+            getattr(components, "tau_obstacle"),
+            getattr(components, "tau_obstacle_compton"),
+            getattr(components, "distance_m"),
+        ),
+        dim=-1,
+    )
+    impact = getattr(components, "uncollided_impact_fractions")
+    if tuple(impact.shape) != tuple(base.shape[:-1]) + (
+        DETECTOR_IMPACT_PHASE_COUNT,
+    ):
+        raise RuntimeError("Torch detector-impact features are misaligned.")
+    return torch.cat((base, impact), dim=-1)
 
 
 class EstimatorStructuralProposalMixin:
@@ -293,18 +375,9 @@ class EstimatorStructuralProposalMixin:
                 components.uncollided_kernel,
                 dtype=np.float64,
             ).reshape(local_shape)
-            unit_features = np.stack(
-                (
-                    np.asarray(components.tau_fe, dtype=np.float64),
-                    np.asarray(components.tau_pb, dtype=np.float64),
-                    np.asarray(
-                        components.tau_obstacle,
-                        dtype=np.float64,
-                    ),
-                    np.asarray(components.distance_m, dtype=np.float64),
-                ),
-                axis=-1,
-            ).reshape(local_shape + (feature_count,))
+            unit_features = _transport_features_numpy(components).reshape(
+                local_shape + (feature_count,)
+            )
             batch_count = int(batch_centers.shape[0])
             candidate_count = batch_count * int(strengths.size)
             total = np.zeros(
@@ -489,14 +562,7 @@ class EstimatorStructuralProposalMixin:
                 "Residual proposal geometry differs from joint station history."
             )
         beta = float(target_beta)
-        active_prefix = self._active_joint_tempering_prefix_count
-        if active_prefix is None:
-            newest_station_power = beta
-        else:
-            newest_view_count = int(stations[-1].fe_indices.size)
-            newest_station_power = (int(active_prefix) - 1 + beta) / float(
-                newest_view_count
-            )
+        newest_station_power = beta
         has_active_likelihood = len(stations) > 1 or newest_station_power > 0.0
         if not has_active_likelihood:
             return (
@@ -641,7 +707,7 @@ class EstimatorStructuralProposalMixin:
         positive_line_indices: NDArray[np.int64],
     ) -> str:
         """Hash all immutable inputs to one unit-transport cache generation."""
-        digest = hashlib.sha256(b"joint_continuous_surface_unit_transport_cache_v1\0")
+        digest = hashlib.sha256(b"joint_continuous_surface_unit_transport_cache_v2\0")
         for text in (
             str(filt.isotope),
             str(filt.structural_rj_surface_atlas_sha256),
@@ -821,10 +887,7 @@ class EstimatorStructuralProposalMixin:
                 )
                 missing_values = tuple(
                     np.transpose(
-                        np.asarray(
-                            getattr(evaluated, name),
-                            dtype=np.float64,
-                        ),
+                        _structural_unit_component_array(evaluated, name),
                         (1, 0, 2),
                     )
                     for name in JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES
@@ -1127,7 +1190,7 @@ class EstimatorStructuralProposalMixin:
             )
             fused_values = tuple(
                 np.transpose(
-                    np.asarray(getattr(evaluated, name), dtype=np.float64),
+                    _structural_unit_component_array(evaluated, name),
                     (1, 0, 2),
                 )
                 for name in JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES
@@ -1185,9 +1248,9 @@ class EstimatorStructuralProposalMixin:
         *,
         filt: IsotopeParticleFilter,
         reference: "torch.Tensor",
-        particle_indices: NDArray[np.int64],
-        positions_pks: NDArray[np.float64],
-        chart_ids_pk: NDArray[np.int64],
+        particle_indices: object,
+        positions_pks: object,
+        chart_ids_pk: object,
     ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
         """Match proposals to immutable sweep-entry transport columns on Torch.
 
@@ -1222,7 +1285,7 @@ class EstimatorStructuralProposalMixin:
                 ),
             }
         indices = torch.as_tensor(
-            np.asarray(particle_indices, dtype=np.int64),
+            particle_indices,
             device=reference.device,
             dtype=torch.long,
         )
@@ -1299,8 +1362,23 @@ class EstimatorStructuralProposalMixin:
             positive_line_indices,
             dtype=np.int64,
         )
+        geometry_digest = hashlib.sha256()
+        for name, values, dtype in (
+            ("detector_positions", data.detector_positions, np.float64),
+            ("fe_indices", data.fe_indices, np.int64),
+            ("pb_indices", data.pb_indices, np.int64),
+            ("live_times", data.live_times, np.float64),
+            ("station_sequence_ids", data.station_sequence_ids, np.int64),
+        ):
+            array = np.ascontiguousarray(values, dtype=dtype)
+            geometry_digest.update(name.encode("ascii"))
+            geometry_digest.update(
+                np.ascontiguousarray(array.shape, dtype=np.int64).tobytes()
+            )
+            geometry_digest.update(array.tobytes())
         signature = (
-            f"{id(data)}:{str(reference.device)}:"
+            f"{geometry_digest.hexdigest()}:{str(reference.device)}:"
+            f"{str(reference.dtype)}:"
             f"{hashlib.sha256(line_indices.tobytes()).hexdigest()}"
         )
         key = (str(filt.isotope), signature)
@@ -1367,14 +1445,21 @@ class EstimatorStructuralProposalMixin:
         *,
         filt: IsotopeParticleFilter,
         cache: dict[str, object],
+        final_state: Mapping[str, object] | None = None,
     ) -> None:
         """Commit pending unit columns only when their proposal was accepted."""
         import torch
 
         pending = cache.get("pending")
-        state = getattr(filt, "_structural_rj_device_state", None)
-        if not isinstance(pending, dict) or state is None:
+        if not isinstance(pending, dict):
             return
+        state = final_state
+        if state is None:
+            state = getattr(filt, "_structural_rj_device_state", None)
+        if state is None:
+            raise RuntimeError(
+                "Pending CUDA unit transport has no accepted-state mirror."
+            )
         indices = pending["particle_indices"]
         cardinality = int(pending["cardinality"])
         current_cardinality = torch.index_select(
@@ -1426,13 +1511,251 @@ class EstimatorStructuralProposalMixin:
             ]
         cache["pending"] = None
 
+    def _joint_commit_staged_cuda_transport_cache_isotope(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        data: StructuralGeometryBatch,
+        stations: Sequence[JointStationObservation],
+        particle_indices: NDArray[np.int64],
+    ) -> None:
+        """Commit exact accepted proposal columns into the global Torch cache.
+
+        Every accepted structural move was already evaluated from staged unit
+        transport. Reusing those exact columns avoids recomputing the same
+        geometry immediately after the sweep. Missing staged columns are an
+        invariant violation and fail closed instead of invoking a fallback.
+        """
+        import torch
+
+        cache = self._joint_structural_transport_cache
+        if not isinstance(cache, JointTransportCache) or not hasattr(
+            cache[0],
+            "detach",
+        ):
+            raise RuntimeError(
+                "Staged transport commit requires the fixed active Torch cache."
+            )
+        raw_indices = np.asarray(particle_indices)
+        if raw_indices.ndim != 1 or not np.issubdtype(
+            raw_indices.dtype,
+            np.integer,
+        ):
+            raise ValueError("particle_indices must be a 1-D integer array.")
+        indices = np.asarray(raw_indices, dtype=np.int64)
+        if indices.size == 0:
+            return
+        if np.unique(indices).size != indices.size:
+            raise ValueError("particle_indices must not contain duplicates.")
+
+        cached_total, cached_uncollided, cached_features = cache
+        particle_count = int(cached_total.shape[0])
+        if np.any(indices < 0) or np.any(indices >= particle_count):
+            raise IndexError("Staged transport commit row is out of range.")
+        accepted_state = getattr(filt, "_structural_rj_device_state", None)
+        if accepted_state is not None and bool(
+            getattr(filt, "_structural_rj_device_state_authoritative", False)
+        ):
+            if (
+                accepted_state["strengths"].device != cached_total.device
+                or accepted_state["strengths"].dtype != cached_total.dtype
+            ):
+                raise RuntimeError(
+                    "Accepted RJ state and structural cache use different devices."
+                )
+            final_state: dict[str, object] = {
+                name: accepted_state[name]
+                for name in (
+                    "positions",
+                    "strengths",
+                    "mask",
+                    "chart_ids",
+                    "cardinalities",
+                )
+            }
+        else:
+            positions, strengths, mask, chart_ids, _ = (
+                filt._packed_continuous_surface_state_arrays()
+            )
+            final_state = {
+                "positions": torch.as_tensor(
+                    positions,
+                    device=cached_total.device,
+                    dtype=cached_total.dtype,
+                ),
+                "strengths": torch.as_tensor(
+                    strengths,
+                    device=cached_total.device,
+                    dtype=cached_total.dtype,
+                ),
+                "mask": torch.as_tensor(
+                    mask,
+                    device=cached_total.device,
+                    dtype=torch.bool,
+                ),
+                "chart_ids": torch.as_tensor(
+                    chart_ids,
+                    device=cached_total.device,
+                    dtype=torch.long,
+                ),
+                "cardinalities": torch.as_tensor(
+                    np.sum(mask, axis=1, dtype=np.int64),
+                    device=cached_total.device,
+                    dtype=torch.long,
+                ),
+            }
+
+        layout = self._joint_line_layout()
+        isotope = str(filt.isotope)
+        order = self.joint_isotope_order()
+        if isotope not in order or isotope not in layout:
+            raise KeyError(f"Unknown joint PF isotope: {isotope!r}.")
+        global_columns, local_indices, _ = layout[isotope]
+        accepted_cache = self._joint_cuda_accepted_unit_cache_entry(
+            filt=filt,
+            data=data,
+            positive_line_indices=local_indices,
+            reference=cached_total,
+        )
+        self._joint_promote_pending_cuda_unit_transport(
+            filt=filt,
+            cache=accepted_cache,
+            final_state=final_state,
+        )
+
+        slots_per_isotope = int(filt.config.hard_max_sources or 0)
+        slot_start = order.index(isotope) * slots_per_isotope
+        slot_stop = slot_start + slots_per_isotope
+        line_selection = torch.as_tensor(
+            global_columns,
+            device=cached_total.device,
+            dtype=torch.long,
+        )
+        all_index_tensor = torch.as_tensor(
+            indices,
+            device=cached_total.device,
+            dtype=torch.long,
+        )
+        selected_cardinalities = torch.index_select(
+            final_state["cardinalities"],
+            0,
+            all_index_tensor,
+        )
+        commit_plans: list[
+            tuple[
+                torch.Tensor,
+                tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                torch.Tensor,
+            ]
+        ] = []
+        for cardinality_value in torch.unique(selected_cardinalities).tolist():
+            cardinality = int(cardinality_value)
+            selected_tensor = all_index_tensor[
+                selected_cardinalities == cardinality
+            ]
+            replacement_total = torch.zeros(
+                (
+                    int(selected_tensor.numel()),
+                    int(cache.valid_view_count),
+                    slots_per_isotope,
+                    int(cached_total.shape[-1]),
+                ),
+                device=cached_total.device,
+                dtype=cached_total.dtype,
+            )
+            replacement_uncollided = torch.zeros_like(replacement_total)
+            replacement_features = torch.zeros(
+                tuple(replacement_total.shape) + (int(cached_features.shape[-1]),),
+                device=cached_total.device,
+                dtype=cached_total.dtype,
+            )
+            if cardinality:
+                matched, _, unit_components = (
+                    self._joint_match_cuda_accepted_unit_transport(
+                        cache=accepted_cache,
+                        particle_indices=selected_tensor,
+                        positions_pks=torch.index_select(
+                            final_state["positions"],
+                            0,
+                            selected_tensor,
+                        )[:, :cardinality],
+                        chart_ids_pk=torch.index_select(
+                            final_state["chart_ids"],
+                            0,
+                            selected_tensor,
+                        )[:, :cardinality],
+                        reference=cached_total,
+                    )
+                )
+                if not bool(torch.all(matched).item()):
+                    missing = int(torch.count_nonzero(~matched).item())
+                    raise RuntimeError(
+                        "Accepted structural state lacks exact staged unit "
+                        f"transport for {missing} source column(s)."
+                    )
+                strength_tensor = torch.index_select(
+                    final_state["strengths"],
+                    0,
+                    selected_tensor,
+                )[:, None, :cardinality, None]
+                target_slots = slice(0, cardinality)
+                total_subset = replacement_total[:, :, target_slots, :]
+                uncollided_subset = replacement_uncollided[:, :, target_slots, :]
+                feature_subset = replacement_features[:, :, target_slots, :, :]
+                total_subset[..., line_selection] = (
+                    unit_components[0] * strength_tensor
+                )
+                uncollided_subset[..., line_selection] = (
+                    unit_components[1] * strength_tensor
+                )
+                feature_subset[..., line_selection, :] = unit_components[2]
+            commit_plans.append(
+                (
+                    selected_tensor,
+                    (
+                        replacement_total,
+                        replacement_uncollided,
+                        replacement_features,
+                    ),
+                    (
+                        torch.arange(
+                            slots_per_isotope,
+                            device=cached_total.device,
+                            dtype=torch.long,
+                        )[None, :]
+                        < cardinality
+                    ).expand(int(selected_tensor.numel()), -1),
+                )
+            )
+        for selected_tensor, replacement, active_slot_mask in commit_plans:
+            cache.replace_slot_rows(
+                rows=selected_tensor,
+                slot_start=slot_start,
+                slot_stop=slot_stop,
+                replacement=replacement,
+                active_slot_mask=active_slot_mask,
+            )
+
+        self._joint_structural_transport_cache = cache
+        station_signature = self._joint_station_cache_signatures(stations)
+        if station_signature is None:
+            self._joint_persistent_structural_transport_cache = None
+        else:
+            state_sha256 = self._joint_structural_state_sha256()
+            cache.update_state_identity(
+                state_sha256=state_sha256,
+                row_generation=self._joint_row_generation,
+            )
+            self._joint_persistent_structural_transport_cache = cache
+        self.last_joint_staged_transport_commit_rows += int(indices.size)
+
     @staticmethod
     def _joint_match_cuda_accepted_unit_transport(
         *,
         cache: dict[str, object],
-        particle_indices: NDArray[np.int64],
-        positions_pks: NDArray[np.float64],
-        chart_ids_pk: NDArray[np.int64],
+        particle_indices: object,
+        positions_pks: object,
+        chart_ids_pk: object,
         reference: "torch.Tensor",
     ) -> tuple["torch.Tensor", "torch.Tensor", tuple["torch.Tensor", ...]]:
         """Match candidates to accepted sweep-local unit columns on CUDA."""
@@ -1500,9 +1823,9 @@ class EstimatorStructuralProposalMixin:
     def _joint_stage_cuda_unit_transport(
         *,
         cache: dict[str, object],
-        particle_indices: NDArray[np.int64],
-        positions_pks: NDArray[np.float64],
-        chart_ids_pk: NDArray[np.int64],
+        particle_indices: object,
+        positions_pks: object,
+        chart_ids_pk: object,
         unit_total: "torch.Tensor",
         unit_uncollided: "torch.Tensor",
         unit_features: "torch.Tensor",
@@ -1517,7 +1840,7 @@ class EstimatorStructuralProposalMixin:
                 device=reference.device,
                 dtype=torch.long,
             ),
-            "cardinality": int(np.asarray(positions_pks).shape[1]),
+            "cardinality": int(positions_pks.shape[1]),
             "positions": torch.as_tensor(
                 positions_pks,
                 device=reference.device,
@@ -1538,60 +1861,154 @@ class EstimatorStructuralProposalMixin:
         *,
         filt: IsotopeParticleFilter,
         data: StructuralGeometryBatch,
-        positions_pks: NDArray[np.float64],
-        chart_ids_pk: NDArray[np.int64],
-        strengths_pk: NDArray[np.float64],
-        particle_indices: NDArray[np.int64],
+        positions_pks: object,
+        chart_ids_pk: object,
+        strengths_pk: object,
+        particle_indices: object,
         target_beta: float,
         tempering_start_row: int | None,
-    ) -> NDArray[np.float64]:
-        """Evaluate a conditional isotope proposal under the full joint target."""
-        stations = self._active_joint_station_history
+        station_start: int | None = None,
+        station_stop: int | None = None,
+        return_station_log_likelihood: bool = False,
+        stage_unit_transport: bool = True,
+    ) -> object:
+        """Evaluate a conditional isotope proposal on one exact history block."""
+        full_stations = self._active_joint_station_history
         cache = self._joint_structural_transport_cache
-        if stations is None or cache is None:
+        if full_stations is None or cache is None:
             raise RuntimeError("Joint structural target is not active.")
-        self._validate_joint_structural_geometry(data, stations)
+        self._validate_joint_structural_geometry(data, full_stations)
+        full_total_views = sum(
+            int(station.fe_indices.size) for station in full_stations
+        )
+        full_newest_start = full_total_views - int(
+            full_stations[-1].fe_indices.size
+        )
+        if (
+            tempering_start_row is not None
+            and int(tempering_start_row) != full_newest_start
+        ):
+            raise ValueError(
+                "Joint structural tempering must begin at the newest station."
+            )
+        resolved_station_start = 0 if station_start is None else int(station_start)
+        resolved_station_stop = (
+            len(full_stations) if station_stop is None else int(station_stop)
+        )
+        if (
+            isinstance(station_start, bool)
+            or isinstance(station_stop, bool)
+            or resolved_station_start < 0
+            or resolved_station_stop <= resolved_station_start
+            or resolved_station_stop > len(full_stations)
+        ):
+            raise ValueError("Structural target station block is outside history.")
+        station_offsets = [0]
+        for station in full_stations:
+            station_offsets.append(
+                station_offsets[-1] + int(station.fe_indices.size)
+            )
+        view_start = int(station_offsets[resolved_station_start])
+        view_stop = int(station_offsets[resolved_station_stop])
+        stations = tuple(
+            full_stations[resolved_station_start:resolved_station_stop]
+        )
+        if resolved_station_start or resolved_station_stop != len(full_stations):
+            data = StructuralGeometryBatch(
+                detector_positions=data.detector_positions[view_start:view_stop],
+                fe_indices=data.fe_indices[view_start:view_stop],
+                pb_indices=data.pb_indices[view_start:view_stop],
+                live_times=data.live_times[view_start:view_stop],
+                station_sequence_ids=data.station_sequence_ids[view_start:view_stop],
+            )
         order = self.joint_isotope_order()
         if filt.isotope not in order:
             raise ValueError("Conditional RJ filter is not a joint isotope.")
-        indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
-        positions = np.asarray(positions_pks, dtype=np.float64)
-        raw_chart_ids = np.asarray(chart_ids_pk)
-        strengths = np.asarray(strengths_pk, dtype=np.float64)
-        total_views = sum(int(station.fe_indices.size) for station in stations)
+        import torch
+
+        tensor_input = torch.is_tensor(positions_pks)
+        if tensor_input:
+            if not torch.is_tensor(chart_ids_pk) or not torch.is_tensor(
+                strengths_pk
+            ):
+                raise TypeError(
+                    "Torch structural candidates require tensor chart and "
+                    "strength arrays."
+                )
+            positions = positions_pks
+            chart_ids = chart_ids_pk
+            strengths = strengths_pk
+            indices_tensor = torch.as_tensor(
+                particle_indices,
+                device=positions.device,
+                dtype=torch.long,
+            ).reshape(-1)
+            row_count = int(indices_tensor.numel())
+            if chart_ids.dtype != torch.long:
+                raise TypeError("Torch structural chart IDs must use torch.long.")
+            if (
+                positions.device != chart_ids.device
+                or positions.device != strengths.device
+                or positions.dtype != strengths.dtype
+            ):
+                raise ValueError(
+                    "Torch structural candidates must share device and dtype."
+                )
+        else:
+            indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+            positions = np.asarray(positions_pks, dtype=np.float64)
+            raw_chart_ids = np.asarray(chart_ids_pk)
+            strengths = np.asarray(strengths_pk, dtype=np.float64)
+            if not np.issubdtype(raw_chart_ids.dtype, np.integer):
+                raise TypeError("Structural chart IDs must contain integers.")
+            chart_ids = np.asarray(raw_chart_ids, dtype=np.int64)
+            row_count = int(indices.size)
+        total_views = view_stop - view_start
         if (
             positions.ndim != 3
-            or positions.shape[0] != indices.size
+            or int(positions.shape[0]) != row_count
             or positions.shape[2] != 3
             or strengths.shape != positions.shape[:2]
-            or not np.issubdtype(raw_chart_ids.dtype, np.integer)
-            or raw_chart_ids.shape != strengths.shape
+            or chart_ids.shape != strengths.shape
         ):
             raise ValueError(
                 "Conditional isotope candidates must be aligned surface states."
             )
-        chart_ids = np.asarray(raw_chart_ids, dtype=np.int64)
         model = self._full_spectrum_model()
-        cached_total, cached_uncollided, cached_features = cache
+        cached_total = cache[0][:, view_start:view_stop, ...]
+        cached_uncollided = cache[1][:, view_start:view_stop, ...]
+        cached_features = cache[2][:, view_start:view_stop, ...]
         line_count = len(tuple(model.line_identity))
         feature_count = len(tuple(model.transport_feature_order))
         slots_per_isotope = int(filt.config.hard_max_sources)
         total_slot_count = slots_per_isotope * len(order)
+        if int(positions.shape[1]) > slots_per_isotope:
+            raise ValueError(
+                "Conditional candidate cardinality exceeds its source slots."
+            )
         if (
             tuple(cached_total.shape[1:]) != (total_views, total_slot_count, line_count)
             or tuple(cached_uncollided.shape) != tuple(cached_total.shape)
             or tuple(cached_features.shape)
             != tuple(cached_total.shape) + (feature_count,)
-            or np.any(indices < 0)
-            or np.any(indices >= int(cached_total.shape[0]))
         ):
             raise RuntimeError("Joint structural transport cache is misaligned.")
+        if tensor_input:
+            if bool(
+                torch.any(
+                    (indices_tensor < 0)
+                    | (indices_tensor >= int(cached_total.shape[0]))
+                ).item()
+            ):
+                raise RuntimeError("Joint structural particle indices are invalid.")
+        elif np.any(indices < 0) or np.any(indices >= int(cached_total.shape[0])):
+            raise RuntimeError("Joint structural particle indices are invalid.")
         cache_is_torch = hasattr(cached_total, "detach")
         layout = self._joint_line_layout()
         global_columns, local_indices, branching_weights = layout[str(filt.isotope)]
         local_shape = (
             total_views,
-            indices.size,
+            row_count,
             int(positions.shape[1]),
             int(local_indices.size),
         )
@@ -1602,28 +2019,13 @@ class EstimatorStructuralProposalMixin:
             import torch
 
             index_tensor = torch.as_tensor(
-                indices,
+                indices_tensor if tensor_input else indices,
                 device=cached_total.device,
                 dtype=torch.long,
             )
-            total = torch.index_select(
-                cached_total,
-                0,
-                index_tensor,
-            ).clone()
-            uncollided = torch.index_select(
-                cached_uncollided,
-                0,
-                index_tensor,
-            ).clone()
-            features = torch.index_select(
-                cached_features,
-                0,
-                index_tensor,
-            ).clone()
             global_column_selection = torch.as_tensor(
                 global_columns,
-                device=total.device,
+                device=cached_total.device,
                 dtype=torch.long,
             )
             cardinality = int(positions.shape[1])
@@ -1631,7 +2033,7 @@ class EstimatorStructuralProposalMixin:
                 self._joint_cached_state_match_torch(
                     filt=filt,
                     reference=cached_total,
-                    particle_indices=indices,
+                    particle_indices=index_tensor,
                     positions_pks=positions,
                     chart_ids_pk=chart_ids,
                 )
@@ -1649,7 +2051,7 @@ class EstimatorStructuralProposalMixin:
             accepted_matched, _, accepted_unit_components = (
                 self._joint_match_cuda_accepted_unit_transport(
                     cache=accepted_unit_cache,
-                    particle_indices=indices,
+                    particle_indices=index_tensor,
                     positions_pks=positions,
                     chart_ids_pk=chart_ids,
                     reference=cached_total,
@@ -1659,33 +2061,48 @@ class EstimatorStructuralProposalMixin:
             local_line_count = int(local_indices.size)
             candidate_total = torch.zeros(
                 (
-                    indices.size,
+                    row_count,
                     total_views,
                     cardinality,
                     local_line_count,
                 ),
-                device=total.device,
-                dtype=total.dtype,
+                device=cached_total.device,
+                dtype=cached_total.dtype,
             )
             candidate_uncollided = torch.zeros_like(candidate_total)
             candidate_features = torch.zeros(
                 tuple(candidate_total.shape) + (feature_count,),
-                device=total.device,
-                dtype=total.dtype,
+                device=cached_total.device,
+                dtype=cached_total.dtype,
             )
             if cardinality:
                 accepted_total = torch.index_select(
-                    total[:, :, slot_start:slot_stop, :],
+                    cached_total[:, :, slot_start:slot_stop, :],
+                    0,
+                    index_tensor,
+                )
+                accepted_total = torch.index_select(
+                    accepted_total,
                     3,
                     global_column_selection,
                 )
                 accepted_uncollided = torch.index_select(
-                    uncollided[:, :, slot_start:slot_stop, :],
+                    cached_uncollided[:, :, slot_start:slot_stop, :],
+                    0,
+                    index_tensor,
+                )
+                accepted_uncollided = torch.index_select(
+                    accepted_uncollided,
                     3,
                     global_column_selection,
                 )
                 accepted_features = torch.index_select(
-                    features[:, :, slot_start:slot_stop, :, :],
+                    cached_features[:, :, slot_start:slot_stop, :, :],
+                    0,
+                    index_tensor,
+                )
+                accepted_features = torch.index_select(
+                    accepted_features,
                     3,
                     global_column_selection,
                 )
@@ -1719,8 +2136,8 @@ class EstimatorStructuralProposalMixin:
                 )
                 proposed_strength_tensor = torch.as_tensor(
                     strengths,
-                    device=total.device,
-                    dtype=total.dtype,
+                    device=cached_total.device,
+                    dtype=cached_total.dtype,
                 )
                 ratio_tensor = torch.where(
                     matched,
@@ -1751,8 +2168,8 @@ class EstimatorStructuralProposalMixin:
             if cardinality:
                 proposed_strength_tensor = torch.as_tensor(
                     strengths,
-                    device=total.device,
-                    dtype=total.dtype,
+                    device=cached_total.device,
+                    dtype=cached_total.dtype,
                 )[:, None, :, None]
                 accepted_tensor = accepted_matched[:, None, :, None]
                 candidate_total = torch.where(
@@ -1787,12 +2204,34 @@ class EstimatorStructuralProposalMixin:
                 .astype(np.int64, copy=False)
             )
             if unmatched_rows.size:
+                if tensor_input:
+                    unmatched_positions = (
+                        positions[unmatched_index[:, 0], unmatched_index[:, 1]]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    unmatched_chart_ids = (
+                        chart_ids[unmatched_index[:, 0], unmatched_index[:, 1]]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                else:
+                    unmatched_positions = positions[
+                        unmatched_rows,
+                        unmatched_slots,
+                    ]
+                    unmatched_chart_ids = chart_ids[
+                        unmatched_rows,
+                        unmatched_slots,
+                    ]
                 device_components = (
                     filt._continuous_rj_line_transport_component_columns(
                         data,
-                        positions[unmatched_rows, unmatched_slots],
+                        unmatched_positions,
                         local_indices,
-                        chart_ids=chart_ids[unmatched_rows, unmatched_slots],
+                        chart_ids=unmatched_chart_ids,
                         device_resident=True,
                     )
                 )
@@ -1802,13 +2241,13 @@ class EstimatorStructuralProposalMixin:
                     )
                 branch_tensor = torch.as_tensor(
                     branching_weights,
-                    device=total.device,
-                    dtype=total.dtype,
+                    device=cached_total.device,
+                    dtype=cached_total.dtype,
                 )[None, None, :]
                 strength_tensor = torch.as_tensor(
                     strengths[unmatched_rows, unmatched_slots],
-                    device=total.device,
-                    dtype=total.dtype,
+                    device=cached_total.device,
+                    dtype=cached_total.dtype,
                 )[:, None, None]
                 unmatched_total = (
                     device_components.total_kernel.permute(1, 0, 2)
@@ -1820,23 +2259,17 @@ class EstimatorStructuralProposalMixin:
                     * strength_tensor
                     * branch_tensor
                 )
-                unmatched_features = torch.stack(
-                    (
-                        device_components.tau_fe,
-                        device_components.tau_pb,
-                        device_components.tau_obstacle,
-                        device_components.distance_m,
-                    ),
-                    dim=-1,
+                unmatched_features = _transport_features_torch(
+                    device_components
                 ).permute(1, 0, 2, 3)
                 unmatched_row_tensor = torch.as_tensor(
                     unmatched_rows,
-                    device=total.device,
+                    device=cached_total.device,
                     dtype=torch.long,
                 )
                 unmatched_slot_tensor = torch.as_tensor(
                     unmatched_slots,
-                    device=total.device,
+                    device=cached_total.device,
                     dtype=torch.long,
                 )
                 candidate_total[
@@ -1867,33 +2300,32 @@ class EstimatorStructuralProposalMixin:
             )
             staged_strength = torch.as_tensor(
                 strengths,
-                device=total.device,
-                dtype=total.dtype,
+                device=cached_total.device,
+                dtype=cached_total.dtype,
             )[:, None, :, None]
-            self._joint_stage_cuda_unit_transport(
-                cache=accepted_unit_cache,
-                particle_indices=indices,
-                positions_pks=positions,
-                chart_ids_pk=chart_ids,
-                unit_total=candidate_total / staged_strength,
-                unit_uncollided=candidate_uncollided / staged_strength,
-                unit_features=candidate_features,
-            )
+            if stage_unit_transport:
+                self._joint_stage_cuda_unit_transport(
+                    cache=accepted_unit_cache,
+                    particle_indices=index_tensor,
+                    positions_pks=positions,
+                    chart_ids_pk=chart_ids,
+                    unit_total=candidate_total / staged_strength,
+                    unit_uncollided=candidate_uncollided / staged_strength,
+                    unit_features=candidate_features,
+                )
         else:
-            (
-                component_total,
-                component_uncollided,
-                component_tau_fe,
-                component_tau_pb,
-                component_tau_obstacle,
-                component_distance,
-            ) = self._joint_cached_continuous_unit_components(
+            component_values = self._joint_cached_continuous_unit_components(
                 filt=filt,
                 data=data,
                 positions_s3=positions.reshape(-1, 3),
                 chart_ids_s=chart_ids.reshape(-1),
                 positive_line_indices=local_indices,
             )
+            if len(component_values) != len(JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES):
+                raise RuntimeError(
+                    "Structural transport cache returned an incomplete component set."
+                )
+            component_total, component_uncollided = component_values[:2]
             candidate_total_numpy = np.asarray(
                 component_total,
                 dtype=np.float64,
@@ -1903,11 +2335,9 @@ class EstimatorStructuralProposalMixin:
                 dtype=np.float64,
             ).reshape(local_shape)
             candidate_features_numpy = np.stack(
-                (
-                    np.asarray(component_tau_fe, dtype=np.float64),
-                    np.asarray(component_tau_pb, dtype=np.float64),
-                    np.asarray(component_tau_obstacle, dtype=np.float64),
-                    np.asarray(component_distance, dtype=np.float64),
+                tuple(
+                    np.asarray(component, dtype=np.float64)
+                    for component in component_values[2:]
                 ),
                 axis=-1,
             ).reshape(local_shape + (feature_count,))
@@ -1937,14 +2367,119 @@ class EstimatorStructuralProposalMixin:
                 (1, 0, 2, 3, 4),
             )
             global_column_selection = global_columns
+        cardinality = int(positions.shape[1])
+        beta = (
+            float(target_beta)
+            if resolved_station_stop == len(full_stations)
+            else 1.0
+        )
+        if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
+            raise ValueError("Joint structural target_beta must lie in [0, 1].")
+        if data.row_count != total_views:
+            raise ValueError(
+                "Conditional isotope evidence geometry differs from joint history."
+            )
+        if cache_is_torch:
+            replacement_total = torch.zeros(
+                (
+                    row_count,
+                    total_views,
+                    slots_per_isotope,
+                    line_count,
+                ),
+                device=cached_total.device,
+                dtype=cached_total.dtype,
+            )
+            replacement_uncollided = torch.zeros_like(replacement_total)
+            replacement_features = torch.zeros(
+                tuple(replacement_total.shape) + (feature_count,),
+                device=cached_total.device,
+                dtype=cached_total.dtype,
+            )
+            if cardinality:
+                target_slots = slice(0, cardinality)
+                total_subset = replacement_total[:, :, target_slots, :]
+                uncollided_subset = replacement_uncollided[:, :, target_slots, :]
+                feature_subset = replacement_features[:, :, target_slots, :, :]
+                total_subset[..., global_column_selection] = candidate_total
+                uncollided_subset[..., global_column_selection] = candidate_uncollided
+                feature_subset[..., global_column_selection, :] = candidate_features
+            if isinstance(cache, JointTransportCache):
+                replacement_active_slot_mask = (
+                    torch.arange(
+                        slots_per_isotope,
+                        device=cached_total.device,
+                        dtype=torch.long,
+                    )[None, :]
+                    < cardinality
+                ).expand(row_count, -1)
+                result = self._joint_history_slot_overlay_log_likelihood_torch(
+                    filt=filt,
+                    stations=stations,
+                    accepted_total_nvsl=cached_total,
+                    accepted_uncollided_nvsl=cached_uncollided,
+                    accepted_features_nvslf=cached_features,
+                    replacement_total_nvrl=replacement_total,
+                    replacement_uncollided_nvrl=replacement_uncollided,
+                    replacement_features_nvrlf=replacement_features,
+                    particle_indices=index_tensor,
+                    slot_start=slot_start,
+                    slot_stop=slot_stop,
+                    replacement_active_slot_mask=(
+                        replacement_active_slot_mask
+                    ),
+                    target_beta=beta,
+                    return_station_log_likelihood=(
+                        return_station_log_likelihood
+                    ),
+                )
+            else:
+                # Explicit small test oracle only; production refreshes always
+                # construct JointTransportCache and cannot select this branch.
+                total = torch.index_select(cached_total, 0, index_tensor)
+                uncollided = torch.index_select(
+                    cached_uncollided,
+                    0,
+                    index_tensor,
+                )
+                features = torch.index_select(
+                    cached_features,
+                    0,
+                    index_tensor,
+                )
+                total[:, :, slot_start:slot_stop, :] = replacement_total
+                uncollided[:, :, slot_start:slot_stop, :] = replacement_uncollided
+                features[:, :, slot_start:slot_stop, :, :] = replacement_features
+                result = self._joint_history_log_likelihood_torch(
+                    filt=filt,
+                    stations=stations,
+                    total_nvsl=total,
+                    uncollided_nvsl=uncollided,
+                    features_nvslf=features,
+                    target_beta=beta,
+                    return_station_log_likelihood=(
+                        return_station_log_likelihood
+                    ),
+                )
+            if tensor_input:
+                return result
+            if return_station_log_likelihood:
+                target, station_values = result
+                return (
+                    target.detach().cpu().numpy().astype(np.float64, copy=False),
+                    station_values.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64, copy=False),
+                )
+            return result.detach().cpu().numpy().astype(np.float64, copy=False)
+        if return_station_log_likelihood:
+            raise RuntimeError(
+                "TPHT per-station proposal likelihood requires the Torch backend."
+            )
         total[:, :, slot_start:slot_stop, :] = 0.0
         uncollided[:, :, slot_start:slot_stop, :] = 0.0
         features[:, :, slot_start:slot_stop, :, :] = 0.0
-        cardinality = int(positions.shape[1])
-        if cardinality > slots_per_isotope:
-            raise ValueError(
-                "Conditional candidate cardinality exceeds its source slots."
-            )
         if cardinality:
             target_slots = slice(slot_start, slot_start + cardinality)
             total_subset = total[:, :, target_slots, :]
@@ -1953,35 +2488,6 @@ class EstimatorStructuralProposalMixin:
             total_subset[..., global_column_selection] = candidate_total
             uncollided_subset[..., global_column_selection] = candidate_uncollided
             feature_subset[..., global_column_selection, :] = candidate_features
-            total[:, :, target_slots, :] = total_subset
-            uncollided[:, :, target_slots, :] = uncollided_subset
-            features[:, :, target_slots, :, :] = feature_subset
-        beta = float(target_beta)
-        if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
-            raise ValueError("Joint structural target_beta must lie in [0, 1].")
-        expected_start_row = total_views - int(stations[-1].fe_indices.size)
-        if (
-            tempering_start_row is not None
-            and int(tempering_start_row) != expected_start_row
-        ):
-            raise ValueError(
-                "Joint structural tempering must begin at the newest station."
-            )
-        if data.row_count != total_views:
-            raise ValueError(
-                "Conditional isotope evidence geometry differs from joint history."
-            )
-        if cache_is_torch:
-            result = self._joint_history_log_likelihood_torch(
-                filt=filt,
-                stations=stations,
-                total_nvsl=total,
-                uncollided_nvsl=uncollided,
-                features_nvslf=features,
-                target_beta=beta,
-                newest_prefix_count=(self._active_joint_tempering_prefix_count),
-            )
-            return result.detach().cpu().numpy().astype(np.float64, copy=False)
         return self._joint_history_log_likelihood_numpy(
             filt=filt,
             stations=stations,
@@ -1989,7 +2495,119 @@ class EstimatorStructuralProposalMixin:
             uncollided_nvsl=uncollided,
             features_nvslf=features,
             target_beta=beta,
-            newest_prefix_count=self._active_joint_tempering_prefix_count,
+        )
+
+    def _joint_structural_history_tree_evaluator(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        data: StructuralGeometryBatch,
+        positions_pks: object,
+        chart_ids_pk: object,
+        strengths_pk: object,
+        particle_indices: object,
+        current_station_log_likelihood_ps: object,
+        base_target_log_likelihood_p: object,
+        log_non_likelihood_ratio_p: object,
+        log_uniform_p: object,
+        log_refinement_uniform_p: object,
+        support_p: object,
+        target_beta: float,
+        tempering_start_row: int | None,
+        move_family: str,
+    ) -> TPHTProposalDecision:
+        """Apply certified dyadic refinement with an ordinary exact MH test.
+
+        Every evaluated child contains actual station likelihoods. Rows stop
+        only when the unresolved discrete-PMF upper bound proves rejection;
+        every other row reaches the same exact ratio as a full-history test.
+        """
+        import torch
+
+        cache = self._joint_structural_transport_cache
+        stations = self._active_joint_station_history
+        if not isinstance(cache, JointTransportCache) or stations is None:
+            raise RuntimeError("TPHT requires the active fixed exact cache.")
+        tensors = (
+            positions_pks,
+            chart_ids_pk,
+            strengths_pk,
+            particle_indices,
+            current_station_log_likelihood_ps,
+            base_target_log_likelihood_p,
+            log_non_likelihood_ratio_p,
+            log_uniform_p,
+            log_refinement_uniform_p,
+            support_p,
+        )
+        if not all(torch.is_tensor(value) for value in tensors):
+            raise TypeError("TPHT production evaluation requires Torch tensors.")
+        positions = positions_pks
+        chart_ids = chart_ids_pk
+        strengths = strengths_pk
+        indices = particle_indices.reshape(-1)
+        row_count = int(indices.numel())
+        if (
+            not isinstance(move_family, str)
+            or not move_family
+            or row_count <= 0
+            or tuple(positions.shape[:1]) != (row_count,)
+            or tuple(chart_ids.shape) != tuple(strengths.shape)
+            or tuple(positions.shape[:2]) != tuple(strengths.shape)
+        ):
+            raise ValueError("TPHT proposal arrays are not row aligned.")
+        reference = base_target_log_likelihood_p
+        if any(value.device != reference.device for value in tensors):
+            raise ValueError("TPHT proposal arrays changed device.")
+        if (
+            reference.dtype != torch.float64
+            or positions.dtype != reference.dtype
+            or strengths.dtype != reference.dtype
+            or indices.dtype != torch.long
+            or chart_ids.dtype != torch.long
+        ):
+            raise TypeError("TPHT proposal state must use float64 and long IDs.")
+
+        def _evaluate_station_block(
+            local_rows: object,
+            station_start: int,
+            station_stop: int,
+            exact_full_history: bool,
+        ) -> object:
+            """Generate and score one exact proposal-history child block."""
+            selected = torch.as_tensor(
+                local_rows,
+                device=reference.device,
+                dtype=torch.long,
+            ).reshape(-1)
+            _, station_values = self._joint_structural_target_evaluator(
+                filt=filt,
+                data=data,
+                positions_pks=torch.index_select(positions, 0, selected),
+                chart_ids_pk=torch.index_select(chart_ids, 0, selected),
+                strengths_pk=torch.index_select(strengths, 0, selected),
+                particle_indices=torch.index_select(indices, 0, selected),
+                target_beta=float(target_beta),
+                tempering_start_row=tempering_start_row,
+                station_start=int(station_start),
+                station_stop=int(station_stop),
+                return_station_log_likelihood=True,
+                stage_unit_transport=bool(exact_full_history),
+            )
+            return station_values
+
+        return run_tpht_hierarchical_exact_acceptance_torch(
+            current_station_log_likelihood_ps=(
+                current_station_log_likelihood_ps
+            ),
+            base_target_log_likelihood_p=base_target_log_likelihood_p,
+            log_non_likelihood_ratio_p=log_non_likelihood_ratio_p,
+            log_uniform_p=log_uniform_p,
+            log_refinement_uniform_p=log_refinement_uniform_p,
+            support_p=support_p,
+            target_beta=float(target_beta),
+            evaluate_station_block=_evaluate_station_block,
+            stage_accepted_rows=True,
         )
 
     def _joint_structural_strength_grid_target_evaluator(
@@ -2319,21 +2937,6 @@ class EstimatorStructuralProposalMixin:
                 device=cached_total.device,
                 dtype=torch.long,
             )
-            selected_total = torch.index_select(
-                cached_total,
-                0,
-                index_tensor,
-            )
-            selected_uncollided = torch.index_select(
-                cached_uncollided,
-                0,
-                index_tensor,
-            )
-            selected_features = torch.index_select(
-                cached_features,
-                0,
-                index_tensor,
-            )
             global_column_selection = torch.as_tensor(
                 global_columns,
                 device=cached_total.device,
@@ -2386,17 +2989,32 @@ class EstimatorStructuralProposalMixin:
             )
             if cardinality:
                 accepted_total = torch.index_select(
-                    selected_total[:, :, slot_start:slot_stop, :],
+                    cached_total[:, :, slot_start:slot_stop, :],
+                    0,
+                    index_tensor,
+                )
+                accepted_total = torch.index_select(
+                    accepted_total,
                     3,
                     global_column_selection,
                 )
                 accepted_uncollided = torch.index_select(
-                    selected_uncollided[:, :, slot_start:slot_stop, :],
+                    cached_uncollided[:, :, slot_start:slot_stop, :],
+                    0,
+                    index_tensor,
+                )
+                accepted_uncollided = torch.index_select(
+                    accepted_uncollided,
                     3,
                     global_column_selection,
                 )
                 accepted_features = torch.index_select(
-                    selected_features[:, :, slot_start:slot_stop, :, :],
+                    cached_features[:, :, slot_start:slot_stop, :, :],
+                    0,
+                    index_tensor,
+                )
+                accepted_features = torch.index_select(
+                    accepted_features,
                     3,
                     global_column_selection,
                 )
@@ -2507,14 +3125,8 @@ class EstimatorStructuralProposalMixin:
                 unmatched_uncollided = (
                     device_components.uncollided_kernel.permute(1, 0, 2) * branch_tensor
                 )
-                unmatched_features = torch.stack(
-                    (
-                        device_components.tau_fe,
-                        device_components.tau_pb,
-                        device_components.tau_obstacle,
-                        device_components.distance_m,
-                    ),
-                    dim=-1,
+                unmatched_features = _transport_features_torch(
+                    device_components
                 ).permute(1, 0, 2, 3)
                 unmatched_row_tensor = torch.as_tensor(
                     unmatched_rows,
@@ -2559,20 +3171,18 @@ class EstimatorStructuralProposalMixin:
             )[:, :, None, :, None]
             column_selection = global_column_selection
         else:
-            (
-                component_total,
-                component_uncollided,
-                component_tau_fe,
-                component_tau_pb,
-                component_tau_obstacle,
-                component_distance,
-            ) = self._joint_cached_continuous_unit_components(
+            component_values = self._joint_cached_continuous_unit_components(
                 filt=filt,
                 data=data,
                 positions_s3=positions.reshape(-1, 3),
                 chart_ids_s=chart_ids.reshape(-1),
                 positive_line_indices=local_indices,
             )
+            if len(component_values) != len(JOINT_STRUCTURAL_UNIT_COMPONENT_NAMES):
+                raise RuntimeError(
+                    "Structural transport cache returned an incomplete component set."
+                )
+            component_total, component_uncollided = component_values[:2]
             local_shape = (
                 total_views,
                 row_count,
@@ -2589,11 +3199,9 @@ class EstimatorStructuralProposalMixin:
             ) * branching_weights.reshape(1, 1, 1, -1)
             unit_features_numpy = np.transpose(
                 np.stack(
-                    (
-                        np.asarray(component_tau_fe, dtype=np.float64),
-                        np.asarray(component_tau_pb, dtype=np.float64),
-                        np.asarray(component_tau_obstacle, dtype=np.float64),
-                        np.asarray(component_distance, dtype=np.float64),
+                    tuple(
+                        np.asarray(component, dtype=np.float64)
+                        for component in component_values[2:]
                     ),
                     axis=-1,
                 ).reshape(local_shape + (feature_count,)),
@@ -2644,7 +3252,112 @@ class EstimatorStructuralProposalMixin:
             raise ValueError(
                 "Conditional candidate cardinality exceeds its source slots."
             )
+        if cache_is_torch and isinstance(cache, JointTransportCache):
+            candidate_total = (
+                unit_total[:, None] * strength_tensor
+            ).reshape(
+                row_count * grid_count,
+                total_views,
+                cardinality,
+                local_line_count,
+            )
+            candidate_uncollided = (
+                unit_uncollided[:, None] * strength_tensor
+            ).reshape_as(candidate_total)
+            candidate_features = unit_features[:, None].expand(
+                row_count,
+                grid_count,
+                total_views,
+                cardinality,
+                local_line_count,
+                feature_count,
+            ).reshape(
+                row_count * grid_count,
+                total_views,
+                cardinality,
+                local_line_count,
+                feature_count,
+            )
+            replacement_total = torch.zeros(
+                (
+                    row_count * grid_count,
+                    total_views,
+                    slots_per_isotope,
+                    line_count,
+                ),
+                device=cached_total.device,
+                dtype=cached_total.dtype,
+            )
+            replacement_uncollided = torch.zeros_like(replacement_total)
+            replacement_features = torch.zeros(
+                tuple(replacement_total.shape) + (feature_count,),
+                device=cached_total.device,
+                dtype=cached_total.dtype,
+            )
+            if cardinality:
+                target_slice = slice(0, cardinality)
+                replacement_total[..., target_slice, :][
+                    ..., column_selection
+                ] = candidate_total
+                replacement_uncollided[..., target_slice, :][
+                    ..., column_selection
+                ] = candidate_uncollided
+                replacement_features[..., target_slice, :, :][
+                    ..., column_selection, :
+                ] = candidate_features
+            expanded_indices = index_tensor[:, None].expand(
+                row_count,
+                grid_count,
+            ).reshape(-1)
+            self.last_joint_strength_grid_source_slots_before = int(
+                cached_total.shape[2]
+            )
+            self.last_joint_strength_grid_source_slots_after = slots_per_isotope
+            target = self._joint_history_slot_overlay_log_likelihood_torch(
+                filt=filt,
+                stations=stations,
+                accepted_total_nvsl=cached_total,
+                accepted_uncollided_nvsl=cached_uncollided,
+                accepted_features_nvslf=cached_features,
+                replacement_total_nvrl=replacement_total,
+                replacement_uncollided_nvrl=replacement_uncollided,
+                replacement_features_nvrlf=replacement_features,
+                particle_indices=expanded_indices,
+                slot_start=slot_start,
+                slot_stop=slot_stop,
+                replacement_active_slot_mask=(
+                    torch.arange(
+                        slots_per_isotope,
+                        device=cached_total.device,
+                        dtype=torch.long,
+                    )[None, :]
+                    < cardinality
+                ).expand(row_count * grid_count, -1),
+                target_beta=float(target_beta),
+            )
+            return (
+                target.detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64, copy=False)
+                .reshape(row_count, grid_count)
+            )
         if cache_is_torch:
+            selected_total = torch.index_select(
+                cached_total,
+                0,
+                index_tensor,
+            )
+            selected_uncollided = torch.index_select(
+                cached_uncollided,
+                0,
+                index_tensor,
+            )
+            selected_features = torch.index_select(
+                cached_features,
+                0,
+                index_tensor,
+            )
             base_active = torch.any(
                 (selected_total != 0.0) | (selected_uncollided != 0.0),
                 dim=(0, 1, 3),
@@ -2763,7 +3476,6 @@ class EstimatorStructuralProposalMixin:
                 uncollided_nvsl=uncollided,
                 features_nvslf=features,
                 target_beta=float(target_beta),
-                newest_prefix_count=(self._active_joint_tempering_prefix_count),
             )
             return (
                 target.detach()
@@ -2841,5 +3553,4 @@ class EstimatorStructuralProposalMixin:
             uncollided_nvsl=uncollided_numpy,
             features_nvslf=features_numpy,
             target_beta=float(target_beta),
-            newest_prefix_count=self._active_joint_tempering_prefix_count,
         ).reshape(row_count, grid_count)

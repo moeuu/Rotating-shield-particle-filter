@@ -82,6 +82,46 @@ def require_torch_compute_device(
         ) from exc
 
 
+def preflight_cuda_allocation_capacity(
+    *,
+    device: str,
+    required_bytes: int,
+    allocation_name: str,
+) -> dict[str, int | str]:
+    """Fail before acquisition unless one fixed CUDA allocation can fit."""
+    if (
+        isinstance(required_bytes, bool)
+        or not isinstance(required_bytes, int)
+        or required_bytes <= 0
+    ):
+        raise ValueError("required_bytes must be a positive integer.")
+    if (
+        not isinstance(allocation_name, str)
+        or not allocation_name
+        or allocation_name != allocation_name.strip()
+    ):
+        raise ValueError("allocation_name must be a nonempty canonical string.")
+    resolved_device = resolve_device(device)
+    if resolved_device.type != "cuda":
+        raise RuntimeError(
+            f"{allocation_name} requires CUDA; CPU fallback is not permitted."
+        )
+    free_bytes, total_bytes = torch.cuda.mem_get_info(resolved_device)
+    if required_bytes > int(free_bytes):
+        raise RuntimeError(
+            f"{allocation_name} requires {required_bytes} bytes but only "
+            f"{int(free_bytes)} CUDA bytes are free before acquisition. "
+            "CPU fallback is not permitted."
+        )
+    return {
+        "allocation_name": allocation_name,
+        "device": str(resolved_device),
+        "required_bytes": int(required_bytes),
+        "free_bytes": int(free_bytes),
+        "total_bytes": int(total_bytes),
+    }
+
+
 def preflight_compute_backend(
     *,
     use_gpu: bool,

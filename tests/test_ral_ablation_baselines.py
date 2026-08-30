@@ -233,6 +233,8 @@ def test_live_controller_rejects_policy_swap_before_closed_loop(
                 str(tmp_path / "runtime.sock"),
                 "--runtime-root",
                 str(tmp_path),
+                "--cui-truth-overlay-socket",
+                str(tmp_path / "cui-truth.sock"),
                 "--config",
                 str(tmp_path / "pf.json"),
                 "--control-policy",
@@ -423,6 +425,7 @@ def test_ral_controller_process_receives_no_private_scene_inputs(
     command = _controller_command(
         socket_path=tmp_path / "runtime.sock",
         runtime_root=tmp_path / "runtime",
+        cui_truth_overlay_socket_path=tmp_path / "cui-truth.sock",
         pf_config_path=tmp_path / "pf.json",
         control_policy_path=tmp_path / "policy.json",
         expected_control_policy_sha256="a" * 64,
@@ -436,6 +439,7 @@ def test_ral_controller_process_receives_no_private_scene_inputs(
     assert "scene-seed" not in rendered
     assert "truth-manifest" not in rendered
     assert "runtime.sock" in rendered
+    assert "cui-truth.sock" in rendered
 
 
 def test_explicit_shield_program_rotation_limit_is_strict() -> None:

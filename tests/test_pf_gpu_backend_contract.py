@@ -59,6 +59,59 @@ def test_requested_torch_backend_propagates_device_failure(
         )
 
 
+def test_fixed_cuda_allocation_capacity_is_checked_before_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fixed-cache preflight must expose exact free and required byte counts."""
+    monkeypatch.setattr(
+        gpu_utils,
+        "resolve_device",
+        lambda device: gpu_utils.torch.device(device),
+    )
+    monkeypatch.setattr(
+        gpu_utils.torch.cuda,
+        "mem_get_info",
+        lambda device: (2_000, 4_000),
+    )
+
+    result = gpu_utils.preflight_cuda_allocation_capacity(
+        device="cuda",
+        required_bytes=1_500,
+        allocation_name="fixed cache",
+    )
+
+    assert result == {
+        "allocation_name": "fixed cache",
+        "device": "cuda",
+        "required_bytes": 1_500,
+        "free_bytes": 2_000,
+        "total_bytes": 4_000,
+    }
+
+
+def test_fixed_cuda_allocation_capacity_has_no_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Insufficient fixed-cache memory must fail instead of changing backend."""
+    monkeypatch.setattr(
+        gpu_utils,
+        "resolve_device",
+        lambda device: gpu_utils.torch.device(device),
+    )
+    monkeypatch.setattr(
+        gpu_utils.torch.cuda,
+        "mem_get_info",
+        lambda device: (999, 4_000),
+    )
+
+    with pytest.raises(RuntimeError, match="CPU fallback is not permitted"):
+        gpu_utils.preflight_cuda_allocation_capacity(
+            device="cuda",
+            required_bytes=1_000,
+            allocation_name="fixed cache",
+        )
+
+
 @pytest.mark.parametrize(
     ("field_name", "field_value"),
     (

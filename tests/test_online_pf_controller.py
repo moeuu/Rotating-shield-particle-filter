@@ -22,7 +22,7 @@ def test_unapproved_standard_model_fails_before_runtime_config() -> None:
     isotopes = tuple(sorted({str(row["isotope"]) for row in model.line_identity}))
 
     assert model.production_ready is False
-    with pytest.raises(RuntimeError, match="independent all-64 holdout gate"):
+    with pytest.raises(RuntimeError, match="independent all-64 validation gate"):
         estimator_neutral_runtime_config(
             physical,
             backend="geant4",
@@ -90,9 +90,5 @@ def test_closed_loop_binds_final_log_after_live_assimilation() -> None:
     )
 
     assert (
-        update_offset
-        < complete_offset
-        < finalize_offset
-        < bind_offset
-        < write_offset
+        update_offset < complete_offset < finalize_offset < bind_offset < write_offset
     )

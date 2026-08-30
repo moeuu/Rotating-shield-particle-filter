@@ -15,31 +15,49 @@ from pf.particle_filter_math import (
 from pf.particle_types import StructuralGeometryBatch
 from pf.structural_rj import (
     bounded_simplex_probability,
-    distance_weighted_ordered_pair_probabilities,
     independence_refresh_log_acceptance_ratio,
 )
+
 
 class StructuralRJMultiComponentMixin:
     """Provide batched multi-source exact-RJ proposal and move algorithms."""
 
     def _continuous_rj_ordered_pair_probabilities(
         self,
+        data: StructuralGeometryBatch,
         chart_ids: NDArray[np.int64],
         surface_uv: NDArray[np.float64],
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
     ) -> tuple[
         NDArray[np.int64],
         NDArray[np.int64],
         NDArray[np.float64],
     ]:
-        """Return batched distance-weighted ordered merge-pair probabilities."""
+        """Return exact response-aware weak-donor merge probabilities.
+
+        Intrinsic distance and normalized all-history line response select a
+        physically compatible receiver, while a prior-scale decay favors a
+        donor close to the active-strength floor.  A positive uniform mixture
+        gives every ordered pair full support, and callers include this exact
+        state-dependent probability in both directions of the RJ ratio.
+        """
         atlas = self._structural_rj_surface_atlas
         if atlas is None:
             raise RuntimeError("Continuous surface atlas is unavailable.")
         charts = np.asarray(chart_ids, dtype=np.int64)
         uv = np.asarray(surface_uv, dtype=np.float64)
-        if charts.ndim != 2 or charts.shape[1] < 2 or uv.shape != charts.shape + (2,):
+        points = np.asarray(positions, dtype=np.float64)
+        values = np.asarray(strengths, dtype=np.float64)
+        if (
+            charts.ndim != 2
+            or charts.shape[1] < 2
+            or uv.shape != charts.shape + (2,)
+            or points.shape != charts.shape + (3,)
+            or values.shape != charts.shape
+        ):
             raise ValueError(
-                "Merge-pair probabilities require aligned P x K chart/UV arrays."
+                "Merge-pair probabilities require aligned state arrays."
             )
         donor_columns, receiver_columns = _ordered_source_pair_columns(
             int(charts.shape[1])
@@ -50,19 +68,111 @@ class StructuralRJMultiComponentMixin:
             charts[:, receiver_columns],
             uv[:, receiver_columns, :],
         )
-        probabilities = distance_weighted_ordered_pair_probabilities(
-            distances,
-            sigma_m=float(self.config.structural_rj_merge_distance_sigma_m),
-            uniform_component_probability=float(
-                self.config.structural_rj_merge_uniform_pair_probability
-            ),
+        signatures = self._continuous_rj_source_response_signatures(
+            data,
+            chart_ids=charts,
+            positions=points,
         )
+        donor_signatures = signatures[:, donor_columns, :]
+        receiver_signatures = signatures[:, receiver_columns, :]
+        response_cosine = np.clip(
+            np.sum(donor_signatures * receiver_signatures, axis=-1),
+            -1.0,
+            1.0,
+        )
+        response_distance = np.sqrt(
+            np.maximum(0.0, 2.0 - 2.0 * response_cosine)
+        )
+        strength_scale = (
+            float(self._strength_prior.gamma_scale)
+            if self._strength_prior.family == "shifted_gamma"
+            else float(self._strength_prior.maximum - self._strength_prior.minimum)
+        )
+        donor_excess = np.maximum(
+            values[:, donor_columns] - float(self._strength_prior.minimum),
+            0.0,
+        )
+        weak_donor_weight = np.exp(
+            -np.minimum(donor_excess / strength_scale, 745.0)
+        )
+        scores = weak_donor_weight * np.exp(
+            -0.5
+            * np.square(
+                distances / float(self.config.structural_rj_merge_distance_sigma_m)
+            )
+            -0.5
+            * np.square(
+                response_distance
+                / float(self.config.structural_rj_merge_response_sigma)
+            )
+        )
+        score_sums = np.sum(scores, axis=1, keepdims=True)
+        informed = np.divide(
+            scores,
+            score_sums,
+            out=np.full_like(scores, 1.0 / float(scores.shape[1])),
+            where=score_sums > 0.0,
+        )
+        uniform = float(self.config.structural_rj_merge_uniform_pair_probability)
+        probabilities = (
+            (1.0 - uniform) * informed + uniform / float(scores.shape[1])
+        )
+        probabilities /= np.sum(probabilities, axis=1, keepdims=True)
         expected_shape = (charts.shape[0], donor_columns.size)
         if probabilities.shape != expected_shape:
             raise RuntimeError(
                 "Distance-weighted merge proposal returned an invalid shape."
             )
         return donor_columns, receiver_columns, probabilities
+
+    def _continuous_rj_source_response_signatures(
+        self,
+        data: StructuralGeometryBatch,
+        *,
+        chart_ids: NDArray[np.int64],
+        positions: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return normalized all-history line-response rows for each source."""
+        charts = np.asarray(chart_ids, dtype=np.int64)
+        points = np.asarray(positions, dtype=np.float64)
+        if charts.ndim != 2 or points.shape != charts.shape + (3,):
+            raise ValueError("Response signatures require aligned P x K states.")
+        row_count, cardinality = charts.shape
+        line_indices = self.continuous_kernel.positive_line_indices(self.isotope)
+        branching_weights = np.asarray(
+            self.continuous_kernel.line_branching_weights(
+                self.isotope,
+                line_indices,
+            ),
+            dtype=np.float64,
+        )
+        components = self._continuous_rj_line_transport_component_columns(
+            data,
+            points.reshape(row_count * cardinality, 3),
+            line_indices,
+            chart_ids=charts.reshape(row_count * cardinality),
+        )
+        physical_response = np.asarray(
+            components.total_kernel,
+            dtype=np.float64,
+        ).reshape(
+            int(data.row_count),
+            row_count,
+            cardinality,
+            int(line_indices.size),
+        )
+        physical_response *= branching_weights.reshape(1, 1, 1, -1)
+        signatures = np.transpose(
+            physical_response,
+            (1, 2, 0, 3),
+        ).reshape(row_count, cardinality, -1)
+        norms = np.linalg.norm(signatures, axis=-1, keepdims=True)
+        return np.divide(
+            signatures,
+            norms,
+            out=np.zeros_like(signatures),
+            where=norms > 0.0,
+        )
 
     def _continuous_rj_multi_group_probabilities(
         self,
@@ -90,44 +200,10 @@ class StructuralRJMultiComponentMixin:
             dtype=np.float64,
         )
         minimum_response_cosine = np.ones_like(maximum_surface_distance)
-        line_indices = self.continuous_kernel.positive_line_indices(self.isotope)
-        branching_weights = self.continuous_kernel.line_branching_weights(
-            self.isotope,
-            line_indices,
-        )
-        flattened_positions = np.asarray(
-            positions,
-            dtype=np.float64,
-        ).reshape(row_count * cardinality, 3)
-        flattened_charts = np.asarray(
-            chart_ids,
-            dtype=np.int64,
-        ).reshape(row_count * cardinality)
-        components = self._continuous_rj_line_transport_component_columns(
+        signatures = self._continuous_rj_source_response_signatures(
             data,
-            flattened_positions,
-            line_indices,
-            chart_ids=flattened_charts,
-        )
-        measurement_count = int(data.row_count)
-        physical_response = np.asarray(
-            components.total_kernel,
-            dtype=np.float64,
-        ).reshape(
-            measurement_count,
-            row_count,
-            cardinality,
-            int(line_indices.size),
-        )
-        physical_response *= branching_weights.reshape(1, 1, 1, -1)
-        signatures = np.transpose(
-            physical_response,
-            (1, 2, 0, 3),
-        ).reshape(row_count, cardinality, -1)
-        norms = np.sqrt(np.sum(np.square(signatures), axis=-1, keepdims=True))
-        signatures = signatures / np.maximum(
-            norms,
-            np.finfo(np.float64).tiny,
+            chart_ids=chart_ids,
+            positions=positions,
         )
         selected_signatures = signatures[:, groups, :]
         for first, second in itertools.combinations(range(int(group_size)), 2):
@@ -351,6 +427,11 @@ class StructuralRJMultiComponentMixin:
         bounded-simplex density, position density, and strength Jacobian are
         all included in the forward/reverse ratio.
         """
+        if self._continuous_rj_torch_enabled():
+            return self._apply_continuous_rj_multi_component_torch(
+                data,
+                target_beta=target_beta,
+            )
         probability = float(self.config.structural_rj_multi_component_probability)
         if probability <= 0.0:
             return 0, 0
@@ -358,10 +439,7 @@ class StructuralRJMultiComponentMixin:
         if atlas is None:
             raise RuntimeError("Continuous surface atlas is unavailable.")
         particle_count = len(self.continuous_particles)
-        cardinalities = np.asarray(
-            [particle.state.num_sources for particle in self.continuous_particles],
-            dtype=np.int64,
-        )
+        cardinalities = self._continuous_rj_cardinalities_numpy()
         available = np.asarray(
             [
                 sum(self._continuous_rj_multi_direction_support(int(value))[2:]) > 0.0
@@ -707,6 +785,7 @@ class StructuralRJMultiComponentMixin:
         )
         self._record_structural_mh_components(
             "multi_split",
+            particle_indices=particle_indices,
             delta_log_likelihood=_extended_log_target_ratio(
                 proposed_ll,
                 base_ll,
@@ -950,6 +1029,7 @@ class StructuralRJMultiComponentMixin:
         )
         self._record_structural_mh_components(
             "multi_merge",
+            particle_indices=particle_indices,
             delta_log_likelihood=_extended_log_target_ratio(
                 proposed_ll,
                 base_ll,

@@ -6,6 +6,51 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+def extended_log_target_ratio_torch(
+    proposed_log_target: object,
+    current_log_target: object,
+) -> object:
+    """Return the exact extended-real MH target ratio as a Torch tensor.
+
+    This is the device-resident counterpart of
+    :func:`extended_log_target_ratio`.  It intentionally accepts ``object`` in
+    the public type signature so importing this small numerical module does not
+    initialize Torch in CPU-only commands.
+    """
+    import torch
+
+    if not torch.is_tensor(proposed_log_target) or not torch.is_tensor(
+        current_log_target
+    ):
+        raise TypeError("Torch MH log targets must both be tensors.")
+    proposed = proposed_log_target
+    current = current_log_target
+    if proposed.shape != current.shape:
+        raise ValueError("Proposed and current Torch log targets must be aligned.")
+    invalid = (
+        torch.isnan(proposed)
+        | torch.isnan(current)
+        | torch.isposinf(proposed)
+        | torch.isposinf(current)
+    )
+    if bool(torch.any(invalid).item()):
+        raise ValueError(
+            "Torch MH log targets may be finite or negative infinity, not "
+            "NaN or positive infinity."
+        )
+    proposed_finite = torch.isfinite(proposed)
+    current_finite = torch.isfinite(current)
+    return torch.where(
+        proposed_finite & current_finite,
+        proposed - current,
+        torch.where(
+            proposed_finite & ~current_finite,
+            torch.full_like(proposed, float("inf")),
+            torch.full_like(proposed, float("-inf")),
+        ),
+    )
+
+
 def ordered_source_pair_columns(
     cardinality: int,
 ) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
@@ -66,4 +111,8 @@ def extended_log_target_ratio(
     return result
 
 
-__all__ = ["extended_log_target_ratio", "ordered_source_pair_columns"]
+__all__ = [
+    "extended_log_target_ratio",
+    "extended_log_target_ratio_torch",
+    "ordered_source_pair_columns",
+]

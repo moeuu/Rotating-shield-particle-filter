@@ -11,7 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.observation_model import (
-    build_runtime_observation_model,
+    build_nonproduction_observation_model,
     continuous_kernel_from_observation_model,
 )
 from runtime.forward_conformance import (
@@ -59,7 +59,7 @@ def _case_ids_for_isotope(
 def evaluate_forward_response_fixture(
     payload: Mapping[str, object] | ForwardConformanceFixture,
 ) -> tuple[NDArray[np.str_], NDArray[np.float64]]:
-    """Evaluate all cases with the production PF observation model and kernel."""
+    """Evaluate cases through the explicit nonproduction conformance kernel."""
     fixture = (
         payload
         if isinstance(payload, ForwardConformanceFixture)
@@ -73,7 +73,7 @@ def evaluate_forward_response_fixture(
         "source_rate_model": "detector_cps_1m",
         "line_resolved_shield_attenuation": True,
     }
-    observation_model = build_runtime_observation_model(
+    observation_model = build_nonproduction_observation_model(
         runtime_config,
         isotopes=isotopes,
     )

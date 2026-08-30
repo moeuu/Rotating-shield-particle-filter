@@ -35,16 +35,18 @@ class StructuralRJSplitMergeMixin:
         Jacobian, and the truncated split-fraction density are included in the
         RJ ratio.
         """
+        if self._continuous_rj_torch_enabled():
+            return self._apply_continuous_rj_split_merge_torch(
+                data,
+                target_beta=target_beta,
+            )
         atlas = self._structural_rj_surface_atlas
         cardinality_prior = self._structural_rj_cardinality_prior
         move_probabilities = self._structural_rj_split_merge_probabilities
         if atlas is None or cardinality_prior is None or move_probabilities is None:
             raise RuntimeError("Continuous split/merge priors are unavailable.")
         particle_count = len(self.continuous_particles)
-        cardinalities = np.asarray(
-            [particle.state.num_sources for particle in self.continuous_particles],
-            dtype=np.int64,
-        )
+        cardinalities = self._continuous_rj_cardinalities_numpy()
         split_probabilities, merge_probabilities = move_probabilities.probabilities(
             cardinalities
         )
@@ -199,8 +201,11 @@ class StructuralRJSplitMergeMixin:
                         reverse_receiver_columns,
                         reverse_pair_probabilities,
                     ) = self._continuous_rj_ordered_pair_probabilities(
+                        data,
                         proposed_chart_ids,
                         proposed_uv,
+                        proposed_positions,
+                        proposed_strengths,
                     )
                     reverse_pair_matches = (
                         reverse_donor_columns[None, :] == int(cardinality)
@@ -392,6 +397,7 @@ class StructuralRJSplitMergeMixin:
                         )
                     self._record_structural_mh_components(
                         "split",
+                        particle_indices=particle_indices,
                         delta_log_likelihood=split_delta_likelihood,
                         delta_log_prior=split_delta_prior,
                         log_reverse_minus_forward=split_proposal_ratio,
@@ -434,8 +440,11 @@ class StructuralRJSplitMergeMixin:
                     receiver_candidates,
                     pair_probabilities,
                 ) = self._continuous_rj_ordered_pair_probabilities(
+                    data,
                     chart_ids,
                     surface_uv,
+                    positions,
+                    strengths,
                 )
                 pair_cdf = np.cumsum(pair_probabilities, axis=1)
                 pair_cdf[:, -1] = 1.0
@@ -716,6 +725,7 @@ class StructuralRJSplitMergeMixin:
                     )
                 self._record_structural_mh_components(
                     "merge",
+                    particle_indices=particle_indices,
                     delta_log_likelihood=merge_delta_likelihood,
                     delta_log_prior=merge_delta_prior,
                     log_reverse_minus_forward=merge_proposal_ratio,

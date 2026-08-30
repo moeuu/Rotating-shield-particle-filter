@@ -14,12 +14,19 @@ from scipy.special import logsumexp
 from measurement.kernels import MeasurementGeometry, ShieldParams
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacles import ObstacleGrid
+from spectrum.air_attenuation import (
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+    NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+)
 from pf.estimator_types import (
     JointPlanningParticles as JointPlanningParticles,
     JointStationObservation as JointStationObservation,
     MeasurementRecord as MeasurementRecord,
 )
-from pf.full_spectrum import validate_full_spectrum_model
+from pf.full_spectrum import (
+    FullSpectrumGenerativeModel,
+    validate_full_spectrum_model,
+)
 from pf.particle_filter import (
     IsotopeParticle,
     IsotopeParticleFilter,
@@ -47,6 +54,7 @@ from pf.estimator_likelihood import (
     JOINT_HISTORY_STATION_ACTION_BATCH_SIZE as JOINT_HISTORY_STATION_ACTION_BATCH_SIZE,
     JointLikelihoodMixin,
 )
+from pf.joint_transport_cache import JointTransportCache
 from pf.estimator_rejuvenation import JointRejuvenationMixin
 from pf.estimator_reporting import EstimatorReportingMixin
 from pf.estimator_sampling import (
@@ -116,6 +124,9 @@ class RotatingShieldPFEstimator(
         source_extent_radius_m: float = 0.0,
         source_extent_samples: int = 1,
         line_mu_by_isotope: dict[str, object] | None = None,
+        strict_catalog_line_contract: bool = False,
+        dry_air_total_attenuation_contract_id: str | None = None,
+        dry_air_total_attenuation_contract_sha256: str | None = None,
         full_spectrum_generative_model: object | None = None,
         random_seed: int = 0,
     ) -> None:
@@ -204,9 +215,65 @@ class RotatingShieldPFEstimator(
                 "positive radius with at least two samples."
             )
         self.line_mu_by_isotope = line_mu_by_isotope
+        if not isinstance(strict_catalog_line_contract, bool):
+            raise TypeError("strict_catalog_line_contract must be a boolean.")
+        self.strict_catalog_line_contract = strict_catalog_line_contract
+        self.dry_air_total_attenuation_contract_id = (
+            dry_air_total_attenuation_contract_id
+        )
+        self.dry_air_total_attenuation_contract_sha256 = (
+            dry_air_total_attenuation_contract_sha256
+        )
+        air_contract = (
+            self.dry_air_total_attenuation_contract_id,
+            self.dry_air_total_attenuation_contract_sha256,
+        )
+        authenticated_air_contract = (
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_ID,
+            NIST_XCOM_DRY_AIR_TOTAL_CONTRACT_SHA256,
+        )
+        if self.strict_catalog_line_contract:
+            if not isinstance(self.line_mu_by_isotope, dict) or not (
+                self.line_mu_by_isotope
+            ):
+                raise ValueError(
+                    "Strict PF transport requires a nonempty exact catalog "
+                    "line table."
+                )
+            if air_contract != authenticated_air_contract:
+                raise ValueError(
+                    "Strict PF transport requires the exact authenticated "
+                    "XCOM dry-air contract."
+                )
+        elif air_contract != (None, None):
+            raise ValueError(
+                "A dry-air contract cannot be enabled while exact catalog "
+                "line transport is disabled."
+            )
         self.full_spectrum_generative_model = validate_full_spectrum_model(
             full_spectrum_generative_model
         )
+        self._authenticated_full_spectrum_model_object = (
+            self.full_spectrum_generative_model
+        )
+        self._authenticated_full_spectrum_contract_hash_sha256 = str(
+            self.full_spectrum_generative_model.contract_hash_sha256
+        )
+        if not np.isclose(
+            self.detector_aperture_radius_m,
+            float(self.full_spectrum_generative_model.detector_target_radius_m),
+            rtol=0.0,
+            atol=1.0e-12,
+        ):
+            raise ValueError(
+                "PF detector aperture radius does not match the authenticated "
+                "detector Green boundary."
+            )
+        if self.source_extent_radius_m != 0.0 or self.source_extent_samples != 1:
+            raise ValueError(
+                "Full-spectrum detector-impact conditioning requires the "
+                "authenticated point-source contract."
+            )
         self.additive_scatter_response = getattr(
             self.full_spectrum_generative_model,
             "additive_scatter_response",
@@ -245,23 +312,15 @@ class RotatingShieldPFEstimator(
             tuple[JointStationObservation, ...] | None
         ) = None
         self._active_joint_structural_geometry: StructuralGeometryBatch | None = None
-        self._active_joint_tempering_prefix_count: int | None = None
-        self._joint_structural_transport_cache: (
-            tuple[
-                object,
-                object,
-                object,
-            ]
-            | None
-        ) = None
+        self._joint_structural_transport_cache: JointTransportCache | None = None
         self._joint_persistent_structural_transport_cache: (
-            tuple[object, object, object] | None
+            JointTransportCache | None
         ) = None
-        self._joint_persistent_structural_station_signature: tuple[str, ...] = ()
-        self._joint_persistent_structural_state_sha256: str | None = None
+        self.joint_transport_cache_preflight: dict[str, object] | None = None
         self.last_joint_persistent_cache_reuse_count = 0
         self.last_joint_persistent_cache_append_count = 0
         self.last_joint_persistent_cache_reindex_count = 0
+        self.last_joint_station_transport_cache_reuse_count = 0
         self._joint_structural_unit_transport_cache: dict[
             str,
             dict[str, dict[str, Any]],
@@ -278,6 +337,12 @@ class RotatingShieldPFEstimator(
         self._joint_structural_unit_cache_access_generation = 0
         self.last_joint_structural_unit_cache_hits = 0
         self.last_joint_structural_unit_cache_misses = 0
+        self.last_joint_staged_transport_commit_rows = 0
+        self.last_joint_slot_overlay_likelihood_calls = 0
+        self.last_joint_full_history_clone_count = 0
+        self.last_joint_station_likelihood_cache_reuse_count = 0
+        self.last_joint_station_likelihood_append_count = 0
+        self.last_joint_station_likelihood_full_refresh_count = 0
         self.last_joint_strength_grid_source_slots_before = 0
         self.last_joint_strength_grid_source_slots_after = 0
         self._joint_strength_grid_batch_size_cache: dict[tuple[object, ...], int] = {}
@@ -316,12 +381,17 @@ class RotatingShieldPFEstimator(
             self.random_seed,
             "joint_isotope_particle_filter",
         )
+        self._joint_torch_generator: object | None = None
+        self._joint_tpht_generator: object | None = None
         self.last_joint_resample_indices = np.zeros(0, dtype=np.int64)
         self.last_joint_temper_steps: list[dict[str, float]] = []
         self.last_joint_rejuvenation_diagnostics: list[dict[str, float]] = []
         self.last_joint_smc_wall_time_limit_exceeded = False
         self.last_joint_rejuvenation_mixing_incomplete = False
         self.last_joint_structural_mixing_incomplete = False
+        self.last_joint_structural_mixing_incomplete_by_isotope = {
+            str(isotope): False for isotope in self.isotopes
+        }
         self._joint_guided_initialization_applied = False
         self.last_joint_guided_initialization_ess: float | None = None
         self.last_joint_cross_isotope_state_attempted_weight_mass = 0.0
@@ -334,10 +404,21 @@ class RotatingShieldPFEstimator(
         self.last_joint_strength_block_accepted_weight_mass = 0.0
         self.last_joint_device_mh_acceptance_calls = 0
         self.last_joint_device_mh_acceptance_rows = 0
+        self.last_joint_tpht_diagnostics: dict[str, int] = {}
+        self._joint_tpht_linear_scaling_streak = 0
         self._joint_initial_product_prior_state_sha256: str | None = None
         self.last_joint_station_unique_ancestor_count: int | None = None
         self.last_joint_cumulative_unique_ancestor_count: int | None = None
         self._joint_cumulative_lineage_ids: NDArray[np.int64] | None = None
+        self._joint_lineage_recovery_active = False
+        self._joint_lineage_recovery_epoch = 0
+        self._joint_lineage_recovery_certified_mask_by_isotope: dict[
+            str,
+            NDArray[np.bool_],
+        ] = {
+            str(isotope): np.zeros(0, dtype=np.bool_)
+            for isotope in self.isotopes
+        }
         self.last_pair_sequence_update_wall_s = 0.0
         self.last_pair_sequence_stage_wall_s: dict[str, float] = {}
         self.last_structural_update_wall_s = 0.0
@@ -351,6 +432,29 @@ class RotatingShieldPFEstimator(
             dict[str, NDArray[np.float64]],
         ] = {}
         self._surface_diagnostic_response_prefix_cache_order: list[tuple[Any, ...]] = []
+
+    def authenticated_full_spectrum_model(self) -> FullSpectrumGenerativeModel:
+        """Return the construction-authenticated immutable model binding.
+
+        Full schema and production evidence are checked once at the estimator
+        boundary. Internal PF/planning calls then verify the exact object and
+        contract identity without repeating the complete acceptance audit.
+        """
+        model = self.full_spectrum_generative_model
+        if model is not self._authenticated_full_spectrum_model_object:
+            raise RuntimeError(
+                "The full-spectrum model was replaced after estimator "
+                "authentication."
+            )
+        if (
+            str(model.contract_hash_sha256)
+            != self._authenticated_full_spectrum_contract_hash_sha256
+        ):
+            raise RuntimeError(
+                "The full-spectrum model contract changed after estimator "
+                "authentication."
+            )
+        return model
 
     def _named_planning_rng(
         self,
@@ -791,9 +895,20 @@ class RotatingShieldPFEstimator(
             detector_aperture_radius_m=self.detector_aperture_radius_m,
             detector_aperture_samples=self.detector_aperture_samples,
             detector_aperture_sampling=self.detector_aperture_sampling,
+            detector_impact_parameter_edges_fraction=(
+                self.full_spectrum_generative_model
+                .detector_impact_parameter_edges_fraction
+            ),
             source_extent_radius_m=self.source_extent_radius_m,
             source_extent_samples=self.source_extent_samples,
             line_mu_by_isotope=self.line_mu_by_isotope,
+            strict_catalog_line_contract=self.strict_catalog_line_contract,
+            dry_air_total_attenuation_contract_id=(
+                self.dry_air_total_attenuation_contract_id
+            ),
+            dry_air_total_attenuation_contract_sha256=(
+                self.dry_air_total_attenuation_contract_sha256
+            ),
             additive_scatter_response=self.additive_scatter_response,
             random_seed=self.random_seed,
         )
@@ -862,6 +977,13 @@ class RotatingShieldPFEstimator(
             source_extent_radius_m=self.source_extent_radius_m,
             source_extent_samples=self.source_extent_samples,
             line_mu_by_isotope=self.line_mu_by_isotope,
+            strict_catalog_line_contract=self.strict_catalog_line_contract,
+            dry_air_total_attenuation_contract_id=(
+                self.dry_air_total_attenuation_contract_id
+            ),
+            dry_air_total_attenuation_contract_sha256=(
+                self.dry_air_total_attenuation_contract_sha256
+            ),
             additive_scatter_response=self.additive_scatter_response,
         )
 
@@ -927,6 +1049,9 @@ class RotatingShieldPFEstimator(
         for isotope in self.joint_isotope_order():
             filt = self.filters[isotope]
             filt.set_joint_target_evaluator(self._joint_structural_target_evaluator)
+            filt.set_joint_history_tree_evaluator(
+                self._joint_structural_history_tree_evaluator
+            )
             filt.set_joint_strength_grid_target_evaluator(
                 self._joint_structural_strength_grid_target_evaluator
             )
@@ -1062,6 +1187,12 @@ class RotatingShieldPFEstimator(
             particle_count,
             dtype=np.int64,
         )
+        self._joint_lineage_recovery_active = False
+        self._joint_lineage_recovery_epoch = 0
+        self._joint_lineage_recovery_certified_mask_by_isotope = {
+            isotope: np.zeros(particle_count, dtype=np.bool_)
+            for isotope in order
+        }
         self._joint_particles_initialized = True
         self._invalidate_posterior_summary_cache()
         state_matrix = np.asarray(
@@ -1200,6 +1331,38 @@ class RotatingShieldPFEstimator(
         self._ensure_kernel_cache()
         self._assert_joint_particle_alignment()
         return self._assert_joint_surface_atlas_alignment()
+
+    def initialize_joint_exact_transport_cache(self) -> int:
+        """Reserve the fixed live CUDA transport cache before acquisition."""
+        if self._joint_persistent_structural_transport_cache is not None:
+            raise RuntimeError(
+                "The fixed joint transport cache is already initialized."
+            )
+        self.initialize_joint_particle_filters()
+        if not bool(self.pf_config.use_gpu):
+            raise RuntimeError(
+                "Live joint exact inference requires CUDA; CPU fallback is "
+                "not permitted."
+            )
+        import torch
+
+        model = self._full_spectrum_model()
+        source_slots = (
+            len(self.joint_isotope_order())
+            * int(self.pf_config.cardinality_capacity)
+        )
+        cache = JointTransportCache.allocate_empty_torch(
+            particle_count=int(self.pf_config.num_particles),
+            source_slots=source_slots,
+            line_count=len(tuple(model.line_identity)),
+            feature_count=len(tuple(model.transport_feature_order)),
+            device=torch.device(str(self.pf_config.gpu_device)),
+            dtype=torch.float64,
+            state_sha256=self._joint_structural_state_sha256(),
+            row_generation=self._joint_row_generation,
+        )
+        self._joint_persistent_structural_transport_cache = cache
+        return cache.allocated_bytes
 
     def continuous_surface_atlas(self) -> Any:
         """Return the one authoritative atlas shared by all isotope filters."""
@@ -1474,6 +1637,12 @@ class RotatingShieldPFEstimator(
             self._joint_row_identity_root_sha256 = None
             self._joint_row_generation = None
             self._joint_cumulative_lineage_ids = None
+            self._joint_lineage_recovery_active = False
+            self._joint_lineage_recovery_epoch = 0
+            self._joint_lineage_recovery_certified_mask_by_isotope = {
+                str(isotope): np.zeros(0, dtype=np.bool_)
+                for isotope in self.isotopes
+            }
             self._joint_birth_proposal_prefix_scores = {}
             self._joint_birth_proposal_prefix_station_count = 0
             self._joint_birth_proposal_reference_mean_vb = None

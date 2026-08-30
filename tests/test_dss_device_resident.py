@@ -74,6 +74,8 @@ def _multi_isotope_estimator(
         ),
         shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
         detector_radius_m=0.025,
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         line_mu_by_isotope=_line_mu_by_isotope(model),
         full_spectrum_generative_model=model,
         random_seed=9,
@@ -142,7 +144,7 @@ def test_multi_isotope_dss_components_remain_device_resident(
         programs,
         host_estimator.planning_joint_particles(),
         live_time_s=2.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
     )
     device = _full_spectrum_joint_program_components(
         device_estimator,
@@ -150,7 +152,7 @@ def test_multi_isotope_dss_components_remain_device_resident(
         programs,
         device_estimator.planning_joint_particles(),
         live_time_s=2.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
         device_resident=True,
     )
 
@@ -158,7 +160,7 @@ def test_multi_isotope_dss_components_remain_device_resident(
     expected_shapes = {
         "total_pnvsl": (2, 3, 2, 4, 9),
         "uncollided_pnvsl": (2, 3, 2, 4, 9),
-        "features_pnvslf": (2, 3, 2, 4, 9, 4),
+        "features_pnvslf": (2, 3, 2, 4, 9, 13),
         "live_times_v": (2,),
     }
     for field_name, expected_shape in expected_shapes.items():

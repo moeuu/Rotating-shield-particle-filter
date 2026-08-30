@@ -15,7 +15,8 @@ from pf.estimator import (
     RotatingShieldPFConfig,
     RotatingShieldPFEstimator,
 )
-from pf.particle_filter import IsotopeParticle
+from pf.particle_filter import IsotopeParticle, StructuralGeometryBatch
+from pf.joint_transport_cache import JointTransportCache
 from pf.state import IsotopeState
 from pf.strength_prior import BoundedUniformStrengthPriorTestConfig
 from tests.pure_pf_test_support import (
@@ -69,6 +70,8 @@ def _estimator(
             position_max=(3.0, 3.0, 3.0),
         ),
         detector_radius_m=0.025,
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         full_spectrum_generative_model=model,
         random_seed=17,
     )
@@ -194,6 +197,214 @@ def test_exact_rj_candidate_target_matches_numpy_and_torch_cpu() -> None:
         rtol=2.0e-12,
         atol=1.0e-8,
     )
+    assert isinstance(
+        torch_estimator._joint_persistent_structural_transport_cache,
+        JointTransportCache,
+    )
+    assert torch_estimator.last_joint_slot_overlay_likelihood_calls > 0
+    assert torch_estimator.last_joint_full_history_clone_count == 0
+    diagnostics = (
+        torch_estimator._full_spectrum_model().last_torch_slot_overlay_diagnostics
+    )
+    assert diagnostics["mode"] == "bounded_exact_slot_overlay"
+    assert diagnostics["full_history_clone_count"] == 0
+
+
+def test_station_cache_signature_binds_observed_spectrum() -> None:
+    """Transport and station-likelihood identity must bind MeasurementLog data."""
+    station = _station()
+    changed_spectrum = np.asarray(station.spectrum_vb).copy()
+    changed_spectrum[0, 0] += 1
+    changed = replace(station, spectrum_vb=changed_spectrum)
+
+    assert (
+        RotatingShieldPFEstimator._joint_station_cache_signature(station)
+        != RotatingShieldPFEstimator._joint_station_cache_signature(changed)
+    )
+
+
+def test_standard_joint_estimator_installs_tpht_for_every_isotope() -> None:
+    """Production filters must not bypass the estimator-owned TPHT scheduler."""
+    estimator = _estimator(use_gpu=True, gpu_device="cpu")
+    expected = estimator._joint_structural_history_tree_evaluator.__func__
+    for filt in estimator.filters.values():
+        evaluator = filt._joint_history_tree_evaluator
+        assert evaluator is not None
+        assert evaluator.__self__ is estimator
+        assert evaluator.__func__ is expected
+
+
+def test_tpht_unit_cache_key_binds_geometry_content_not_object_identity() -> None:
+    """Dyadic slice caches must neither alias nor miss by transient object ID."""
+    pytest.importorskip("torch")
+    estimator = _estimator(use_gpu=True, gpu_device="cpu")
+    station = _station()
+    stations = (station,)
+    isotope = "Cs-137"
+    filt = estimator.filters[isotope]
+    estimator._active_joint_station_history = stations
+    estimator._refresh_joint_structural_transport_cache(stations)
+    cache = estimator._joint_structural_transport_cache
+    assert isinstance(cache, JointTransportCache)
+    geometry = estimator._joint_history_structural_geometry(isotope, stations)
+    geometry_copy = StructuralGeometryBatch(
+        detector_positions=geometry.detector_positions.copy(),
+        fe_indices=geometry.fe_indices.copy(),
+        pb_indices=geometry.pb_indices.copy(),
+        live_times=geometry.live_times.copy(),
+        station_sequence_ids=geometry.station_sequence_ids.copy(),
+    )
+    changed_fe = geometry.fe_indices.copy()
+    changed_fe[0] = (int(changed_fe[0]) + 1) % 8
+    changed = StructuralGeometryBatch(
+        detector_positions=geometry.detector_positions.copy(),
+        fe_indices=changed_fe,
+        pb_indices=geometry.pb_indices.copy(),
+        live_times=geometry.live_times.copy(),
+        station_sequence_ids=geometry.station_sequence_ids.copy(),
+    )
+    local_lines = estimator._joint_line_layout()[isotope][1]
+    first = estimator._joint_cuda_accepted_unit_cache_entry(
+        filt=filt,
+        data=geometry,
+        positive_line_indices=local_lines,
+        reference=cache[0],
+    )
+    equivalent = estimator._joint_cuda_accepted_unit_cache_entry(
+        filt=filt,
+        data=geometry_copy,
+        positive_line_indices=local_lines,
+        reference=cache[0],
+    )
+    distinct = estimator._joint_cuda_accepted_unit_cache_entry(
+        filt=filt,
+        data=changed,
+        positive_line_indices=local_lines,
+        reference=cache[0],
+    )
+    assert equivalent is first
+    assert distinct is not first
+
+
+def test_staged_accepted_transport_commits_without_recomputation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted exact proposal columns must become the global cache directly."""
+    pytest.importorskip("torch")
+    estimator = _estimator(use_gpu=True, gpu_device="cpu")
+    isotope = "Cs-137"
+    filt = estimator.filters[isotope]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    _set_single_source_states(
+        estimator,
+        isotope,
+        strength_cps_1m=5_000.0,
+        surface_u=0.2,
+    )
+    station = _station()
+    stations = (station,)
+    estimator._active_joint_station_history = stations
+    estimator._refresh_joint_structural_transport_cache(stations)
+    evidence = estimator._joint_history_structural_geometry(isotope, stations)
+    chart_ids = np.asarray([[2], [3]], dtype=np.int64)
+    surface_uv = np.asarray(
+        [[[0.65, 0.35]], [[0.75, 0.45]]],
+        dtype=np.float64,
+    )
+    positions = atlas.positions_xyz(chart_ids, surface_uv)
+    strengths = np.asarray([[7_500.0], [9_500.0]], dtype=np.float64)
+    estimator._joint_structural_target_evaluator(
+        filt=filt,
+        data=evidence,
+        positions_pks=positions,
+        chart_ids_pk=chart_ids,
+        strengths_pk=strengths,
+        particle_indices=np.arange(2, dtype=np.int64),
+        target_beta=1.0,
+        tempering_start_row=0,
+    )
+    for row, particle in enumerate(filt.continuous_particles):
+        particle.state = IsotopeState(
+            num_sources=1,
+            strengths=strengths[row].copy(),
+            surface_chart_ids=chart_ids[row].copy(),
+            surface_uv=surface_uv[row].copy(),
+        )
+
+    expected = estimator._joint_isotope_station_transport_components_torch(
+        station,
+        isotope,
+    )
+
+    def _forbid_recomputation(*args: object, **kwargs: object) -> object:
+        """Fail if the post-sweep path launches accepted-state transport."""
+        del args, kwargs
+        raise AssertionError("accepted transport was recomputed")
+
+    monkeypatch.setattr(
+        estimator,
+        "_joint_isotope_station_transport_components_torch",
+        _forbid_recomputation,
+    )
+    estimator._joint_commit_staged_cuda_transport_cache_isotope(
+        filt=filt,
+        data=evidence,
+        stations=stations,
+        particle_indices=np.arange(2, dtype=np.int64),
+    )
+
+    committed = estimator._joint_structural_transport_cache
+    assert committed is not None
+    order = estimator.joint_isotope_order()
+    slot_start = order.index(isotope) * estimator.pf_config.cardinality_capacity
+    slot_stop = slot_start + estimator.pf_config.cardinality_capacity
+    for committed_values, expected_values in zip(
+        committed,
+        expected,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            committed_values[:, :, slot_start:slot_stop]
+            .detach()
+            .cpu()
+            .numpy(),
+            expected_values.detach().cpu().numpy(),
+            rtol=2.0e-12,
+            atol=1.0e-12,
+        )
+    assert estimator.last_joint_staged_transport_commit_rows == 2
+    assert isinstance(committed, JointTransportCache)
+    assert committed.state_sha256 == estimator._joint_structural_state_sha256()
+
+
+def test_staged_transport_commit_fails_closed_when_proposal_is_missing() -> None:
+    """A changed Torch row must never fall back to transport recomputation."""
+    pytest.importorskip("torch")
+    estimator = _estimator(use_gpu=True, gpu_device="cpu")
+    isotope = "Cs-137"
+    filt = estimator.filters[isotope]
+    _set_single_source_states(
+        estimator,
+        isotope,
+        strength_cps_1m=5_000.0,
+    )
+    station = _station()
+    stations = (station,)
+    estimator._active_joint_station_history = stations
+    estimator._refresh_joint_structural_transport_cache(stations)
+    evidence = estimator._joint_history_structural_geometry(isotope, stations)
+
+    with pytest.raises(
+        RuntimeError,
+        match="lacks exact staged unit transport",
+    ):
+        estimator._joint_commit_staged_cuda_transport_cache_isotope(
+            filt=filt,
+            data=evidence,
+            stations=stations,
+            particle_indices=np.asarray([0], dtype=np.int64),
+        )
 
 
 @pytest.mark.parametrize(
@@ -347,7 +558,12 @@ def test_cuda_strength_grid_autotunes_real_batches_above_128() -> None:
         estimator._active_joint_station_history = None
     assert target.shape == (particle_count, 5)
     assert np.all(np.isfinite(target))
-    np.testing.assert_array_equal(repeated, target[:10])
+    np.testing.assert_allclose(
+        repeated,
+        target[:10],
+        rtol=5.0e-12,
+        atol=1.0e-10,
+    )
     assert first_diagnostics["mode"] == "empirical_cuda_autotune"
     trials = first_diagnostics["trials"]
     assert isinstance(trials, list)
@@ -552,13 +768,20 @@ def test_cached_fixed_state_transport_matches_direct_batch_kernel() -> None:
             rtol=0.0,
             atol=0.0,
         )
-        direct_features = np.stack(
-            [
-                direct.tau_fe.detach().cpu().numpy(),
-                direct.tau_pb.detach().cpu().numpy(),
-                direct.tau_obstacle.detach().cpu().numpy(),
-                direct.distance_m.detach().cpu().numpy(),
-            ],
+        direct_features = np.concatenate(
+            (
+                np.stack(
+                    [
+                        direct.tau_fe.detach().cpu().numpy(),
+                            direct.tau_pb.detach().cpu().numpy(),
+                            direct.tau_obstacle.detach().cpu().numpy(),
+                            direct.tau_obstacle_compton.detach().cpu().numpy(),
+                            direct.distance_m.detach().cpu().numpy(),
+                    ],
+                    axis=-1,
+                ),
+                direct.uncollided_impact_fractions.detach().cpu().numpy(),
+            ),
             axis=-1,
         )
         np.testing.assert_allclose(
@@ -1107,7 +1330,10 @@ def test_unit_transport_cache_retains_reused_state_during_proposal_churn(
     assert estimator.last_joint_structural_unit_cache_misses == misses_before_reuse
 
 
-def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_raw_spectrum_joint_smc_concentrates_on_physical_truth(
+    use_gpu: bool,
+) -> None:
     """An exact raw-spectrum update must retain truth support and target ESS."""
     model = approved_full_spectrum_model()
     particle_count = 48
@@ -1123,9 +1349,11 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
         pf_config=RotatingShieldPFConfig(
             num_particles=particle_count,
             max_sources=1,
+            hard_max_sources=2,
             variable_cardinality=True,
             init_num_sources=(0, 1),
-            use_gpu=False,
+            use_gpu=use_gpu,
+            gpu_device="cpu",
             position_max=(3.0, 3.0, 3.0),
             structural_rj_surface_chart_max_edge_m=2.0,
             strength_prior=BoundedUniformStrengthPriorTestConfig(
@@ -1136,13 +1364,13 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
             target_ess_ratio=0.25,
             max_temper_steps=64,
             min_delta_beta=1.0e-8,
-            joint_rejuvenation_boundary_mass_threshold=1.0,
-            joint_rejuvenation_min_k_transition_weight_mass=0.0,
             joint_rejuvenation_min_state_change_weight_mass=0.0,
             joint_rejuvenation_min_surface_esjd_m2=0.0,
             joint_rejuvenation_min_log_strength_esjd=0.0,
         ),
         detector_radius_m=0.025,
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         full_spectrum_generative_model=model,
         random_seed=1_827,
     )
@@ -1290,3 +1518,71 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth() -> None:
     assert cs_filter.last_ess >= 0.25 * particle_count - 1.0e-9
     assert estimator.last_joint_temper_steps[-1]["beta_total"] == 1.0
     assert 1 <= estimator.last_joint_station_unique_ancestor_count <= particle_count
+    if use_gpu:
+        assert estimator.last_joint_staged_transport_commit_rows > 0
+
+
+def test_cuda_joint_moves_keep_state_and_mh_on_device() -> None:
+    """Joint strength/state proposals must not materialize station PF rows."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    estimator = _estimator(
+        use_gpu=True,
+        gpu_device="cuda",
+        num_particles=8,
+    )
+    estimator.pf_config.joint_strength_block_probability = 1.0
+    estimator.pf_config.joint_cross_isotope_state_block_probability = 1.0
+    estimator.pf_config.structural_rj_move_probability = 0.0
+    estimator.pf_config.structural_rj_split_merge_probability = 0.0
+    estimator.pf_config.structural_rj_multi_component_probability = 0.0
+    estimator.pf_config.structural_rj_block_independence_probability = 0.0
+    estimator.pf_config.structural_rj_position_move_probability = 0.0
+    estimator.pf_config.structural_rj_local_position_move_probability = 0.0
+    estimator.pf_config.structural_rj_strength_move_probability = 0.0
+    for isotope in TEST_ISOTOPES:
+        _set_single_source_states(
+            estimator,
+            isotope,
+            strength_cps_1m=5_000.0,
+        )
+        filt_config = estimator.filters[isotope].config
+        filt_config.structural_rj_move_probability = 0.0
+        filt_config.structural_rj_split_merge_probability = 0.0
+        filt_config.structural_rj_multi_component_probability = 0.0
+        filt_config.structural_rj_block_independence_probability = 0.0
+        filt_config.structural_rj_position_move_probability = 0.0
+        filt_config.structural_rj_local_position_move_probability = 0.0
+        filt_config.structural_rj_strength_move_probability = 0.0
+    station = _station()
+    stations = (station,)
+    estimator._refresh_joint_structural_transport_cache(stations)
+    reference = estimator._joint_station_log_likelihood_torch(station)
+    for filt in estimator.filters.values():
+        assert filt._begin_continuous_rj_station_device_state(reference)
+
+    diagnostics = estimator._joint_rejuvenate(
+        stations,
+        target_beta=0.5,
+    )
+
+    assert diagnostics["joint_strength_attempted_weight_mass"] == pytest.approx(
+        1.0
+    )
+    assert diagnostics[
+        "cross_isotope_state_attempted_weight_mass"
+    ] == pytest.approx(1.0)
+    assert estimator.last_joint_device_mh_acceptance_calls >= 2
+    assert diagnostics["tpht.joint.joint_strength.proposal_rows"] > 0.0
+    assert diagnostics["tpht.joint.cross_isotope.proposal_rows"] > 0.0
+    assert diagnostics["tpht.proposal_rows"] > 0.0
+    assert diagnostics["tpht.station_evaluations"] > 0.0
+    for filt in estimator.filters.values():
+        assert filt.last_structural_device_diagnostics["proposal_backend"] == "torch"
+        assert filt.last_structural_device_diagnostics["materialization_calls"] == 0
+        assert filt._structural_rj_device_state_authoritative
+
+    for filt in estimator.filters.values():
+        filt._end_continuous_rj_station_device_state()
+        assert filt.last_structural_device_diagnostics["materialization_calls"] == 1

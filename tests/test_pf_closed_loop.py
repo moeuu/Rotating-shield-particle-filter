@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from measurement.obstacles import ObstacleGrid
 from measurement.shielding import generate_octant_orientations
 from runtime.adaptive_client import (
     AdaptiveCandidateSnapshot,
@@ -28,7 +29,9 @@ from pf.closed_loop import (
     PFControlBudget,
     _bootstrap_program,
     _completion_diagnostics_extensions,
+    _obstacle_grid,
     _particle_diagnostics,
+    _publish_failure_diagnostics,
     _require_plannable_sampler_health,
     _require_refinement_seed_capacity,
     _shield_view_count_shadow_health,
@@ -135,7 +138,273 @@ def test_failed_sampler_health_aborts_before_next_planning(
     health[failed_gate] = False
 
     with pytest.raises(RuntimeError, match="forbids further live planning"):
-        _require_plannable_sampler_health({"sampler_health": health})
+        _require_plannable_sampler_health(
+            {
+                "sampler_health": health,
+                "assessment": {
+                    "diversity_evidence_available": True,
+                    "diversity_warning": False,
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "assessment",
+    (
+        {
+            "diversity_evidence_available": False,
+            "diversity_warning": True,
+        },
+        {
+            "diversity_evidence_available": True,
+            "diversity_warning": True,
+        },
+    ),
+)
+def test_particle_diversity_warning_aborts_before_next_planning(
+    assessment: dict[str, bool],
+) -> None:
+    """Lineage collapse must be an action gate, not a display-only warning."""
+    with pytest.raises(RuntimeError, match="forbids further live planning"):
+        _require_plannable_sampler_health(
+            {
+                "sampler_health": {
+                    "smc_rejuvenation_wall_time_respected": True,
+                    "rejuvenation_mixing_complete": True,
+                    "structural_mixing_complete": True,
+                },
+                "assessment": assessment,
+            }
+        )
+
+
+def test_full_support_rejuvenation_recovers_collapsed_lineage() -> None:
+    """Exact global moves may recover lineage collapse without hiding it."""
+    isotopes = ("Cs-137", "Co-60")
+
+    def _row() -> dict[str, object]:
+        """Return one healthy collapsed-lineage isotope diagnostic."""
+        return {
+            "particle_count": 100,
+            "current_ess": 80.0,
+            "current_ess_ratio": 0.8,
+            "temper_resamples": 4,
+            "temper_min_ess": 40.0,
+            "joint_guided_initialization_ess": 70.0,
+            "station_unique_ancestor_count": 1,
+            "cumulative_unique_ancestor_count": 1,
+            "r_probability_by_count": {"1": 1.0},
+            "joint_smc_wall_time_limit_exceeded": False,
+            "joint_rejuvenation_mixing_incomplete": False,
+            "joint_structural_mixing_incomplete": False,
+            "transition_weight_mass": {},
+        }
+
+    final_rejuvenation: dict[str, float] = {
+        "lineage_recovery_required": 1.0,
+        "lineage_recovery_sufficient": 1.0,
+        "lineage_recovery_epoch": 1.0,
+        "lineage_recovery_min_surviving_weight_mass": 1.0e-4,
+        "distinct_joint_state_count": 83.0,
+        "minimum_distinct_joint_states": 40.0,
+    }
+    for isotope in isotopes:
+        final_rejuvenation.update(
+            {
+                f"lineage_recovery_certified_row_count.{isotope}": 20.0,
+                f"lineage_recovery_surviving_weight_mass.{isotope}": 0.2,
+                f"lineage_recovery_sufficient.{isotope}": 1.0,
+            }
+        )
+    estimator = SimpleNamespace(
+        isotopes=isotopes,
+        pf_config=SimpleNamespace(
+            num_particles=100,
+            target_ess_ratio=0.4,
+            joint_lineage_recovery_min_surviving_weight_mass=1.0e-4,
+        ),
+        last_joint_rejuvenation_diagnostics=[final_rejuvenation],
+        step_diagnostics=lambda **_kwargs: {
+            isotope: _row() for isotope in isotopes
+        },
+    )
+
+    diagnostics = _particle_diagnostics(estimator)
+
+    assessment = diagnostics["assessment"]
+    assert assessment["genealogical_collapse_detected"] is True
+    assert assessment["lineage_recovery_required"] is True
+    assert assessment["lineage_recovery_complete"] is True
+    assert assessment["diversity_warning"] is False
+    _require_plannable_sampler_health(diagnostics)
+
+
+def test_lineage_recovery_fails_when_one_isotope_lacks_certified_descendants() -> None:
+    """One isotope cannot borrow another isotope's recovery descendants."""
+    isotopes = ("Cs-137", "Co-60")
+
+    def _row() -> dict[str, object]:
+        """Return one healthy collapsed-lineage isotope diagnostic."""
+        return {
+            "particle_count": 100,
+            "current_ess": 80.0,
+            "current_ess_ratio": 0.8,
+            "temper_resamples": 4,
+            "temper_min_ess": 40.0,
+            "joint_guided_initialization_ess": 70.0,
+            "station_unique_ancestor_count": 1,
+            "cumulative_unique_ancestor_count": 1,
+            "r_probability_by_count": {"1": 1.0},
+            "joint_smc_wall_time_limit_exceeded": False,
+            "joint_rejuvenation_mixing_incomplete": False,
+            "joint_structural_mixing_incomplete": False,
+            "transition_weight_mass": {},
+        }
+
+    estimator = SimpleNamespace(
+        isotopes=isotopes,
+        pf_config=SimpleNamespace(
+            num_particles=100,
+            target_ess_ratio=0.4,
+            joint_lineage_recovery_min_surviving_weight_mass=1.0e-4,
+        ),
+        last_joint_rejuvenation_diagnostics=[
+            {
+                "lineage_recovery_required": 1.0,
+                "lineage_recovery_sufficient": 0.0,
+                "lineage_recovery_epoch": 1.0,
+                "lineage_recovery_min_surviving_weight_mass": 1.0e-4,
+                "distinct_joint_state_count": 83.0,
+                "minimum_distinct_joint_states": 40.0,
+                "lineage_recovery_certified_row_count.Cs-137": 20.0,
+                "lineage_recovery_surviving_weight_mass.Cs-137": 0.2,
+                "lineage_recovery_sufficient.Cs-137": 1.0,
+                "lineage_recovery_certified_row_count.Co-60": 0.0,
+                "lineage_recovery_surviving_weight_mass.Co-60": 0.0,
+                "lineage_recovery_sufficient.Co-60": 0.0,
+            }
+        ],
+        step_diagnostics=lambda **_kwargs: {
+            isotope: _row() for isotope in isotopes
+        },
+    )
+
+    diagnostics = _particle_diagnostics(estimator)
+
+    assert diagnostics["assessment"]["lineage_recovery_complete"] is False
+    assert diagnostics["assessment"]["diversity_warning"] is True
+    with pytest.raises(RuntimeError, match="particle_diversity_warning"):
+        _require_plannable_sampler_health(diagnostics)
+
+
+def test_lineage_recovery_rejects_inconsistent_sufficiency_diagnostics() -> None:
+    """A success flag cannot override an insufficient surviving certificate mass."""
+    isotope = "Cs-137"
+    estimator = SimpleNamespace(
+        isotopes=(isotope,),
+        pf_config=SimpleNamespace(
+            num_particles=100,
+            target_ess_ratio=0.4,
+            joint_lineage_recovery_min_surviving_weight_mass=0.1,
+        ),
+        last_joint_rejuvenation_diagnostics=[
+            {
+                "lineage_recovery_required": 1.0,
+                "lineage_recovery_sufficient": 1.0,
+                "lineage_recovery_epoch": 1.0,
+                "lineage_recovery_min_surviving_weight_mass": 0.1,
+                "distinct_joint_state_count": 80.0,
+                "minimum_distinct_joint_states": 40.0,
+                "lineage_recovery_certified_row_count.Cs-137": 1.0,
+                "lineage_recovery_surviving_weight_mass.Cs-137": 0.01,
+                "lineage_recovery_sufficient.Cs-137": 1.0,
+            }
+        ],
+        step_diagnostics=lambda **_kwargs: {
+            isotope: {
+                "particle_count": 100,
+                "current_ess": 80.0,
+                "current_ess_ratio": 0.8,
+                "temper_resamples": 4,
+                "temper_min_ess": 40.0,
+                "joint_guided_initialization_ess": 70.0,
+                "station_unique_ancestor_count": 1,
+                "cumulative_unique_ancestor_count": 1,
+                "r_probability_by_count": {"1": 1.0},
+                "joint_smc_wall_time_limit_exceeded": False,
+                "joint_rejuvenation_mixing_incomplete": False,
+                "joint_structural_mixing_incomplete": False,
+                "transition_weight_mass": {},
+            }
+        },
+    )
+
+    diagnostics = _particle_diagnostics(estimator)
+
+    assert diagnostics["assessment"]["lineage_recovery_complete"] is False
+    assert diagnostics["assessment"]["diversity_warning"] is True
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("lineage_recovery_required", True),
+        ("lineage_recovery_sufficient", True),
+        ("minimum_distinct_joint_states", 39.0),
+        ("lineage_recovery_certified_row_count.Cs-137", 101.0),
+        ("lineage_recovery_sufficient.Cs-137", True),
+    ),
+)
+def test_lineage_recovery_rejects_malformed_redundant_diagnostics(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    """Malformed redundant success evidence must fail closed."""
+    isotope = "Cs-137"
+    final_rejuvenation: dict[str, object] = {
+        "lineage_recovery_required": 1.0,
+        "lineage_recovery_sufficient": 1.0,
+        "lineage_recovery_epoch": 1.0,
+        "lineage_recovery_min_surviving_weight_mass": 0.1,
+        "distinct_joint_state_count": 80.0,
+        "minimum_distinct_joint_states": 40.0,
+        "lineage_recovery_certified_row_count.Cs-137": 20.0,
+        "lineage_recovery_surviving_weight_mass.Cs-137": 0.2,
+        "lineage_recovery_sufficient.Cs-137": 1.0,
+    }
+    final_rejuvenation[field_name] = invalid_value
+    estimator = SimpleNamespace(
+        isotopes=(isotope,),
+        pf_config=SimpleNamespace(
+            num_particles=100,
+            target_ess_ratio=0.4,
+            joint_lineage_recovery_min_surviving_weight_mass=0.1,
+        ),
+        last_joint_rejuvenation_diagnostics=[final_rejuvenation],
+        step_diagnostics=lambda **_kwargs: {
+            isotope: {
+                "particle_count": 100,
+                "current_ess": 80.0,
+                "current_ess_ratio": 0.8,
+                "temper_resamples": 4,
+                "temper_min_ess": 40.0,
+                "joint_guided_initialization_ess": 70.0,
+                "station_unique_ancestor_count": 1,
+                "cumulative_unique_ancestor_count": 1,
+                "r_probability_by_count": {"1": 1.0},
+                "joint_smc_wall_time_limit_exceeded": False,
+                "joint_rejuvenation_mixing_incomplete": False,
+                "joint_structural_mixing_incomplete": False,
+                "transition_weight_mass": {},
+            }
+        },
+    )
+
+    diagnostics = _particle_diagnostics(estimator)
+
+    assert diagnostics["assessment"]["lineage_recovery_complete"] is False
+    assert diagnostics["assessment"]["diversity_warning"] is True
 
 
 def _write_one_station_production_config(
@@ -426,6 +695,54 @@ def _context_payload() -> dict[str, object]:
     }
 
 
+def _innovation_diagnostics(
+    *,
+    available: bool = True,
+    passed: bool = True,
+) -> dict[str, object]:
+    """Return the exact model-native posterior innovation schema."""
+    return {
+        "available": available,
+        "passed": passed,
+        "view_count": 8,
+        "dimension": 6808,
+        "renewal_total_max_abs_z": 1.0,
+        "renewal_total_within_confidence": True,
+        "conditional_mark_pearson": 100.0,
+        "conditional_mark_degrees_of_freedom": 6800,
+        "conditional_mark_tail_probability": 0.5,
+        "conditional_mark_upper_tail_probability": 0.75,
+        "confidence": 0.95,
+    }
+
+
+def test_obstacle_grid_accepts_immutable_runtime_context_mapping() -> None:
+    """The typed handshake's frozen JSON mapping must remain consumable."""
+    expected = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 2),
+        blocked_cells=((1, 1),),
+    )
+    payload = _context_payload()
+    payload["environment"]["obstacle_grid"] = expected.to_dict()
+    event = AdaptiveReadyEvent.from_payload(
+        {
+            "type": "ready",
+            "schema_version": 1,
+            "context": payload,
+            "candidates": _candidate_snapshot_payload(),
+            "bootstrap": {
+                "candidate_index": 0,
+                "fe_orientation_index": 0,
+                "pb_orientation_index": 3,
+            },
+        }
+    )
+
+    assert _obstacle_grid(event.context) == expected
+
+
 def test_standard_bootstrap_does_not_depend_on_legacy_program_library() -> None:
     """Guard-free live bootstrap must remain usable after old48 removal."""
     estimator = SimpleNamespace(normals=np.zeros((8, 3), dtype=np.float64))
@@ -458,7 +775,7 @@ def test_shield_view_count_health_is_truth_free_and_fail_closed() -> None:
                 "rejuvenation_mixing_complete": False,
                 "structural_mixing_complete": True,
             },
-            "innovation": {"available": True, "passed": False},
+            "innovation": _innovation_diagnostics(passed=False),
             "isotopes": {
                 "Cs-137": {
                     "gates": {
@@ -507,7 +824,7 @@ def test_shield_view_count_health_does_not_require_convergence_ready() -> None:
                 "rejuvenation_mixing_complete": True,
                 "structural_mixing_complete": True,
             },
-            "innovation": {"available": True, "passed": True},
+            "innovation": _innovation_diagnostics(),
             "isotopes": {
                 "Cs-137": {
                     "gates": {
@@ -552,7 +869,7 @@ def test_missing_particle_diversity_evidence_fails_closed() -> None:
                 "rejuvenation_mixing_complete": True,
                 "structural_mixing_complete": True,
             },
-            "innovation": {"available": True, "passed": True},
+            "innovation": _innovation_diagnostics(),
             "isotopes": {
                 "Cs-137": {
                     "gates": {
@@ -636,7 +953,6 @@ class _FakeRuntimeClient:
         self.aborted = False
         self.requests: list[dict[str, object]] = []
         self.refinement_requests: list[dict[str, object]] = []
-        self.overlay_requests: list[bool] = []
         self.candidates = {
             "current_pose_xyz": [0.5, 0.5, 0.5],
             "candidate_poses_xyz": [[0.5, 0.5, 0.5]],
@@ -748,11 +1064,6 @@ class _FakeRuntimeClient:
         """Refine candidates through the concise runtime API."""
         return self.request_refinement(request)
 
-    def request_cui_overlay(self, *, include_truth: bool) -> dict[str, object]:
-        """Fail if an estimator-owned controller requests realized truth."""
-        self.overlay_requests.append(bool(include_truth))
-        raise AssertionError("PF closed loop must not request a truth overlay.")
-
     def finalize(self) -> dict[str, object]:
         """Return the fake immutable log path."""
         return {
@@ -812,6 +1123,8 @@ class _FakeEstimator:
                 "particle_count": 2000,
                 "current_ess": 1000.0,
                 "current_ess_ratio": 0.5,
+                "station_unique_ancestor_count": 1000,
+                "cumulative_unique_ancestor_count": 1000,
                 "joint_smc_wall_time_limit_exceeded": False,
                 "joint_rejuvenation_mixing_incomplete": False,
                 "joint_structural_mixing_incomplete": False,
@@ -1419,10 +1732,59 @@ def test_failed_acquisition_never_publishes_a_partial_result(
     assert failure["status"] == "failed"
     assert failure["output_bundle_published"] is False
     assert failure["error_type"] == "AssertionError"
+    assert failure["failure_diagnostics_published"] is True
+    diagnostic_root = Path(failure["failure_diagnostics_dir"])
+    assert diagnostic_root.parent == tmp_path
+    assert diagnostic_root.name.startswith("output.failure-diagnostics-")
+    posterior = json.loads(
+        (diagnostic_root / "truth_free_posterior.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert posterior["publishable"] is False
+    assert (diagnostic_root / "planner_audit.jsonl").is_file()
+    manifest = json.loads(
+        (diagnostic_root / "failure_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["artifact_family"] == "pure_pf_failure_diagnostics"
+    assert manifest["success_result"] is False
+    assert manifest["truth_read"] is False
     client = _MismatchedRuntimeClient.instance
     assert client is not None
     assert client.aborted is True
     assert client.closed is True
+
+
+def test_failure_diagnostics_preserve_only_truth_free_last_cui_image(
+    tmp_path: Path,
+) -> None:
+    """The diagnostic bundle must keep PF evidence without a truth overlay."""
+    staging = tmp_path / ".output.bundle-test"
+    cui = staging / "cui_live"
+    cui.mkdir(parents=True)
+    (staging / "planner_audit.jsonl").write_text(
+        '{"station_id":0}\n',
+        encoding="utf-8",
+    )
+    (staging / "pf_station_trace.jsonl").write_text("", encoding="utf-8")
+    (cui / "latest_pf_3d.png").write_bytes(b"truth-free-pf")
+    (cui / "latest_pf_3d_labeled.png").write_bytes(b"private-truth-overlay")
+
+    diagnostic_root = _publish_failure_diagnostics(
+        target=tmp_path / "output",
+        staging_dir=staging,
+        stage_suffix="test",
+        estimator=_FakeEstimator(),
+        primary_error=RuntimeError("synthetic failure"),
+    )
+
+    assert (diagnostic_root / "last_cui_pf_3d.png").read_bytes() == b"truth-free-pf"
+    assert not (diagnostic_root / "latest_pf_3d_labeled.png").exists()
+    manifest = json.loads(
+        (diagnostic_root / "failure_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["last_cui_image_available"] is True
+    assert manifest["posterior_source"] == "current_estimator_state"
 
 
 def test_abort_cleanup_failures_preserve_primary_error_and_failure_evidence(
@@ -1507,11 +1869,11 @@ def test_abort_cleanup_failures_preserve_primary_error_and_failure_evidence(
     assert client.closed is True
 
 
-def test_failure_receipt_error_preserves_primary_error_and_discards_stage(
+def test_failure_receipt_error_preserves_primary_error_and_diagnostics(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """A failed receipt write must not retain staging or replace the cause."""
+    """A failed receipt write must retain diagnostics without replacing cause."""
     from pf import closed_loop
 
     class _MismatchedRuntimeClient(_FakeRuntimeClient):
@@ -1563,6 +1925,9 @@ def test_failure_receipt_error_preserves_primary_error_and_discards_stage(
     assert not list(tmp_path.glob(".output.bundle-*"))
     assert not list(tmp_path.glob(".output.failed-*"))
     assert not list(tmp_path.glob(".output.failure-*.json"))
+    diagnostic_roots = list(tmp_path.glob("output.failure-diagnostics-*"))
+    assert len(diagnostic_roots) == 1
+    assert (diagnostic_roots[0] / "truth_free_posterior.json").is_file()
 
 
 
@@ -1813,6 +2178,7 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
     run_pf_closed_loop(
         tmp_path / "runtime.sock",
         runtime_root=tmp_path,
+        cui_truth_overlay_socket_path=tmp_path / "cui-truth.sock",
         pf_config_path=config,
         output_dir=tmp_path / "output",
         seed=17,
@@ -1832,10 +2198,12 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
     assert truth_updates == []
     assert len(cui_constructor_kwargs) == 1
     assert cui_constructor_kwargs[0]["save_step_history"] is False
+    assert cui_constructor_kwargs[0]["truth_overlay_socket_path"] == (
+        tmp_path / "cui-truth.sock"
+    )
     assert server_close_calls == [True]
     client = _FakeRuntimeClient.instance
     assert client is not None
-    assert client.overlay_requests == []
     assert (
         "CUI split visualization URL: http://example.test:8877/index.html"
     ) in output_messages

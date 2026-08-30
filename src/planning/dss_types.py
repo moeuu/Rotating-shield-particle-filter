@@ -10,9 +10,7 @@ from numpy.typing import NDArray
 
 from measurement.detector_geometry import DEFAULT_DETECTOR_APERTURE_SAMPLES
 from planning.program_types import ShieldProgram
-
-
-DEFAULT_DSS_PP_LIVE_TIME_S = 30.0
+from runtime.experiment_profiles import STANDARD_ACQUISITION_LIVE_TIME_S
 
 
 def estimate_lambda_cost(
@@ -66,7 +64,7 @@ class DSSPPConfig:
     max_modes_per_isotope: int = 5
     planning_particles: int | None = None
     planning_method: str | None = None
-    live_time_s: float = DEFAULT_DSS_PP_LIVE_TIME_S
+    live_time_s: float = STANDARD_ACQUISITION_LIVE_TIME_S
     lambda_eig: float = 1.0
     lambda_distance: float | None = None
     lambda_horizontal_time: float = 0.0

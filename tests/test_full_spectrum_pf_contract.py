@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,36 +10,43 @@ import pytest
 
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.full_spectrum import (
+    catalog_line_layout_by_isotope,
     validate_full_spectrum_model,
+    validate_nonproduction_full_spectrum_model,
     validate_observed_spectrum,
-    validate_training_full_spectrum_model,
+    validated_catalog_transport_lines,
 )
-from pure_pf_test_support import approved_full_spectrum_model
+from pf.pure_estimator import PurePFEstimator
+from measurement.kernels import ShieldParams
+from pure_pf_test_support import (
+    approved_full_spectrum_model,
+    runtime_observation_model,
+)
+from spectrum.air_attenuation import dry_air_total_linear_attenuation_numpy
+from spectrum.library import default_library
 from spectrum.transport_spectral import GeometryConditionedSpectralModel
 
 
 def _runtime_ready_candidate() -> GeometryConditionedSpectralModel:
-    """Return a training-ready model without independent holdout approval."""
+    """Return a runtime-ready model without independent validation approval."""
     approved = approved_full_spectrum_model()
-    return GeometryConditionedSpectralModel.standard_native(
+    return GeometryConditionedSpectralModel.physics_only_native(
         ("Co-60", "Cs-137", "Eu-154"),
         dead_time_tau_s=approved.dead_time_tau_s,
         background_rate_cps=approved.background_rate_cps,
-        rate_scale_nodes_j=approved.rate_scale_nodes_j,
-        rate_scale_weights_j=approved.rate_scale_weights_j,
-        mark_concentration_source=approved.mark_concentration_source,
-        discrepancy_training_manifest=approved.discrepancy_training_manifest,
-        additive_scatter_response=approved.additive_scatter_response,
+        detector_green_operator=approved.detector_green_operator,
     )
 
 
 def _station_contract_estimator() -> RotatingShieldPFEstimator:
     """Return a compact estimator with one registered detector pose."""
+    model = approved_full_spectrum_model(("Cs-137",))
+    observation = runtime_observation_model(("Cs-137",))
     estimator = RotatingShieldPFEstimator(
         isotopes=("Cs-137",),
         surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
         shield_normals=None,
-        mu_by_isotope={"Cs-137": 0.0},
+        mu_by_isotope=observation.mu_by_isotope,
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
             max_sources=1,
@@ -47,12 +55,113 @@ def _station_contract_estimator() -> RotatingShieldPFEstimator:
             use_gpu=False,
             position_max=(2.0, 2.0, 2.0),
         ),
-        full_spectrum_generative_model=approved_full_spectrum_model(),
+        shield_params=observation.shield_params,
+        line_mu_by_isotope=observation.line_mu_by_isotope,
+        strict_catalog_line_contract=True,
+        dry_air_total_attenuation_contract_id=(
+            observation.dry_air_total_attenuation_contract_id
+        ),
+        dry_air_total_attenuation_contract_sha256=(
+            observation.dry_air_total_attenuation_contract_sha256
+        ),
+        detector_radius_m=observation.detector_geometry.count_radius_m,
+        detector_aperture_radius_m=(
+            observation.detector_geometry.aperture_radius_m
+        ),
+        detector_aperture_samples=observation.detector_geometry.aperture_samples,
+        detector_aperture_sampling=(
+            observation.detector_geometry.aperture_sampling
+        ),
+        full_spectrum_generative_model=model,
     )
-    estimator.add_measurement_pose(
-        np.asarray([1.0, 1.0, 1.0], dtype=np.float64)
-    )
+    estimator.add_measurement_pose(np.asarray([1.0, 1.0, 1.0], dtype=np.float64))
     return estimator
+
+
+def _pure_transport_estimator_kwargs(observation: object) -> dict[str, object]:
+    """Return minimal production PF arguments for transport-boundary tests."""
+    return {
+        "isotopes": ("Cs-137",),
+        "surface_diagnostic_points": np.asarray(
+            [[0.0, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        "shield_normals": None,
+        "observation_model": observation,
+        "pf_config": RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=1,
+            variable_cardinality=False,
+            init_num_sources=(0, 0),
+            use_gpu=False,
+            position_max=(2.0, 2.0, 2.0),
+        ),
+        "full_spectrum_generative_model": approved_full_spectrum_model(
+            ("Cs-137",)
+        ),
+        "measurement_log_schema_version": 2,
+        "config_hash": "a" * 64,
+        "resolved_config_hash": "b" * 64,
+        "measurement_log_sha256": "c" * 64,
+        "random_seed": 7,
+    }
+
+
+def test_pure_pf_preserves_one_authenticated_transport_contract() -> None:
+    """Filter and planner kernels must retain exact air and shield physics."""
+    base = runtime_observation_model(("Cs-137",))
+    shield = ShieldParams(
+        mu_pb=base.shield_params.mu_pb,
+        mu_fe=base.shield_params.mu_fe,
+        thickness_pb_cm=1.25,
+        thickness_fe_cm=2.5,
+        inner_radius_fe_cm=4.5,
+        inner_radius_pb_cm=7.0,
+        buildup_fe_coeff=0.125,
+        buildup_pb_coeff=0.25,
+    )
+    observation = replace(base, shield_params=shield)
+    estimator = PurePFEstimator(**_pure_transport_estimator_kwargs(observation))
+    estimator.add_measurement_pose(np.asarray([1.0, 1.0, 1.0]))
+    estimator.initialize_joint_particle_filters()
+
+    shared = estimator.continuous_kernel(use_gpu=False)
+    particle = estimator.filters["Cs-137"].continuous_kernel
+    for kernel in (shared, particle):
+        assert kernel.shield_params == shield
+        assert kernel.strict_catalog_line_contract is True
+        assert kernel.dry_air_total_attenuation_contract_id == (
+            observation.dry_air_total_attenuation_contract_id
+        )
+        assert kernel.dry_air_total_attenuation_contract_sha256 == (
+            observation.dry_air_total_attenuation_contract_sha256
+        )
+        distances = np.asarray([0.0, 18.0], dtype=np.float64)
+        actual = kernel._line_air_tau_numpy("Cs-137", distances)
+        energies = np.asarray(
+            [
+                row["energy_keV"]
+                for row in observation.line_mu_by_isotope["Cs-137"]
+            ],
+            dtype=np.float64,
+        )
+        expected = (
+            distances[:, np.newaxis]
+            * 100.0
+            * dry_air_total_linear_attenuation_numpy(energies)
+        )
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+        assert np.all(actual[1] > 0.0)
+
+
+def test_pure_pf_rejects_duplicate_transport_physics() -> None:
+    """Production callers cannot override fields from the observation model."""
+    observation = runtime_observation_model(("Cs-137",))
+    kwargs = _pure_transport_estimator_kwargs(observation)
+    kwargs["shield_params"] = ShieldParams()
+
+    with pytest.raises(TypeError, match="duplicate fields=.*shield_params"):
+        PurePFEstimator(**kwargs)
 
 
 def _zero_spectrum_record(
@@ -124,26 +233,146 @@ def test_observed_full_spectrum_accepts_unit_weight_integer_counts() -> None:
     assert validated.flags.c_contiguous
 
 
-def test_production_model_validator_rejects_pre_holdout_model() -> None:
-    """Production PF must reject a merely training-ready model."""
+def test_production_model_validator_rejects_pre_validation_model() -> None:
+    """Production PF must reject a merely runtime-ready model."""
     candidate = _runtime_ready_candidate()
 
-    with pytest.raises(RuntimeError, match="independent all-64 holdout"):
+    with pytest.raises(RuntimeError, match="independent all-64 validation"):
         validate_full_spectrum_model(candidate)
 
     assert candidate.runtime_ready is True
     assert candidate.production_ready is False
 
 
-def test_training_model_validator_is_explicitly_nonproduction() -> None:
-    """Training and holdout tools may use their separate validation API."""
+def test_estimator_rejects_model_replacement_after_boundary_authentication() -> None:
+    """Internal O(1) binding checks must reject a post-construction model swap."""
+    estimator = _station_contract_estimator()
+    authenticated = estimator.authenticated_full_spectrum_model()
+
+    assert authenticated is estimator.full_spectrum_generative_model
+    estimator.full_spectrum_generative_model = _runtime_ready_candidate()
+
+    with pytest.raises(RuntimeError, match="replaced after estimator authentication"):
+        estimator.authenticated_full_spectrum_model()
+
+
+def test_nonproduction_model_validator_is_explicit() -> None:
+    """Construction and validation tools use a separate nonproduction API."""
     candidate = _runtime_ready_candidate()
 
-    validated = validate_training_full_spectrum_model(candidate)
+    validated = validate_nonproduction_full_spectrum_model(candidate)
 
     assert validated is candidate
     assert candidate.runtime_ready is True
     assert candidate.production_ready is False
+
+
+def test_catalog_lines_support_unvalidated_nuclides_without_response_rebuild() -> None:
+    """Additional catalog nuclides reuse the same isotope-free Green operator."""
+    approved = approved_full_spectrum_model()
+    candidate = GeometryConditionedSpectralModel.physics_only_native(
+        ("Am-241", "Eu-152"),
+        dead_time_tau_s=approved.dead_time_tau_s,
+        background_rate_cps=approved.background_rate_cps,
+        detector_green_operator=approved.detector_green_operator,
+    )
+
+    validated = validate_nonproduction_full_spectrum_model(candidate)
+    lines = validated_catalog_transport_lines(validated)
+    layout = catalog_line_layout_by_isotope(
+        validated,
+        ("Am-241", "Eu-152"),
+    )
+    catalog = default_library()
+
+    assert candidate.detector_green_operator.contract_hash_sha256 == (
+        approved.detector_green_operator.contract_hash_sha256
+    )
+    for isotope in ("Am-241", "Eu-152"):
+        expected = tuple(
+            float(line.energy_keV)
+            for line in catalog[isotope].lines
+            if float(line.intensity) > 0.0
+        )
+        assert layout[isotope].energies_keV == expected
+        assert sum(layout[isotope].branching_weights) == pytest.approx(1.0)
+    assert {line.isotope for line in lines} == {"Am-241", "Eu-152"}
+    assert candidate.production_ready is False
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("unknown_field", "schema is incompatible"),
+        ("index_gap", "order or branching normalization"),
+        ("branching_drift", "order or branching normalization"),
+        ("energy_outside_domain", "physically inconsistent"),
+    ),
+)
+def test_catalog_line_contract_fails_closed_on_tampering(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    """PF rejects changed catalog rows before any likelihood evaluation."""
+    model = _runtime_ready_candidate()
+    rows = [dict(row) for row in model.line_identity]
+    if mutation == "unknown_field":
+        rows[0]["legacy_peak_scale"] = 1.0
+    elif mutation == "index_gap":
+        rows[1]["transport_line_index"] = 7
+    elif mutation == "branching_drift":
+        rows[0]["branching_weight"] = 0.25
+    else:
+        rows[0]["energy_keV"] = 1800.0
+    monkeypatch.setattr(model, "_line_identity", tuple(rows))
+
+    with pytest.raises(ValueError, match=message):
+        validate_nonproduction_full_spectrum_model(model)
+
+
+def test_pf_manifest_rejects_retired_detector_response_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A schema-v4 model cannot smuggle an analytic response legacy field."""
+    model = _runtime_ready_candidate()
+    original = model.manifest_payload
+
+    def _manifest_with_legacy_field() -> dict[str, object]:
+        """Return a copied manifest containing one retired response field."""
+        payload = dict(original())
+        payload["detector_response_contract_sha256"] = "a" * 64
+        return payload
+
+    monkeypatch.setattr(model, "manifest_payload", _manifest_with_legacy_field)
+
+    with pytest.raises(ValueError, match="retired fields"):
+        validate_nonproduction_full_spectrum_model(model)
+
+
+def test_pf_rejects_catalog_energy_drift_in_transport_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assimilation cannot use a kernel with a different catalog energy row."""
+    estimator = _station_contract_estimator()
+    estimator.initialize_joint_particle_filters()
+    kernel = estimator.filters["Cs-137"].continuous_kernel
+    original = kernel.line_transport_contract
+
+    def _energy_drift(
+        isotope: str,
+        indices: object,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return the physical rows with one deliberately stale energy."""
+        weights, energies, mu_fe, mu_pb = original(isotope, indices)
+        changed = energies.copy()
+        changed[0] += 1.0
+        return weights, changed, mu_fe, mu_pb
+
+    monkeypatch.setattr(kernel, "line_transport_contract", _energy_drift)
+
+    with pytest.raises(RuntimeError, match="catalog energy"):
+        estimator._joint_line_layout()
 
 
 def test_production_model_validator_rejects_truthy_production_flag(
@@ -224,7 +453,7 @@ def test_model_validator_rejects_coerced_feature_identifiers(
         ),
     )
 
-    with pytest.raises(ValueError, match="canonical order"):
+    with pytest.raises(ValueError, match="canonical.*order"):
         validate_full_spectrum_model(model)
 
 
@@ -393,9 +622,7 @@ def test_station_rejects_spectrum_coercion_before_assimilation(
         invalid_spectrum = spectrum.astype(str)
     else:
         invalid_spectrum = spectrum.copy()
-        invalid_spectrum[0] = (
-            np.nan if mutation == "nonfinite" else 0.5
-        )
+        invalid_spectrum[0] = np.nan if mutation == "nonfinite" else 0.5
 
     with pytest.raises(error_type, match=message):
         estimator._joint_station_from_spectrum_records(
@@ -485,6 +712,4 @@ def test_eight_raw_views_enter_one_joint_station_update() -> None:
     station = captured[0]
     assert station.spectrum_vb.shape[0] == 8
     assert len(estimator.measurements) == 8
-    assert {
-        record.station_sequence_id for record in estimator.measurements
-    } == {0}
+    assert {record.station_sequence_id for record in estimator.measurements} == {0}

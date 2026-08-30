@@ -20,6 +20,8 @@ uv run rotating-shield-sim generate-scenario /private/run-001.json \
   --truth-manifest-output /private/truth/run-001.json \
   --measurement-log-output /private/logs/run-001 \
   --run-id run-001 \
+  --experiment-profile multi_isotope_surface_search \
+  --scene-variant mix9 \
   --runtime-config configs/geant4/variance_reduction_external_no_isaac_32threads.json
 
 # Runtime serves the private scenario over an opaque local socket
@@ -49,3 +51,10 @@ The private runtime scenario and the separately joined private truth manifest ma
 contain realized source truth. MeasurementLog and every estimator-visible adaptive
 event reject private scene variant, scene seed/RNG provenance, and realized source
 fields.
+
+The private RA-L session runner may additionally create a second mode-`0600` Unix
+socket for the CUI renderer. The runtime serves one exact truth overlay on that
+socket, and the asynchronous renderer child uses it to draw numbered XYZ truth
+labels. `AdaptiveRuntimeClient`, PF frames, planning, MeasurementLog, and published
+PF artifacts do not receive that payload; omitting the second socket keeps truth
+hidden.

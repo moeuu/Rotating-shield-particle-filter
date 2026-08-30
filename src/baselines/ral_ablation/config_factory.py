@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
+from runtime.experiment_profiles import MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE
 from sim.runtime import (
     load_production_runtime_config,
     validate_production_runtime_config,
@@ -31,7 +31,8 @@ from pf.profiles import enforce_pure_runtime_settings
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RUNTIME_ROOT = ROOT.parent / "Rotating-shield-simulation-runtime"
 DEFAULT_RUNTIME_CONFIG = (
-    DEFAULT_RUNTIME_ROOT / STANDARD_EXPERIMENT_PROFILE.runtime_config_relative_path
+    DEFAULT_RUNTIME_ROOT
+    / MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.runtime_config_relative_path
 )
 DEFAULT_PF_CONFIG = ROOT / "configs" / "pf" / "pf_strict_3d.json"
 DEFAULT_OUTPUT_DIR = ROOT / "results" / "ral_ablation"
@@ -294,11 +295,9 @@ class AblationPlanEntry:
 
 
 RAL_CASE_NAME = "mix9_multi_isotope_cardinality"
-RAL_EXPERIMENT_PROFILE_ID = STANDARD_EXPERIMENT_PROFILE.profile_id
+RAL_EXPERIMENT_PROFILE_ID = MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.profile_id
 RAL_SCENE_VARIANT_ID = "mix9"
-RAL_RUNTIME_INTERVENTION_FIELDS = frozenset(
-    {"shield_transmission_target"}
-)
+RAL_RUNTIME_INTERVENTION_FIELDS = frozenset({"shield_transmission_target"})
 
 DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
     AblationVariant(
@@ -401,15 +400,17 @@ def _pf_config(
 
 def _control_policy(variant: AblationVariant) -> dict[str, object]:
     """Return the separate RA-L adapter policy for one experiment variant."""
-    return validate_ral_control_policy_payload({
-        "schema_version": 1,
-        "path_policy": (
-            None if variant.path_policy is None else dict(variant.path_policy)
-        ),
-        "shield_policy": (
-            None if variant.shield_policy is None else dict(variant.shield_policy)
-        ),
-    })
+    return validate_ral_control_policy_payload(
+        {
+            "schema_version": 1,
+            "path_policy": (
+                None if variant.path_policy is None else dict(variant.path_policy)
+            ),
+            "shield_policy": (
+                None if variant.shield_policy is None else dict(variant.shield_policy)
+            ),
+        }
+    )
 
 
 def _runtime_config(
@@ -493,6 +494,7 @@ def _scenario_command(
 def _session_command(
     *,
     scenario_path: Path,
+    truth_manifest_path: Path,
     runtime_root: Path,
     pf_config_path: Path,
     control_policy_path: Path,
@@ -500,7 +502,7 @@ def _session_command(
     pf_output_dir: Path,
     pf_seed: int,
 ) -> tuple[str, ...]:
-    """Return the RA-L adapter command that isolates PF behind a socket."""
+    """Return the private runner command that isolates its PF child by socket."""
     return (
         "uv",
         "run",
@@ -513,6 +515,8 @@ def _session_command(
         runtime_root.as_posix(),
         "--scenario",
         scenario_path.as_posix(),
+        "--truth-manifest",
+        truth_manifest_path.as_posix(),
         "--pf-config",
         pf_config_path.as_posix(),
         "--control-policy",
@@ -651,6 +655,7 @@ def build_ablation_plan(
                     scenario_command=scenario_command,
                     session_command=_session_command(
                         scenario_path=scenario_path,
+                        truth_manifest_path=truth_manifest_path,
                         runtime_root=runtime_root,
                         pf_config_path=generated_pf_path,
                         control_policy_path=control_policy_path,

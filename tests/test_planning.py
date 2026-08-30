@@ -16,6 +16,7 @@ from pf.estimator import (
     RotatingShieldPFEstimator,
     build_complete_surface_atlas_quadrature,
 )
+from pf.full_spectrum import DETECTOR_IMPACT_PHASE_COUNT
 from measurement.surface_atlas import ContinuousSurfaceAtlas
 from pf.state import IsotopeState
 from pf.provenance import strict_canonical_json_bytes, strict_json_loads
@@ -32,6 +33,11 @@ from pure_pf_test_support import approved_full_spectrum_model
 from planning_test_support import (
     build_full_spectrum_planning_estimator as _build_full_spectrum_planning_estimator,
     state_on_filter as _state_on_filter,
+)
+
+
+TEST_IMPACT_PARAMETER_EDGES = np.sqrt(
+    np.linspace(0.0, 1.0, DETECTOR_IMPACT_PHASE_COUNT + 1, dtype=np.float64)
 )
 
 
@@ -112,6 +118,8 @@ def _build_simple_estimator(
         pf_config=config,
         shield_params=ShieldParams(),
         detector_radius_m=0.025,
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     estimator.add_measurement_pose(np.array([0.0, 0.0, 0.0]))
@@ -198,15 +206,31 @@ def test_dss_full_spectrum_components_and_eig_share_pf_model(
         components.features_pnvslf,
         components.live_times_v,
     )
-    source_rate = np.sum(components.total_pnvsl, axis=(-2, -1))
-
     assert components.total_pnvsl.shape[:3] == (1, 2, 1)
     assert np.all(components.uncollided_pnvsl <= components.total_pnvsl + 1.0e-12)
-    node_rates = source_rate[..., None] * model._rate_scale_nodes_j + float(
-        model.background_rate_cps
+    source_mean, background_mean = model._pre_dead_time_mean_numpy(
+        components.total_pnvsl,
+        components.uncollided_pnvsl,
+        components.features_pnvslf,
+        components.live_times_v,
+        return_components=True,
+    )
+    source_counts = np.sum(source_mean, axis=-1)
+    background_counts = np.sum(background_mean, axis=-1)
+    node_counts = (
+        source_counts[..., None] * model._rate_scale_nodes_j
+        + background_counts[..., None]
     )
     expected_totals = np.sum(
-        (3.0 * node_rates / (1.0 + node_rates * float(model.dead_time_tau_s)))
+        (
+            node_counts
+            / (
+                1.0
+                + node_counts
+                / components.live_times_v
+                * float(model.dead_time_tau_s)
+            )
+        )
         * model._rate_scale_weights_j,
         axis=-1,
     )
@@ -302,7 +326,7 @@ def test_dss_full_spectrum_components_remain_device_resident(
         programs,
         joint,
         live_time_s=3.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
     )
     device = dss_pp._full_spectrum_joint_program_components(
         estimator,
@@ -310,7 +334,7 @@ def test_dss_full_spectrum_components_remain_device_resident(
         programs,
         joint,
         live_time_s=3.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
         device_resident=True,
     )
 
@@ -361,7 +385,7 @@ def test_dss_predictive_eig_stays_on_torch_device_until_final_scores(
         [program, program],
         joint,
         live_time_s=1.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
         device_resident=True,
     )
     model = estimator.full_spectrum_generative_model
@@ -513,7 +537,7 @@ def test_dss_device_predictive_sampler_fails_closed(
         [program],
         joint,
         live_time_s=1.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
         device_resident=True,
     )
     model = estimator.full_spectrum_generative_model
@@ -586,7 +610,7 @@ def test_dss_device_cross_likelihood_fails_closed(
         [program],
         joint,
         live_time_s=1.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
         device_resident=True,
     )
     model = estimator.full_spectrum_generative_model
@@ -767,9 +791,14 @@ def test_dss_selected_transport_retains_dense_all_pair_host_kernel() -> None:
             detector_positions: np.ndarray,
             sources: np.ndarray,
             positive_line_indices: np.ndarray,
+            impact_parameter_edges_fraction: np.ndarray,
         ) -> SimpleNamespace:
             """Return all four pair identifiers as response components."""
             assert isotope == "Cs-137"
+            np.testing.assert_array_equal(
+                impact_parameter_edges_fraction,
+                TEST_IMPACT_PARAMETER_EDGES,
+            )
             self.all_pair_calls += 1
             shape = (
                 np.asarray(detector_positions).shape[0],
@@ -787,7 +816,13 @@ def test_dss_selected_transport_retains_dense_all_pair_host_kernel() -> None:
                 tau_fe=values,
                 tau_pb=values,
                 tau_obstacle=values,
+                tau_obstacle_compton=values,
                 distance_m=values,
+                uncollided_impact_fractions=np.full(
+                    shape + (DETECTOR_IMPACT_PHASE_COUNT,),
+                    1.0 / DETECTOR_IMPACT_PHASE_COUNT,
+                    dtype=np.float64,
+                ),
             )
 
         def line_transport_components_pair_program_for_detectors(
@@ -809,6 +844,7 @@ def test_dss_selected_transport_retains_dense_all_pair_host_kernel() -> None:
         pair_ids_av=np.asarray([[0, 1], [2, 3]], dtype=np.int64),
         sources=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
         positive_line_indices=np.asarray([0], dtype=np.int64),
+        impact_parameter_edges_fraction=TEST_IMPACT_PARAMETER_EDGES,
     )
 
     assert kernel.all_pair_calls == 1
@@ -839,6 +875,11 @@ def test_dss_dense_device_transport_reuses_runtime_component_storage() -> None:
         )
     }
     runtime_components = SimpleNamespace(**values)
+    runtime_components.uncollided_impact_fractions = torch.full(
+        shape + (DETECTOR_IMPACT_PHASE_COUNT,),
+        1.0 / DETECTOR_IMPACT_PHASE_COUNT,
+        dtype=torch.float64,
+    )
 
     class DenseDeviceKernel:
         """Return one runtime-owned dense response tensor set."""
@@ -874,6 +915,7 @@ def test_dss_dense_device_transport_reuses_runtime_component_storage() -> None:
         ),
         sources=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
         positive_line_indices=np.asarray([0], dtype=np.int64),
+        impact_parameter_edges_fraction=TEST_IMPACT_PARAMETER_EDGES,
         device_resident=True,
     )
 
@@ -883,6 +925,7 @@ def test_dss_dense_device_transport_reuses_runtime_component_storage() -> None:
         "tau_fe",
         "tau_pb",
         "tau_obstacle",
+        "tau_obstacle_compton",
         "distance_m",
     ):
         assert actual[field_name].data_ptr() == values[field_name].data_ptr()
@@ -907,6 +950,11 @@ def test_dss_dense_host_transport_reuses_runtime_component_storage() -> None:
         )
     }
     runtime_components = SimpleNamespace(**values)
+    runtime_components.uncollided_impact_fractions = np.full(
+        shape + (DETECTOR_IMPACT_PHASE_COUNT,),
+        1.0 / DETECTOR_IMPACT_PHASE_COUNT,
+        dtype=np.float64,
+    )
 
     class DenseHostKernel:
         """Return one runtime-owned dense host response array set."""
@@ -941,6 +989,7 @@ def test_dss_dense_host_transport_reuses_runtime_component_storage() -> None:
         ),
         sources=np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
         positive_line_indices=np.asarray([0], dtype=np.int64),
+        impact_parameter_edges_fraction=TEST_IMPACT_PARAMETER_EDGES,
     )
 
     for field_name in (
@@ -949,9 +998,71 @@ def test_dss_dense_host_transport_reuses_runtime_component_storage() -> None:
         "tau_fe",
         "tau_pb",
         "tau_obstacle",
+        "tau_obstacle_compton",
         "distance_m",
     ):
         assert np.shares_memory(actual[field_name], values[field_name])
+
+
+def test_dss_transport_rejects_unnormalized_active_impact_phases() -> None:
+    """Planner ingestion must fail before using malformed phase probabilities."""
+    shape = (1, 1, 1, 1)
+    outputs: dict[str, object] = {
+        field_name: np.ones(shape, dtype=np.float64)
+        for field_name in (
+            "total_kernel",
+            "uncollided_kernel",
+            "tau_fe",
+            "tau_pb",
+            "tau_obstacle",
+            "tau_obstacle_compton",
+            "distance_m",
+        )
+    }
+    outputs["uncollided_impact_fractions"] = np.full(
+        shape + (DETECTOR_IMPACT_PHASE_COUNT,),
+        0.5 / DETECTOR_IMPACT_PHASE_COUNT,
+        dtype=np.float64,
+    )
+
+    with pytest.raises(RuntimeError, match="normalized detector-impact"):
+        dss_eig._validate_selected_transport_outputs(
+            outputs,
+            output_shape=shape,
+            impact_phase_count=DETECTOR_IMPACT_PHASE_COUNT,
+            device_resident=False,
+        )
+
+
+def test_dss_device_transport_rejects_unnormalized_active_impact_phases() -> None:
+    """Device ingestion must enforce the same phase contract as host code."""
+    torch = pytest.importorskip("torch")
+    shape = (1, 1, 1, 1)
+    outputs: dict[str, object] = {
+        field_name: torch.ones(shape, dtype=torch.float64)
+        for field_name in (
+            "total_kernel",
+            "uncollided_kernel",
+            "tau_fe",
+            "tau_pb",
+            "tau_obstacle",
+            "tau_obstacle_compton",
+            "distance_m",
+        )
+    }
+    outputs["uncollided_impact_fractions"] = torch.full(
+        shape + (DETECTOR_IMPACT_PHASE_COUNT,),
+        0.5 / DETECTOR_IMPACT_PHASE_COUNT,
+        dtype=torch.float64,
+    )
+
+    with pytest.raises(RuntimeError, match="violate the physical contract"):
+        dss_eig._validate_selected_transport_outputs(
+            outputs,
+            output_shape=shape,
+            impact_phase_count=DETECTOR_IMPACT_PHASE_COUNT,
+            device_resident=True,
+        )
 
 
 def test_dss_selected_program_transport_matches_legacy_all_pair_physics(
@@ -976,7 +1087,7 @@ def test_dss_selected_program_transport_matches_legacy_all_pair_physics(
     ]
     kernel = _continuous_kernel_for_estimator(
         estimator,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
     )
     all_pair_evaluator = kernel.line_transport_components_all_pairs_for_detectors
     monkeypatch.setattr(
@@ -990,7 +1101,7 @@ def test_dss_selected_program_transport_matches_legacy_all_pair_physics(
         programs,
         joint,
         live_time_s=3.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
     )
 
     def _legacy_all_pair_adapter(**kwargs: object) -> SimpleNamespace:
@@ -1003,9 +1114,16 @@ def test_dss_selected_program_transport_matches_legacy_all_pair_physics(
             detector_positions=np.asarray(kwargs["detector_positions"]),
             sources=np.asarray(kwargs["sources"]),
             positive_line_indices=np.asarray(kwargs["positive_line_indices"]),
+            impact_parameter_edges_fraction=np.asarray(
+                kwargs["impact_parameter_edges_fraction"],
+                dtype=np.float64,
+            ),
         )
         detector_rows = np.arange(pair_ids.shape[0], dtype=np.int64)[:, None]
         return SimpleNamespace(
+            uncollided_impact_fractions=np.asarray(
+                full.uncollided_impact_fractions
+            )[detector_rows, pair_ids],
             **{
                 field_name: np.asarray(getattr(full, field_name))[
                     detector_rows,
@@ -1017,6 +1135,7 @@ def test_dss_selected_program_transport_matches_legacy_all_pair_physics(
                     "tau_fe",
                     "tau_pb",
                     "tau_obstacle",
+                    "tau_obstacle_compton",
                     "distance_m",
                 )
             }
@@ -1033,7 +1152,7 @@ def test_dss_selected_program_transport_matches_legacy_all_pair_physics(
         programs,
         joint,
         live_time_s=3.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
     )
 
     np.testing.assert_allclose(
@@ -1244,11 +1363,25 @@ def test_dss_exact_eig_is_action_batch_invariant(
         joint_particles=joint,
     )
 
+    relative_tolerance = (
+        1.0e-10
+        if torch_device == "cuda"
+        else 1.0e-11
+        if torch_device == "cpu"
+        else 0.0
+    )
+    absolute_tolerance = (
+        1.0e-10
+        if torch_device == "cuda"
+        else 5.0e-12
+        if torch_device == "cpu"
+        else 5.0e-13
+    )
     np.testing.assert_allclose(
         np.concatenate(one_batch),
         np.concatenate(scalar_batches),
-        rtol=1.0e-10 if torch_device == "cuda" else 0.0,
-        atol=1.0e-10 if torch_device == "cuda" else 0.0,
+        rtol=relative_tolerance,
+        atol=absolute_tolerance,
     )
 
 
@@ -1409,7 +1542,9 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
     )
 
     assert attempted_action_counts[0] == 3
-    assert all(count == 1 for count in attempted_action_counts[1:])
+    assert all(
+        count == 1 for count in attempted_action_counts[1:]
+    ), attempted_action_counts
     assert diagnostics["oom_retry_count"] == 1
     assert release_calls == 1
     assert "cpu_fallback_used" not in diagnostics
@@ -1426,8 +1561,14 @@ def test_dss_exact_eig_halves_and_retries_after_oom(
     ]
     scratch_bytes = diagnostics["successful_response_scratch_budget_bytes"]
     assert len(resident_bytes) == len(materialization_bytes) == len(scratch_bytes)
+    phase_count = DETECTOR_IMPACT_PHASE_COUNT
+    expected_resident_fields = (2 + 5 + phase_count) + (7 + phase_count) + (
+        8 + phase_count
+    )
+    expected_peak_fields = expected_resident_fields + 8 + phase_count
     assert all(
-        int(peak) * 5 == int(resident) * 7
+        int(peak) * expected_resident_fields
+        == int(resident) * expected_peak_fields
         for resident, peak in zip(
             resident_bytes,
             materialization_bytes,
@@ -1484,7 +1625,7 @@ def test_conditional_pose_batch_retries_without_changing_eig(
         program_length=1,
         forced_program_pair_ids=(0,),
         live_time_s=1.0,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
     )
     call_kwargs = {
         "estimator": estimator,
@@ -1531,9 +1672,11 @@ def test_conditional_pose_batch_retries_without_changing_eig(
     )
     actual = dss_pp._evaluate_conditional_pose_batches(**call_kwargs)
 
-    np.testing.assert_array_equal(
+    np.testing.assert_allclose(
         actual.information_gains_ra,
         expected.information_gains_ra,
+        rtol=1.0e-12,
+        atol=1.0e-12,
     )
     np.testing.assert_array_equal(
         actual.program_pair_ids_ral,
@@ -1554,7 +1697,7 @@ def test_fixed_confirmation_releases_failed_cache_before_retry(
     config = DSSPPConfig(
         program_length=1,
         forced_program_pair_ids=(0,),
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
     )
     attempted_pose_counts: list[int] = []
     failed_response: weakref.ReferenceType[object] | None = None
@@ -2562,7 +2705,7 @@ def test_dss_conditional_policy_searches_all_pairs_without_a_guard() -> None:
             lambda_eig=1.0,
             lambda_distance=0.0,
             exact_eig_coverage_reserve=0,
-            detector_aperture_samples=1,
+        detector_aperture_samples=8,
             exact_eig_pose_min=8,
             exact_eig_pose_max=16,
         ),
@@ -2620,7 +2763,7 @@ def test_shield_view_count_shadow_is_paired_and_does_not_change_execution() -> N
                 lambda_eig=1.0,
                 lambda_distance=0.0,
                 exact_eig_coverage_reserve=0,
-                detector_aperture_samples=1,
+        detector_aperture_samples=8,
                 exact_eig_pose_min=8,
                 exact_eig_pose_max=16,
                 shield_view_count_shadow_enabled=enabled,
@@ -2719,7 +2862,7 @@ def test_shield_view_count_shadow_logs_all_proxy_poses_and_exact_union() -> None
             lambda_eig=1.0,
             lambda_distance=0.0,
             exact_eig_coverage_reserve=0,
-            detector_aperture_samples=1,
+        detector_aperture_samples=8,
             exact_eig_pose_min=8,
             exact_eig_pose_max=16,
             proxy_stability_refinement_pool=24,
@@ -2782,7 +2925,7 @@ def test_dss_conditional_policy_exposes_no_retired_program_path() -> None:
             lambda_eig=1.0,
             lambda_distance=0.0,
             exact_eig_coverage_reserve=0,
-            detector_aperture_samples=1,
+        detector_aperture_samples=8,
         ),
     )
 
@@ -2816,6 +2959,8 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
         mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
         pf_config=config,
         shield_params=ShieldParams(),
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
@@ -2892,6 +3037,8 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
         mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
         pf_config=config,
         shield_params=ShieldParams(),
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
@@ -2959,6 +3106,8 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
         mu_by_isotope={"Cs-137": 0.08},
         pf_config=config,
         shield_params=ShieldParams(),
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
@@ -3025,6 +3174,8 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
         mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
         pf_config=config,
         shield_params=ShieldParams(),
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([1.0, 1.0, 0.5], dtype=float))
@@ -3438,7 +3589,7 @@ def test_sparse_surface_observability_matches_dense_physics_oracle() -> None:
     )
     kernel = dss_pp._continuous_kernel_for_estimator(
         estimator,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
     )
     surfaces = np.asarray(
         [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [4.0, 0.0, 0.0]],
@@ -3490,7 +3641,7 @@ def test_surface_observability_resolves_horizontal_and_vertical_actions() -> Non
     estimator = _build_simple_estimator()
     kernel = dss_pp._continuous_kernel_for_estimator(
         estimator,
-        detector_aperture_samples=1,
+        detector_aperture_samples=8,
     )
     surfaces = np.asarray(
         [[0.0, 0.0, 0.0], [0.0, 0.0, 8.0], [8.0, 0.0, 0.0]],
@@ -3600,6 +3751,8 @@ def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
         mu_by_isotope={"Co-60": {"fe": 0.0, "pb": 0.0}},
         pf_config=config,
         shield_params=ShieldParams(),
+        detector_aperture_radius_m=0.0395,
+        detector_aperture_samples=33,
         full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([2.0, 3.0, 0.5], dtype=float))

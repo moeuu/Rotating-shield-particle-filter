@@ -88,7 +88,9 @@ class TorchLineTransportComponents:
     tau_fe: torch.Tensor
     tau_pb: torch.Tensor
     tau_obstacle: torch.Tensor
+    tau_obstacle_compton: torch.Tensor
     distance_m: torch.Tensor
+    uncollided_impact_fractions: torch.Tensor
 
 
 __all__ = ["StructuralGeometryBatch", "TorchLineTransportComponents"]

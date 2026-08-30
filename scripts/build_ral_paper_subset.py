@@ -168,7 +168,7 @@ def _validated_scenario_command(row: Mapping[str, str]) -> str:
 
 
 def _validated_session_command(row: Mapping[str, str]) -> str:
-    """Validate one adapter command while keeping PF inputs truth-free."""
+    """Validate the private runner while keeping its PF child truth-free."""
     tokens = _tokens(str(row["session_command"]), name="session_command")
     expected_module = "baselines.ral_ablation.session_runner"
     if tokens[:2] != ["uv", "run"] or expected_module not in tokens:
@@ -180,6 +180,7 @@ def _validated_session_command(row: Mapping[str, str]) -> str:
     runtime_root = _required_option(scenario_tokens, "--directory")
     expected_options = {
         "--scenario": row["scenario_path"],
+        "--truth-manifest": row["truth_manifest_path"],
         "--runtime-root": runtime_root,
         "--pf-config": row["pf_config_path"],
         "--control-policy": row["control_policy_path"],
@@ -192,6 +193,7 @@ def _validated_session_command(row: Mapping[str, str]) -> str:
         equal = actual == expected
         if option in {
             "--scenario",
+            "--truth-manifest",
             "--runtime-root",
             "--pf-config",
             "--control-policy",

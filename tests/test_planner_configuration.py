@@ -32,7 +32,7 @@ def _acquisition_contract(**overrides: object) -> AcquisitionContract:
     values: dict[str, object] = {
         "max_stations": 16,
         "views_per_station": 8,
-        "live_time_s": 30.0,
+        "live_time_s": 20.0,
         "max_measurements": 128,
         "min_station_separation_m": 3.0,
         "coverage_radius_m": 3.0,

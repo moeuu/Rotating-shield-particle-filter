@@ -19,8 +19,9 @@ from scipy.spatial import cKDTree
 from measurement.continuous_kernels import ContinuousKernel
 from pf.estimator import JointPlanningParticles, RotatingShieldPFEstimator
 from pf.full_spectrum import (
+    TRANSPORT_FEATURE_ORDER,
     TorchPredictiveFullSpectrumModel,
-    validate_full_spectrum_model,
+    catalog_line_layout_by_isotope,
 )
 from pf.randomness import named_random_generator, named_stream_seed
 
@@ -203,7 +204,7 @@ def _full_spectrum_joint_program_components(
         or int(working_memory_budget_bytes) <= 0
     ):
         raise ValueError("working_memory_budget_bytes must be a positive integer.")
-    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
+    model = estimator.authenticated_full_spectrum_model()
     isotope_order = tuple(str(value) for value in joint_particles.isotope_order)
     if isotope_order != tuple(sorted(str(value) for value in estimator.isotopes)):
         raise ValueError("Joint planning isotope order must equal the estimator order.")
@@ -213,9 +214,15 @@ def _full_spectrum_joint_program_components(
     particle_count = int(particle_weights.size)
     line_identity = tuple(model.line_identity)
     line_count = len(line_identity)
+    catalog_layout = catalog_line_layout_by_isotope(model, isotope_order)
     feature_order = tuple(str(value) for value in model.transport_feature_order)
-    if feature_order != ("tau_fe", "tau_pb", "tau_obstacle", "distance_m"):
+    if feature_order != TRANSPORT_FEATURE_ORDER:
         raise ValueError("DSS and PF transport feature orders differ.")
+    impact_edges = np.asarray(
+        model.detector_impact_parameter_edges_fraction,
+        dtype=np.float64,
+    )
+    impact_phase_count = int(impact_edges.size - 1)
     slot_counts = {
         isotope: int(
             np.asarray(
@@ -317,49 +324,45 @@ def _full_spectrum_joint_program_components(
                 "Joint full-spectrum planning particles contain an invalid "
                 f"state for {isotope!r}."
             )
+        isotope_layout = catalog_layout[isotope]
         global_line_indices = np.asarray(
-            [
-                index
-                for index, metadata in enumerate(line_identity)
-                if str(metadata["isotope"]) == isotope
-            ],
+            isotope_layout.global_columns,
             dtype=np.int64,
         )
         local_line_indices = np.asarray(
-            [
-                int(line_identity[int(index)]["transport_line_index"])
-                for index in global_line_indices
-            ],
+            isotope_layout.transport_line_indices,
             dtype=np.int64,
         )
         branching_weights = np.asarray(
-            [
-                float(line_identity[int(index)]["branching_weight"])
-                for index in global_line_indices
-            ],
+            isotope_layout.branching_weights,
             dtype=np.float64,
         )
-        if (
-            global_line_indices.size == 0
-            or np.any(local_line_indices < 0)
-            or np.any(~np.isfinite(branching_weights))
-            or np.any(branching_weights <= 0.0)
-        ):
-            raise RuntimeError(
-                f"Full-spectrum model has no valid positive line for {isotope!r}."
-            )
-        configured_branching = kernel.line_branching_weights(
+        (
+            configured_branching,
+            configured_energies,
+            configured_mu_fe,
+            configured_mu_pb,
+        ) = kernel.line_transport_contract(
             isotope,
             local_line_indices,
         )
-        if not np.allclose(
-            configured_branching,
-            branching_weights,
-            rtol=1.0e-12,
-            atol=1.0e-15,
+        if not all(
+            np.allclose(
+                actual,
+                np.asarray(expected, dtype=np.float64),
+                rtol=1.0e-12,
+                atol=1.0e-15,
+            )
+            for actual, expected in (
+                (configured_branching, isotope_layout.branching_weights),
+                (configured_energies, isotope_layout.energies_keV),
+                (configured_mu_fe, isotope_layout.mu_fe_cm_inv),
+                (configured_mu_pb, isotope_layout.mu_pb_cm_inv),
+            )
         ):
             raise RuntimeError(
-                f"DSS, PF, and spectrum-model branching weights differ for {isotope!r}."
+                "DSS, PF, and spectrum-model catalog transport rows differ "
+                f"for {isotope!r}."
             )
         if slot_count == 0:
             continue
@@ -381,6 +384,7 @@ def _full_spectrum_joint_program_components(
             pair_ids_av=pair_ids,
             sources=active_transport_positions,
             positive_line_indices=local_line_indices,
+            impact_parameter_edges_fraction=impact_edges,
             device_resident=device_resident,
             working_memory_budget_bytes=working_memory_budget_bytes,
         )
@@ -428,7 +432,32 @@ def _full_spectrum_joint_program_components(
         tau_fe = _local_component("tau_fe")
         tau_pb = _local_component("tau_pb")
         tau_obstacle = _local_component("tau_obstacle")
+        tau_obstacle_compton = _local_component("tau_obstacle_compton")
         distance_m = _local_component("distance_m")
+        raw_impact = component_arrays["uncollided_impact_fractions"]
+        expected_impact_shape = expected_program_shape + (impact_phase_count,)
+        if device_resident:
+            import torch
+
+            impact_fractions = torch.as_tensor(
+                raw_impact,
+                device=total_components.device,
+                dtype=total_components.dtype,
+            )
+            if tuple(impact_fractions.shape) != expected_impact_shape:
+                raise RuntimeError(
+                    "Full-spectrum detector-impact component shape is invalid."
+                )
+        else:
+            impact_fractions = np.asarray(raw_impact, dtype=np.float64)
+            if (
+                impact_fractions.shape != expected_impact_shape
+                or np.any(~np.isfinite(impact_fractions))
+                or np.any(impact_fractions < 0.0)
+            ):
+                raise RuntimeError(
+                    "Full-spectrum detector-impact component is invalid."
+                )
         if device_resident:
             import torch
 
@@ -449,13 +478,37 @@ def _full_spectrum_joint_program_components(
         total_local *= source_scale
         uncollided_local *= source_scale
         local_features = (
-            torch.stack(
-                (tau_fe, tau_pb, tau_obstacle, distance_m),
+            torch.cat(
+                (
+                    torch.stack(
+                        (
+                            tau_fe,
+                            tau_pb,
+                            tau_obstacle,
+                            tau_obstacle_compton,
+                            distance_m,
+                        ),
+                        dim=-1,
+                    ),
+                    impact_fractions,
+                ),
                 dim=-1,
             )
             if device_resident
-            else np.stack(
-                (tau_fe, tau_pb, tau_obstacle, distance_m),
+            else np.concatenate(
+                (
+                    np.stack(
+                        (
+                            tau_fe,
+                            tau_pb,
+                            tau_obstacle,
+                            tau_obstacle_compton,
+                            distance_m,
+                        ),
+                        axis=-1,
+                    ),
+                    impact_fractions,
+                ),
                 axis=-1,
             )
         )
@@ -510,7 +563,9 @@ def _full_spectrum_joint_program_components(
             tau_fe,
             tau_pb,
             tau_obstacle,
+            tau_obstacle_compton,
             distance_m,
+            impact_fractions,
             source_scale,
             local_features,
             target,
@@ -625,7 +680,7 @@ def _program_information_gains_for_poses(
         raise RuntimeError(
             "Pure PF planning requires one initialized filter per isotope."
         )
-    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
+    model = estimator.authenticated_full_spectrum_model()
     detectors = np.asarray(detector_positions, dtype=np.float64)
     if detectors.size == 0:
         detectors = np.zeros((0, 3), dtype=np.float64)
@@ -719,6 +774,15 @@ def _program_information_gains_for_poses(
     )
     line_count = len(tuple(model.line_identity))
     feature_count = len(tuple(model.transport_feature_order))
+    impact_phase_count = sum(
+        str(name).startswith("uncollided_impact_fraction_")
+        for name in model.transport_feature_order
+    )
+    if impact_phase_count <= 0 or feature_count - impact_phase_count != 5:
+        raise RuntimeError(
+            "DSS full-spectrum transport requires the complete five-scalar "
+            "physics and detector-impact feature contract."
+        )
     memory_budget_bytes = (
         config.exact_eig_memory_budget_bytes
         if memory_budget_bytes_override is None
@@ -852,22 +916,33 @@ def _program_information_gains_for_poses(
                 planner_destination_bytes = int(
                     (2 + max(feature_count, 1)) * response_field_bytes
                 )
-                # The host generic path preallocates a six-field selected-
-                # action result before runtime transport. The device path
-                # allocates it only after transport, so it is not resident
-                # during scratch. Dense all-pair requests use less memory,
-                # but these bounds cover every supported action layout.
+                # The host generic path preallocates seven scalar response fields
+                # plus the complete detector-impact axis. The device path
+                # allocates that selected result only after transport, so it is
+                # not resident during runtime scratch. Dense all-pair requests
+                # use less memory, but these bounds cover every action layout.
+                selected_response_field_count = 7 + impact_phase_count
                 selected_response_bytes = int(
-                    (0 if use_gpu else 6) * response_field_bytes
+                    (0 if use_gpu else selected_response_field_count)
+                    * response_field_bytes
                 )
-                runtime_retained_bytes = int(8 * response_field_bytes)
+                runtime_retained_field_count = 8 + impact_phase_count
+                runtime_retained_bytes = int(
+                    runtime_retained_field_count * response_field_bytes
+                )
                 response_resident_bytes = int(
                     planner_destination_bytes
                     + selected_response_bytes
                     + runtime_retained_bytes
                 )
                 response_assembly_peak_bytes = int(
-                    (20 if use_gpu else 28) * response_field_bytes
+                    response_resident_bytes
+                    + (
+                        selected_response_field_count
+                        if use_gpu
+                        else runtime_retained_field_count
+                    )
+                    * response_field_bytes
                 )
                 response_materialization_peak_bytes = int(
                     max(
@@ -2186,7 +2261,7 @@ def _evaluate_conditional_pose_batches(
             for values in joint_particles.strengths_nk_by_isotope.values()
         )
     )
-    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
+    model = estimator.authenticated_full_spectrum_model()
     minimum_response_scratch = _conditional_minimum_response_scratch_budget(
         estimator,
         detector_aperture_samples=int(config.detector_aperture_samples),
@@ -2516,7 +2591,7 @@ def _evaluate_fixed_programs_in_pose_batches(
             for values in joint_particles.strengths_nk_by_isotope.values()
         )
     )
-    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
+    model = estimator.authenticated_full_spectrum_model()
     minimum_response_scratch = _conditional_minimum_response_scratch_budget(
         estimator,
         detector_aperture_samples=int(config.detector_aperture_samples),
@@ -3835,8 +3910,7 @@ def _build_conditional_nodes(
         )
     )
     exact_subset_evaluation_count = int(
-        exact_pose_indices.size
-        * (greedy_count + swap_count + contender_count)
+        exact_pose_indices.size * (greedy_count + swap_count + contender_count)
         + program_confirmation_count * contender_count
         + pose_confirmation_count
     )
@@ -4421,9 +4495,7 @@ def _build_nodes(
     while next_evaluation_offset < total_action_count:
         adaptive_round_count += 1
         next_stop = (
-            initial_indices.size
-            if next_evaluation_offset == 0
-            else total_action_count
+            initial_indices.size if next_evaluation_offset == 0 else total_action_count
         )
         if next_stop <= next_evaluation_offset:
             raise RuntimeError("Adaptive exact-EIG batch made no progress.")
@@ -4625,7 +4697,7 @@ def _build_nodes(
         if selected_pending_index >= 0
         else 0
     )
-    model = validate_full_spectrum_model(estimator.full_spectrum_generative_model)
+    model = estimator.authenticated_full_spectrum_model()
     sample_count = int(estimator.pf_config.planning_eig_samples)
     particle_count = int(np.asarray(joint_particles.weights_n).size)
     view_count = max((len(program.pair_ids) for program in programs), default=0)
@@ -5189,9 +5261,7 @@ def _select_dss_pp_test_oracle(
         config=config,
         rng=rng,
         candidate_motion_times_s=candidate_motion_times_s,
-        candidate_horizontal_travel_times_s=(
-            candidate_horizontal_travel_times_s
-        ),
+        candidate_horizontal_travel_times_s=(candidate_horizontal_travel_times_s),
         candidate_mast_vertical_times_s=candidate_mast_vertical_times_s,
         candidate_settling_times_s=candidate_settling_times_s,
     )
@@ -5225,9 +5295,7 @@ def select_dss_pp_next_station(
         config=config,
         rng=rng,
         candidate_motion_times_s=candidate_motion_times_s,
-        candidate_horizontal_travel_times_s=(
-            candidate_horizontal_travel_times_s
-        ),
+        candidate_horizontal_travel_times_s=(candidate_horizontal_travel_times_s),
         candidate_mast_vertical_times_s=candidate_mast_vertical_times_s,
         candidate_settling_times_s=candidate_settling_times_s,
     )
