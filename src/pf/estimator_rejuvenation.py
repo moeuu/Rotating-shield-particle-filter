@@ -2274,18 +2274,19 @@ class JointRejuvenationMixin:
             return tuple(
                 device_state[name].clone()
                 for name in (
+                    "positions",
                     "strengths",
                     "mask",
                     "chart_ids",
                     "surface_uv",
                 )
             )
-        _, strengths, mask, chart_ids, surface_uv = (
+        positions, strengths, mask, chart_ids, surface_uv = (
             filt._packed_continuous_surface_state_arrays()
         )
         return tuple(
             np.ascontiguousarray(values).copy()
-            for values in (strengths, mask, chart_ids, surface_uv)
+            for values in (positions, strengths, mask, chart_ids, surface_uv)
         )
 
     @staticmethod
@@ -2303,6 +2304,7 @@ class JointRejuvenationMixin:
             after = tuple(
                 state[name]
                 for name in (
+                    "positions",
                     "strengths",
                     "mask",
                     "chart_ids",
@@ -2932,6 +2934,7 @@ class JointRejuvenationMixin:
                             data=evidence,
                             stations=active,
                             particle_indices=changed_rows,
+                            sweep_entry_state=cache_state_before,
                         )
                         if not isinstance(cache, JointTransportCache):
                             raise RuntimeError(

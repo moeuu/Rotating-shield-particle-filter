@@ -1347,6 +1347,119 @@ class EstimatorStructuralProposalMixin:
             )
         return matched, matched_slots, accepted_strength
 
+    @staticmethod
+    def _joint_explicit_cached_state_match_torch(
+        *,
+        sweep_entry_state: tuple[object, ...],
+        reference: "torch.Tensor",
+        particle_indices: object,
+        positions_pks: object,
+        chart_ids_pk: object,
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        """Match geometry to the immutable state that owns the global cache."""
+        import torch
+
+        if len(sweep_entry_state) != 5:
+            raise ValueError(
+                "Sweep-entry cache state must contain five aligned tensors."
+            )
+        raw_positions, raw_strengths, raw_mask, raw_charts, raw_uv = (
+            sweep_entry_state
+        )
+        cached_positions = torch.as_tensor(
+            raw_positions,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        cached_strengths = torch.as_tensor(
+            raw_strengths,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        cached_mask = torch.as_tensor(
+            raw_mask,
+            device=reference.device,
+            dtype=torch.bool,
+        )
+        cached_charts = torch.as_tensor(
+            raw_charts,
+            device=reference.device,
+            dtype=torch.long,
+        )
+        cached_uv = torch.as_tensor(
+            raw_uv,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        particle_count = int(reference.shape[0])
+        maximum = int(cached_strengths.shape[1])
+        if (
+            tuple(cached_positions.shape) != (particle_count, maximum, 3)
+            or tuple(cached_mask.shape) != (particle_count, maximum)
+            or tuple(cached_charts.shape) != (particle_count, maximum)
+            or tuple(cached_uv.shape) != (particle_count, maximum, 2)
+        ):
+            raise RuntimeError(
+                "Sweep-entry state is not aligned with the global cache."
+            )
+        indices = torch.as_tensor(
+            particle_indices,
+            device=reference.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if bool(
+            torch.any((indices < 0) | (indices >= particle_count)).item()
+        ):
+            raise IndexError("Sweep-entry cache match row is out of range.")
+        selected_positions = torch.index_select(cached_positions, 0, indices)
+        selected_strengths = torch.index_select(cached_strengths, 0, indices)
+        selected_mask = torch.index_select(cached_mask, 0, indices)
+        selected_charts = torch.index_select(cached_charts, 0, indices)
+        positions = torch.as_tensor(
+            positions_pks,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        charts = torch.as_tensor(
+            chart_ids_pk,
+            device=reference.device,
+            dtype=torch.long,
+        )
+        if (
+            positions.ndim != 3
+            or positions.shape[0] != indices.numel()
+            or positions.shape[2] != 3
+            or tuple(charts.shape) != tuple(positions.shape[:2])
+        ):
+            raise ValueError("Sweep-entry match candidates are misaligned.")
+        matches = (
+            selected_mask[:, None, :]
+            & (charts[:, :, None] == selected_charts[:, None, :])
+            & torch.all(
+                positions[:, :, None, :] == selected_positions[:, None, :, :],
+                dim=3,
+            )
+        )
+        match_counts = torch.sum(matches, dim=2, dtype=torch.long)
+        matched = match_counts == 1
+        matched_slots = torch.argmax(matches.to(torch.int8), dim=2)
+        accepted_strength = torch.gather(
+            selected_strengths,
+            1,
+            matched_slots,
+        )
+        invalid = torch.stack(
+            (
+                torch.any(match_counts > 1),
+                torch.any(matched & (accepted_strength <= 0.0)),
+            )
+        ).any()
+        if bool(invalid.item()):
+            raise RuntimeError(
+                "Sweep-entry source matches are ambiguous or invalid."
+            )
+        return matched, matched_slots, accepted_strength
+
     def _joint_cuda_accepted_unit_cache_entry(
         self,
         *,
@@ -1518,6 +1631,7 @@ class EstimatorStructuralProposalMixin:
         data: StructuralGeometryBatch,
         stations: Sequence[JointStationObservation],
         particle_indices: NDArray[np.int64],
+        sweep_entry_state: tuple[object, ...],
     ) -> None:
         """Commit exact accepted proposal columns into the global Torch cache.
 
@@ -1670,28 +1784,144 @@ class EstimatorStructuralProposalMixin:
                 dtype=cached_total.dtype,
             )
             if cardinality:
-                matched, _, unit_components = (
+                selected_positions = torch.index_select(
+                    final_state["positions"],
+                    0,
+                    selected_tensor,
+                )[:, :cardinality]
+                selected_charts = torch.index_select(
+                    final_state["chart_ids"],
+                    0,
+                    selected_tensor,
+                )[:, :cardinality]
+                (
+                    sweep_entry_matched,
+                    sweep_entry_slots,
+                    sweep_entry_strengths,
+                ) = self._joint_explicit_cached_state_match_torch(
+                    sweep_entry_state=sweep_entry_state,
+                    reference=cached_total,
+                    particle_indices=selected_tensor,
+                    positions_pks=selected_positions,
+                    chart_ids_pk=selected_charts,
+                )
+                staged_matched, _, staged_unit_components = (
                     self._joint_match_cuda_accepted_unit_transport(
                         cache=accepted_cache,
                         particle_indices=selected_tensor,
-                        positions_pks=torch.index_select(
-                            final_state["positions"],
-                            0,
-                            selected_tensor,
-                        )[:, :cardinality],
-                        chart_ids_pk=torch.index_select(
-                            final_state["chart_ids"],
-                            0,
-                            selected_tensor,
-                        )[:, :cardinality],
+                        positions_pks=selected_positions,
+                        chart_ids_pk=selected_charts,
                         reference=cached_total,
                     )
                 )
-                if not bool(torch.all(matched).item()):
-                    missing = int(torch.count_nonzero(~matched).item())
+                staged_matched &= ~sweep_entry_matched
+                all_matched = sweep_entry_matched | staged_matched
+                if not bool(torch.all(all_matched).item()):
+                    missing = int(torch.count_nonzero(~all_matched).item())
                     raise RuntimeError(
-                        "Accepted structural state lacks exact staged unit "
+                        "Accepted structural state lacks exact cached unit "
                         f"transport for {missing} source column(s)."
+                    )
+                local_line_count = int(global_columns.size)
+                unit_total = torch.zeros(
+                    (
+                        int(selected_tensor.numel()),
+                        int(cache.valid_view_count),
+                        cardinality,
+                        local_line_count,
+                    ),
+                    device=cached_total.device,
+                    dtype=cached_total.dtype,
+                )
+                unit_uncollided = torch.zeros_like(unit_total)
+                unit_features = torch.zeros(
+                    tuple(unit_total.shape) + (int(cached_features.shape[-1]),),
+                    device=cached_total.device,
+                    dtype=cached_total.dtype,
+                )
+                if bool(torch.any(sweep_entry_matched).item()):
+                    accepted_total = torch.index_select(
+                        cached_total[:, :, slot_start:slot_stop, :],
+                        0,
+                        selected_tensor,
+                    )
+                    accepted_total = torch.index_select(
+                        accepted_total,
+                        3,
+                        line_selection,
+                    )
+                    accepted_uncollided = torch.index_select(
+                        cached_uncollided[:, :, slot_start:slot_stop, :],
+                        0,
+                        selected_tensor,
+                    )
+                    accepted_uncollided = torch.index_select(
+                        accepted_uncollided,
+                        3,
+                        line_selection,
+                    )
+                    accepted_features = torch.index_select(
+                        cached_features[:, :, slot_start:slot_stop, :, :],
+                        0,
+                        selected_tensor,
+                    )
+                    accepted_features = torch.index_select(
+                        accepted_features,
+                        3,
+                        line_selection,
+                    )
+                    line_gather = sweep_entry_slots[:, None, :, None].expand(
+                        -1,
+                        int(cache.valid_view_count),
+                        -1,
+                        local_line_count,
+                    )
+                    feature_gather = line_gather[..., None].expand(
+                        -1,
+                        -1,
+                        -1,
+                        -1,
+                        int(cached_features.shape[-1]),
+                    )
+                    safe_strength = torch.where(
+                        sweep_entry_matched,
+                        sweep_entry_strengths,
+                        torch.ones_like(sweep_entry_strengths),
+                    )[:, None, :, None]
+                    sweep_entry_mask = sweep_entry_matched[:, None, :, None]
+                    unit_total = torch.where(
+                        sweep_entry_mask,
+                        torch.gather(accepted_total, 2, line_gather)
+                        / safe_strength,
+                        unit_total,
+                    )
+                    unit_uncollided = torch.where(
+                        sweep_entry_mask,
+                        torch.gather(accepted_uncollided, 2, line_gather)
+                        / safe_strength,
+                        unit_uncollided,
+                    )
+                    unit_features = torch.where(
+                        sweep_entry_mask[..., None],
+                        torch.gather(accepted_features, 2, feature_gather),
+                        unit_features,
+                    )
+                if bool(torch.any(staged_matched).item()):
+                    staged_mask = staged_matched[:, None, :, None]
+                    unit_total = torch.where(
+                        staged_mask,
+                        staged_unit_components[0],
+                        unit_total,
+                    )
+                    unit_uncollided = torch.where(
+                        staged_mask,
+                        staged_unit_components[1],
+                        unit_uncollided,
+                    )
+                    unit_features = torch.where(
+                        staged_mask[..., None],
+                        staged_unit_components[2],
+                        unit_features,
                     )
                 strength_tensor = torch.index_select(
                     final_state["strengths"],
@@ -1703,12 +1933,12 @@ class EstimatorStructuralProposalMixin:
                 uncollided_subset = replacement_uncollided[:, :, target_slots, :]
                 feature_subset = replacement_features[:, :, target_slots, :, :]
                 total_subset[..., line_selection] = (
-                    unit_components[0] * strength_tensor
+                    unit_total * strength_tensor
                 )
                 uncollided_subset[..., line_selection] = (
-                    unit_components[1] * strength_tensor
+                    unit_uncollided * strength_tensor
                 )
-                feature_subset[..., line_selection, :] = unit_components[2]
+                feature_subset[..., line_selection, :] = unit_features
             commit_plans.append(
                 (
                     selected_tensor,

@@ -307,6 +307,7 @@ def test_staged_accepted_transport_commits_without_recomputation(
     estimator._active_joint_station_history = stations
     estimator._refresh_joint_structural_transport_cache(stations)
     evidence = estimator._joint_history_structural_geometry(isotope, stations)
+    sweep_entry_state = estimator._joint_isotope_cache_state(filt)
     chart_ids = np.asarray([[2], [3]], dtype=np.int64)
     surface_uv = np.asarray(
         [[[0.65, 0.35]], [[0.75, 0.45]]],
@@ -352,6 +353,7 @@ def test_staged_accepted_transport_commits_without_recomputation(
         data=evidence,
         stations=stations,
         particle_indices=np.arange(2, dtype=np.int64),
+        sweep_entry_state=sweep_entry_state,
     )
 
     committed = estimator._joint_structural_transport_cache
@@ -378,10 +380,15 @@ def test_staged_accepted_transport_commits_without_recomputation(
     assert committed.state_sha256 == estimator._joint_structural_state_sha256()
 
 
-def test_staged_transport_commit_fails_closed_when_proposal_is_missing() -> None:
-    """A changed Torch row must never fall back to transport recomputation."""
-    pytest.importorskip("torch")
-    estimator = _estimator(use_gpu=True, gpu_device="cpu")
+@pytest.mark.parametrize("gpu_device", ["cpu", "cuda"])
+def test_strength_only_commit_reuses_exact_sweep_entry_transport(
+    gpu_device: str,
+) -> None:
+    """A strength-only change must reuse exact accepted geometry transport."""
+    torch = pytest.importorskip("torch")
+    if gpu_device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    estimator = _estimator(use_gpu=True, gpu_device=gpu_device)
     isotope = "Cs-137"
     filt = estimator.filters[isotope]
     _set_single_source_states(
@@ -394,16 +401,104 @@ def test_staged_transport_commit_fails_closed_when_proposal_is_missing() -> None
     estimator._active_joint_station_history = stations
     estimator._refresh_joint_structural_transport_cache(stations)
     evidence = estimator._joint_history_structural_geometry(isotope, stations)
+    cache = estimator._joint_structural_transport_cache
+    assert isinstance(cache, JointTransportCache)
+    sweep_entry_state = estimator._joint_isotope_cache_state(filt)
+    if gpu_device == "cuda":
+        assert filt._begin_continuous_rj_station_device_state(cache[0])
+    else:
+        filt._initialize_continuous_rj_device_state(cache[0])
+    state = filt._structural_rj_device_state
+    assert state is not None
+    before = tuple(
+        value[0].clone()
+        for value in cache
+    )
+    if gpu_device == "cuda":
+        state["strengths"][0, 0] *= 1.75
+    else:
+        original_state = filt.continuous_particles[0].state
+        filt.continuous_particles[0].state = IsotopeState(
+            num_sources=1,
+            strengths=original_state.strengths * 1.75,
+            surface_chart_ids=original_state.surface_chart_ids.copy(),
+            surface_uv=original_state.surface_uv.copy(),
+        )
+
+    estimator._joint_commit_staged_cuda_transport_cache_isotope(
+        filt=filt,
+        data=evidence,
+        stations=stations,
+        particle_indices=np.asarray([0], dtype=np.int64),
+        sweep_entry_state=sweep_entry_state,
+    )
+
+    line_columns = estimator._joint_line_layout()[isotope][0]
+    slot_start = estimator.joint_isotope_order().index(isotope) * int(
+        filt.config.hard_max_sources
+    )
+    np.testing.assert_allclose(
+        cache[0][0, :, slot_start, line_columns].detach().cpu().numpy(),
+        before[0][:, slot_start, line_columns].detach().cpu().numpy() * 1.75,
+        rtol=2.0e-12,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        cache[1][0, :, slot_start, line_columns].detach().cpu().numpy(),
+        before[1][:, slot_start, line_columns].detach().cpu().numpy() * 1.75,
+        rtol=2.0e-12,
+        atol=1.0e-12,
+    )
+    np.testing.assert_array_equal(
+        cache[2][0, :, slot_start, line_columns].detach().cpu().numpy(),
+        before[2][:, slot_start, line_columns].detach().cpu().numpy(),
+    )
+
+
+def test_staged_transport_commit_fails_closed_for_unknown_geometry() -> None:
+    """A geometry absent from both exact caches must fail without recomputing."""
+    pytest.importorskip("torch")
+    estimator = _estimator(use_gpu=True, gpu_device="cpu")
+    isotope = "Cs-137"
+    filt = estimator.filters[isotope]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    _set_single_source_states(
+        estimator,
+        isotope,
+        strength_cps_1m=5_000.0,
+    )
+    station = _station()
+    stations = (station,)
+    estimator._active_joint_station_history = stations
+    estimator._refresh_joint_structural_transport_cache(stations)
+    evidence = estimator._joint_history_structural_geometry(isotope, stations)
+    cache = estimator._joint_structural_transport_cache
+    assert isinstance(cache, JointTransportCache)
+    sweep_entry_state = estimator._joint_isotope_cache_state(filt)
+    filt._initialize_continuous_rj_device_state(cache[0])
+    state = filt._structural_rj_device_state
+    assert state is not None
+    original_state = filt.continuous_particles[0].state
+    changed_uv = original_state.surface_uv[0].copy()
+    changed_uv[0] = min(float(changed_uv[0]) + 0.125, 0.95)
+    filt.continuous_particles[0].state = IsotopeState(
+        num_sources=1,
+        strengths=original_state.strengths.copy(),
+        surface_chart_ids=original_state.surface_chart_ids.copy(),
+        surface_uv=changed_uv.reshape(1, 2),
+    )
 
     with pytest.raises(
         RuntimeError,
-        match="lacks exact staged unit transport",
+        match="lacks exact cached unit transport",
     ):
         estimator._joint_commit_staged_cuda_transport_cache_isotope(
             filt=filt,
             data=evidence,
             stations=stations,
             particle_indices=np.asarray([0], dtype=np.int64),
+            sweep_entry_state=sweep_entry_state,
         )
 
 
