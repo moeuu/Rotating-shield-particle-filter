@@ -148,6 +148,15 @@ scenario path, truth payload, source profile, scene seed, or source RNG provenan
 Only the asynchronous renderer child reads the overlay endpoint; it labels truth in
 the CUI without placing truth in PF frames or controller results.
 
+The generated run script authors all four scenarios before starting any adaptive
+session. It then runs `baselines.ral_ablation.batch_contract`, which requires the
+four authored scenarios to have byte-canonical equality of the comparison-bearing
+environment, obstacle geometry, source positions and strengths, isotope set,
+scene RNG provenance, and acquisition contract. Run IDs and output/config paths
+remain variant-specific and are excluded from the shared comparison digest. The
+owner-only contract is written below `private_runs/ral_ablation/batch_contracts/`;
+any mismatch aborts the whole batch before the proposed run begins.
+
 Each control-policy file is an exact schema-version-2 document with exactly
 `schema_version`, `variant`, and `shield_policy`; it has no aliases, defaults,
 or unknown members. The private manifest records the SHA-256 digest of
@@ -196,6 +205,26 @@ Run the selected full simulations with:
 ```bash
 bash ../Rotating-shield-simulation-runtime/private_runs/ral_ablation/run_paper_subset.sh
 ```
+
+Each private session prints an initially absent stop-sentinel path below
+`private_runs/ral_ablation/stop_requests/`. To retain a long but valid prefix,
+create that exact empty file with `touch`. A request made earlier remains pending;
+after ten completed stations, the controller finishes the current complete station,
+seals its causal PF state, asks the runtime to finalize the exact MeasurementLog
+prefix, publishes the normal result bundle, and runs the standard private-truth
+evaluation with `stop_reason=station_boundary_stop_requested`. A symlink, stale
+pre-run sentinel, or nonempty sentinel is an error. Killing a process or encountering
+an inference invariant failure still aborts and never becomes a successful result;
+the sentinel is the only supported partial-budget finalization path.
+
+Every run also publishes `pf_station_performance.jsonl`. It separates acquisition,
+PF update and its internal report stage, live-health diagnostics, CUI enqueue work,
+and next-station planning. CUI still publishes every acquired view, but immutable
+particle-display arrays are reused within a station and the former duplicate
+station-end posterior redraw is removed. Live health uses the compact diagnostic
+path and no longer copies unused rejuvenation/cache detail. These changes affect
+only reporting and execution overhead; observations, particles, likelihood, RJ
+moves, DSS-PP, EIG sample counts, and Geant4 histories are unchanged.
 
 Regenerate the RA-L manuscript figures after paper-scope results are available:
 

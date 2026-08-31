@@ -299,6 +299,14 @@ def test_generated_manifest_round_trips_through_strict_subset_builder(
         f"--scene-variant {MODULE.RAL_SCENE_VARIANT_ID}" in row["scenario_command"]
         for row in selected
     )
+    run_script = (private_root / "run_subset.sh").read_text(encoding="utf-8")
+    assert run_script.count("baselines.ral_ablation.batch_contract") == 1
+    assert run_script.index("baselines.ral_ablation.batch_contract") > (
+        run_script.rindex("generate-scenario")
+    )
+    assert run_script.index("baselines.ral_ablation.batch_contract") < (
+        run_script.index("baselines.ral_ablation.session_runner")
+    )
 
 
 @pytest.mark.parametrize(

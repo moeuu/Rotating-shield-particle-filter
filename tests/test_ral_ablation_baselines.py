@@ -31,7 +31,11 @@ from baselines.ral_ablation.control_policy import (
     load_ral_control_policy,
     load_ral_control_policy_document,
 )
-from baselines.ral_ablation.live_controller import main as live_controller_main
+from baselines.ral_ablation.live_controller import (
+    RAL_MINIMUM_FINALIZABLE_STATIONS,
+    RALStationStopRequest,
+    main as live_controller_main,
+)
 from baselines.ral_ablation.session_runner import _controller_command
 from baselines.ral_ablation.shield_policies import select_baseline_shield_program
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
@@ -428,6 +432,7 @@ def test_ral_controller_process_receives_no_private_scene_inputs(
         expected_control_policy_sha256="a" * 64,
         pf_output_dir=tmp_path / "output",
         pf_seed=5678,
+        station_stop_request_path=tmp_path / "station.stop",
     )
     rendered = " ".join(command)
 
@@ -437,6 +442,39 @@ def test_ral_controller_process_receives_no_private_scene_inputs(
     assert "truth-manifest" not in rendered
     assert "runtime.sock" in rendered
     assert "cui-truth.sock" in rendered
+    assert "station.stop" in rendered
+
+
+def test_ral_station_stop_request_waits_for_ten_complete_stations(
+    tmp_path: Path,
+) -> None:
+    """An operator sentinel must finalize only at an eligible boundary."""
+    path = tmp_path / "run.stop"
+    request = RALStationStopRequest(
+        path,
+        minimum_stations=RAL_MINIMUM_FINALIZABLE_STATIONS,
+    )
+
+    assert request(9) is False
+    path.touch()
+    assert request(9) is False
+    assert request(10) is True
+
+
+def test_ral_station_stop_request_rejects_stale_or_nonempty_files(
+    tmp_path: Path,
+) -> None:
+    """A stale or malformed stop control must never be silently accepted."""
+    stale = tmp_path / "stale.stop"
+    stale.touch()
+    with pytest.raises(FileExistsError, match="absent"):
+        RALStationStopRequest(stale, minimum_stations=10)
+
+    malformed = tmp_path / "malformed.stop"
+    request = RALStationStopRequest(malformed, minimum_stations=10)
+    malformed.write_text("stop", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="empty sentinel"):
+        request(10)
 
 
 def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) -> None:
@@ -617,7 +655,14 @@ def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) ->
     assert stat.S_IMODE(script_path.stat().st_mode) == 0o700
     script = script_path.read_text(encoding="utf-8")
     assert script.count("generate-scenario") == 4
+    assert script.count("baselines.ral_ablation.batch_contract") == 1
     assert script.count("baselines.ral_ablation.session_runner") == 4
+    assert script.index("baselines.ral_ablation.batch_contract") > script.rindex(
+        "generate-scenario"
+    )
+    assert script.index("baselines.ral_ablation.batch_contract") < script.index(
+        "baselines.ral_ablation.session_runner"
+    )
     assert "--full-simulation" not in script
 
     controller_source = inspect.getsource(live_controller_main)

@@ -6,7 +6,7 @@ import argparse
 from contextlib import ExitStack
 import json
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -63,6 +63,7 @@ from planning.bootstrap_program import build_balanced_bootstrap_program
 from planning.dss_pp import DSSPPConfig, DSSPPResult, select_dss_pp_next_station
 from planning.program_types import ShieldProgram
 from visualization.artifacts import publish_final_cui_split_views
+from visualization.frame import PFFrame
 from visualization.realtime_viz import (
     AsyncCUISplitPFVisualizer,
     build_frame_from_pf,
@@ -456,7 +457,8 @@ def _publish_cui_frame(
     *,
     elapsed_time_s: float,
     record_measurement: bool,
-) -> None:
+    reusable_frame: PFFrame | None = None,
+) -> PFFrame:
     """Queue one truth-free PF CUI frame without changing PF state."""
     if record_measurement:
         route: CUIRoute = cui_route_from_records((*route_records, record))
@@ -471,23 +473,46 @@ def _publish_cui_frame(
     spectrum_counts = np.asarray(record.spectrum_counts, dtype=np.int64)
     if energy_edges.ndim != 1 or energy_edges.size != spectrum_counts.size + 1:
         raise ValueError("Adaptive record has incompatible spectrum bin edges.")
-    frame = build_frame_from_pf(
-        estimator,
-        int(record.step_id),
-        float(elapsed_time_s),
-        detector_position=np.asarray(record.detector_pose_xyz, dtype=np.float64),
-        spectrum_energy_keV=0.5 * (energy_edges[:-1] + energy_edges[1:]),
-        spectrum_counts=spectrum_counts,
+    path_waypoints = (
+        None
+        if not route.travel_path_segments_xyz
+        else route.travel_path_segments_xyz[-1].copy()
     )
-    if route.travel_path_segments_xyz:
-        frame.path_waypoints_xyz = route.travel_path_segments_xyz[-1].copy()
-    frame.cui_route = route
+    spectrum_energy = 0.5 * (energy_edges[:-1] + energy_edges[1:])
+    detector_position = np.asarray(record.detector_pose_xyz, dtype=np.float64)
+    if reusable_frame is None:
+        frame = build_frame_from_pf(
+            estimator,
+            int(record.step_id),
+            float(elapsed_time_s),
+            detector_position=detector_position,
+            spectrum_energy_keV=spectrum_energy,
+            spectrum_counts=spectrum_counts,
+        )
+        frame.path_waypoints_xyz = path_waypoints
+        frame.cui_route = route
+    else:
+        frame = replace(
+            reusable_frame,
+            step_index=int(record.step_id),
+            time=float(elapsed_time_s),
+            robot_position=detector_position,
+            path_waypoints_xyz=path_waypoints,
+            spectrum_energy_keV=spectrum_energy,
+            spectrum_counts=spectrum_counts,
+            cui_route=route,
+        )
     visualizer.update(frame)
+    return frame
 
 
 def _particle_diagnostics(estimator: object) -> dict[str, object]:
     """Extract particle-adequacy evidence without simulation truth."""
-    raw = estimator.step_diagnostics(top_k=0, include_estimates=False)
+    raw = estimator.step_diagnostics(
+        top_k=0,
+        include_estimates=False,
+        include_runtime_details=False,
+    )
     if not isinstance(raw, Mapping) or not raw:
         raise TypeError("PF step diagnostics must contain isotope mappings.")
     expected_isotopes = tuple(str(value) for value in estimator.isotopes)
@@ -1302,12 +1327,17 @@ def _publish_failure_diagnostics(
         station_trace_path=station_trace_path,
     )
     planner_audit_path = staging_dir / "planner_audit.jsonl"
+    performance_trace_path = staging_dir / "pf_station_performance.jsonl"
     cui_image_path = staging_dir / "cui_live" / "latest_pf_3d.png"
     planner_available = bool(
         planner_audit_path.is_file() and not planner_audit_path.is_symlink()
     )
     station_trace_available = bool(
         station_trace_path.is_file() and not station_trace_path.is_symlink()
+    )
+    performance_trace_available = bool(
+        performance_trace_path.is_file()
+        and not performance_trace_path.is_symlink()
     )
     cui_image_available = bool(
         cui_image_path.is_file() and not cui_image_path.is_symlink()
@@ -1331,6 +1361,13 @@ def _publish_failure_diagnostics(
             publisher.copy_file(station_trace_path, "pf_station_trace.jsonl")
         else:
             publisher.write_bytes("pf_station_trace.jsonl", b"")
+        if performance_trace_available:
+            publisher.copy_file(
+                performance_trace_path,
+                "pf_station_performance.jsonl",
+            )
+        else:
+            publisher.write_bytes("pf_station_performance.jsonl", b"")
         if cui_image_available:
             publisher.copy_file(cui_image_path, "last_cui_pf_3d.png")
         publisher.write_bytes(
@@ -1346,6 +1383,9 @@ def _publish_failure_diagnostics(
                     "posterior_source": posterior_source,
                     "planner_audit_available": planner_available,
                     "station_trace_available": station_trace_available,
+                    "performance_trace_available": (
+                        performance_trace_available
+                    ),
                     "last_cui_image_available": cui_image_available,
                     "error_type": type(primary_error).__name__,
                     "message": str(primary_error),
@@ -1367,6 +1407,7 @@ def run_pf_closed_loop(
     cui_truth_overlay_socket_path: str | Path | None = None,
     profile: str = "pf_strict",
     control_policy: object | None = None,
+    station_boundary_stop_request: Callable[[int], bool] | None = None,
     output_hook: Any = print,
 ) -> PFClosedLoopResult:
     """Run a PF closed loop over an opaque truth-free runtime session socket."""
@@ -1374,6 +1415,10 @@ def run_pf_closed_loop(
         raise TypeError("Production PF seed must be a nonnegative integer.")
     if seed < 0:
         raise ValueError("Production PF seed must be a nonnegative integer.")
+    if station_boundary_stop_request is not None and not callable(
+        station_boundary_stop_request
+    ):
+        raise TypeError("station_boundary_stop_request must be callable or null.")
     control_policy_provenance = validate_control_policy(control_policy)
     validated_config = load_production_live_pf_config(
         pf_config_path,
@@ -1419,6 +1464,11 @@ def run_pf_closed_loop(
             mode=0o644,
         )
         resources.callback(controller_writer.close)
+        performance_writer = DurableJSONLWriter(
+            staging_dir / "pf_station_performance.jsonl",
+            mode=0o644,
+        )
+        resources.callback(performance_writer.close)
         client = AdaptiveRuntimeClient.connect(
             session_socket,
             output_hook=output_hook,
@@ -1472,6 +1522,7 @@ def run_pf_closed_loop(
             control_policy,
         )
         visited: list[np.ndarray]
+        reusable_cui_frame: PFFrame | None = None
         stop_reason = "maximum_station_budget"
         continue_acquisition = True
         if schema_version == 1:
@@ -1514,6 +1565,10 @@ def run_pf_closed_loop(
                 stop_reason = "maximum_measurement_budget"
                 break
             station_records: list[MeasurementLogRecord] = []
+            station_wall_start_s = time.perf_counter()
+            station_cui_enqueue_elapsed_s = 0.0
+            station_cui_particle_rebuilds = 0
+            station_cui_particle_reuses = 0
             assimilation_start_s: float | None = None
             for view_index, pair_id in enumerate(current_program.pair_ids):
                 candidate_index = candidate_index_for_pose(candidates, current_pose)
@@ -1552,14 +1607,30 @@ def run_pf_closed_loop(
                     + float(record.shield_actuation_time_s)
                 )
                 if cui_split_viz is not None:
-                    _publish_cui_frame(
+                    cui_enqueue_start_s = time.perf_counter()
+                    rebuild_particle_frame = bool(
+                        reusable_cui_frame is None or completed_station
+                    )
+                    reusable_cui_frame = _publish_cui_frame(
                         cui_split_viz,
                         estimator,
                         record,
                         cui_route_records,
                         elapsed_time_s=cui_elapsed_time_s,
                         record_measurement=True,
+                        reusable_frame=(
+                            None
+                            if rebuild_particle_frame
+                            else reusable_cui_frame
+                        ),
                     )
+                    station_cui_enqueue_elapsed_s += (
+                        time.perf_counter() - cui_enqueue_start_s
+                    )
+                    if rebuild_particle_frame:
+                        station_cui_particle_rebuilds += 1
+                    else:
+                        station_cui_particle_reuses += 1
                     cui_frame_enqueued = True
             if assimilation_start_s is None:
                 raise RuntimeError("PF station completed without an assimilation start.")
@@ -1570,12 +1641,17 @@ def run_pf_closed_loop(
             )
             visited.append(current_pose.copy())
             completed_stations = station_id + 1
+            boundary_diagnostics_start_s = time.perf_counter()
+            phase_start_s = time.perf_counter()
             latest_adaptive_stop_status = stop_tracker.assess(
                 estimator,
                 station_count=completed_stations,
             )
+            adaptive_stop_elapsed_s = time.perf_counter() - phase_start_s
+            phase_start_s = time.perf_counter()
             particle_adequacy = _particle_diagnostics(estimator)
-            _require_plannable_sampler_health(particle_adequacy)
+            particle_diagnostics_elapsed_s = time.perf_counter() - phase_start_s
+            phase_start_s = time.perf_counter()
             shadow_health = _current_shadow_health(
                 estimator,
                 planner=planner,
@@ -1583,17 +1659,10 @@ def run_pf_closed_loop(
                 particle_adequacy=particle_adequacy,
                 adaptive_stop_status=latest_adaptive_stop_status,
             )
+            shadow_health_elapsed_s = time.perf_counter() - phase_start_s
+            phase_start_s = time.perf_counter()
             posterior_snapshot = _live_posterior_summary(estimator)
-            if cui_split_viz is not None:
-                _publish_cui_frame(
-                    cui_split_viz,
-                    estimator,
-                    station_records[-1],
-                    cui_route_records,
-                    elapsed_time_s=cui_elapsed_time_s,
-                    record_measurement=False,
-                )
-                cui_frame_enqueued = True
+            posterior_snapshot_elapsed_s = time.perf_counter() - phase_start_s
             station_trace = {
                 "schema_version": 2,
                 "station_id": station_id,
@@ -1606,17 +1675,83 @@ def run_pf_closed_loop(
             )
             if compact_stop is not None:
                 station_trace["adaptive_stop"] = compact_stop
+            phase_start_s = time.perf_counter()
             controller_writer.append(station_trace)
+            station_trace_write_elapsed_s = time.perf_counter() - phase_start_s
+            phase_start_s = time.perf_counter()
+            station_stop_requested = False
+            if station_boundary_stop_request is not None:
+                station_stop_requested = station_boundary_stop_request(
+                    completed_stations
+                )
+                if type(station_stop_requested) is not bool:
+                    raise TypeError(
+                        "station_boundary_stop_request must return a boolean."
+                    )
+            stop_request_elapsed_s = time.perf_counter() - phase_start_s
+            terminal_reason: str | None = None
             if record_count >= budget.max_measurements:
-                stop_reason = "maximum_measurement_budget"
+                terminal_reason = "maximum_measurement_budget"
+            elif completed_stations >= budget.max_stations:
+                terminal_reason = "maximum_station_budget"
+            elif latest_adaptive_stop_status["stop_ready"]:
+                terminal_reason = "intrinsic_surface_posterior_converged"
+            elif station_stop_requested:
+                terminal_reason = "station_boundary_stop_requested"
+            boundary_diagnostics_elapsed_s = (
+                time.perf_counter() - boundary_diagnostics_start_s
+            )
+            assimilation_stage = getattr(
+                estimator,
+                "last_pair_sequence_stage_wall_s",
+                {},
+            )
+            if not isinstance(assimilation_stage, Mapping):
+                raise TypeError(
+                    "PF station assimilation timing must be a mapping."
+                )
+            performance_record: dict[str, object] = {
+                "schema_version": 1,
+                "station_id": int(station_id),
+                "completed_station_count": int(completed_stations),
+                "view_count": int(len(station_records)),
+                "timing_s": {
+                    "station_wall_through_boundary": float(
+                        time.perf_counter() - station_wall_start_s
+                    ),
+                    "pf_update": float(assimilation_elapsed_s),
+                    "pf_update_breakdown": dict(assimilation_stage),
+                    "boundary_diagnostics": float(
+                        boundary_diagnostics_elapsed_s
+                    ),
+                    "adaptive_stop": float(adaptive_stop_elapsed_s),
+                    "particle_health": float(particle_diagnostics_elapsed_s),
+                    "shadow_health": float(shadow_health_elapsed_s),
+                    "posterior_snapshot": float(
+                        posterior_snapshot_elapsed_s
+                    ),
+                    "station_trace_write": float(
+                        station_trace_write_elapsed_s
+                    ),
+                    "stop_request_poll": float(stop_request_elapsed_s),
+                    "cui_enqueue": float(station_cui_enqueue_elapsed_s),
+                },
+                "cui_particle_state": {
+                    "rebuild_count": int(station_cui_particle_rebuilds),
+                    "reuse_count": int(station_cui_particle_reuses),
+                },
+                "terminal_reason": terminal_reason,
+            }
+            if terminal_reason is not None:
+                stop_reason = terminal_reason
+                performance_record["timing_s"]["planning"] = 0.0
+                performance_writer.append(performance_record)
                 break
-            if completed_stations >= budget.max_stations:
-                stop_reason = "maximum_station_budget"
-                break
-            if latest_adaptive_stop_status["stop_ready"]:
-                stop_reason = "intrinsic_surface_posterior_converged"
-                break
+            phase_start_s = time.perf_counter()
+            _require_plannable_sampler_health(particle_adequacy)
+            sampler_health_gate_elapsed_s = time.perf_counter() - phase_start_s
             station_planner_rng = _planner_rng(seed, completed_stations)
+            planning_start_s = time.perf_counter()
             planned = _plan(
                 estimator,
                 candidates,
@@ -1645,6 +1780,7 @@ def run_pf_closed_loop(
                 station_index=completed_stations,
                 control_policy=control_policy,
             )
+            planning_elapsed_s = time.perf_counter() - planning_start_s
             station_id += 1
             planner_writer.append(
                 _planner_audit_for_mode(
@@ -1658,6 +1794,16 @@ def run_pf_closed_loop(
             )
             current_pose = np.asarray(planned.next_pose, dtype=np.float64)
             current_program = planned.shield_program
+            timing = performance_record["timing_s"]
+            assert isinstance(timing, dict)
+            timing["sampler_health_gate"] = float(
+                sampler_health_gate_elapsed_s
+            )
+            timing["planning"] = float(planning_elapsed_s)
+            timing["station_wall_including_planning"] = float(
+                time.perf_counter() - station_wall_start_s
+            )
+            performance_writer.append(performance_record)
         live_session.complete_live_state(
             diagnostics_extensions=_completion_diagnostics_extensions(
                 stop_reason=stop_reason,

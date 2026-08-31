@@ -597,13 +597,16 @@ class EstimatorReportingMixin:
         top_k: int = 3,
         *,
         include_estimates: bool = True,
+        include_runtime_details: bool = True,
     ) -> dict[str, dict[str, Any]]:
         """
         Return per-isotope diagnostics for the current PF state.
 
         The diagnostics include ESS, resample/birth/death counts, and the source
-        count distribution. When include_estimates is false, the routine avoids
-        the posterior point-estimate projection.
+        count distribution. When ``include_estimates`` is false, the routine
+        avoids the posterior point-estimate projection. When
+        ``include_runtime_details`` is false, it also avoids copying large
+        rejuvenation, rejection, and transport-cache diagnostic structures.
         """
         diagnostics: dict[str, dict[str, Any]] = {}
         eps = 1e-12
@@ -739,8 +742,10 @@ class EstimatorReportingMixin:
                 "resample_count": int(getattr(filt, "last_resample_count", 0)),
                 "birth_count": int(getattr(filt, "last_birth_count", 0)),
                 "death_count": int(getattr(filt, "last_death_count", 0)),
-                "structural_timing_s": dict(
-                    getattr(filt, "last_structural_timing_s", {})
+                "structural_timing_s": (
+                    dict(getattr(filt, "last_structural_timing_s", {}))
+                    if include_runtime_details
+                    else {}
                 ),
                 "transition_weight_mass": dict(
                     getattr(
@@ -749,17 +754,30 @@ class EstimatorReportingMixin:
                         {},
                     )
                 ),
-                "structural_rejection_diagnostics": dict(
-                    getattr(
-                        filt,
-                        "last_structural_rejection_diagnostics",
-                        {},
+                "structural_rejection_diagnostics": (
+                    dict(
+                        getattr(
+                            filt,
+                            "last_structural_rejection_diagnostics",
+                            {},
+                        )
                     )
+                    if include_runtime_details
+                    else {}
                 ),
-                "temper_steps": list(getattr(filt, "last_temper_steps", [])),
-                "joint_rejuvenation_diagnostics": [
-                    dict(entry) for entry in self.last_joint_rejuvenation_diagnostics
-                ],
+                "temper_steps": (
+                    list(getattr(filt, "last_temper_steps", []))
+                    if include_runtime_details
+                    else []
+                ),
+                "joint_rejuvenation_diagnostics": (
+                    [
+                        dict(entry)
+                        for entry in self.last_joint_rejuvenation_diagnostics
+                    ]
+                    if include_runtime_details
+                    else []
+                ),
                 "joint_smc_wall_time_limit_exceeded": bool(
                     self.last_joint_smc_wall_time_limit_exceeded
                 ),
@@ -775,8 +793,10 @@ class EstimatorReportingMixin:
                 "joint_guided_initialization_ess": (
                     self.last_joint_guided_initialization_ess
                 ),
-                "joint_cross_isotope_state_rejection_diagnostics": dict(
-                    self.last_joint_cross_isotope_state_rejection_diagnostics
+                "joint_cross_isotope_state_rejection_diagnostics": (
+                    dict(self.last_joint_cross_isotope_state_rejection_diagnostics)
+                    if include_runtime_details
+                    else {}
                 ),
                 "joint_transport_cache": {
                     "preflight": (
@@ -857,7 +877,7 @@ class EstimatorReportingMixin:
                         is not None
                         else None
                     ),
-                },
+                } if include_runtime_details else {},
                 "temper_resamples": int(getattr(filt, "last_temper_resample_count", 0)),
                 "temper_min_ess": getattr(filt, "last_temper_min_ess", None),
                 "station_unique_ancestor_count": getattr(

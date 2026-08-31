@@ -429,11 +429,48 @@ def write_manifest(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
     Path(path).chmod(0o600)
 
 
-def write_run_script(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
+def write_run_script(
+    path: Path,
+    rows: Sequence[Mapping[str, str]],
+    *,
+    manifest_path: Path,
+) -> None:
     """Write scenario-authoring and PF-control commands for each trial."""
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
     for row in rows:
         lines.append(_validated_scenario_command(row))
+    batch_ids = tuple(dict.fromkeys(row["batch_id"] for row in rows))
+    if len(batch_ids) != 1:
+        raise ValueError("RA-L paper run script requires exactly one batch_id.")
+    contract_path = (
+        Path(path).expanduser().resolve().parent
+        / "batch_contracts"
+        / f"{batch_ids[0]}.json"
+    )
+    lines.extend(
+        (
+            "",
+            shlex.join(
+                (
+                    "uv",
+                    "run",
+                    "--directory",
+                    ROOT.as_posix(),
+                    "python",
+                    "-m",
+                    "baselines.ral_ablation.batch_contract",
+                    "--manifest",
+                    Path(manifest_path).expanduser().resolve().as_posix(),
+                    "--batch-id",
+                    batch_ids[0],
+                    "--output",
+                    contract_path.as_posix(),
+                )
+            ),
+            "",
+        )
+    )
+    for row in rows:
         lines.append(_validated_session_command(row))
     atomic_write_text(path, "\n".join(lines) + "\n")
     mode = Path(path).stat().st_mode
@@ -477,7 +514,11 @@ def build_subset(
                 f"RA-L variant {variant.name!r} has an undeclared PF difference."
             )
     write_manifest(subset_manifest_path, selected)
-    write_run_script(run_script_path, selected)
+    write_run_script(
+        run_script_path,
+        selected,
+        manifest_path=subset_manifest_path,
+    )
     return selected
 
 

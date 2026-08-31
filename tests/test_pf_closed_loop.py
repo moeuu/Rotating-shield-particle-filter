@@ -1567,9 +1567,19 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
         "pf_state.json",
         "pf_checkpoint.json",
         "pf_particles.npz",
+        "pf_station_performance.jsonl",
         "closed_loop_result.json",
     ):
         assert (tmp_path / "output" / name).is_file()
+    performance = json.loads(
+        (tmp_path / "output" / "pf_station_performance.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert performance["station_id"] == 0
+    assert performance["terminal_reason"] == "maximum_measurement_budget"
+    assert performance["timing_s"]["pf_update"] >= 0.0
+    assert performance["timing_s"]["planning"] == 0.0
 
 
 def test_failed_acquisition_never_publishes_a_partial_result(
@@ -2074,14 +2084,10 @@ def test_pf_closed_loop_starts_truth_free_cui_and_publishes_frames(
         output_hook=output_messages.append,
     )
 
-    assert len(frames) == 2
+    assert len(frames) == 1
     assert np.asarray(frames[0].path_waypoints_xyz).shape == (2, 3)
     np.testing.assert_array_equal(
         frames[0].cui_route.measurement_visit_counts,
-        np.asarray([1], dtype=np.int64),
-    )
-    np.testing.assert_array_equal(
-        frames[1].cui_route.measurement_visit_counts,
         np.asarray([1], dtype=np.int64),
     )
     assert truth_updates == []

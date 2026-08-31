@@ -37,6 +37,7 @@ def _controller_command(
     expected_control_policy_sha256: str,
     pf_output_dir: Path,
     pf_seed: int,
+    station_stop_request_path: Path,
 ) -> list[str]:
     """Build the PF-process command from truth-free inputs only."""
     return [
@@ -61,6 +62,8 @@ def _controller_command(
         expected_control_policy_sha256,
         "--output-dir",
         pf_output_dir.expanduser().resolve().as_posix(),
+        "--station-stop-request",
+        station_stop_request_path.expanduser().resolve().as_posix(),
         "--profile",
         "pf_strict",
         "--seed",
@@ -108,6 +111,22 @@ def run_isolated_ral_session(
             "Refusing to replace an existing post-run evaluation: "
             f"{evaluation_output}"
         )
+    stop_request_path = (
+        truth_manifest_path.parent.parent
+        / "stop_requests"
+        / f"{truth_manifest_path.stem}.stop"
+    )
+    stop_request_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stop_request_path.parent.chmod(0o700)
+    if stop_request_path.exists() or stop_request_path.is_symlink():
+        raise FileExistsError(
+            "Refusing a stale RA-L station-stop request: "
+            f"{stop_request_path}"
+        )
+    print(
+        "RA-L graceful station-stop sentinel (eligible after 10 completed "
+        f"stations): {stop_request_path}"
+    )
     with tempfile.TemporaryDirectory(prefix="ral-adaptive-session-") as directory:
         socket_path = Path(directory) / "runtime.sock"
         cui_truth_overlay_socket_path = Path(directory) / "cui-truth.sock"
@@ -135,6 +154,7 @@ def run_isolated_ral_session(
                 expected_control_policy_sha256=expected_control_policy_sha256,
                 pf_output_dir=pf_output_dir,
                 pf_seed=pf_seed,
+                station_stop_request_path=stop_request_path,
             )
             completed = subprocess.run(controller_command, cwd=ROOT, check=False)
             if completed.returncode != 0:

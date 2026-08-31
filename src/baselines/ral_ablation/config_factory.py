@@ -737,6 +737,31 @@ def write_ablation_plan(
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
     for entry in entries:
         lines.append(shlex.join(entry.scenario_command))
+    lines.append("")
+    batch_ids = tuple(dict.fromkeys(entry.batch_id for entry in entries))
+    for batch_id in batch_ids:
+        contract_path = private_root / "batch_contracts" / f"{batch_id}.json"
+        lines.append(
+            shlex.join(
+                (
+                    "uv",
+                    "run",
+                    "--directory",
+                    ROOT.as_posix(),
+                    "python",
+                    "-m",
+                    "baselines.ral_ablation.batch_contract",
+                    "--manifest",
+                    manifest_path.as_posix(),
+                    "--batch-id",
+                    batch_id,
+                    "--output",
+                    contract_path.as_posix(),
+                )
+            )
+        )
+    lines.append("")
+    for entry in entries:
         lines.append(shlex.join(entry.session_command))
     script_path = private_root / "run_all.sh"
     atomic_write_text(script_path, "\n".join(lines) + "\n")
