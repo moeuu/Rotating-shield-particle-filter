@@ -10,6 +10,8 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
+from pf.parallel_chunks import ordered_exact_parallel_map
+
 
 PROBABILITY_ROUNDOFF_ATOL = 1.0e-12
 SurfaceCoordinateDistance = Callable[
@@ -21,6 +23,17 @@ SurfaceCoordinateDistance = Callable[
     ],
     NDArray[np.float64],
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSurfacePosteriorStratum:
+    """Hold one exact aligned surface stratum for reuse during reporting."""
+
+    particle_indices: NDArray[np.int64]
+    positions_nk3: NDArray[np.float64]
+    strengths_nk: NDArray[np.float64]
+    chart_ids_nk: NDArray[np.int64]
+    surface_uv_nk2: NDArray[np.float64]
 
 
 def validated_probability(value: object, *, name: str) -> float:
@@ -834,8 +847,16 @@ def _surface_mode_medoid_coordinates_batched(
         dtype=np.float64,
     )
     finite_cost = np.empty_like(connected_mass)
-    for start in range(0, particle_count, chunk_size):
-        stop = min(start + chunk_size, particle_count)
+    chunks = tuple(
+        (start, min(start + chunk_size, particle_count))
+        for start in range(0, particle_count, chunk_size)
+    )
+
+    def _evaluate_chunk(
+        chunk: tuple[int, int],
+    ) -> tuple[int, int, NDArray[np.float64], NDArray[np.float64]]:
+        """Return connected mass and finite cost for one candidate chunk."""
+        start, stop = chunk
         distances = _validated_surface_distances(
             distance_function,
             ids[start:stop].T[None, :, :],
@@ -849,18 +870,28 @@ def _surface_mode_medoid_coordinates_batched(
             ),
         )
         finite = np.isfinite(distances)
-        connected_mass[:, start:stop] = np.einsum(
+        local_connected_mass = np.einsum(
             "p,pkc->kc",
             normalized,
             finite,
             optimize=True,
         )
-        finite_cost[:, start:stop] = np.einsum(
+        local_finite_cost = np.einsum(
             "p,pkc->kc",
             normalized,
             np.where(finite, np.square(distances), 0.0),
             optimize=True,
         )
+        return start, stop, local_connected_mass, local_finite_cost
+
+    chunk_results = (
+        ordered_exact_parallel_map(_evaluate_chunk, chunks)
+        if particle_count >= 512 and len(chunks) > 1
+        else [_evaluate_chunk(chunk) for chunk in chunks]
+    )
+    for start, stop, local_connected_mass, local_finite_cost in chunk_results:
+        connected_mass[:, start:stop] = local_connected_mass
+        finite_cost[:, start:stop] = local_finite_cost
     maximum_connected_mass = np.max(connected_mass, axis=1, keepdims=True)
     dominant_component = np.isclose(
         connected_mass,
@@ -1119,6 +1150,7 @@ def posterior_point_estimate_from_states(
     selected_particle_indices: NDArray[np.int64] | None = None,
     representative_particle_index: int | None = None,
     selected_stratum_mass: float | None = None,
+    prepared_surface_stratum: PreparedSurfacePosteriorStratum | None = None,
 ) -> PFPointEstimate:
     """Aggregate a PF-only estimate from a deterministic MAP-cardinality stratum.
 
@@ -1301,19 +1333,16 @@ def posterior_point_estimate_from_states(
     if strength_rows.shape != (selected_indices.size, map_cardinality):
         raise ValueError("particle strengths do not match their cardinality.")
 
-    aligned_chart_ids: NDArray[np.int64] | None = None
-    aligned_surface_uv: NDArray[np.float64] | None = None
-    if (
-        surface_chart_ids_by_state is None
-        or surface_uv_by_state is None
-        or surface_coordinate_path_distance is None
-    ):
-        aligned_positions, aligned_strengths = align_spatial_modes_batched(
-            position_rows,
-            strength_rows,
-            selected_weights,
-        )
-    else:
+    surface_coordinates_active = bool(
+        surface_chart_ids_by_state is not None
+        and surface_uv_by_state is not None
+        and surface_coordinate_path_distance is not None
+    )
+    chart_id_rows: NDArray[np.int64] | None = None
+    surface_uv_rows: NDArray[np.float64] | None = None
+    if surface_coordinates_active:
+        assert surface_chart_ids_by_state is not None
+        assert surface_uv_by_state is not None
         chart_id_rows = np.stack(
             [
                 np.asarray(
@@ -1334,6 +1363,130 @@ def posterior_point_estimate_from_states(
             ],
             axis=0,
         )
+
+    aligned_chart_ids: NDArray[np.int64] | None = None
+    aligned_surface_uv: NDArray[np.float64] | None = None
+    if prepared_surface_stratum is not None:
+        if not surface_coordinates_active:
+            raise ValueError(
+                "A prepared surface stratum requires surface-aware reporting."
+            )
+        assert chart_id_rows is not None
+        assert surface_uv_rows is not None
+        prepared_indices = np.asarray(
+            prepared_surface_stratum.particle_indices,
+            dtype=np.int64,
+        ).reshape(-1)
+        aligned_positions = np.asarray(
+            prepared_surface_stratum.positions_nk3,
+            dtype=np.float64,
+        )
+        aligned_strengths = np.asarray(
+            prepared_surface_stratum.strengths_nk,
+            dtype=np.float64,
+        )
+        aligned_chart_ids = np.asarray(
+            prepared_surface_stratum.chart_ids_nk,
+            dtype=np.int64,
+        )
+        aligned_surface_uv = np.asarray(
+            prepared_surface_stratum.surface_uv_nk2,
+            dtype=np.float64,
+        )
+        expected_shape = (selected_indices.size, map_cardinality)
+        if (
+            not np.array_equal(prepared_indices, selected_indices)
+            or aligned_positions.shape != expected_shape + (3,)
+            or aligned_strengths.shape != expected_shape
+            or aligned_chart_ids.shape != expected_shape
+            or aligned_surface_uv.shape != expected_shape + (2,)
+            or np.any(~np.isfinite(aligned_positions))
+            or np.any(~np.isfinite(aligned_strengths))
+            or np.any(aligned_strengths <= 0.0)
+            or np.any(aligned_chart_ids < 0)
+            or np.any(~np.isfinite(aligned_surface_uv))
+            or np.any(aligned_surface_uv < 0.0)
+            or np.any(aligned_surface_uv > 1.0)
+        ):
+            raise ValueError("Prepared surface stratum is invalid or stale.")
+        original_order = np.lexsort(
+            (
+                strength_rows,
+                surface_uv_rows[..., 1],
+                surface_uv_rows[..., 0],
+                chart_id_rows,
+            ),
+            axis=1,
+        )
+        prepared_order = np.lexsort(
+            (
+                aligned_strengths,
+                aligned_surface_uv[..., 1],
+                aligned_surface_uv[..., 0],
+                aligned_chart_ids,
+            ),
+            axis=1,
+        )
+        if (
+            not np.array_equal(
+                np.take_along_axis(chart_id_rows, original_order, axis=1),
+                np.take_along_axis(
+                    aligned_chart_ids,
+                    prepared_order,
+                    axis=1,
+                ),
+            )
+            or not np.allclose(
+                np.take_along_axis(
+                    surface_uv_rows,
+                    original_order[..., None],
+                    axis=1,
+                ),
+                np.take_along_axis(
+                    aligned_surface_uv,
+                    prepared_order[..., None],
+                    axis=1,
+                ),
+                rtol=0.0,
+                atol=1.0e-12,
+            )
+            or not np.allclose(
+                np.take_along_axis(strength_rows, original_order, axis=1),
+                np.take_along_axis(
+                    aligned_strengths,
+                    prepared_order,
+                    axis=1,
+                ),
+                rtol=0.0,
+                atol=1.0e-12,
+            )
+            or not np.allclose(
+                np.take_along_axis(
+                    position_rows,
+                    original_order[..., None],
+                    axis=1,
+                ),
+                np.take_along_axis(
+                    aligned_positions,
+                    prepared_order[..., None],
+                    axis=1,
+                ),
+                rtol=0.0,
+                atol=1.0e-12,
+            )
+        ):
+            raise ValueError(
+                "Prepared surface stratum differs from selected PF states."
+            )
+    elif not surface_coordinates_active:
+        aligned_positions, aligned_strengths = align_spatial_modes_batched(
+            position_rows,
+            strength_rows,
+            selected_weights,
+        )
+    else:
+        assert chart_id_rows is not None
+        assert surface_uv_rows is not None
         (
             aligned_positions,
             aligned_strengths,
@@ -1353,25 +1506,25 @@ def posterior_point_estimate_from_states(
         aligned_positions,
         optimize=True,
     )
-    if (
-        aligned_chart_ids is not None
-        and aligned_surface_uv is not None
-        and surface_coordinate_path_distance is not None
-    ):
-        configuration_distance = (
-            surface_configuration_medoid_distance_batched(
-                aligned_chart_ids,
-                aligned_surface_uv,
-                selected_weights,
-                surface_coordinate_path_distance,
-            )
-        )
-    else:
-        configuration_distance = np.sum(
-            (aligned_positions - position_barycenter[None, :, :]) ** 2,
-            axis=(1, 2),
-        )
     if representative_particle_index is None:
+        if (
+            aligned_chart_ids is not None
+            and aligned_surface_uv is not None
+            and surface_coordinate_path_distance is not None
+        ):
+            configuration_distance = (
+                surface_configuration_medoid_distance_batched(
+                    aligned_chart_ids,
+                    aligned_surface_uv,
+                    selected_weights,
+                    surface_coordinate_path_distance,
+                )
+            )
+        else:
+            configuration_distance = np.sum(
+                (aligned_positions - position_barycenter[None, :, :]) ** 2,
+                axis=(1, 2),
+            )
         minimum_distance = float(np.min(configuration_distance))
         tied = np.flatnonzero(
             np.isclose(

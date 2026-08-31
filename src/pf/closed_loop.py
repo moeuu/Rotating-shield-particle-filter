@@ -1116,6 +1116,29 @@ def _plan(
     )
 
 
+def _planning_stage_wall_times(result: DSSPPResult) -> dict[str, float]:
+    """Return the exact planner stage timings from one native DSS result."""
+    if not isinstance(result.diagnostics, Mapping):
+        raise TypeError("DSS planning diagnostics must be a mapping.")
+    raw = result.diagnostics.get("planning_stage_wall_s")
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("Native DSS planning omitted stage timing diagnostics.")
+    required = {
+        "planning_particle_snapshot",
+        "geometry_particle_snapshot",
+        "signature_mode_extraction",
+        "official_mode_projection",
+        "node_build_and_eig",
+        "total_before_result",
+    }
+    if set(raw) != required:
+        raise RuntimeError("Native DSS planning stage timing schema is incomplete.")
+    resolved = {str(key): float(raw[key]) for key in sorted(required)}
+    if any(not np.isfinite(value) or value < 0.0 for value in resolved.values()):
+        raise RuntimeError("Native DSS planning stage timings are invalid.")
+    return resolved
+
+
 def _planner_rng(seed: int, station_index: int) -> np.random.Generator:
     """Return the deterministic planner stream for one fresh-run station."""
     return np.random.default_rng(
@@ -1781,6 +1804,7 @@ def run_pf_closed_loop(
                 control_policy=control_policy,
             )
             planning_elapsed_s = time.perf_counter() - planning_start_s
+            planning_stage_wall_s = _planning_stage_wall_times(planned)
             station_id += 1
             planner_writer.append(
                 _planner_audit_for_mode(
@@ -1800,6 +1824,7 @@ def run_pf_closed_loop(
                 sampler_health_gate_elapsed_s
             )
             timing["planning"] = float(planning_elapsed_s)
+            timing["planning_breakdown"] = planning_stage_wall_s
             timing["station_wall_including_planning"] = float(
                 time.perf_counter() - station_wall_start_s
             )

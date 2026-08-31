@@ -13,6 +13,7 @@ from pf.posterior import (
     validated_probability,
     validated_probability_distribution,
 )
+from pf.parallel_chunks import ordered_exact_parallel_map
 from planning.dss_types import DSSPPConfig, SignatureMode
 
 
@@ -281,8 +282,16 @@ def _weighted_surface_medoid_index(
         raise ValueError("row_chunk_size must be a positive integer.")
     medoid_costs = np.empty(positions.shape[0], dtype=float)
     chunk_size = int(row_chunk_size)
-    for start in range(0, positions.shape[0], chunk_size):
-        stop = min(start + chunk_size, positions.shape[0])
+    chunks = tuple(
+        (start, min(start + chunk_size, positions.shape[0]))
+        for start in range(0, positions.shape[0], chunk_size)
+    )
+
+    def _evaluate_chunk(
+        chunk: tuple[int, int],
+    ) -> tuple[int, int, NDArray[np.float64]]:
+        """Return exact weighted medoid costs for one candidate row chunk."""
+        start, stop = chunk
         if coordinates_active:
             assert chart_ids is not None
             assert uv is not None
@@ -316,7 +325,15 @@ def _weighted_surface_medoid_index(
             or np.any(distance_matrix < 0.0)
         ):
             raise RuntimeError("Surface medoid calculation returned invalid distances.")
-        medoid_costs[start:stop] = distance_matrix @ sample_weights
+        return start, stop, distance_matrix @ sample_weights
+
+    chunk_results = (
+        ordered_exact_parallel_map(_evaluate_chunk, chunks)
+        if positions.shape[0] >= 512 and len(chunks) > 1
+        else [_evaluate_chunk(chunk) for chunk in chunks]
+    )
+    for start, stop, local_costs in chunk_results:
+        medoid_costs[start:stop] = local_costs
     minimum_cost = float(np.min(medoid_costs))
     tied = np.flatnonzero(
         np.isclose(medoid_costs, minimum_cost, rtol=0.0, atol=1.0e-12)

@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import planning.dss_eig as dss_eig
+import planning.dss_modes as dss_modes
 import planning.dss_pp as dss_pp
 from measurement.kernels import ShieldParams
 from measurement.surface_charts import SurfaceChartGeometry
@@ -173,6 +174,46 @@ def test_dss_pp_uses_estimator_shared_continuous_kernel() -> None:
 
     assert result is sentinel
     assert calls == [7]
+
+
+@pytest.mark.parametrize("method", ["top_weight", "resample"])
+def test_planning_subset_reuses_full_snapshot_exactly(method: str) -> None:
+    """One packed full posterior must reproduce the former subset API."""
+    estimator = _build_simple_estimator()
+    full = estimator.planning_joint_particles()
+    expected = estimator.planning_joint_particles(
+        max_particles=1,
+        method=method,
+        rng=np.random.default_rng(981),
+    )
+    actual = dss_pp._planning_subset_from_full_snapshot(
+        full,
+        max_particles=1,
+        method=method,
+        rng=np.random.default_rng(981),
+    )
+
+    assert actual.isotope_order == expected.isotope_order
+    np.testing.assert_array_equal(actual.weights_n, expected.weights_n)
+    np.testing.assert_array_equal(
+        actual.original_particle_indices,
+        expected.original_particle_indices,
+    )
+    for field_name in (
+        "positions_nk3_by_isotope",
+        "surface_chart_ids_nk_by_isotope",
+        "surface_uv_nk2_by_isotope",
+        "strengths_nk_by_isotope",
+        "source_mask_nk_by_isotope",
+    ):
+        actual_mapping = getattr(actual, field_name)
+        expected_mapping = getattr(expected, field_name)
+        assert set(actual_mapping) == set(expected_mapping)
+        for isotope in actual.isotope_order:
+            np.testing.assert_array_equal(
+                actual_mapping[isotope],
+                expected_mapping[isotope],
+            )
 
 
 def test_dss_pp_default_aperture_samples_matches_pf_standard() -> None:
@@ -2136,6 +2177,64 @@ def test_estimate_lambda_cost_range_scales_motion() -> None:
     lam = estimate_lambda_cost(uncertainties, distances, method="range")
     expected = (4.0 - 1.0) / (2.5 - 0.5)
     assert lam == pytest.approx(expected)
+
+
+def test_large_planner_medoid_parallelizes_without_numeric_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planner mode medoids must use exact ordered CPU chunks at live scale."""
+    rng = np.random.default_rng(319)
+    sample_count = 513
+    surface_uv = rng.uniform(0.0, 1.0, size=(sample_count, 2))
+    positions = np.column_stack(
+        (surface_uv, np.zeros(sample_count, dtype=np.float64))
+    )
+    chart_ids = np.zeros(sample_count, dtype=np.int64)
+    weights = rng.uniform(0.01, 1.0, size=sample_count)
+    weights /= np.sum(weights)
+    parallel_calls: list[int] = []
+    original_parallel_map = dss_modes.ordered_exact_parallel_map
+
+    def recording_parallel_map(function: object, chunks: object) -> object:
+        """Record and execute the production ordered thread pool."""
+        work = tuple(chunks)  # type: ignore[arg-type]
+        parallel_calls.append(len(work))
+        return original_parallel_map(function, work)  # type: ignore[arg-type]
+
+    def coordinate_distance(
+        left_ids: np.ndarray,
+        left_uv: np.ndarray,
+        right_ids: np.ndarray,
+        right_uv: np.ndarray,
+    ) -> np.ndarray:
+        """Return Euclidean distance inside one connected chart."""
+        left_id_array, right_id_array = np.broadcast_arrays(left_ids, right_ids)
+        left_uv_array, right_uv_array = np.broadcast_arrays(left_uv, right_uv)
+        distance = np.linalg.norm(left_uv_array - right_uv_array, axis=-1)
+        return np.where(left_id_array == right_id_array, distance, np.inf)
+
+    monkeypatch.setattr(
+        dss_modes,
+        "ordered_exact_parallel_map",
+        recording_parallel_map,
+    )
+    selected = dss_modes._weighted_surface_medoid_index(
+        positions,
+        weights,
+        surface_path_distance=None,
+        surface_chart_ids=chart_ids,
+        surface_uv=surface_uv,
+        surface_coordinate_path_distance=coordinate_distance,
+        row_chunk_size=32,
+    )
+    squared_distance = np.sum(
+        np.square(surface_uv[:, None, :] - surface_uv[None, :, :]),
+        axis=2,
+    )
+    oracle = int(np.argmin(squared_distance @ weights))
+
+    assert parallel_calls == [17]
+    assert selected == oracle
 
 
 def test_extract_signature_modes_uses_pf_posterior_weights() -> None:

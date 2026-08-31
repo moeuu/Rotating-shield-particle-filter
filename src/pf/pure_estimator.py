@@ -17,6 +17,7 @@ from pf.estimator import (
 from pf.posterior import (
     PFPointEstimate,
     PFPosteriorSnapshot,
+    PreparedSurfacePosteriorStratum,
     align_surface_modes_batched,
     cardinality_distribution_from_states,
     posterior_point_estimate_from_states,
@@ -978,6 +979,7 @@ class PurePFEstimator(_PFEstimatorCore):
             selected_indices.size,
             dtype=np.float64,
         )
+        prepared_strata: dict[str, PreparedSurfacePosteriorStratum] = {}
         for isotope_index, isotope in enumerate(isotope_order):
             cardinality = int(
                 joint_cardinality_vectors[
@@ -1039,8 +1041,8 @@ class PurePFEstimator(_PFEstimatorCore):
                 axis=0,
             )
             (
-                _,
-                _,
+                aligned_positions,
+                aligned_strengths,
                 aligned_chart_ids,
                 aligned_surface_uv,
             ) = align_surface_modes_batched(
@@ -1050,6 +1052,13 @@ class PurePFEstimator(_PFEstimatorCore):
                 surface_uv,
                 selected_weights,
                 atlas.surface_coordinate_path_distance_upper_bound_m,
+            )
+            prepared_strata[str(isotope)] = PreparedSurfacePosteriorStratum(
+                particle_indices=selected_indices.copy(),
+                positions_nk3=aligned_positions,
+                strengths_nk=aligned_strengths,
+                chart_ids_nk=aligned_chart_ids,
+                surface_uv_nk2=aligned_surface_uv,
             )
             joint_configuration_distance += (
                 surface_configuration_medoid_distance_batched(
@@ -1104,6 +1113,7 @@ class PurePFEstimator(_PFEstimatorCore):
                 selected_particle_indices=selected_indices,
                 representative_particle_index=(representative_particle_index),
                 selected_stratum_mass=maximum_mass,
+                prepared_surface_stratum=prepared_strata.get(str(isotope)),
             )
         return self._store_posterior_point_estimate(result)
 

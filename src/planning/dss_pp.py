@@ -4813,6 +4813,99 @@ def _build_nodes(
     return raw_nodes, diagnostics
 
 
+def _planning_subset_from_full_snapshot(
+    particles: JointPlanningParticles,
+    *,
+    max_particles: int,
+    method: str,
+    rng: np.random.Generator,
+) -> JointPlanningParticles:
+    """Select planning rows from one already packed full posterior snapshot."""
+    weights = np.asarray(particles.weights_n, dtype=np.float64).reshape(-1)
+    particle_count = int(weights.size)
+    requested = int(max_particles)
+    if (
+        particle_count < 1
+        or np.any(~np.isfinite(weights))
+        or np.any(weights < 0.0)
+        or not np.isclose(np.sum(weights), 1.0, rtol=0.0, atol=1.0e-12)
+    ):
+        raise ValueError("Full planning snapshot contains invalid weights.")
+    if not 1 <= requested <= particle_count:
+        raise ValueError("Planning subset size lies outside the full snapshot.")
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError("Planning subset selection requires a NumPy generator.")
+    if method == "top_weight":
+        indices = np.argsort(weights)[::-1][:requested].astype(
+            np.int64,
+            copy=False,
+        )
+        selected_weights = weights[indices].copy()
+        selected_weights /= float(np.sum(selected_weights))
+    elif method == "resample":
+        indices = np.asarray(
+            rng.choice(
+                particle_count,
+                size=requested,
+                replace=True,
+                p=weights,
+            ),
+            dtype=np.int64,
+        )
+        selected_weights = np.full(
+            requested,
+            1.0 / float(requested),
+            dtype=np.float64,
+        )
+    else:
+        raise ValueError("Planning subset method must be 'top_weight' or 'resample'.")
+
+    def _subset_mapping(
+        values: Mapping[str, NDArray[Any]],
+    ) -> dict[str, NDArray[Any]]:
+        """Gather selected common rows from one isotope-array mapping."""
+        if set(values) != set(particles.isotope_order):
+            raise ValueError("Full planning snapshot isotope mappings are incomplete.")
+        result: dict[str, NDArray[Any]] = {}
+        for isotope in particles.isotope_order:
+            array = np.asarray(values[isotope])
+            if array.shape[:1] != (particle_count,):
+                raise ValueError("Full planning snapshot arrays are row-misaligned.")
+            result[isotope] = np.ascontiguousarray(array[indices])
+        return result
+
+    original_indices = np.asarray(
+        particles.original_particle_indices,
+        dtype=np.int64,
+    ).reshape(-1)
+    if (
+        original_indices.shape != (particle_count,)
+        or np.any(original_indices < 0)
+        or np.unique(original_indices).size != particle_count
+    ):
+        raise ValueError("Full planning snapshot original row indices are invalid.")
+    return JointPlanningParticles(
+        isotope_order=tuple(str(value) for value in particles.isotope_order),
+        weights_n=np.ascontiguousarray(selected_weights),
+        positions_nk3_by_isotope=_subset_mapping(
+            particles.positions_nk3_by_isotope
+        ),
+        surface_chart_ids_nk_by_isotope=_subset_mapping(
+            particles.surface_chart_ids_nk_by_isotope
+        ),
+        surface_uv_nk2_by_isotope=_subset_mapping(
+            particles.surface_uv_nk2_by_isotope
+        ),
+        strengths_nk_by_isotope=_subset_mapping(
+            particles.strengths_nk_by_isotope
+        ),
+        source_mask_nk_by_isotope=_subset_mapping(
+            particles.source_mask_nk_by_isotope
+        ),
+        original_particle_indices=np.ascontiguousarray(original_indices[indices]),
+    )
+
+
 def _select_dss_pp_core(
     estimator: RotatingShieldPFEstimator,
     candidate_poses_xyz: NDArray[np.float64],
@@ -4829,6 +4922,7 @@ def _select_dss_pp_core(
     candidate_settling_times_s: NDArray[np.float64] | None = None,
 ) -> DSSPPResult:
     """Run the shared DSS-PP implementation over validated or oracle inputs."""
+    planning_started = time.perf_counter()
     cfg = config or DSSPPConfig()
     if not isinstance(rng, np.random.Generator):
         raise TypeError(
@@ -4841,15 +4935,21 @@ def _select_dss_pp_core(
     current_pose = np.asarray(current_pose_xyz, dtype=float)
     if current_pose.shape != (3,) or np.any(~np.isfinite(current_pose)):
         raise ValueError("current_pose_xyz must be a finite shape-(3,) vector.")
+    geometry_snapshot_started = time.perf_counter()
+    geometry_joint_particles = estimator.planning_joint_particles()
+    geometry_snapshot_wall_s = time.perf_counter() - geometry_snapshot_started
+    particle_snapshot_started = time.perf_counter()
     if cfg.planning_particles is None:
-        joint_particles = estimator.planning_joint_particles()
+        joint_particles = geometry_joint_particles
     else:
-        joint_particles = estimator.planning_joint_particles(
+        joint_particles = _planning_subset_from_full_snapshot(
+            geometry_joint_particles,
             max_particles=cfg.planning_particles,
             method=cfg.planning_method,
             rng=planning_rng,
         )
-    geometry_joint_particles = estimator.planning_joint_particles()
+    particle_snapshot_wall_s = time.perf_counter() - particle_snapshot_started
+    signature_mode_started = time.perf_counter()
     modes = extract_signature_modes(
         estimator,
         mode_cluster_radius_m=float(cfg.mode_cluster_radius_m),
@@ -4857,10 +4957,13 @@ def _select_dss_pp_core(
         rng=planning_rng,
         joint_particles=geometry_joint_particles,
     )
+    signature_mode_wall_s = time.perf_counter() - signature_mode_started
+    official_mode_started = time.perf_counter()
     _official_modes, official_snapshot_diagnostics = _official_signature_modes(
         estimator,
         max_modes_per_isotope=int(cfg.max_modes_per_isotope),
     )
+    official_mode_wall_s = time.perf_counter() - official_mode_started
     input_candidates = np.asarray(candidate_poses_xyz, dtype=float)
     if (
         input_candidates.ndim != 2
@@ -5000,6 +5103,7 @@ def _select_dss_pp_core(
         program_pairs = set(int(pair_id) for pair_id in program.pair_ids)
         for pair_id in program_pairs:
             companion_sets[pair_id].update(program_pairs - {pair_id})
+    node_build_started = time.perf_counter()
     nodes, shortlist_diagnostics = _build_nodes(
         estimator=estimator,
         candidate_poses_xyz=candidates,
@@ -5015,6 +5119,7 @@ def _select_dss_pp_core(
         candidate_motion_times_s=motion_times,
         candidate_motion_time_components_s=motion_time_components,
     )
+    node_build_wall_s = time.perf_counter() - node_build_started
     if not nodes:
         raise ValueError("DSS-PP could not evaluate any station-program node.")
     nodes_by_pose: dict[int, list[DSSPPNode]] = {}
@@ -5192,6 +5297,14 @@ def _select_dss_pp_core(
             "same_full_spectrum_predictive_sampler_and_log_likelihood_as_pf"
         ),
         "planning_eig_shortlist": dict(shortlist_diagnostics),
+        "planning_stage_wall_s": {
+            "planning_particle_snapshot": float(particle_snapshot_wall_s),
+            "geometry_particle_snapshot": float(geometry_snapshot_wall_s),
+            "signature_mode_extraction": float(signature_mode_wall_s),
+            "official_mode_projection": float(official_mode_wall_s),
+            "node_build_and_eig": float(node_build_wall_s),
+            "total_before_result": float(time.perf_counter() - planning_started),
+        },
         "first_information_gain": float(first.information_gain),
         "selected_pose_exact_program_count": int(len(selected_pose_nodes)),
         "selected_pose_exact_information_gain_leader": float(selected_pose_eig_leader),

@@ -14,6 +14,7 @@ import pytest
 
 import pf.estimator_rejuvenation as pf_rejuvenation_module
 import pf.estimator_reporting as pf_reporting_module
+import pf.posterior as pf_posterior_module
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import source_surface_kind
@@ -42,6 +43,7 @@ from pf.joint_transport_cache import JointTransportCache
 from pf.posterior import (
     PFPointEstimate,
     PFPosteriorSnapshot,
+    PreparedSurfacePosteriorStratum,
     PFSourceMode,
     _surface_mode_medoid_coordinates_batched,
     align_surface_modes_batched,
@@ -2666,6 +2668,67 @@ def test_exact_surface_medoid_matches_scalar_oracle_beyond_old_cap() -> None:
     assert max(evaluated_chunk_widths) <= 7
 
 
+def test_large_exact_surface_medoid_uses_parallel_chunks_and_matches_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production-sized medoids must parallelize without changing the result."""
+    rng = np.random.default_rng(861)
+    particle_count = 513
+    chart_ids = np.zeros((particle_count, 1), dtype=np.int64)
+    surface_uv = rng.uniform(0.0, 1.0, size=(particle_count, 1, 2))
+    weights = rng.uniform(0.01, 1.0, size=particle_count)
+    weights /= np.sum(weights)
+    parallel_calls: list[int] = []
+    original_parallel_map = pf_posterior_module.ordered_exact_parallel_map
+
+    def recording_parallel_map(function: object, chunks: object) -> object:
+        """Record and execute the real ordered thread-pool implementation."""
+        work = tuple(chunks)  # type: ignore[arg-type]
+        parallel_calls.append(len(work))
+        return original_parallel_map(function, work)  # type: ignore[arg-type]
+
+    def coordinate_distance(
+        left_ids: NDArray[np.int64],
+        left_uv: NDArray[np.float64],
+        right_ids: NDArray[np.int64],
+        right_uv: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return broadcast Euclidean distance on one connected chart."""
+        left_id_array, right_id_array = np.broadcast_arrays(left_ids, right_ids)
+        left_uv_array, right_uv_array = np.broadcast_arrays(left_uv, right_uv)
+        distance = np.linalg.norm(left_uv_array - right_uv_array, axis=-1)
+        return np.where(left_id_array == right_id_array, distance, np.inf)
+
+    monkeypatch.setattr(
+        pf_posterior_module,
+        "ordered_exact_parallel_map",
+        recording_parallel_map,
+    )
+    medoid_ids, medoid_uv = _surface_mode_medoid_coordinates_batched(
+        chart_ids,
+        surface_uv,
+        weights,
+        coordinate_distance,
+        candidate_chunk_size=32,
+    )
+    uv_rows = surface_uv[:, 0, :]
+    squared_distance = np.sum(
+        np.square(uv_rows[:, None, :] - uv_rows[None, :, :]),
+        axis=2,
+    )
+    costs = weights @ squared_distance
+    oracle_index = int(np.argmin(costs))
+
+    assert parallel_calls == [17]
+    np.testing.assert_array_equal(medoid_ids, np.asarray([0], dtype=np.int64))
+    np.testing.assert_allclose(
+        medoid_uv[0],
+        surface_uv[oracle_index, 0],
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 def test_exact_surface_atlas_drives_projection_and_surface_kinds() -> None:
     """PF report projection and labels must use the exact transport-box atlas."""
     isotope = "Cs-137"
@@ -3117,6 +3180,98 @@ def test_pure_posterior_uses_joint_map_cardinality_vector() -> None:
         pytest.approx(1.0 / 3.0)
     )
     assert uncertainty["Co-60"][0]["existence_mass"] == pytest.approx(0.15)
+
+
+def test_prepared_surface_stratum_reuses_exact_alignment() -> None:
+    """Prepared report arrays must reproduce the ordinary exact report."""
+    positions = np.asarray(
+        [
+            [[0.1, 0.2, 0.0], [0.8, 0.7, 0.0]],
+            [[0.2, 0.1, 0.0], [0.7, 0.8, 0.0]],
+            [[0.15, 0.25, 0.0], [0.75, 0.65, 0.0]],
+        ],
+        dtype=np.float64,
+    )
+    strengths = np.asarray(
+        [[10.0, 20.0], [11.0, 19.0], [9.0, 21.0]],
+        dtype=np.float64,
+    )
+    chart_ids = np.zeros((3, 2), dtype=np.int64)
+    surface_uv = positions[..., :2].copy()
+    weights = np.asarray([0.2, 0.5, 0.3], dtype=np.float64)
+    states = [
+        IsotopeState(
+            num_sources=2,
+            strengths=strengths[row].copy(),
+            surface_chart_ids=chart_ids[row].copy(),
+            surface_uv=surface_uv[row].copy(),
+        )
+        for row in range(3)
+    ]
+
+    def coordinate_distance(
+        left_ids: NDArray[np.int64],
+        left_uv: NDArray[np.float64],
+        right_ids: NDArray[np.int64],
+        right_uv: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return Euclidean distance within the single connected chart."""
+        left_id_array, right_id_array = np.broadcast_arrays(left_ids, right_ids)
+        left_uv_array, right_uv_array = np.broadcast_arrays(left_uv, right_uv)
+        distance = np.linalg.norm(left_uv_array - right_uv_array, axis=-1)
+        return np.where(left_id_array == right_id_array, distance, np.inf)
+
+    selected_indices = np.arange(3, dtype=np.int64)
+    (
+        aligned_positions,
+        aligned_strengths,
+        aligned_chart_ids,
+        aligned_surface_uv,
+    ) = align_surface_modes_batched(
+        positions,
+        strengths,
+        chart_ids,
+        surface_uv,
+        weights,
+        coordinate_distance,
+    )
+    prepared = PreparedSurfacePosteriorStratum(
+        particle_indices=selected_indices.copy(),
+        positions_nk3=aligned_positions,
+        strengths_nk=aligned_strengths,
+        chart_ids_nk=aligned_chart_ids,
+        surface_uv_nk2=aligned_surface_uv,
+    )
+    common = {
+        "positions_by_state": [row.copy() for row in positions],
+        "surface_chart_ids_by_state": [row.copy() for row in chart_ids],
+        "surface_uv_by_state": [row.copy() for row in surface_uv],
+        "surface_coordinate_path_distance": coordinate_distance,
+        "max_cardinality": 2,
+        "selected_particle_indices": selected_indices,
+        "representative_particle_index": 1,
+        "selected_stratum_mass": 1.0,
+    }
+    ordinary = posterior_point_estimate_from_states(states, weights, **common)
+    reused = posterior_point_estimate_from_states(
+        states,
+        weights,
+        prepared_surface_stratum=prepared,
+        **common,
+    )
+
+    assert reused.to_dict() == ordinary.to_dict()
+    stale = replace(
+        prepared,
+        particle_indices=np.asarray([2, 1, 0], dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="invalid or stale"):
+        posterior_point_estimate_from_states(
+            states,
+            weights,
+            prepared_surface_stratum=stale,
+            **common,
+        )
 
 
 def test_pure_posterior_uses_one_joint_configuration_medoid_row() -> None:
