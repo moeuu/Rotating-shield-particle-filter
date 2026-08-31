@@ -101,17 +101,17 @@ def _manifest_row(
     }
 
 
-def test_select_paper_subset_uses_mix9_four_run_plan() -> None:
-    """The paper subset should retain exactly the four causal MIX-9 runs."""
+def test_select_paper_subset_uses_cs4_co3_four_run_plan() -> None:
+    """The paper subset should retain exactly the four causal Cs4/Co3 runs."""
     rows = [
-        _manifest_row("mix9_multi_isotope_cardinality", variant)
+        _manifest_row(MODULE.RAL_CASE_NAME, variant)
         for variant in MODULE.CORE_VARIANTS
     ]
 
     subset = select_paper_subset(rows)
 
     assert [row["variant"] for row in subset] == list(MODULE.CORE_VARIANTS)
-    assert all(row["case"] == "mix9_multi_isotope_cardinality" for row in subset)
+    assert all(row["case"] == MODULE.RAL_CASE_NAME for row in subset)
     assert all("generate-scenario" in row["scenario_command"] for row in subset)
     assert all(
         "baselines.ral_ablation.session_runner" in row["session_command"]
@@ -123,7 +123,7 @@ def test_select_paper_subset_requires_id_for_multi_batch_manifest() -> None:
     """Implicit selection must not choose among opaque comparison batches."""
     rows = [
         _manifest_row(
-            "mix9_multi_isotope_cardinality",
+            MODULE.RAL_CASE_NAME,
             variant,
             batch_id=batch_id,
         )
@@ -137,7 +137,7 @@ def test_select_paper_subset_requires_id_for_multi_batch_manifest() -> None:
 def test_select_paper_subset_rejects_extra_row_in_selected_batch() -> None:
     """A selected batch cannot hide an undeclared legacy trial."""
     rows = [
-        _manifest_row("mix9_multi_isotope_cardinality", variant)
+        _manifest_row(MODULE.RAL_CASE_NAME, variant)
         for variant in MODULE.CORE_VARIANTS
     ]
     rows.append(_manifest_row("legacy_case", "legacy_variant"))
@@ -149,7 +149,7 @@ def test_select_paper_subset_rejects_noncanonical_batch_id() -> None:
     """Batch identifiers must be safe exact artifact identifiers."""
     rows = [
         _manifest_row(
-            "mix9_multi_isotope_cardinality",
+            MODULE.RAL_CASE_NAME,
             variant,
             batch_id="bad batch",
         )
@@ -180,7 +180,7 @@ def test_select_paper_subset_rejects_cross_bound_batch_rows(
 ) -> None:
     """All four variants must bind to one environment and truth identity."""
     rows = [
-        _manifest_row("mix9_multi_isotope_cardinality", variant)
+        _manifest_row(MODULE.RAL_CASE_NAME, variant)
         for variant in MODULE.CORE_VARIANTS
     ]
     rows[-1][field] = replacement
@@ -197,7 +197,7 @@ def test_select_paper_subset_rejects_cross_bound_batch_rows(
 def test_select_paper_subset_rejects_seed_aliasing(field: str) -> None:
     """PF and transport randomness must not alias private truth generation."""
     rows = [
-        _manifest_row("mix9_multi_isotope_cardinality", variant)
+        _manifest_row(MODULE.RAL_CASE_NAME, variant)
         for variant in MODULE.CORE_VARIANTS
     ]
     for row in rows:
@@ -228,7 +228,7 @@ def test_select_paper_subset_rejects_obsolete_or_mismatched_commands(
 ) -> None:
     """Manifest commands must match the current runtime-to-PF boundary."""
     rows = [
-        _manifest_row("mix9_multi_isotope_cardinality", variant)
+        _manifest_row(MODULE.RAL_CASE_NAME, variant)
         for variant in MODULE.CORE_VARIANTS
     ]
     if field == "scenario_command" and replacement == "rotating-shield-sim":
@@ -252,7 +252,7 @@ def test_select_paper_subset_rejects_obsolete_or_mismatched_commands(
 
 def test_manifest_reader_requires_exact_current_header(tmp_path: Path) -> None:
     """Extra or reordered CSV fields must not enter the paper run script."""
-    row = _manifest_row("mix9_multi_isotope_cardinality", MODULE.CORE_VARIANTS[0])
+    row = _manifest_row(MODULE.RAL_CASE_NAME, MODULE.CORE_VARIANTS[0])
     malformed = tmp_path / "manifest.csv"
     malformed.write_text(
         ",".join((*MODULE.MANIFEST_FIELDS, "legacy_field"))

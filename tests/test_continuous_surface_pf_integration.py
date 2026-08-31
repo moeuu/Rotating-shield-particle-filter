@@ -1233,18 +1233,29 @@ def test_cuda_structural_sweep_keeps_all_moves_device_resident() -> None:
         structural_rj_block_independence_probability=1.0,
     )
 
-    def _target(*, positions_pks: object, **_: object) -> object:
+    def _target(
+        *,
+        positions_pks: object,
+        return_station_log_likelihood: bool = False,
+        **_: object,
+    ) -> object:
         """Return a neutral target on the candidate input backend."""
         if torch.is_tensor(positions_pks):
-            return torch.zeros(
+            target = torch.zeros(
                 int(positions_pks.shape[0]),
                 device=positions_pks.device,
                 dtype=positions_pks.dtype,
             )
-        return np.zeros(
-            int(np.asarray(positions_pks).shape[0]),
-            dtype=np.float64,
-        )
+            station = target[:, None]
+        else:
+            target = np.zeros(
+                int(np.asarray(positions_pks).shape[0]),
+                dtype=np.float64,
+            )
+            station = target[:, None]
+        if return_station_log_likelihood:
+            return target, station
+        return target
 
     filt.set_joint_target_evaluator(_target)
     _install_torch_response_proposal_oracles(filt)
@@ -1258,6 +1269,11 @@ def test_cuda_structural_sweep_keeps_all_moves_device_resident() -> None:
         _one_row_geometry(),
         current_target_log_likelihood=torch.zeros(
             filt.N,
+            device="cuda",
+            dtype=torch.float64,
+        ),
+        current_station_log_likelihood=torch.zeros(
+            (filt.N, 1),
             device="cuda",
             dtype=torch.float64,
         ),

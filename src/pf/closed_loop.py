@@ -39,6 +39,7 @@ from runtime.measurement_log import (
     MeasurementLogRecord,
     load_measurement_log,
 )
+from pf.cardinality_policy import HARD_CAP_POSTERIOR_MASS_LIMIT
 from pf.control_policy import validate_control_policy
 from pf.cui_runtime import (
     resolve_cui_split_view_enabled,
@@ -248,12 +249,14 @@ class PFClosedLoopResult:
     record_count: int
     station_count: int
     stop_reason: str
+    sampler_quality_status: str
 
     def to_dict(self) -> dict[str, object]:
         """Return one strict JSON-safe result payload."""
         return {
-            "schema_version": 1,
-            "status": "complete",
+            "schema_version": 2,
+            "execution_status": "complete",
+            "sampler_quality_status": self.sampler_quality_status,
             "control_mode": "pf_closed_loop",
             "measurement_log_path": self.measurement_log_path.as_posix(),
             "pf_output_dir": self.pf_output_dir.as_posix(),
@@ -532,6 +535,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         "station_unique_ancestor_count",
         "cumulative_unique_ancestor_count",
         "r_probability_by_count",
+        "hard_max_sources",
         "transition_weight_mass",
         "joint_smc_wall_time_limit_exceeded",
         "joint_rejuvenation_mixing_incomplete",
@@ -602,6 +606,33 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
                 ),
             },
         }
+        hard_cap = values["hard_max_sources"]
+        distribution = values["r_probability_by_count"]
+        if (
+            isinstance(hard_cap, bool)
+            or not isinstance(hard_cap, int)
+            or hard_cap <= 0
+            or not isinstance(distribution, Mapping)
+        ):
+            raise TypeError(
+                f"PF isotope {isotope} omits hard-cap cardinality evidence."
+            )
+        hard_cap_mass = distribution.get(
+            int(hard_cap),
+            distribution.get(str(int(hard_cap)), 0.0),
+        )
+        if (
+            isinstance(hard_cap_mass, bool)
+            or not isinstance(hard_cap_mass, (int, float))
+            or not np.isfinite(float(hard_cap_mass))
+            or not 0.0 <= float(hard_cap_mass) <= 1.0 + 1.0e-12
+        ):
+            raise TypeError(
+                f"PF isotope {isotope} has invalid hard-cap posterior mass."
+            )
+        compact["hard_cap_source_count"] = int(hard_cap)
+        compact["hard_cap_posterior_mass"] = float(hard_cap_mass)
+        compact["hard_cap_posterior_mass_limit"] = HARD_CAP_POSTERIOR_MASS_LIMIT
         isotopes[isotope] = {
             key: value for key, value in compact.items() if value is not None
         }
@@ -803,17 +834,19 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
             for values in retained.values()
         ),
     }
-    return {
+    result = {
         "assessment": evidence,
         "sampler_health": sampler_health,
         "isotopes": isotopes,
     }
+    result["sampler_quality"] = _sampler_quality_summary(result)
+    return result
 
 
 def _require_plannable_sampler_health(
     particle_adequacy: Mapping[str, object],
 ) -> None:
-    """Abort before planning when the latest PF transition is incomplete."""
+    """Validate sampler diagnostics without blocking the next acquisition."""
     raw_health = particle_adequacy.get("sampler_health")
     expected = {
         "smc_rejuvenation_wall_time_respected",
@@ -826,19 +859,77 @@ def _require_plannable_sampler_health(
         )
     if any(type(raw_health[name]) is not bool for name in expected):
         raise TypeError("PF sampler-health gates must be booleans.")
-    failed = sorted(name for name in expected if raw_health[name] is not True)
     assessment = particle_adequacy.get("assessment")
     if not isinstance(assessment, Mapping):
         raise TypeError("PF particle diagnostics must contain diversity assessment.")
+    if type(assessment.get("diversity_evidence_available")) is not bool or type(
+        assessment.get("diversity_warning")
+    ) is not bool:
+        raise TypeError("PF diversity assessment must contain Boolean evidence.")
+    quality = particle_adequacy.get("sampler_quality")
+    if quality is None:
+        return
+    if not isinstance(quality, Mapping):
+        raise TypeError("PF sampler quality must be an object.")
+    if quality.get("status") not in {"pass", "warning", "failed"}:
+        raise TypeError("PF sampler quality has an invalid status.")
+    reasons = quality.get("reasons")
+    if not isinstance(reasons, list) or any(
+        not isinstance(reason, str) or not reason for reason in reasons
+    ):
+        raise TypeError("PF sampler-quality reasons must be a string list.")
+
+
+def _sampler_quality_summary(
+    particle_adequacy: Mapping[str, object],
+) -> dict[str, object]:
+    """Classify truth-free sampler quality without changing execution status."""
+    raw_health = particle_adequacy.get("sampler_health")
+    assessment = particle_adequacy.get("assessment")
+    isotopes = particle_adequacy.get("isotopes")
+    if not isinstance(raw_health, Mapping) or not isinstance(
+        assessment, Mapping
+    ) or not isinstance(isotopes, Mapping):
+        raise TypeError("PF sampler quality requires health, diversity, and isotope rows.")
+    reasons = sorted(
+        name for name, value in raw_health.items() if value is not True
+    )
     if assessment.get("diversity_evidence_available") is not True:
-        failed.append("particle_diversity_evidence_unavailable")
+        reasons.append("particle_diversity_evidence_unavailable")
     elif assessment.get("diversity_warning") is not False:
-        failed.append("particle_diversity_warning")
-    if failed:
-        raise RuntimeError(
-            "PF sampler health forbids further live planning: "
-            f"{failed}."
-        )
+        reasons.append("particle_diversity_warning")
+    hard_cap_isotopes: list[str] = []
+    for isotope, raw_row in isotopes.items():
+        if not isinstance(isotope, str) or not isinstance(raw_row, Mapping):
+            raise TypeError("PF sampler-quality isotope rows are invalid.")
+        mass = raw_row.get("hard_cap_posterior_mass")
+        limit = raw_row.get("hard_cap_posterior_mass_limit")
+        if (
+            isinstance(mass, bool)
+            or not isinstance(mass, (int, float))
+            or isinstance(limit, bool)
+            or not isinstance(limit, (int, float))
+            or not np.isfinite(float(mass))
+            or not np.isfinite(float(limit))
+        ):
+            raise TypeError("PF sampler-quality hard-cap evidence is invalid.")
+        if float(mass) > float(limit):
+            hard_cap_isotopes.append(isotope)
+    reasons.extend(
+        f"hard_cap_posterior_mass_exceeded.{isotope}"
+        for isotope in sorted(hard_cap_isotopes)
+    )
+    status = (
+        "failed"
+        if hard_cap_isotopes
+        else "warning"
+        if reasons
+        else "pass"
+    )
+    return {
+        "status": status,
+        "reasons": sorted(set(reasons)),
+    }
 
 
 def _shield_view_count_shadow_health(
@@ -1272,15 +1363,20 @@ def _completion_diagnostics_extensions(
     stop_reason: str,
     budget: PFControlBudget,
     adaptive_stop_status: Mapping[str, object] | None,
+    particle_adequacy: Mapping[str, object],
 ) -> dict[str, object]:
     """Return controller diagnostics sealed with the canonical PF state."""
     stop: dict[str, object] = {"reason": stop_reason}
     compact_stop = _compact_adaptive_stop_status(adaptive_stop_status)
     if compact_stop is not None:
         stop["adaptive"] = compact_stop
+    quality = particle_adequacy.get("sampler_quality")
+    if not isinstance(quality, Mapping):
+        raise TypeError("Final PF diagnostics require sampler quality.")
     return {
         "stop": stop,
         "control_budget": asdict(budget),
+        "particle_adequacy": dict(particle_adequacy),
     }
 
 
@@ -1834,6 +1930,7 @@ def run_pf_closed_loop(
                 stop_reason=stop_reason,
                 budget=budget,
                 adaptive_stop_status=latest_adaptive_stop_status,
+                particle_adequacy=particle_adequacy,
             )
         )
         published = client.finalize_log()
@@ -1848,6 +1945,9 @@ def run_pf_closed_loop(
             record_count=len(log.records),
             station_count=log.station_view().station_count,
             stop_reason=stop_reason,
+            sampler_quality_status=str(
+                particle_adequacy["sampler_quality"]["status"]
+            ),
         )
         resources.close()
         if cui_split_viz is not None:

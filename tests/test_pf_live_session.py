@@ -654,6 +654,9 @@ class _SpyEstimator:
             "isotopes": {
                 isotope: {
                     "cardinality_distribution": {0: 0.1, 1: 0.9},
+                    "hard_cap_source_count": 8,
+                    "hard_cap_posterior_mass": 0.0,
+                    "hard_cap_posterior_mass_limit": 0.05,
                     "gates": {
                         "cardinality_not_at_upper_boundary": True,
                         "surface_path_concentration": False,
@@ -1583,11 +1586,11 @@ def test_external_policy_provenance_matches_posterior_state_and_checkpoint(
     assert checkpoint["control_policy"] == expected
 
 
-def test_live_completion_rejects_failed_sampler_health(
+def test_live_completion_records_failed_sampler_health(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Final sealing must not promote an unhealthy sampler to complete."""
+    """Final sealing separates completed execution from sampler quality."""
     log = load_measurement_log(
         make_measurement_log(
             tmp_path / "measurement-log",
@@ -1616,10 +1619,15 @@ def test_live_completion_rejects_failed_sampler_health(
         unhealthy_diagnostics,
     )
 
-    with pytest.raises(PFLiveSessionError, match="sampler-health gates"):
-        session.complete_live_state()
+    completed = session.complete_live_state()
+    diagnostics = json.loads(completed.diagnostics_json)
 
-    assert session.phase == "failed"
+    assert session.phase == "completed"
+    assert diagnostics["execution_status"] == "complete"
+    assert diagnostics["sampler_quality_status"] == "warning"
+    assert diagnostics["sampler_quality_reasons"] == [
+        "rejuvenation_mixing_complete"
+    ]
 
 
 def test_bound_facade_publishes_package_owned_result_bundle(
@@ -1657,7 +1665,9 @@ def test_bound_facade_publishes_package_owned_result_bundle(
     diagnostics = json.loads(
         published.diagnostics_path.read_text(encoding="utf-8")
     )
-    assert diagnostics["schema_version"] == 2
+    assert diagnostics["schema_version"] == 3
+    assert diagnostics["execution_status"] == "complete"
+    assert diagnostics["sampler_quality_status"] == "pass"
     assert diagnostics["posterior_predictive_check"] == {"available": False}
     assert (
         diagnostics["sampler_health"][

@@ -408,7 +408,7 @@ class StructuralRJTorchBasicMoveMixin:
                     support = torch.isfinite(prior_delta) & torch.isfinite(
                         proposal_delta
                     )
-                    decision = self._continuous_rj_history_tree_decision_torch(
+                    decision = self._continuous_rj_exact_decision_torch(
                         data,
                         proposed_positions,
                         proposed_strengths,
@@ -444,7 +444,6 @@ class StructuralRJTorchBasicMoveMixin:
                         )
                         & torch.isfinite(log_strength_proposal),
                         log_acceptance_ratio=log_ratio,
-                        likelihood_exact=decision.likelihood_exact,
                     )
                     new_matches = (
                         (proposed_chart_ids == new_chart_ids[:, None])
@@ -567,7 +566,7 @@ class StructuralRJTorchBasicMoveMixin:
                 support = torch.isfinite(prior_delta) & torch.isfinite(
                     proposal_delta
                 )
-                decision = self._continuous_rj_history_tree_decision_torch(
+                decision = self._continuous_rj_exact_decision_torch(
                     data,
                     proposed_positions,
                     proposed_strengths,
@@ -603,7 +602,6 @@ class StructuralRJTorchBasicMoveMixin:
                     )
                     & torch.isfinite(log_reverse_strength),
                     log_acceptance_ratio=log_ratio,
-                    likelihood_exact=decision.likelihood_exact,
                 )
                 self._record_source_events_torch(
                     "source_removed",
@@ -757,7 +755,7 @@ class StructuralRJTorchBasicMoveMixin:
                 )
             )
             support = torch.isfinite(delta_prior) & torch.isfinite(proposal_delta)
-            decision = self._continuous_rj_history_tree_decision_torch(
+            decision = self._continuous_rj_exact_decision_torch(
                 data,
                 proposed_positions,
                 proposed_strengths,
@@ -785,7 +783,6 @@ class StructuralRJTorchBasicMoveMixin:
                 current_cardinality=cardinality,
                 proposed_cardinality=cardinality,
                 log_acceptance_ratio=log_ratio,
-                likelihood_exact=decision.likelihood_exact,
             )
             self._continuous_rj_transition_mass_torch(
                 "global_position_accepted",
@@ -953,7 +950,7 @@ class StructuralRJTorchBasicMoveMixin:
             )
             support = moved & positive_response & strength_support
             movable_count += int(torch.count_nonzero(moved).item())
-            decision = self._continuous_rj_history_tree_decision_torch(
+            decision = self._continuous_rj_exact_decision_torch(
                 data,
                 proposed_positions,
                 proposed_strengths,
@@ -985,7 +982,6 @@ class StructuralRJTorchBasicMoveMixin:
                 geometry_support_feasible=moved & positive_response,
                 strength_support_feasible=strength_support,
                 log_acceptance_ratio=log_ratio,
-                likelihood_exact=decision.likelihood_exact,
             )
             accepted_count += self._commit_continuous_rj_state_tensors(
                 indices,
@@ -1056,7 +1052,7 @@ class StructuralRJTorchBasicMoveMixin:
                 torch.arange(row_count, device=indices.device),
                 source_columns,
             ] = self._continuous_rj_sample_strength_prior_torch((row_count,))
-            decision = self._continuous_rj_history_tree_decision_torch(
+            decision = self._continuous_rj_exact_decision_torch(
                 data,
                 positions,
                 proposed_strengths,

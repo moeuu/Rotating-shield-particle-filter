@@ -27,7 +27,15 @@ def _completed_run_artifacts(tmp_path: Path) -> dict[str, Path]:
         "input": tmp_path / "pf_post_run_evaluation_input.json",
         "truth": tmp_path / "truth_manifest.json",
     }
-    _write_json(paths["result"], {"status": "complete", "run_id": "run-1"})
+    _write_json(
+        paths["result"],
+        {
+            "schema_version": 2,
+            "execution_status": "complete",
+            "sampler_quality_status": "pass",
+            "run_id": "run-1",
+        },
+    )
     _write_json(
         paths["posterior"],
         {
@@ -101,11 +109,43 @@ def test_completed_run_evaluation_joins_exact_truth_and_reports_each_source(
         truth_manifest_path=paths["truth"],
     )
 
-    assert result["passed"] is True
+    assert result["execution_status"] == "complete"
+    assert result["sampler_quality_status"] == "pass"
+    assert result["accuracy_status"] == "pass"
     assert result["run_identity"]["run_id"] == "run-1"
     source = result["isotopes"]["Cs-137"]["truth_sources"][0]
     assert source["representative_position_error_m"] == pytest.approx(0.1)
     assert source["combined_relative_strength_error"] == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize(
+    ("sampler_status", "hard_cap_mass"),
+    (("pass", 0.2), ("failed", 0.01)),
+)
+def test_completed_run_rejects_sampler_hard_cap_contradiction(
+    tmp_path: Path,
+    sampler_status: str,
+    hard_cap_mass: float,
+) -> None:
+    """Published quality and posterior hard-cap evidence must agree exactly."""
+    paths = _completed_run_artifacts(tmp_path)
+    result = json.loads(paths["result"].read_text(encoding="utf-8"))
+    result["sampler_quality_status"] = sampler_status
+    _write_json(paths["result"], result)
+    posterior = json.loads(paths["posterior"].read_text(encoding="utf-8"))
+    posterior["isotopes"]["Cs-137"]["cardinality_distribution"] = {
+        "1": 1.0 - hard_cap_mass,
+        "8": hard_cap_mass,
+    }
+    _write_json(paths["posterior"], posterior)
+
+    with pytest.raises(ValueError, match="contradicts hard-cap"):
+        evaluate_completed_pf_run(
+            result_path=paths["result"],
+            posterior_path=paths["posterior"],
+            evaluation_input_path=paths["input"],
+            truth_manifest_path=paths["truth"],
+        )
 
 
 def test_private_session_runner_always_publishes_post_run_evaluation(
@@ -156,7 +196,12 @@ def test_private_session_runner_always_publishes_post_run_evaluation(
     def _evaluate(**kwargs: Path) -> dict[str, object]:
         """Record the private post-run join without reading fake artifacts."""
         calls.append(dict(kwargs))
-        return {"schema_version": 1, "passed": True}
+        return {
+            "schema_version": 2,
+            "execution_status": "complete",
+            "sampler_quality_status": "pass",
+            "accuracy_status": "pass",
+        }
 
     monkeypatch.setattr(session_runner, "evaluate_completed_pf_run", _evaluate)
 
@@ -186,6 +231,8 @@ def test_private_session_runner_always_publishes_post_run_evaluation(
     )
     evaluation_path = private_root / "evaluations" / "run.json"
     assert json.loads(evaluation_path.read_text(encoding="utf-8")) == {
-        "passed": True,
-        "schema_version": 1,
+        "accuracy_status": "pass",
+        "execution_status": "complete",
+        "sampler_quality_status": "pass",
+        "schema_version": 2,
     }

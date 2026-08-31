@@ -111,9 +111,9 @@
   acknowledgment. Do not remove it or move it into the main text unless the
   user explicitly asks for a camera-ready/non-anonymous version.
 - The current RA-L paper subset is four full-simulation runs on
-  `mix9_multi_isotope_cardinality`:
+  `cs4_co3_multi_source_cardinality`:
   `proposed`, `no_shield_native_path`, `round_robin_shield`,
-  and `eig_only_path`. The task uses `4 Cs-137 + 3 Co-60 + 2 Eu-154` sources.
+  and `eig_only_path`. The task uses `4 Cs-137 + 3 Co-60` sources.
   Every variant uses `pure_pf_schema_version: 2`, the `pf_strict` profile, and
   the same exact reversible-jump PF; variants change only shield and planning
   policy.

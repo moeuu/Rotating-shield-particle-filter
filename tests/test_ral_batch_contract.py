@@ -7,12 +7,13 @@ import json
 from pathlib import Path
 
 import pytest
-from runtime.experiment_profiles import MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE
+from runtime.experiment_profiles import CS_CO_SURFACE_SEARCH_PROFILE
 
 from baselines.ral_ablation.batch_contract import seal_authored_batch
 from baselines.ral_ablation.config_factory import (
     DEFAULT_RUNTIME_CONFIG,
     DEFAULT_RUNTIME_ROOT,
+    RAL_SCENE_VARIANT_ID,
     build_ablation_plan,
     write_ablation_plan,
 )
@@ -49,22 +50,20 @@ def _authored_batch(tmp_path: Path) -> tuple[Path, list[object]]:
     }
     sources = [
         {
-            "isotope": "Cs-137",
-            "position": [1.0, 2.0, 3.0],
-            "intensity_cps_1m": 500000.0,
-        },
-        {
-            "isotope": "Co-60",
-            "position": [4.0, 5.0, 1.0],
-            "intensity_cps_1m": 600000.0,
-        },
+            "isotope": isotope,
+            "position": [float(index + 1), float(2 * index + 1), 1.0],
+            "intensity_cps_1m": 500000.0 + 10000.0 * index,
+        }
+        for index, isotope in enumerate(
+            ("Cs-137",) * 4 + ("Co-60",) * 3
+        )
     ]
     acquisition = {
         "schema_version": 1,
-        **asdict(MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition),
+        **asdict(CS_CO_SURFACE_SEARCH_PROFILE.acquisition),
     }
     environment = {
-        "experiment_profile_id": MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.profile_id,
+        "experiment_profile_id": CS_CO_SURFACE_SEARCH_PROFILE.profile_id,
         "acquisition_contract": acquisition,
         "size_x": 10.0,
         "size_y": 15.0,
@@ -72,8 +71,8 @@ def _authored_batch(tmp_path: Path) -> tuple[Path, list[object]]:
         "obstacle_grid": {"contract": "same"},
     }
     metadata = {
-        "experiment_profile_id": MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.profile_id,
-        "private_scene_variant_id": "mix9",
+        "experiment_profile_id": CS_CO_SURFACE_SEARCH_PROFILE.profile_id,
+        "private_scene_variant_id": RAL_SCENE_VARIANT_ID,
         "scene_seed": 1234,
         "scene_rng_provenance": provenance,
         "scenario_family": "test",
@@ -99,7 +98,7 @@ def _authored_batch(tmp_path: Path) -> tuple[Path, list[object]]:
                 "backend": "geant4",
                 "runtime_config_path": entry.runtime_config_path.as_posix(),
                 "output_dir": entry.measurement_log_path.as_posix(),
-                "isotopes": ["Co-60", "Cs-137", "Eu-154"],
+                "isotopes": ["Co-60", "Cs-137"],
                 "environment": environment,
                 "obstacle_layout_path": None,
                 "scene": {"sources": sources, "geometry": "same"},
@@ -124,7 +123,7 @@ def test_authored_batch_contract_seals_identical_environment_and_sources(
     )
 
     assert output.is_file()
-    assert contract["source_count_by_isotope"] == {"Co-60": 1, "Cs-137": 1}
+    assert contract["source_count_by_isotope"] == {"Co-60": 3, "Cs-137": 4}
     assert len(contract["comparison_contract_sha256"]) == 64
     assert len(contract["private_truth_contract_sha256"]) == 64
     assert set(contract["per_variant"]) == {

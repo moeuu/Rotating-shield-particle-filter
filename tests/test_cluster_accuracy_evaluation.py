@@ -89,7 +89,8 @@ def test_local_splits_are_aggregated_without_scoring_raw_cardinality() -> None:
         _input(modes, signatures),
     )
 
-    assert result["passed"] is True
+    assert result["accuracy_status"] == "pass"
+    assert result["hard_cap_sampler_quality_status"] == "pass"
     isotope = result["isotopes"]["Cs-137"]
     assert isotope["raw_estimate_component_count"] == 3
     assert isotope["raw_component_cardinality_scored"] is False
@@ -125,13 +126,16 @@ def test_response_distinct_remote_component_fails_cluster_accuracy() -> None:
         _input(modes, signatures),
     )
 
-    assert result["passed"] is False
+    assert result["accuracy_status"] == "failed"
+    assert result["hard_cap_sampler_quality_status"] == "pass"
     isotope = result["isotopes"]["Cs-137"]
     assert isotope["response_distinct_remote_component_count"] == 1
-    assert "response_distinct_remote_components" in isotope["failure_reasons"]
+    assert "response_distinct_remote_components" in isotope[
+        "accuracy_failure_reasons"
+    ]
 
 
-def test_hard_cap_mass_fails_even_when_physical_cluster_is_accurate() -> None:
+def test_hard_cap_mass_marks_sampler_failure_not_accuracy_failure() -> None:
     """Hard-cap saturation remains a sampler failure outside raw-K scoring."""
     truth = {
         "Cs-137": [
@@ -146,10 +150,13 @@ def test_hard_cap_mass_fails_even_when_physical_cluster_is_accurate() -> None:
         _input(modes, [[1.0]]),
     )
 
-    assert result["passed"] is False
+    assert result["accuracy_status"] == "pass"
+    assert result["hard_cap_sampler_quality_status"] == "failed"
     isotope = result["isotopes"]["Cs-137"]
     assert isotope["hard_cap_saturation_passed"] is False
-    assert "hard_cardinality_cap_saturation" in isotope["failure_reasons"]
+    assert "hard_cardinality_cap_saturation" in isotope[
+        "hard_cap_sampler_quality_failure_reasons"
+    ]
 
 
 def test_post_run_uses_the_same_inclusive_hard_cap_limit_as_live_health() -> None:

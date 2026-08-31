@@ -13,7 +13,7 @@ from typing import Any
 
 from runtime.artifacts import atomic_write_json
 from runtime.experiment_profiles import (
-    MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE,
+    CS_CO_SURFACE_SEARCH_PROFILE,
     acquisition_contract_from_environment,
 )
 
@@ -180,7 +180,7 @@ def _require_authored_identity(
     if scene.get("sources") != truth.get("sources"):
         raise ValueError("Authored scenario sources differ from private truth.")
     acquisition = acquisition_contract_from_environment(environment)
-    if acquisition != MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition:
+    if acquisition != CS_CO_SURFACE_SEARCH_PROFILE.acquisition:
         raise ValueError("Authored acquisition contract differs from the RA-L profile.")
 
 
@@ -301,20 +301,20 @@ def seal_authored_batch(
         "private_truth_contract_sha256": shared_truth_digest,
         "source_count_by_isotope": dict(sorted(source_counts.items())),
         "acquisition_contract": {
-            "max_stations": MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition.max_stations,
+            "max_stations": CS_CO_SURFACE_SEARCH_PROFILE.acquisition.max_stations,
             "views_per_station": (
-                MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition.views_per_station
+                CS_CO_SURFACE_SEARCH_PROFILE.acquisition.views_per_station
             ),
-            "live_time_s": MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition.live_time_s,
+            "live_time_s": CS_CO_SURFACE_SEARCH_PROFILE.acquisition.live_time_s,
             "max_measurements": (
-                MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition.max_measurements
+                CS_CO_SURFACE_SEARCH_PROFILE.acquisition.max_measurements
             ),
             "min_station_separation_m": (
-                MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition
+                CS_CO_SURFACE_SEARCH_PROFILE.acquisition
                 .min_station_separation_m
             ),
             "coverage_radius_m": (
-                MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.acquisition.coverage_radius_m
+                CS_CO_SURFACE_SEARCH_PROFILE.acquisition.coverage_radius_m
             ),
         },
         "per_variant": per_variant,

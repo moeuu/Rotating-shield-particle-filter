@@ -126,10 +126,10 @@ def test_refinement_top_k_must_fit_authenticated_candidate_snapshot() -> None:
         "structural_mixing_complete",
     ),
 )
-def test_failed_sampler_health_aborts_before_next_planning(
+def test_failed_sampler_health_is_diagnostic_before_next_planning(
     failed_gate: str,
 ) -> None:
-    """No incomplete rejuvenation state may feed another live action."""
+    """Incomplete mixing is recorded but does not invalidate acquisition."""
     health = {
         "smc_rejuvenation_wall_time_respected": True,
         "rejuvenation_mixing_complete": True,
@@ -137,16 +137,15 @@ def test_failed_sampler_health_aborts_before_next_planning(
     }
     health[failed_gate] = False
 
-    with pytest.raises(RuntimeError, match="forbids further live planning"):
-        _require_plannable_sampler_health(
-            {
-                "sampler_health": health,
-                "assessment": {
-                    "diversity_evidence_available": True,
-                    "diversity_warning": False,
-                },
-            }
-        )
+    _require_plannable_sampler_health(
+        {
+            "sampler_health": health,
+            "assessment": {
+                "diversity_evidence_available": True,
+                "diversity_warning": False,
+            },
+        }
+    )
 
 
 @pytest.mark.parametrize(
@@ -162,21 +161,20 @@ def test_failed_sampler_health_aborts_before_next_planning(
         },
     ),
 )
-def test_particle_diversity_warning_aborts_before_next_planning(
+def test_particle_diversity_warning_does_not_block_next_planning(
     assessment: dict[str, bool],
 ) -> None:
-    """Lineage collapse must be an action gate, not a display-only warning."""
-    with pytest.raises(RuntimeError, match="forbids further live planning"):
-        _require_plannable_sampler_health(
-            {
-                "sampler_health": {
-                    "smc_rejuvenation_wall_time_respected": True,
-                    "rejuvenation_mixing_complete": True,
-                    "structural_mixing_complete": True,
-                },
-                "assessment": assessment,
-            }
-        )
+    """Lineage collapse remains visible without invalidating acquisition."""
+    _require_plannable_sampler_health(
+        {
+            "sampler_health": {
+                "smc_rejuvenation_wall_time_respected": True,
+                "rejuvenation_mixing_complete": True,
+                "structural_mixing_complete": True,
+            },
+            "assessment": assessment,
+        }
+    )
 
 
 def test_full_support_rejuvenation_recovers_collapsed_lineage() -> None:
@@ -195,6 +193,7 @@ def test_full_support_rejuvenation_recovers_collapsed_lineage() -> None:
             "station_unique_ancestor_count": 1,
             "cumulative_unique_ancestor_count": 1,
             "r_probability_by_count": {"1": 1.0},
+            "hard_max_sources": 8,
             "joint_smc_wall_time_limit_exceeded": False,
             "joint_rejuvenation_mixing_incomplete": False,
             "joint_structural_mixing_incomplete": False,
@@ -240,7 +239,7 @@ def test_full_support_rejuvenation_recovers_collapsed_lineage() -> None:
     _require_plannable_sampler_health(diagnostics)
 
 
-def test_lineage_recovery_fails_when_one_isotope_lacks_certified_descendants() -> None:
+def test_lineage_recovery_warning_is_isotope_specific() -> None:
     """One isotope cannot borrow another isotope's recovery descendants."""
     isotopes = ("Cs-137", "Co-60")
 
@@ -256,6 +255,7 @@ def test_lineage_recovery_fails_when_one_isotope_lacks_certified_descendants() -
             "station_unique_ancestor_count": 1,
             "cumulative_unique_ancestor_count": 1,
             "r_probability_by_count": {"1": 1.0},
+            "hard_max_sources": 8,
             "joint_smc_wall_time_limit_exceeded": False,
             "joint_rejuvenation_mixing_incomplete": False,
             "joint_structural_mixing_incomplete": False,
@@ -294,8 +294,8 @@ def test_lineage_recovery_fails_when_one_isotope_lacks_certified_descendants() -
 
     assert diagnostics["assessment"]["lineage_recovery_complete"] is False
     assert diagnostics["assessment"]["diversity_warning"] is True
-    with pytest.raises(RuntimeError, match="particle_diversity_warning"):
-        _require_plannable_sampler_health(diagnostics)
+    assert diagnostics["sampler_quality"]["status"] == "warning"
+    _require_plannable_sampler_health(diagnostics)
 
 
 def test_lineage_recovery_rejects_inconsistent_sufficiency_diagnostics() -> None:
@@ -332,6 +332,7 @@ def test_lineage_recovery_rejects_inconsistent_sufficiency_diagnostics() -> None
                 "station_unique_ancestor_count": 1,
                 "cumulative_unique_ancestor_count": 1,
                 "r_probability_by_count": {"1": 1.0},
+                "hard_max_sources": 8,
                 "joint_smc_wall_time_limit_exceeded": False,
                 "joint_rejuvenation_mixing_incomplete": False,
                 "joint_structural_mixing_incomplete": False,
@@ -393,6 +394,7 @@ def test_lineage_recovery_rejects_malformed_redundant_diagnostics(
                 "station_unique_ancestor_count": 1,
                 "cumulative_unique_ancestor_count": 1,
                 "r_probability_by_count": {"1": 1.0},
+                "hard_max_sources": 8,
                 "joint_smc_wall_time_limit_exceeded": False,
                 "joint_rejuvenation_mixing_incomplete": False,
                 "joint_structural_mixing_incomplete": False,
@@ -836,6 +838,8 @@ def test_missing_particle_diversity_evidence_fails_closed() -> None:
         pf_config=SimpleNamespace(num_particles=4096, target_ess_ratio=0.4),
         step_diagnostics=lambda **_kwargs: {
             "Cs-137": {
+                "r_probability_by_count": {"0": 1.0},
+                "hard_max_sources": 8,
                 "joint_smc_wall_time_limit_exceeded": False,
                 "joint_rejuvenation_mixing_incomplete": False,
                 "joint_structural_mixing_incomplete": False,
@@ -888,6 +892,7 @@ def test_particle_diagnostics_omit_deep_rejection_payloads() -> None:
                 "station_unique_ancestor_count": 50,
                 "cumulative_unique_ancestor_count": 40,
                 "r_probability_by_count": {"1": 0.7, "2": 0.3},
+                "hard_max_sources": 8,
                 "joint_smc_wall_time_limit_exceeded": False,
                 "joint_rejuvenation_mixing_incomplete": False,
                 "joint_structural_mixing_incomplete": False,
@@ -1111,6 +1116,9 @@ class _FakeEstimator:
                 "particle_count": 2000,
                 "current_ess": 1000.0,
                 "current_ess_ratio": 0.5,
+                "r_probability_by_count": {"1": 1.0},
+                "hard_max_sources": 8,
+                "transition_weight_mass": {},
                 "station_unique_ancestor_count": 1000,
                 "cumulative_unique_ancestor_count": 1000,
                 "joint_smc_wall_time_limit_exceeded": False,
@@ -1283,6 +1291,9 @@ def test_final_diagnostics_keep_one_compact_copy_of_each_diagnostic(
             "stop_ready": False,
             "posterior_convergence": {"duplicated": True},
         },
+        particle_adequacy={
+            "sampler_quality": {"status": "pass", "reasons": []}
+        },
     )
 
     assert diagnostics["stop"]["adaptive"] == {
@@ -1291,6 +1302,10 @@ def test_final_diagnostics_keep_one_compact_copy_of_each_diagnostic(
         "stop_ready": False,
     }
     assert diagnostics["stop"]["reason"] == "maximum_station_budget"
+    assert diagnostics["particle_adequacy"]["sampler_quality"] == {
+        "status": "pass",
+        "reasons": [],
+    }
     assert diagnostics["control_budget"] == {
         "max_stations": 1,
         "max_measurements": 1,

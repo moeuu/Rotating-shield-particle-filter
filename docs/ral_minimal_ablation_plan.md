@@ -22,14 +22,14 @@ estimator-visible adaptive events must not contain it.
   seed or PF seed and therefore cannot reconstruct source placement.
 - All four methods in one comparison batch use the same generated environment
   and truth layout. The private manifest binds them to one opaque batch ID,
-  experiment profile, `mix9` scene variant, scene seed, PF seed, and transport
+  experiment profile, `cs4-co3` scene variant, scene seed, PF seed, and transport
   seed. A later batch must use a new seed and batch ID.
 
 Use one main RA-L task. Past Case01/Case02/Case03 paper cases are not part of
 the standard RA-L ablation implementation:
 
-- `mix9_multi_isotope_cardinality`
-- ground truth source cardinality: `4 Cs-137 + 3 Co-60 + 2 Eu-154`
+- `cs4_co3_multi_source_cardinality`
+- ground truth source cardinality: `4 Cs-137 + 3 Co-60`
 - source support: continuous walls, floor, ceiling, and every exposed
   transport-component face from the shared physical surface geometry
 - random placement is uniform with respect to physical surface area,
@@ -48,7 +48,7 @@ meaningful test of separate-source recovery without screening locations for
 favourable visibility or response conditioning.
 
 The runtime is the single production source of the RA-L physical environment.
-`runtime.experiment_profiles.MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE` in the sibling runtime
+`runtime.experiment_profiles.CS_CO_SURFACE_SEARCH_PROFILE` in the sibling runtime
 repository defines the 10 x 15 x 5 m room, and both the runtime scene and the
 truth-free environment payload are derived from that object. Estimator
 repositories must not redeclare those dimensions; they consume the environment
@@ -85,7 +85,7 @@ ground-truth source count in the task.
 
 The paper claim is joint multi-isotope source-term estimation with unknown
 isotope-wise cardinality, 3-D localization, strength estimation, and
-posterior-adaptive attenuation coding. The single MIX-9 task exercises these
+posterior-adaptive attenuation coding. The single Cs4/Co3 task exercises these
 mechanisms in one expensive run.
 
 - `proposed` jointly uses the Fe/Pb pose-pair code in the full-spectrum SMC/RJ
@@ -139,7 +139,7 @@ sibling runtime repository:
 Each row first invokes the sibling runtime's
 `rotating-shield-sim generate-scenario`, which writes both the private
 scenario and a separate private truth manifest keyed by opaque `run_id`. The
-command binds the experiment profile and `mix9` scene variant explicitly;
+command binds the experiment profile and `cs4-co3` scene variant explicitly;
 runtime defaults are not part of the paper contract. It then
 starts the RA-L-only session adapter. The adapter gives the generic PF controller
 an owner-only adaptive Unix socket, an opaque renderer-overlay endpoint, a
@@ -240,7 +240,7 @@ inspect the generated review PNGs.
 ## Result Reporting Contract
 
 Do not place placeholder comparison numbers in the paper. Until the paired
-four-run MIX-9 batch is complete, an older completed run may appear only as a
+four-run Cs4/Co3 batch is complete, an older completed run may appear only as a
 clearly labelled predecessor-code diagnostic. It may demonstrate plotting and
 failure analysis, but it cannot establish the proposed method's current
 accuracy or comparative advantage.
@@ -255,7 +255,7 @@ source cluster. Also report mission motion time separately from the fixed
 2560 s detector live-time budget.
 
 The four variants share one scene within one fresh batch, so report paired
-descriptive differences. Do not treat nine sources as independent experiments
+descriptive differences. Do not treat seven sources as independent experiments
 or attach unsupported p-values to a single scene.
 
 Every variant uses the same immutable joint full-spectrum observation model.

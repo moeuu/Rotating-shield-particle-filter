@@ -107,35 +107,13 @@ global-optimality claim. Its contribution is a tractable posterior-adaptive
 physical code over the complete 64-pair hardware alphabet, evaluated with the
 same full-spectrum probability law as inference.
 
-### 4. Exact transition-preserving history scheduling
-
-TPHT is a supporting computational contribution, not the definition of the
-whole proposed method. It keeps the complete acquired history as the posterior
-target but evaluates a proposal in stages:
-
-```text
-latest exact station -> recent exact stations -> dyadic exact old blocks
-                     -> full exact replay only for survivors.
-```
-
-It uses a reversible two-factor delayed-acceptance decision. An unresolved row
-can be rejected by a valid probability upper bound, but it can never be
-accepted without evaluating every required exact factor. Accepted rows are
-replayed and checked before an atomic CUDA-cache commit.
-
-Tree metadata is logarithmic, but proposal work is data dependent from one to
-all `T` stations. The manuscript must retain the worst-case `O(T)` work per
-proposal and `O(T^2)` acquisition statement; it may report the measured
-reduction in evaluated stations and ESJD per second. It must not claim an
-unconditional `O(T log T)` algorithm.
-
 ## What is and is not novel
 
 The paper's clearest novelty is the coupling of posterior-adaptive physical
 attenuation-code design with shield-conditioned joint transdimensional
 full-spectrum SMC. Shield hardware, particle filters, reversible-jump MCMC,
-expected information gain, conditional greedy selection, and delayed
-acceptance each have prior art and require citations.
+expected information gain, and conditional greedy selection each have prior
+art and require citations.
 
 The defensible implementation-specific contribution is their exact coupling:
 
@@ -143,20 +121,23 @@ The defensible implementation-specific contribution is their exact coupling:
 - the actual code conditions particle weights and structural moves;
 - continuous surface position and strength are moved jointly under that coded
   likelihood; and
-- TPHT skips unnecessary old transport while preserving the same posterior.
+- complete stations are tempered as joint factors before exact full-history
+  one-stage MH/RJ rejuvenation.
 
 Do not claim the first directional detector, first active radiation search,
 first use of shielding, first RJ particle filter, or universal radionuclide
 validation. The current application acceptance is isotope-profile specific.
 
-GPU batching, fixed-capacity caches, strict schemas, provenance binding,
-fail-close lifecycle checks, and CUI rendering are important reproducibility
-engineering but should receive only compact implementation text.
+GPU batching, fixed-capacity source-resolved caches, slot overlays, strict
+schemas, provenance binding, fail-close lifecycle checks, and CUI rendering are
+important reproducibility engineering but should receive only compact
+implementation text. The cache changes execution and memory use; it does not
+define a second posterior or an additional paper contribution.
 
 ## Four full-simulation comparisons
 
 The main paper uses exactly four paired high-fidelity closed-loop runs on one
-fresh `4 Cs-137 + 3 Co-60 + 2 Eu-154` scene:
+fresh `4 Cs-137 + 3 Co-60` scene:
 
 | Variant | Physical shield | Eight-pair code | Pose policy | Question |
 | --- | --- | --- | --- | --- |
@@ -169,12 +150,6 @@ All variants retain the same exact RJSMC, catalog, detector response, candidate
 contract, maximum 16 stations, eight views per station, and 20 s per view. The
 no-shield variant retains the native planner algorithm but need not select the
 same physical poses because its predictive distribution is different.
-
-TPHT versus one-stage exact full-history RJPF is a separate computation
-ablation at matched saved states and proposals. It is not a fifth or sixth
-Geant4 run. Report sweep time, evaluated stations per proposal, full-history
-fraction, peak GPU memory, position/log-strength ESJD per second, exact-target
-agreement, and detailed-balance tests.
 
 ## Evaluation contract
 
@@ -195,7 +170,7 @@ Primary outcomes:
   fixed maximum 2560 s detector live time.
 
 Report medians and ranges or IQRs across sources as descriptive summaries, but
-do not pretend that nine sources in one scene are independent repeated trials.
+do not pretend that seven sources in one scene are independent repeated trials.
 The four runs form one paired batch. Additional independent batches are needed
 for inferential statistics.
 
@@ -223,8 +198,9 @@ Use three vector PDF figures with text at least 7 pt at final size:
    waypoints were persisted.
 
 Planned text allocation is page 1 introduction and Fig. 1; pages 2--4 model and
-method with Fig. 2; page 5 TPHT and experiment contract; pages 6--7 Fig. 3,
-tables, results, and discussion; page 8 limitations, conclusion, and references.
+method with Fig. 2; page 5 experiment and evaluation contract; pages 6--7
+Fig. 3, tables, results, and discussion; page 8 limitations, conclusion, and
+references.
 
 ## Current evidence boundary
 
@@ -244,7 +220,7 @@ four-variant result table explicitly pending rather than fabricating values.
 ## Citation boundary
 
 Use compact citations for: active radiation-source localization with particle
-filters; active planning/EIG; RJMCMC; SMC tempering; delayed acceptance;
+filters; active planning/EIG; RJMCMC; SMC tempering;
 finite-Monte-Carlo template uncertainty; Geant4; evaluated nuclear line data;
 and detector response matrices. Cite the authors' prior shielded-search work to
 make the incremental claim explicit. Standards and simulator implementation

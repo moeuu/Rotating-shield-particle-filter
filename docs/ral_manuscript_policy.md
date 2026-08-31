@@ -24,14 +24,14 @@ These rules apply whenever editing the RA-L manuscript in
 - Allocate most method space to: the shield-conditioned joint multi-isotope
   likelihood; full-station tempered SMC; shield-aware birth, coupled
   position/strength, death/merge RJ moves; conditional-greedy selection of
-  eight poses from all 64 Fe/Pb pairs; and exact TPHT history scheduling.
+  eight poses from all 64 Fe/Pb pairs; and one-stage exact full-history MH/RJ
+  evaluation through the source-resolved CUDA slot overlay.
 - State the boundary precisely: isotope line catalogs are supplied, while the
   detector response operator is isotope-independent. Do not claim isotope-blind
   identification or universal application validation.
-- Present TPHT as an exact acceptance-decision scheduler and supporting
-  computational contribution. Do not describe it as a surrogate posterior or
-  claim unconditional O(T log T) cost; ambiguous decisions may refine to all
-  exact history leaves.
+- Present the fixed-capacity CUDA cache and slot overlay as implementation
+  engineering, not as an independent methodological contribution. Every
+  proposal uses one exact full-history target difference and one MH uniform.
 - Move implementation-only details, simulator details, and long result
   interpretation out of the method section.
 - Keep the experimental section compact. It should define the evaluation setup,
@@ -49,7 +49,8 @@ These rules apply whenever editing the RA-L manuscript in
   problem/shield-coding figure.
 - Pages 2--4: related boundary, model, and the coupled inference/design method;
   the method figure may occupy about one quarter page across both columns.
-- Page 5: exact TPHT scheduler and experiment/evaluation contract.
+- Page 5: experiment and evaluation contract, including the paired Cs4/Co3
+  comparison and truth-matching criteria.
 - Pages 6--7: main paired-projection result figure, four-variant design table,
   provisional diagnostic or final paired results, and discussion.
 - Page 8: limitations, conclusion, and references. Use the full page without

@@ -68,8 +68,19 @@ def load_private_truth_for_completed_result(
 ) -> PrivateEvaluationTruth:
     """Join truth only after PF completion and require an exact run_id match."""
     result = _load_json_object(result_path, name="PF result")
-    if result.get("status") != "complete":
+    if (
+        result.get("schema_version") != 2
+        or result.get("execution_status") != "complete"
+    ):
         raise ValueError("Private truth may be joined only to a completed PF result.")
+    if result.get("sampler_quality_status") not in {
+        "pass",
+        "warning",
+        "failed",
+    }:
+        raise ValueError(
+            "Completed PF result has an invalid sampler_quality_status."
+        )
     run_id = result.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("Completed PF result must declare a nonempty run_id.")

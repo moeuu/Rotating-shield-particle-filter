@@ -28,18 +28,6 @@ class StructuralRJSweepMixin:
             "state_scatter_calls",
             "state_scatter_rows",
             "group_gather_calls",
-            "tpht_proposal_rows",
-            "tpht_refinement_bound_rejected_rows",
-            "tpht_first_stage_station_evaluations",
-            "tpht_first_stage_rejected_rows",
-            "tpht_full_history_rows",
-            "tpht_exact_rejected_rows",
-            "tpht_exact_station_evaluations",
-            "tpht_block_evaluation_calls",
-            "tpht_refinement_rounds",
-            "tpht_staged_replay_rows",
-            "tpht_maximum_block_level",
-            "tpht_debug_oracle_rows",
         ):
             self.last_structural_device_diagnostics[name] = 0
         self._structural_rj_tempering_start_row = tempering_start_row
@@ -75,7 +63,6 @@ class StructuralRJSweepMixin:
                 )
             self._structural_rj_current_target_log_likelihood = current.copy()
         self._structural_rj_torch_generator = None
-        self._structural_rj_tpht_generator = None
         if self._continuous_rj_torch_enabled():
             import torch
 
@@ -92,9 +79,6 @@ class StructuralRJSweepMixin:
             generator = torch.Generator(device=state["strengths"].device)
             generator.manual_seed(seed)
             self._structural_rj_torch_generator = generator
-            tpht_generator = torch.Generator(device=state["strengths"].device)
-            tpht_generator.manual_seed(seed ^ 0x2F4B6D183A5C7091)
-            self._structural_rj_tpht_generator = tpht_generator
             if current_target_log_likelihood is not None:
                 if device_input:
                     current_device = current_target_log_likelihood
@@ -143,15 +127,15 @@ class StructuralRJSweepMixin:
                     or bool(torch.any(~torch.isfinite(station_device)).item())
                 ):
                     raise ValueError(
-                        "CUDA TPHT station targets must align with the "
+                        "CUDA station targets must align with the "
                         "authoritative particle state."
                     )
                 self._structural_rj_current_station_log_likelihood_device = (
                     station_device.clone()
                 )
-            elif self._joint_history_tree_evaluator is not None:
+            elif self._joint_target_evaluator is not None:
                 raise RuntimeError(
-                    "Joint production rejuvenation requires TPHT station targets."
+                    "Joint production rejuvenation requires per-station targets."
                 )
             self.last_structural_device_diagnostics["proposal_backend"] = "torch"
         elif device_input:
@@ -193,7 +177,6 @@ class StructuralRJSweepMixin:
             self._structural_rj_current_target_log_likelihood_device = None
             self._structural_rj_current_station_log_likelihood_device = None
             self._structural_rj_torch_generator = None
-            self._structural_rj_tpht_generator = None
             self._structural_rj_current_block_strength_centers = None
             self._structural_rj_current_block_strength_cardinalities = None
             self._clear_continuous_rj_device_state()
@@ -481,18 +464,6 @@ class StructuralRJSweepMixin:
             "state_scatter_calls",
             "state_scatter_rows",
             "group_gather_calls",
-            "tpht_proposal_rows",
-            "tpht_refinement_bound_rejected_rows",
-            "tpht_first_stage_station_evaluations",
-            "tpht_first_stage_rejected_rows",
-            "tpht_full_history_rows",
-            "tpht_exact_rejected_rows",
-            "tpht_exact_station_evaluations",
-            "tpht_block_evaluation_calls",
-            "tpht_refinement_rounds",
-            "tpht_staged_replay_rows",
-            "tpht_maximum_block_level",
-            "tpht_debug_oracle_rows",
         )
         for name in diagnostic_names:
             self.last_structural_timing_s[f"device_{name}"] = float(

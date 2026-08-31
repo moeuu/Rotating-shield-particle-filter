@@ -320,7 +320,7 @@ class StructuralRJTorchSplitMergeMixin:
                         + torch.log(width)
                     )
                     log_jacobian = torch.log(total_strength)
-                    decision = self._continuous_rj_history_tree_decision_torch(
+                    decision = self._continuous_rj_exact_decision_torch(
                         data,
                         proposed_positions,
                         proposed_strengths,
@@ -369,7 +369,6 @@ class StructuralRJTorchSplitMergeMixin:
                         ),
                         strength_support_feasible=feasible,
                         log_acceptance_ratio=log_ratio,
-                        likelihood_exact=decision.likelihood_exact,
                     )
                     accepted_splits += self._commit_continuous_rj_state_tensors(
                         indices,
@@ -566,7 +565,7 @@ class StructuralRJTorchSplitMergeMixin:
                     - log_forward_position
                 )
                 log_jacobian = -torch.log(merged_strength)
-                decision = self._continuous_rj_history_tree_decision_torch(
+                decision = self._continuous_rj_exact_decision_torch(
                     data,
                     proposed_positions,
                     proposed_strengths,
@@ -615,7 +614,6 @@ class StructuralRJTorchSplitMergeMixin:
                     ),
                     strength_support_feasible=feasible,
                     log_acceptance_ratio=log_ratio,
-                    likelihood_exact=decision.likelihood_exact,
                 )
                 accepted_merges += self._commit_continuous_rj_state_tensors(
                     indices,

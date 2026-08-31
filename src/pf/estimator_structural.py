@@ -11,10 +11,6 @@ from numpy.typing import NDArray
 
 from pf.estimator_types import JointStationObservation
 from pf.full_spectrum import DETECTOR_IMPACT_PHASE_COUNT
-from pf.history_tree import (
-    TPHTProposalDecision,
-    run_tpht_hierarchical_exact_acceptance_torch,
-)
 from pf.joint_transport_cache import (
     JointTransportCache,
 )
@@ -1982,7 +1978,7 @@ class EstimatorStructuralProposalMixin:
         unit_uncollided: "torch.Tensor",
         unit_features: "torch.Tensor",
     ) -> None:
-        """Commit exact TPHT-replayed columns for already accepted rows."""
+        """Commit staged exact columns for already accepted rows."""
         import torch
 
         reference = unit_total
@@ -2029,12 +2025,10 @@ class EstimatorStructuralProposalMixin:
         particle_indices: object,
         target_beta: float,
         tempering_start_row: int | None,
-        station_start: int | None = None,
-        station_stop: int | None = None,
         return_station_log_likelihood: bool = False,
         stage_unit_transport: bool = False,
     ) -> object:
-        """Evaluate a conditional isotope proposal on one exact history block."""
+        """Evaluate a conditional isotope proposal on the exact full history."""
         full_stations = self._active_joint_station_history
         cache = self._joint_structural_transport_cache
         if full_stations is None or cache is None:
@@ -2053,36 +2047,9 @@ class EstimatorStructuralProposalMixin:
             raise ValueError(
                 "Joint structural tempering must begin at the newest station."
             )
-        resolved_station_start = 0 if station_start is None else int(station_start)
-        resolved_station_stop = (
-            len(full_stations) if station_stop is None else int(station_stop)
-        )
-        if (
-            isinstance(station_start, bool)
-            or isinstance(station_stop, bool)
-            or resolved_station_start < 0
-            or resolved_station_stop <= resolved_station_start
-            or resolved_station_stop > len(full_stations)
-        ):
-            raise ValueError("Structural target station block is outside history.")
-        station_offsets = [0]
-        for station in full_stations:
-            station_offsets.append(
-                station_offsets[-1] + int(station.fe_indices.size)
-            )
-        view_start = int(station_offsets[resolved_station_start])
-        view_stop = int(station_offsets[resolved_station_stop])
-        stations = tuple(
-            full_stations[resolved_station_start:resolved_station_stop]
-        )
-        if resolved_station_start or resolved_station_stop != len(full_stations):
-            data = StructuralGeometryBatch(
-                detector_positions=data.detector_positions[view_start:view_stop],
-                fe_indices=data.fe_indices[view_start:view_stop],
-                pb_indices=data.pb_indices[view_start:view_stop],
-                live_times=data.live_times[view_start:view_stop],
-                station_sequence_ids=data.station_sequence_ids[view_start:view_stop],
-            )
+        stations = tuple(full_stations)
+        view_start = 0
+        view_stop = full_total_views
         order = self.joint_isotope_order()
         if filt.isotope not in order:
             raise ValueError("Conditional RJ filter is not a joint isotope.")
@@ -2526,11 +2493,7 @@ class EstimatorStructuralProposalMixin:
             )
             global_column_selection = global_columns
         cardinality = int(positions.shape[1])
-        beta = (
-            float(target_beta)
-            if resolved_station_stop == len(full_stations)
-            else 1.0
-        )
+        beta = float(target_beta)
         if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
             raise ValueError("Joint structural target_beta must lie in [0, 1].")
         if data.row_count != total_views:
@@ -2633,7 +2596,7 @@ class EstimatorStructuralProposalMixin:
             return result.detach().cpu().numpy().astype(np.float64, copy=False)
         if return_station_log_likelihood:
             raise RuntimeError(
-                "TPHT per-station proposal likelihood requires the Torch backend."
+                "Per-station proposal likelihood requires the Torch backend."
             )
         total[:, :, slot_start:slot_stop, :] = 0.0
         uncollided[:, :, slot_start:slot_stop, :] = 0.0
@@ -2653,119 +2616,6 @@ class EstimatorStructuralProposalMixin:
             uncollided_nvsl=uncollided,
             features_nvslf=features,
             target_beta=beta,
-        )
-
-    def _joint_structural_history_tree_evaluator(
-        self,
-        *,
-        filt: IsotopeParticleFilter,
-        data: StructuralGeometryBatch,
-        positions_pks: object,
-        chart_ids_pk: object,
-        strengths_pk: object,
-        particle_indices: object,
-        current_station_log_likelihood_ps: object,
-        base_target_log_likelihood_p: object,
-        log_non_likelihood_ratio_p: object,
-        log_uniform_p: object,
-        log_refinement_uniform_p: object,
-        support_p: object,
-        target_beta: float,
-        tempering_start_row: int | None,
-        move_family: str,
-    ) -> TPHTProposalDecision:
-        """Apply certified dyadic refinement with an ordinary exact MH test.
-
-        Every evaluated child contains actual station likelihoods. Rows stop
-        only when the unresolved discrete-PMF upper bound proves rejection;
-        every other row reaches the same exact ratio as a full-history test.
-        """
-        import torch
-
-        cache = self._joint_structural_transport_cache
-        stations = self._active_joint_station_history
-        if not isinstance(cache, JointTransportCache) or stations is None:
-            raise RuntimeError("TPHT requires the active fixed exact cache.")
-        tensors = (
-            positions_pks,
-            chart_ids_pk,
-            strengths_pk,
-            particle_indices,
-            current_station_log_likelihood_ps,
-            base_target_log_likelihood_p,
-            log_non_likelihood_ratio_p,
-            log_uniform_p,
-            log_refinement_uniform_p,
-            support_p,
-        )
-        if not all(torch.is_tensor(value) for value in tensors):
-            raise TypeError("TPHT production evaluation requires Torch tensors.")
-        positions = positions_pks
-        chart_ids = chart_ids_pk
-        strengths = strengths_pk
-        indices = particle_indices.reshape(-1)
-        row_count = int(indices.numel())
-        if (
-            not isinstance(move_family, str)
-            or not move_family
-            or row_count <= 0
-            or tuple(positions.shape[:1]) != (row_count,)
-            or tuple(chart_ids.shape) != tuple(strengths.shape)
-            or tuple(positions.shape[:2]) != tuple(strengths.shape)
-        ):
-            raise ValueError("TPHT proposal arrays are not row aligned.")
-        reference = base_target_log_likelihood_p
-        if any(value.device != reference.device for value in tensors):
-            raise ValueError("TPHT proposal arrays changed device.")
-        if (
-            reference.dtype != torch.float64
-            or positions.dtype != reference.dtype
-            or strengths.dtype != reference.dtype
-            or indices.dtype != torch.long
-            or chart_ids.dtype != torch.long
-        ):
-            raise TypeError("TPHT proposal state must use float64 and long IDs.")
-
-        def _evaluate_station_block(
-            local_rows: object,
-            station_start: int,
-            station_stop: int,
-            exact_full_history: bool,
-        ) -> object:
-            """Generate and score one exact proposal-history child block."""
-            selected = torch.as_tensor(
-                local_rows,
-                device=reference.device,
-                dtype=torch.long,
-            ).reshape(-1)
-            _, station_values = self._joint_structural_target_evaluator(
-                filt=filt,
-                data=data,
-                positions_pks=torch.index_select(positions, 0, selected),
-                chart_ids_pk=torch.index_select(chart_ids, 0, selected),
-                strengths_pk=torch.index_select(strengths, 0, selected),
-                particle_indices=torch.index_select(indices, 0, selected),
-                target_beta=float(target_beta),
-                tempering_start_row=tempering_start_row,
-                station_start=int(station_start),
-                station_stop=int(station_stop),
-                return_station_log_likelihood=True,
-                stage_unit_transport=bool(exact_full_history),
-            )
-            return station_values
-
-        return run_tpht_hierarchical_exact_acceptance_torch(
-            current_station_log_likelihood_ps=(
-                current_station_log_likelihood_ps
-            ),
-            base_target_log_likelihood_p=base_target_log_likelihood_p,
-            log_non_likelihood_ratio_p=log_non_likelihood_ratio_p,
-            log_uniform_p=log_uniform_p,
-            log_refinement_uniform_p=log_refinement_uniform_p,
-            support_p=support_p,
-            target_beta=float(target_beta),
-            evaluate_station_block=_evaluate_station_block,
-            stage_accepted_rows=True,
         )
 
     def _joint_structural_strength_grid_target_evaluator(

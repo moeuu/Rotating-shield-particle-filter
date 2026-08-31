@@ -349,7 +349,8 @@ def compute_cluster_accuracy_evaluation(
     isotope_results: dict[str, object] = {}
     all_position_errors: list[float] = []
     all_relative_strength_errors: list[float] = []
-    global_failures: list[str] = []
+    global_accuracy_failures: list[str] = []
+    global_hard_cap_failures: list[str] = []
     raw_truth_count = 0
     raw_estimate_count = 0
     for isotope in isotope_names:
@@ -388,7 +389,7 @@ def compute_cluster_accuracy_evaluation(
         truth_rows: list[dict[str, object]] = []
         cluster_signatures: list[NDArray[np.float64]] = []
         covered_truth_indices: list[int] = []
-        isotope_failures: list[str] = []
+        isotope_accuracy_failures: list[str] = []
         isotope_position_errors: list[float] = []
         isotope_relative_strength_errors: list[float] = []
         for truth_index, truth_source in enumerate(truth):
@@ -459,12 +460,18 @@ def compute_cluster_accuracy_evaluation(
                 <= criteria.maximum_relative_strength_error
             )
             if not covered:
-                isotope_failures.append(f"missing_truth_cluster:{truth_index}")
+                isotope_accuracy_failures.append(
+                    f"missing_truth_cluster:{truth_index}"
+                )
             else:
                 if not position_passed:
-                    isotope_failures.append(f"position_error:{truth_index}")
+                    isotope_accuracy_failures.append(
+                        f"position_error:{truth_index}"
+                    )
                 if not strength_passed:
-                    isotope_failures.append(f"strength_error:{truth_index}")
+                    isotope_accuracy_failures.append(
+                        f"strength_error:{truth_index}"
+                    )
             truth_rows.append(
                 {
                     "truth_source_index": truth_index,
@@ -529,17 +536,28 @@ def compute_cluster_accuracy_evaluation(
                 }
             )
         if response_distinct_remote_count:
-            isotope_failures.append("response_distinct_remote_components")
+            isotope_accuracy_failures.append(
+                "response_distinct_remote_components"
+            )
         hard_cap_mass = _hard_cap_mass(
             cardinality_distribution,
             hard_max_sources,
         )
         hard_cap_passed = hard_cap_mass_is_acceptable(hard_cap_mass)
-        if not hard_cap_passed:
-            isotope_failures.append("hard_cardinality_cap_saturation")
+        isotope_hard_cap_failures = (
+            [] if hard_cap_passed else ["hard_cardinality_cap_saturation"]
+        )
         isotope_results[isotope] = {
-            "passed": not isotope_failures,
-            "failure_reasons": isotope_failures,
+            "accuracy_status": (
+                "pass" if not isotope_accuracy_failures else "failed"
+            ),
+            "accuracy_failure_reasons": isotope_accuracy_failures,
+            "hard_cap_sampler_quality_status": (
+                "pass" if hard_cap_passed else "failed"
+            ),
+            "hard_cap_sampler_quality_failure_reasons": (
+                isotope_hard_cap_failures
+            ),
             "raw_truth_count": len(truth),
             "raw_estimate_component_count": len(estimates),
             "raw_component_cardinality_scored": False,
@@ -575,20 +593,31 @@ def compute_cluster_accuracy_evaluation(
             "truth_sources": truth_rows,
             "remote_estimates": remote_rows,
         }
-        global_failures.extend(f"{isotope}:{reason}" for reason in isotope_failures)
+        global_accuracy_failures.extend(
+            f"{isotope}:{reason}" for reason in isotope_accuracy_failures
+        )
+        global_hard_cap_failures.extend(
+            f"{isotope}:{reason}" for reason in isotope_hard_cap_failures
+        )
         raw_truth_count += len(truth)
         raw_estimate_count += len(estimates)
     position_array = np.asarray(all_position_errors, dtype=np.float64)
     strength_array = np.asarray(all_relative_strength_errors, dtype=np.float64)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_family": "completed_pf_cluster_accuracy_evaluation",
         "criteria": criteria.to_dict(),
         "criteria_sha256": criteria.sha256,
         "truth_used_only_after_completion": True,
         "changes_pf_state_or_cardinality": False,
-        "passed": not global_failures,
-        "failure_reasons": global_failures,
+        "accuracy_status": (
+            "pass" if not global_accuracy_failures else "failed"
+        ),
+        "accuracy_failure_reasons": global_accuracy_failures,
+        "hard_cap_sampler_quality_status": (
+            "pass" if not global_hard_cap_failures else "failed"
+        ),
+        "hard_cap_sampler_quality_failure_reasons": global_hard_cap_failures,
         "global": {
             "truth_source_count": raw_truth_count,
             "raw_estimate_component_count": raw_estimate_count,

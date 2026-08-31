@@ -1108,10 +1108,10 @@ def test_lineage_recovery_certifies_only_changed_full_support_rows() -> None:
     )
 
 
-def test_lineage_recovery_certificate_extinction_fails_closed(
+def test_lineage_recovery_certificate_extinction_marks_mixing_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Resampling away certified descendants must reactivate recovery failure."""
+    """Resampling away certified descendants must reactivate its warning."""
     estimator = _joint_row_identity_estimator()
     collapsed = np.zeros(4, dtype=np.int64)
     estimator._joint_cumulative_lineage_ids = collapsed.copy()
@@ -1139,14 +1139,14 @@ def test_lineage_recovery_certificate_extinction_fails_closed(
     )
     estimator.pf_config.joint_smc_rejuvenation_wall_time_limit_s = 1.0e-12
 
-    with pytest.raises(RuntimeError, match="certified_recovery_by_isotope"):
-        estimator._joint_rejuvenate_adaptive(
-            (),
-            target_beta=1.0,
-            station_start_s=time.perf_counter(),
-            enforce_lineage_recovery=True,
-        )
+    estimator._joint_rejuvenate_adaptive(
+        (),
+        target_beta=1.0,
+        station_start_s=time.perf_counter(),
+        enforce_lineage_recovery=True,
+    )
 
+    assert estimator.last_joint_rejuvenation_mixing_incomplete
     assert not any(
         np.any(mask)
         for mask in (
@@ -4114,10 +4114,10 @@ def test_guided_cardinality_draws_cover_prior_strata_deterministically() -> None
     )
 
 
-def test_adaptive_rejuvenation_fails_at_wall_time_without_mixing(
+def test_adaptive_rejuvenation_stops_at_wall_time_with_mixing_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The wall-time limit must fail rather than bless an unmixed state."""
+    """The wall-time limit must stop without blessing an unmixed state."""
     estimator = object.__new__(RotatingShieldPFEstimator)
     estimator.pf_config = SimpleNamespace(
         joint_rejuvenation_min_sweeps=1,
@@ -4157,15 +4157,11 @@ def test_adaptive_rejuvenation_fails_at_wall_time_without_mixing(
     estimator.last_joint_rejuvenation_diagnostics = []
     estimator.pf_config.joint_smc_rejuvenation_wall_time_limit_s = 1.0
     calls = 0
-    with pytest.raises(
-        RuntimeError,
-        match="exceeded its rejuvenation wall-time contract",
-    ):
-        estimator._joint_rejuvenate_adaptive(
-            (),
-            target_beta=0.5,
-            station_start_s=time.perf_counter() - 2.0,
-        )
+    estimator._joint_rejuvenate_adaptive(
+        (),
+        target_beta=0.5,
+        station_start_s=time.perf_counter() - 2.0,
+    )
 
     assert calls == 1
     assert estimator.last_joint_smc_wall_time_limit_exceeded
@@ -4173,15 +4169,11 @@ def test_adaptive_rejuvenation_fails_at_wall_time_without_mixing(
     estimator.last_joint_rejuvenation_diagnostics = []
     estimator.last_joint_smc_wall_time_limit_exceeded = False
     calls = 1
-    with pytest.raises(
-        RuntimeError,
-        match="exceeded its rejuvenation wall-time contract",
-    ):
-        estimator._joint_rejuvenate_adaptive(
-            (),
-            target_beta=0.5,
-            station_start_s=time.perf_counter() - 2.0,
-        )
+    estimator._joint_rejuvenate_adaptive(
+        (),
+        target_beta=0.5,
+        station_start_s=time.perf_counter() - 2.0,
+    )
 
     assert calls == 2
     assert estimator.last_joint_smc_wall_time_limit_exceeded
@@ -4524,10 +4516,10 @@ def test_intermediate_target_never_waits_for_final_cardinality_health(
     assert final["hard_boundary_saturated.Co-60"] == 0.0
 
 
-def test_final_target_hard_boundary_fails_without_repeated_sweeps(
+def test_final_target_hard_boundary_marks_quality_without_repeated_sweeps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Final hard-cap saturation must fail immediately, not after a timeout."""
+    """Final hard-cap saturation must mark quality without wasting sweeps."""
     estimator = object.__new__(RotatingShieldPFEstimator)
     estimator.pf_config = SimpleNamespace(
         joint_rejuvenation_min_sweeps=1,
@@ -4561,14 +4553,17 @@ def test_final_target_hard_boundary_fails_without_repeated_sweeps(
         }
 
     monkeypatch.setattr(estimator, "_joint_rejuvenate", _sweep)
-    with pytest.raises(RuntimeError, match="saturated the hard cardinality"):
-        estimator._joint_rejuvenate_adaptive(
-            (),
-            target_beta=1.0,
-            station_start_s=time.perf_counter(),
-        )
+    estimator._joint_rejuvenate_adaptive(
+        (),
+        target_beta=1.0,
+        station_start_s=time.perf_counter(),
+    )
 
     assert calls == 1
+    assert estimator.last_joint_structural_mixing_incomplete
+    assert estimator.last_joint_structural_mixing_incomplete_by_isotope == {
+        "Co-60": True
+    }
 
 
 def test_final_ordinary_boundary_does_not_require_prior_acceptance(

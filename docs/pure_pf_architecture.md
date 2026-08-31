@@ -130,11 +130,10 @@ is an error rather than a forced likelihood application.
 Exact-RJ history evaluation uses the fixed-capacity, source-resolved CUDA cache
 described in [Fixed-horizon exact transport cache](joint_exact_transport_cache.md).
 It replaces changed isotope slot blocks without copying unchanged history and
-uses the [Transition-Preserving History Tree](transition_preserving_history_tree.md)
-to test the actual latest-station factor first and progressively evaluate exact
-dyadic child blocks for surviving proposals. The full acquired history remains
-the posterior target; no station represents another station, and no spectrum is
-weighted, averaged, or discarded.
+evaluates the complete acquired history once for every supported proposal. The
+one-stage MH/RJ decision uses that exact target difference and one uniform
+draw. No station represents another station, and no spectrum is weighted,
+averaged, screened, or discarded.
 
 Within each intermediate target, conditional isotope moves evaluate the full
 joint spectrum with all other isotope states held fixed. The reversible-jump
@@ -177,22 +176,23 @@ prior, reverse-minus-forward proposal, Jacobian, support, nonfinite, and MH
 random terms. Counts of unweighted moved particles are retained only as
 secondary diagnostics. Structural mixing is gated independently per isotope;
 motion in Co-60 cannot satisfy a stalled Cs-137 boundary transition. Hard-cap
-saturation and unavailable diversity evidence abort the live lifecycle instead
-of being published only as warnings. A cumulative-lineage collapse starts one
-persistent recovery epoch. Exact full-support moves certify only rows whose
-isotope state actually changed, and those certificates follow the same batched
-ancestor vector through later resampling. Planning may resume only while every
-isotope retains the configured certified posterior-weight mass and the joint
-state population meets the ESS-derived distinct-state floor. The PF does not
-require an unrelated fresh global acceptance at every later station; loss or
-malformed provenance still fails closed.
+saturation, cumulative-lineage collapse, incomplete recovery, and incomplete
+mixing are recorded as isotope-specific sampler-quality evidence; they do not
+discard an otherwise complete acquisition. Exact full-support moves certify
+only rows whose isotope state actually changed, and those certificates follow
+the same batched ancestor vector through later resampling. The PF does not
+require an unrelated fresh global acceptance at every later station. Missing
+proposal attempts, invalid support, non-finite MH ratios, or malformed
+provenance remain kernel-integrity errors and fail closed.
 
 Accepted birth moves count as full-support recovery evidence because their
 position and strength proposal retains a positive physical-prior component over
 the complete configured support. Rejuvenation has no independent fixed sweep
-ceiling: it continues until the movement and lineage gates pass or the explicit
-emergency wall-time contract aborts the station. This avoids a second, much
-shorter timeout silently overriding the declared wall-time policy.
+ceiling: it continues until the movement and lineage diagnostics pass, until
+progress stalls for the configured number of sweeps, or until the explicit
+station wall-time guard is reached. The latter two outcomes end rejuvenation
+with a sampler-quality warning and allow acquisition to continue; they are not
+relabelled as execution failures.
 
 ## Posterior reporting and stopping
 

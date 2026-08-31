@@ -96,7 +96,7 @@ class StructuralRJTorchBlockIndependenceMixin:
             grid_size,
         ).reshape(-1)
         conditional_target = (
-            self._continuous_rj_recent_proposal_log_likelihood_torch(
+            self._continuous_rj_proposal_guide_log_target_torch(
                 data,
                 expanded_positions,
                 candidate_strengths.reshape(candidate_count, int(cardinality)),
@@ -439,7 +439,7 @@ class StructuralRJTorchBlockIndependenceMixin:
                 & torch.isfinite(current_log_prior[rows])
                 & torch.isfinite(current_log_proposal[rows])
             )
-            decision = self._continuous_rj_history_tree_decision_torch(
+            decision = self._continuous_rj_exact_decision_torch(
                 data,
                 positions,
                 strengths,
@@ -479,7 +479,6 @@ class StructuralRJTorchBlockIndependenceMixin:
                     else torch.ones_like(accepted)
                 ),
                 log_acceptance_ratio=log_ratio,
-                likelihood_exact=decision.likelihood_exact,
             )
             accepted_count += self._commit_continuous_rj_state_tensors(
                 particle_indices,

@@ -24,6 +24,7 @@ def evaluate_completed_pf_run(
     truth_manifest_path: str | Path,
 ) -> dict[str, Any]:
     """Return standard metrics after an exact completed-run private-truth join."""
+    result = _load_json_object(result_path, name="PF result")
     truth = load_private_truth_for_completed_result(
         result_path,
         truth_manifest_path,
@@ -58,6 +59,20 @@ def evaluate_completed_pf_run(
         evaluation_input,
         criteria=DEFAULT_CLUSTER_ACCURACY_CRITERIA,
     )
+    sampler_quality_status = result.get("sampler_quality_status")
+    if sampler_quality_status not in {"pass", "warning", "failed"}:
+        raise ValueError(
+            "Completed PF result has an invalid sampler_quality_status."
+        )
+    hard_cap_failed = (
+        evaluation["hard_cap_sampler_quality_status"] == "failed"
+    )
+    if hard_cap_failed != (sampler_quality_status == "failed"):
+        raise ValueError(
+            "Completed PF sampler quality contradicts hard-cap posterior evidence."
+        )
+    evaluation["execution_status"] = "complete"
+    evaluation["sampler_quality_status"] = sampler_quality_status
     evaluation["run_identity"] = {
         "run_id": truth.run_id,
         "experiment_profile_id": truth.experiment_profile_id,

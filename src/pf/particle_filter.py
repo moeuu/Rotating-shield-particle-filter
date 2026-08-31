@@ -324,7 +324,6 @@ class IsotopeParticleFilter(
             "torch.Tensor" | None
         ) = None
         self._structural_rj_torch_generator: "torch.Generator" | None = None
-        self._structural_rj_tpht_generator: "torch.Generator" | None = None
         self._structural_rj_device_constants: dict[str, "torch.Tensor"] = {}
         self.last_structural_target_log_likelihood: NDArray[np.float64] | None = None
         self.last_structural_target_log_likelihood_device: (
@@ -334,7 +333,6 @@ class IsotopeParticleFilter(
             "torch.Tensor" | None
         ) = None
         self._joint_target_evaluator: Callable[..., NDArray[np.float64]] | None = None
-        self._joint_history_tree_evaluator: Callable[..., object] | None = None
         self._joint_strength_grid_target_evaluator: (
             Callable[..., NDArray[np.float64]] | None
         ) = None

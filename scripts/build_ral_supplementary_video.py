@@ -88,7 +88,7 @@ def discover_storyboard_segments(root: Path = ROOT) -> list[VideoSegment]:
             image_path=figure_root / "geant4_obstacle_scatter.png",
         ),
         VideoSegment(
-            title="MIX-9 PF output",
+            title="Cs4/Co3 PF output",
             caption=(
                 "The final figure summarizes source-term estimates, ground truth, "
                 "PF support, and the robot trajectory for the main multi-isotope run."

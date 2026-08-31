@@ -13,6 +13,7 @@ from measurement.source_surfaces import (
     SOURCE_SURFACE_REPORT_LABELS,
     source_surface_kinds,
 )
+from pf.cardinality_policy import HARD_CAP_POSTERIOR_MASS_LIMIT
 from pf.estimator_config import (
     _strict_config_number,
     _strict_nonnegative_integer,
@@ -895,6 +896,7 @@ class EstimatorReportingMixin:
                 "r_weighted_mean": r_weighted_mean,
                 "r_weighted_var": r_weighted_var,
                 "r_probability_by_count": r_probability_by_count,
+                "hard_max_sources": int(filt.config.hard_max_sources or 0),
                 "r_particle_count_by_count": r_particle_count_by_count,
                 "posterior": (
                     posterior_positions,
@@ -1612,6 +1614,14 @@ class EstimatorReportingMixin:
                 int(cardinality): float(mass)
                 for cardinality, mass in point_estimate.cardinality_distribution.items()
             }
+            hard_cap_source_count = int(filt.config.hard_max_sources or 0)
+            if hard_cap_source_count <= 0:
+                raise RuntimeError(
+                    "Variable-cardinality convergence requires a hard source cap."
+                )
+            hard_cap_posterior_mass = float(
+                distribution.get(hard_cap_source_count, 0.0)
+            )
             ordinary_maximum = int(filt.config.max_sources or 0)
             boundary_mass = float(
                 sum(
@@ -1668,6 +1678,9 @@ class EstimatorReportingMixin:
                     default=0.0,
                 ),
                 "maximum_cardinality_boundary_mass": boundary_mass,
+                "hard_cap_source_count": hard_cap_source_count,
+                "hard_cap_posterior_mass": hard_cap_posterior_mass,
+                "hard_cap_posterior_mass_limit": HARD_CAP_POSTERIOR_MASS_LIMIT,
                 "credible_surface_radii_95_m": radii,
                 "surface_connected_masses": connected_masses,
                 "minimum_surface_connected_mass": minimum_connected_mass,

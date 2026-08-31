@@ -324,7 +324,7 @@ def select_paper_subset(
                 f"Paper variants must share one exact {field}; found {sorted(values)}."
             )
     if selected[0]["case"] != RAL_CASE_NAME:
-        raise ValueError("Paper batch must use the declared MIX-9 case.")
+        raise ValueError("Paper batch must use the declared Cs4/Co3 case.")
     if selected[0]["experiment_profile_id"] != RAL_EXPERIMENT_PROFILE_ID:
         raise ValueError("Paper batch has the wrong experiment profile.")
     if selected[0]["scene_variant_id"] != RAL_SCENE_VARIANT_ID:

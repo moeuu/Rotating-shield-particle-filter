@@ -616,18 +616,14 @@ def _compact_pf_diagnostics(estimator: object) -> dict[str, object]:
         raise PFLiveSessionError(
             "PF sampler health must contain exactly the three Boolean gates."
         )
-    failed_sampler_gates = sorted(
+    sampler_quality_reasons = sorted(
         name for name in expected_sampler_health if sampler_health[name] is not True
     )
-    if failed_sampler_gates:
-        raise PFLiveSessionError(
-            "PF live state cannot be sealed with failed sampler-health gates: "
-            f"{failed_sampler_gates}."
-        )
     isotope_rows = convergence.get("isotopes")
     if not isinstance(isotope_rows, Mapping) or not isotope_rows:
         raise PFLiveSessionError("PF convergence requires nonempty isotope rows.")
     normalized_isotope_rows: dict[str, object] = {}
+    hard_cap_failures: list[str] = []
     for isotope, raw_row in isotope_rows.items():
         if not isinstance(isotope, str) or not isotope:
             raise PFLiveSessionError(
@@ -644,6 +640,27 @@ def _compact_pf_diagnostics(estimator: object) -> dict[str, object]:
                 location=f"PF convergence {isotope} cardinality distribution",
             )
         )
+        hard_cap_mass = row.get("hard_cap_posterior_mass")
+        hard_cap_limit = row.get("hard_cap_posterior_mass_limit")
+        hard_cap_count = row.get("hard_cap_source_count")
+        if (
+            isinstance(hard_cap_count, bool)
+            or not isinstance(hard_cap_count, int)
+            or hard_cap_count <= 0
+            or isinstance(hard_cap_mass, bool)
+            or not isinstance(hard_cap_mass, (int, float))
+            or isinstance(hard_cap_limit, bool)
+            or not isinstance(hard_cap_limit, (int, float))
+            or not np.isfinite(float(hard_cap_mass))
+            or not np.isfinite(float(hard_cap_limit))
+            or not 0.0 <= float(hard_cap_mass) <= 1.0 + 1.0e-12
+            or not 0.0 <= float(hard_cap_limit) < 1.0
+        ):
+            raise PFLiveSessionError(
+                f"PF convergence {isotope} has invalid hard-cap evidence."
+            )
+        if float(hard_cap_mass) > float(hard_cap_limit):
+            hard_cap_failures.append(isotope)
         normalized_isotope_rows[isotope] = row
     convergence["isotopes"] = normalized_isotope_rows
     joint_gates = convergence.get("joint_gates")
@@ -657,9 +674,23 @@ def _compact_pf_diagnostics(estimator: object) -> dict[str, object]:
             for name, value in joint_gates.items()
             if name not in sampler_health
         }
+    sampler_quality_reasons.extend(
+        f"hard_cap_posterior_mass_exceeded.{isotope}"
+        for isotope in sorted(hard_cap_failures)
+    )
+    sampler_quality_status = (
+        "failed"
+        if hard_cap_failures
+        else "warning"
+        if sampler_quality_reasons
+        else "pass"
+    )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "estimator_family": "pure_particle_filter",
+        "execution_status": "complete",
+        "sampler_quality_status": sampler_quality_status,
+        "sampler_quality_reasons": sorted(set(sampler_quality_reasons)),
         "posterior_convergence": convergence,
         "posterior_predictive_check": dict(raw_predictive),
         "sampler_health": dict(sampler_health),

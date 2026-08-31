@@ -38,10 +38,11 @@ measurements.
 
 A remote component is response-distinct when its cosine similarity to every
 covered source-cluster response is below 0.995. Any response-distinct remote
-component fails the run. A spatially remote but response-indistinguishable
-component is reported explicitly as an observability ambiguity; it is not
-silently counted as a new physical source and does not fail the raw-cardinality
-criterion.
+component fails the post-run accuracy assessment. It does not retroactively
+make the completed acquisition an execution failure. A spatially remote but
+response-indistinguishable component is reported explicitly as an
+observability ambiguity; it is not silently counted as a new physical source
+and does not fail the raw-cardinality criterion.
 
 ## Sampler capacity
 
@@ -56,14 +57,27 @@ diagnostic only. When that mass is material, live health verifies that inward
 proposals were attempted, had support, and produced a finite MH ratio; a finite
 batch is allowed to reject every such proposal.
 
-## Run-level success
+## Independent result statuses
 
-A completed run passes only when all of the following hold:
+Every result reports three separate statuses:
+
+- `execution_status`: whether the requested acquisition and posterior
+  publication completed;
+- `sampler_quality_status`: whether truth-free hard-cap, lineage, and mixing
+  diagnostics passed; and
+- `accuracy_status`: the private-truth position, strength, source-coverage, and
+  remote-component assessment performed only after completion.
+
+`accuracy_status=pass` requires all of the following:
 
 1. every true same-isotope source has a local estimated cluster;
 2. every cluster meets the position and summed-strength limits;
-3. no response-distinct remote component remains; and
-4. no isotope is saturated at the hard cardinality cap.
+3. no response-distinct remote component remains.
+
+Hard-cap saturation belongs only to `sampler_quality_status`. A run may
+therefore have `execution_status=complete`, `sampler_quality_status=failed`,
+and `accuracy_status=pass`, or any other evidence-consistent combination. No
+aggregate legacy `passed` field is emitted.
 
 The criteria payload and its SHA-256 digest are written into every evaluation
 artifact. Changing a criterion requires changing this policy before evaluating
@@ -74,6 +88,11 @@ The truth-free `pf_post_run_evaluation_input.json` has one exact schema-v1
 contract. Unknown or missing fields, a mismatched run or MeasurementLog hash,
 reordered modes, duplicate mode labels, and zero or non-normalized response
 columns are errors. They are never ignored or replaced with defaults.
+
+The truth-bearing evaluation report uses schema v2 and cross-checks its
+hard-cap evidence against the published sampler-quality status. A contradiction
+is an artifact-integrity error rather than a status that can be silently
+reconciled.
 
 The private RA-L session orchestrator runs this evaluation after every
 successful full simulation. It does not pass truth to the PF controller and it

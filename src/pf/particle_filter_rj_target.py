@@ -8,11 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.continuous_kernels import LineTransportComponents
-from pf.history_tree import (
-    TPHT_LOG_PROBABILITY_UPPER_BOUND,
-    TPHT_RECENT_EXACT_STATIONS,
-    TPHTProposalDecision,
-)
+from pf.exact_mh import ExactMHDecision, run_exact_mh_acceptance_torch
 from pf.particle_types import StructuralGeometryBatch, TorchLineTransportComponents
 from pf.state import IsotopeState
 
@@ -552,15 +548,6 @@ class StructuralRJTargetMixin:
         if generator is None or not self._continuous_rj_torch_enabled():
             raise RuntimeError(
                 "A station-authoritative CUDA RJ sweep has no Torch generator."
-            )
-        return generator
-
-    def _continuous_rj_tpht_generator_required(self) -> object:
-        """Return the independent CUDA generator for TPHT refinement tests."""
-        generator = self._structural_rj_tpht_generator
-        if generator is None or not self._continuous_rj_torch_enabled():
-            raise RuntimeError(
-                "A station-authoritative CUDA RJ sweep has no TPHT generator."
             )
         return generator
 
@@ -1156,7 +1143,7 @@ class StructuralRJTargetMixin:
             )
         return result
 
-    def _continuous_rj_recent_proposal_log_likelihood_torch(
+    def _continuous_rj_proposal_guide_log_target_torch(
         self,
         data: StructuralGeometryBatch,
         positions: object,
@@ -1166,73 +1153,15 @@ class StructuralRJTargetMixin:
         particle_indices: object,
         target_beta: float,
     ) -> object:
-        """Evaluate the exact recent window used only to guide a proposal.
-
-        This density is evaluated symmetrically in both proposal directions.
-        It changes proposal efficiency only; the certified history scheduler
-        still makes the final decision with the ordinary exact-MH ratio.
-        """
-        import torch
-
-        if self._joint_target_evaluator is None:
-            raise RuntimeError("TPHT proposal guide requires the joint evaluator.")
-        current_station = (
-            self._structural_rj_current_station_log_likelihood_device
-        )
-        if current_station is None or current_station.ndim != 2:
-            if self._joint_history_tree_evaluator is not None:
-                raise RuntimeError(
-                    "Production TPHT proposal guide requires the station cache."
-                )
-            # Directly constructed filters are the explicit small test oracle.
-            return self._continuous_rj_group_log_likelihood_torch(
-                data,
-                positions,
-                strengths,
-                chart_ids=chart_ids,
-                particle_indices=particle_indices,
-                target_beta=float(target_beta),
-            )
-        station_count = int(current_station.shape[1])
-        beta = float(target_beta)
-        if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
-            raise ValueError("TPHT proposal-guide target_beta must lie in [0, 1].")
-        row_count = int(positions.shape[0])
-        recent_start = max(0, station_count - TPHT_RECENT_EXACT_STATIONS)
-        _, station_values = self._joint_target_evaluator(
-            filt=self,
-            data=data,
-            positions_pks=positions,
-            chart_ids_pk=chart_ids,
-            strengths_pk=strengths,
+        """Evaluate the full-history target used symmetrically by a proposal."""
+        return self._continuous_rj_group_log_likelihood_torch(
+            data,
+            positions,
+            strengths,
+            chart_ids=chart_ids,
             particle_indices=particle_indices,
-            target_beta=beta,
-            tempering_start_row=self._structural_rj_tempering_start_row,
-            station_start=recent_start,
-            station_stop=station_count,
-            return_station_log_likelihood=True,
-            stage_unit_transport=False,
+            target_beta=float(target_beta),
         )
-        station_values = torch.as_tensor(
-            station_values,
-            device=positions.device,
-            dtype=positions.dtype,
-        )
-        recent_count = station_count - recent_start
-        if tuple(station_values.shape) != (row_count, recent_count) or bool(
-            torch.any(torch.isnan(station_values)).item()
-            or torch.any(
-                station_values > TPHT_LOG_PROBABILITY_UPPER_BOUND + 1.0e-8
-            ).item()
-        ):
-            raise RuntimeError("TPHT proposal guide violates its PMF contract.")
-        powers = torch.ones(
-            recent_count,
-            device=positions.device,
-            dtype=positions.dtype,
-        )
-        powers[-1] = beta
-        return torch.sum(station_values * powers[None, :], dim=1)
 
     def _continuous_rj_current_log_likelihood(
         self,
@@ -1404,13 +1333,13 @@ class StructuralRJTargetMixin:
         if station_cached is None:
             if proposed_station_log_likelihood is not None:
                 raise RuntimeError(
-                    "A TPHT station proposal exists without its current cache."
+                    "A per-station proposal exists without its current cache."
                 )
             return
         if proposed_station_log_likelihood is None or not torch.is_tensor(
             proposed_station_log_likelihood
         ):
-            raise RuntimeError("TPHT accepted rows require per-station targets.")
+            raise RuntimeError("Accepted rows require per-station targets.")
         station_proposed = proposed_station_log_likelihood
         if (
             station_proposed.device != station_cached.device
@@ -1418,13 +1347,13 @@ class StructuralRJTargetMixin:
             or tuple(station_proposed.shape)
             != (int(indices.numel()), int(station_cached.shape[1]))
         ):
-            raise RuntimeError("TPHT station-target update is misaligned.")
+            raise RuntimeError("Per-station target update is misaligned.")
         selected_station = station_proposed[acceptance]
         if bool(torch.any(~torch.isfinite(selected_station)).item()):
-            raise RuntimeError("Accepted TPHT station targets are invalid.")
+            raise RuntimeError("Accepted per-station targets are invalid.")
         station_cached.index_copy_(0, selected_indices, selected_station)
 
-    def _continuous_rj_history_tree_decision_torch(
+    def _continuous_rj_exact_decision_torch(
         self,
         data: StructuralGeometryBatch,
         proposed_positions: object,
@@ -1437,8 +1366,8 @@ class StructuralRJTargetMixin:
         support: object,
         target_beta: float,
         move_family: str,
-    ) -> TPHTProposalDecision:
-        """Return an exact batched MH decision through the active history tree."""
+    ) -> ExactMHDecision:
+        """Evaluate one full-history target and make one exact MH decision."""
         import torch
 
         values = (
@@ -1451,7 +1380,7 @@ class StructuralRJTargetMixin:
             support,
         )
         if not all(torch.is_tensor(value) for value in values):
-            raise TypeError("CUDA TPHT decisions require Torch tensors.")
+            raise TypeError("CUDA exact-MH decisions require Torch tensors.")
         base = base_log_likelihood.reshape(-1)
         non_likelihood = log_non_likelihood_ratio.reshape(-1)
         feasible = support.to(dtype=torch.bool).reshape(-1)
@@ -1463,22 +1392,7 @@ class StructuralRJTargetMixin:
             or tuple(non_likelihood.shape) != (row_count,)
             or tuple(feasible.shape) != (row_count,)
         ):
-            raise ValueError("CUDA TPHT decision arrays are not row aligned.")
-        generator = self._continuous_rj_torch_generator_required()
-        uniforms = torch.rand(
-            (row_count,),
-            device=base.device,
-            dtype=base.dtype,
-            generator=generator,
-        )
-        log_uniform = torch.log(uniforms)
-        refinement_uniform = torch.rand(
-            (row_count,),
-            device=base.device,
-            dtype=base.dtype,
-            generator=self._continuous_rj_tpht_generator_required(),
-        )
-        log_refinement_uniform = torch.log(refinement_uniform)
+            raise ValueError("CUDA exact-MH decision arrays are not row aligned.")
         diagnostics = self.last_structural_device_diagnostics
         diagnostics["mh_acceptance_calls"] = int(
             diagnostics.get("mh_acceptance_calls", 0)
@@ -1486,121 +1400,113 @@ class StructuralRJTargetMixin:
         diagnostics["mh_acceptance_rows"] = int(
             diagnostics.get("mh_acceptance_rows", 0)
         ) + row_count
-        evaluator = self._joint_history_tree_evaluator
         current_station = (
             self._structural_rj_current_station_log_likelihood_device
         )
-        if evaluator is None:
-            # A directly constructed filter is the explicit small test oracle.
-            # The production estimator always installs both joint evaluators;
-            # that wiring is asserted independently by contract tests.
-            proposed_target = self._continuous_rj_group_log_likelihood_torch(
-                data,
-                proposed_positions,
-                proposed_strengths,
-                chart_ids=proposed_chart_ids,
-                particle_indices=particle_indices,
-                target_beta=target_beta,
-            )
-            delta = proposed_target - base
-            ratio = delta + non_likelihood
-            accepted = feasible & (log_uniform < ratio)
-            exact = torch.ones_like(accepted)
-            diagnostics["tpht_debug_oracle_rows"] = int(
-                diagnostics.get("tpht_debug_oracle_rows", 0)
-            ) + row_count
-            return TPHTProposalDecision(
-                accepted=accepted,
-                proposed_target_log_likelihood=proposed_target,
-                proposed_station_log_likelihood=None,
-                diagnostic_delta_log_likelihood=delta,
-                diagnostic_log_acceptance_ratio=ratio,
-                likelihood_exact=exact,
-                evaluated_station_count=torch.zeros_like(
-                    particle_indices,
-                    dtype=torch.long,
-                ),
-                early_rejected=torch.zeros_like(accepted),
-                block_evaluation_count=1,
-                maximum_block_level=0,
-                refinement_round_count=1,
-                refinement_bound_rejected=torch.zeros_like(accepted),
-                exact_rejected=feasible & ~accepted,
-                staged_replay_row_count=0,
-                first_stage_station_count=torch.zeros_like(
-                    particle_indices,
-                    dtype=torch.long,
-                ),
-                first_stage_rejected=torch.zeros_like(accepted),
-            )
+        supported_rows = torch.nonzero(
+            feasible,
+            as_tuple=False,
+        ).reshape(-1)
+        proposed_target = torch.full_like(base, float("-inf"))
         if current_station is None:
-            raise RuntimeError(
-                "The production TPHT evaluator has no current station cache."
-            )
-        indices = particle_indices.reshape(-1)
-        current_station_rows = torch.index_select(
-            current_station,
-            0,
-            indices,
+            # Directly constructed filters are the explicit small test oracle.
+            proposed_station = None
+            if int(supported_rows.numel()):
+                selected_target = self._continuous_rj_group_log_likelihood_torch(
+                    data,
+                    torch.index_select(proposed_positions, 0, supported_rows),
+                    torch.index_select(proposed_strengths, 0, supported_rows),
+                    chart_ids=torch.index_select(
+                        proposed_chart_ids,
+                        0,
+                        supported_rows,
+                    ),
+                    particle_indices=torch.index_select(
+                        particle_indices.reshape(-1),
+                        0,
+                        supported_rows,
+                    ),
+                    target_beta=target_beta,
+                )
+                proposed_target.index_copy_(
+                    0,
+                    supported_rows,
+                    selected_target,
+                )
+        else:
+            if self._joint_target_evaluator is None:
+                raise RuntimeError(
+                    "Production exact MH requires the joint target evaluator."
+                )
+            indices = particle_indices.reshape(-1)
+            proposed_station = torch.index_select(
+                current_station,
+                0,
+                indices,
+            ).clone()
+            if int(supported_rows.numel()):
+                selected_target, selected_station = self._joint_target_evaluator(
+                    filt=self,
+                    data=data,
+                    positions_pks=torch.index_select(
+                        proposed_positions,
+                        0,
+                        supported_rows,
+                    ),
+                    chart_ids_pk=torch.index_select(
+                        proposed_chart_ids,
+                        0,
+                        supported_rows,
+                    ),
+                    strengths_pk=torch.index_select(
+                        proposed_strengths,
+                        0,
+                        supported_rows,
+                    ),
+                    particle_indices=torch.index_select(
+                        indices,
+                        0,
+                        supported_rows,
+                    ),
+                    target_beta=float(target_beta),
+                    tempering_start_row=self._structural_rj_tempering_start_row,
+                    return_station_log_likelihood=True,
+                    stage_unit_transport=True,
+                )
+                selected_target = torch.as_tensor(
+                    selected_target,
+                    device=base.device,
+                    dtype=base.dtype,
+                ).reshape(-1)
+                selected_station = torch.as_tensor(
+                    selected_station,
+                    device=base.device,
+                    dtype=base.dtype,
+                )
+                proposed_target.index_copy_(
+                    0,
+                    supported_rows,
+                    selected_target,
+                )
+                proposed_station.index_copy_(
+                    0,
+                    supported_rows,
+                    selected_station,
+                )
+            expected_station_shape = (row_count, int(current_station.shape[1]))
+            if tuple(proposed_station.shape) != expected_station_shape:
+                raise RuntimeError(
+                    "Exact-MH proposal station targets are misaligned."
+                )
+        del move_family
+        return run_exact_mh_acceptance_torch(
+            current_target_log_likelihood=base,
+            proposed_target_log_likelihood=proposed_target,
+            proposed_station_log_likelihood=proposed_station,
+            log_non_likelihood_ratio=non_likelihood,
+            support=feasible,
+            generator=self._continuous_rj_torch_generator_required(),
         )
-        decision = evaluator(
-            filt=self,
-            data=data,
-            positions_pks=proposed_positions,
-            chart_ids_pk=proposed_chart_ids,
-            strengths_pk=proposed_strengths,
-            particle_indices=indices,
-            current_station_log_likelihood_ps=current_station_rows,
-            base_target_log_likelihood_p=base,
-            log_non_likelihood_ratio_p=non_likelihood,
-            log_uniform_p=log_uniform,
-            log_refinement_uniform_p=log_refinement_uniform,
-            support_p=feasible,
-            target_beta=float(target_beta),
-            tempering_start_row=self._structural_rj_tempering_start_row,
-            move_family=str(move_family),
-        )
-        if not isinstance(decision, TPHTProposalDecision):
-            raise RuntimeError("TPHT evaluator returned an invalid decision.")
-        evaluated = decision.evaluated_station_count
-        exact = decision.likelihood_exact
-        diagnostics["tpht_proposal_rows"] = int(
-            diagnostics.get("tpht_proposal_rows", 0)
-        ) + row_count
-        diagnostics["tpht_refinement_bound_rejected_rows"] = int(
-            diagnostics.get("tpht_refinement_bound_rejected_rows", 0)
-        ) + int(
-            torch.count_nonzero(decision.refinement_bound_rejected).item()
-        )
-        diagnostics["tpht_full_history_rows"] = int(
-            diagnostics.get("tpht_full_history_rows", 0)
-        ) + int(torch.count_nonzero(exact).item())
-        diagnostics["tpht_exact_rejected_rows"] = int(
-            diagnostics.get("tpht_exact_rejected_rows", 0)
-        ) + int(torch.count_nonzero(decision.exact_rejected).item())
-        diagnostics["tpht_exact_station_evaluations"] = int(
-            diagnostics.get("tpht_exact_station_evaluations", 0)
-        ) + int(torch.sum(evaluated).item())
-        diagnostics["tpht_first_stage_station_evaluations"] = int(
-            diagnostics.get("tpht_first_stage_station_evaluations", 0)
-        ) + int(torch.sum(decision.first_stage_station_count).item())
-        diagnostics["tpht_first_stage_rejected_rows"] = int(
-            diagnostics.get("tpht_first_stage_rejected_rows", 0)
-        ) + int(torch.count_nonzero(decision.first_stage_rejected).item())
-        diagnostics["tpht_block_evaluation_calls"] = int(
-            diagnostics.get("tpht_block_evaluation_calls", 0)
-        ) + int(decision.block_evaluation_count)
-        diagnostics["tpht_refinement_rounds"] = int(
-            diagnostics.get("tpht_refinement_rounds", 0)
-        ) + int(decision.refinement_round_count)
-        diagnostics["tpht_staged_replay_rows"] = int(
-            diagnostics.get("tpht_staged_replay_rows", 0)
-        ) + int(decision.staged_replay_row_count)
-        diagnostics["tpht_maximum_block_level"] = max(
-            int(diagnostics.get("tpht_maximum_block_level", 0)),
-            int(decision.maximum_block_level),
-        )
-        return decision
 
     def set_joint_target_evaluator(
         self,
@@ -1610,15 +1516,6 @@ class StructuralRJTargetMixin:
         if evaluator is not None and not callable(evaluator):
             raise TypeError("Joint target evaluator must be callable or None.")
         self._joint_target_evaluator = evaluator
-
-    def set_joint_history_tree_evaluator(
-        self,
-        evaluator: Callable[..., TPHTProposalDecision] | None,
-    ) -> None:
-        """Attach the estimator-owned certified TPHT evaluator."""
-        if evaluator is not None and not callable(evaluator):
-            raise TypeError("Joint history-tree evaluator must be callable or None.")
-        self._joint_history_tree_evaluator = evaluator
 
     def set_joint_strength_grid_target_evaluator(
         self,
@@ -2337,14 +2234,8 @@ class StructuralRJTargetMixin:
         geometry_support_feasible: object | None = None,
         strength_support_feasible: object | None = None,
         log_acceptance_ratio: object | None = None,
-        likelihood_exact: object | None = None,
     ) -> None:
-        """Transfer one fused diagnostic matrix after a CUDA MH decision.
-
-        ``likelihood_exact`` distinguishes fully evaluated proposals from
-        certified early rejections. For an early rejection the supplied ratio
-        is the rigorous unresolved-history upper bound, not an exact ratio.
-        """
+        """Transfer one fused diagnostic matrix after an exact CUDA MH decision."""
         import torch
 
         if not torch.is_tensor(delta_log_likelihood):
@@ -2375,7 +2266,6 @@ class StructuralRJTargetMixin:
             if strength_support_feasible is None
             else strength_support_feasible
         )
-        exact = True if likelihood_exact is None else likelihood_exact
         ratio = (
             reference
             + _column(delta_log_prior, dtype=reference.dtype)
@@ -2398,7 +2288,6 @@ class StructuralRJTargetMixin:
                 _column(geometry, dtype=reference.dtype),
                 _column(strength, dtype=reference.dtype),
                 ratio,
-                _column(exact, dtype=reference.dtype),
             ),
             dim=1,
         ).detach().cpu().numpy()
@@ -2416,7 +2305,6 @@ class StructuralRJTargetMixin:
             geometry_support_feasible=matrix[:, 9].astype(np.bool_),
             strength_support_feasible=matrix[:, 10].astype(np.bool_),
             log_acceptance_ratio=matrix[:, 11],
-            likelihood_exact=matrix[:, 12].astype(np.bool_),
         )
 
     def _record_source_events_torch(
@@ -2495,9 +2383,8 @@ class StructuralRJTargetMixin:
         geometry_support_feasible: NDArray[np.bool_] | bool | None = None,
         strength_support_feasible: NDArray[np.bool_] | bool | None = None,
         log_acceptance_ratio: NDArray[np.float64] | None = None,
-        likelihood_exact: NDArray[np.bool_] | bool = True,
     ) -> None:
-        """Accumulate batched MH terms and their exactness for diagnosis."""
+        """Accumulate batched exact-MH terms for diagnosis."""
         likelihood = np.asarray(
             delta_log_likelihood,
             dtype=np.float64,
@@ -2570,11 +2457,6 @@ class StructuralRJTargetMixin:
                 accepted,
                 dtype=np.bool_,
                 name="accepted",
-            ),
-            "likelihood_exact": _broadcast(
-                likelihood_exact,
-                dtype=np.bool_,
-                name="likelihood_exact",
             ),
             "current_cardinality": _broadcast(
                 current_cardinality,
@@ -2677,13 +2559,6 @@ class StructuralRJTargetMixin:
                     combined["accepted"],
                     dtype=bool,
                 )[mask]
-                likelihood_exact = np.asarray(
-                    combined.get(
-                        "likelihood_exact",
-                        np.ones_like(combined["accepted"], dtype=np.bool_),
-                    ),
-                    dtype=bool,
-                )[mask]
                 finite_all = feasible.copy()
                 quantiles: dict[str, dict[str, float | int] | None] = {}
                 for name in numeric_names:
@@ -2714,12 +2589,6 @@ class StructuralRJTargetMixin:
                 return {
                     "attempted": int(feasible.size),
                     "accepted": int(np.count_nonzero(accepted)),
-                    "likelihood_exact": int(
-                        np.count_nonzero(likelihood_exact)
-                    ),
-                    "tpht_certified_early_rejected": int(
-                        np.count_nonzero(feasible & ~likelihood_exact)
-                    ),
                     "support_rejected": int(np.count_nonzero(~feasible)),
                     "geometry_support_rejected": int(np.count_nonzero(~geometry)),
                     "strength_support_rejected": int(
@@ -2733,7 +2602,6 @@ class StructuralRJTargetMixin:
                         np.count_nonzero(
                             feasible
                             & finite_all
-                            & likelihood_exact
                             & ~accepted
                         )
                     ),

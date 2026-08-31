@@ -385,7 +385,7 @@ class StructuralRJTorchMultiComponentMixin:
             )
         delta_prior = proposed_prior - current_prior
         reverse_minus_forward = log_reverse - log_forward
-        decision = self._continuous_rj_history_tree_decision_torch(
+        decision = self._continuous_rj_exact_decision_torch(
             data,
             proposed_positions,
             proposed_strengths,
@@ -415,7 +415,6 @@ class StructuralRJTorchMultiComponentMixin:
             geometry_support_feasible=geometry_support,
             strength_support_feasible=strength_support,
             log_acceptance_ratio=log_ratio,
-            likelihood_exact=decision.likelihood_exact,
         )
         self._commit_continuous_rj_state_tensors(
             particle_indices,
@@ -614,7 +613,7 @@ class StructuralRJTorchMultiComponentMixin:
             )
         delta_prior = proposed_prior - current_prior
         reverse_minus_forward = log_reverse - log_forward
-        decision = self._continuous_rj_history_tree_decision_torch(
+        decision = self._continuous_rj_exact_decision_torch(
             data,
             proposed_positions,
             proposed_strengths,
@@ -644,7 +643,6 @@ class StructuralRJTorchMultiComponentMixin:
             geometry_support_feasible=geometry_support,
             strength_support_feasible=strength_support,
             log_acceptance_ratio=log_ratio,
-            likelihood_exact=decision.likelihood_exact,
         )
         self._commit_continuous_rj_state_tensors(
             particle_indices,

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from runtime.experiment_profiles import MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE
+from runtime.experiment_profiles import CS_CO_SURFACE_SEARCH_PROFILE
 from sim.runtime import (
     load_production_runtime_config,
     validate_production_runtime_config,
@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RUNTIME_ROOT = ROOT.parent / "Rotating-shield-simulation-runtime"
 DEFAULT_RUNTIME_CONFIG = (
     DEFAULT_RUNTIME_ROOT
-    / MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.runtime_config_relative_path
+    / CS_CO_SURFACE_SEARCH_PROFILE.runtime_config_relative_path
 )
 DEFAULT_PF_CONFIG = ROOT / "configs" / "pf" / "pf_strict_3d.json"
 DEFAULT_OUTPUT_DIR = ROOT / "results" / "ral_ablation"
@@ -290,9 +290,9 @@ class AblationPlanEntry:
     session_command: tuple[str, ...]
 
 
-RAL_CASE_NAME = "mix9_multi_isotope_cardinality"
-RAL_EXPERIMENT_PROFILE_ID = MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.profile_id
-RAL_SCENE_VARIANT_ID = "mix9"
+RAL_CASE_NAME = "cs4_co3_multi_source_cardinality"
+RAL_EXPERIMENT_PROFILE_ID = CS_CO_SURFACE_SEARCH_PROFILE.profile_id
+RAL_SCENE_VARIANT_ID = "cs4-co3"
 RAL_RUNTIME_INTERVENTION_FIELDS = frozenset({"shield_transmission_target"})
 
 DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (

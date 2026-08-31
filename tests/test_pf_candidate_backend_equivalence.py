@@ -223,19 +223,19 @@ def test_station_cache_signature_binds_observed_spectrum() -> None:
     )
 
 
-def test_standard_joint_estimator_installs_tpht_for_every_isotope() -> None:
-    """Production filters must not bypass the estimator-owned TPHT scheduler."""
+def test_standard_joint_estimator_installs_exact_target_for_every_isotope() -> None:
+    """Production filters must use the estimator-owned joint exact target."""
     estimator = _estimator(use_gpu=True, gpu_device="cpu")
-    expected = estimator._joint_structural_history_tree_evaluator.__func__
+    expected = estimator._joint_structural_target_evaluator.__func__
     for filt in estimator.filters.values():
-        evaluator = filt._joint_history_tree_evaluator
+        evaluator = filt._joint_target_evaluator
         assert evaluator is not None
         assert evaluator.__self__ is estimator
         assert evaluator.__func__ is expected
 
 
-def test_tpht_unit_cache_key_binds_geometry_content_not_object_identity() -> None:
-    """Dyadic slice caches must neither alias nor miss by transient object ID."""
+def test_exact_unit_cache_key_binds_geometry_content_not_object_identity() -> None:
+    """Exact unit caches must bind geometry content, not transient object ID."""
     pytest.importorskip("torch")
     estimator = _estimator(use_gpu=True, gpu_device="cpu")
     station = _station()
@@ -745,10 +745,10 @@ def test_device_delta_reuses_unchanged_positions_exactly(
     np.testing.assert_allclose(actual, expected, rtol=2.0e-12, atol=1.0e-8)
 
 
-def test_sweep_local_unit_cache_commits_only_accepted_replay_geometry(
+def test_sweep_local_unit_cache_commits_only_accepted_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only TPHT accepted-replay columns may enter the sweep-local cache."""
+    """Only exact accepted-proposal columns may enter the sweep-local cache."""
     pytest.importorskip("torch")
     estimator = _estimator(use_gpu=True)
     station = _station()
@@ -1691,10 +1691,6 @@ def test_cuda_joint_moves_keep_state_and_mh_on_device() -> None:
         "cross_isotope_state_attempted_weight_mass"
     ] == pytest.approx(1.0)
     assert estimator.last_joint_device_mh_acceptance_calls >= 2
-    assert diagnostics["tpht.joint.joint_strength.proposal_rows"] > 0.0
-    assert diagnostics["tpht.joint.cross_isotope.proposal_rows"] > 0.0
-    assert diagnostics["tpht.proposal_rows"] > 0.0
-    assert diagnostics["tpht.station_evaluations"] > 0.0
     for filt in estimator.filters.values():
         assert filt.last_structural_device_diagnostics["proposal_backend"] == "torch"
         assert filt.last_structural_device_diagnostics["materialization_calls"] == 0

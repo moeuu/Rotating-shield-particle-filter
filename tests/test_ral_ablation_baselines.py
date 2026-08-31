@@ -519,11 +519,11 @@ def test_ablation_plan_separates_pf_runtime_and_private_truth(tmp_path: Path) ->
         assert "baseline_shield_policy" not in pf_config
         serialized_pf = json.dumps(pf_config, sort_keys=True)
         assert "1234" not in serialized_pf
-        assert '"mix9"' not in serialized_pf
+        assert f'"{RAL_SCENE_VARIANT_ID}"' not in serialized_pf
         assert "backend" not in pf_config
         assert "shield_thickness_scale" not in pf_config
         assert "1234" not in entry.pf_config_path.name
-        assert "mix9" not in entry.pf_config_path.name
+        assert RAL_SCENE_VARIANT_ID not in entry.pf_config_path.name
         assert entry.pf_seed == 5678
         assert entry.control_policy_sha256 == sha256(
             entry.control_policy_path.read_bytes()

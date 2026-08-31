@@ -11,7 +11,7 @@ text/marker overlap, and confirm that every panel has a clear scientific role.
 ## Main Result Figure
 
 The main paper result figure is a PF result figure for the
-`mix9_multi_isotope_cardinality` task, not a generic ablation dashboard. It
+`cs4_co3_multi_source_cardinality` task, not a generic ablation dashboard. It
 should show where the robot measured, where the sources actually were, where
 the proposed PF/reporting pipeline placed the final estimates, and whether the
 final PF particle support is consistent with the reported result.
@@ -63,7 +63,7 @@ uv run python scripts/build_ral_figures.py \
   --completed-run-dir ../Rotating-shield-simulation-runtime/private_runs/full_simulations/cs4_co3_20260827_175045
 ```
 
-After the fresh MIX-9 batch is complete, generate the main paper result from the
+After the fresh Cs4/Co3 batch is complete, generate the main paper result from the
 four evaluator outputs for `proposed`, `no_shield_native_path`,
 `round_robin_shield`, and `eig_only_path`. Never mix result files from different
 opaque batch IDs.
@@ -84,7 +84,7 @@ Use these images for the mandatory visual QA pass.
 
 ## Supplementary Figures
 
-The final main paper figure should focus on the MIX-9 multi-isotope task because it contains
+The final main paper figure should focus on the Cs4/Co3 multi-source task because it contains
 spectral isotope separation, variable isotope-wise source cardinality, and
 same-isotope spatial ambiguity in one scene.
 

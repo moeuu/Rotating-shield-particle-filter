@@ -382,7 +382,6 @@ class RotatingShieldPFEstimator(
             "joint_isotope_particle_filter",
         )
         self._joint_torch_generator: object | None = None
-        self._joint_tpht_generator: object | None = None
         self.last_joint_resample_indices = np.zeros(0, dtype=np.int64)
         self.last_joint_temper_steps: list[dict[str, float]] = []
         self.last_joint_rejuvenation_diagnostics: list[dict[str, float]] = []
@@ -404,8 +403,6 @@ class RotatingShieldPFEstimator(
         self.last_joint_strength_block_accepted_weight_mass = 0.0
         self.last_joint_device_mh_acceptance_calls = 0
         self.last_joint_device_mh_acceptance_rows = 0
-        self.last_joint_tpht_diagnostics: dict[str, int] = {}
-        self._joint_tpht_linear_scaling_streak = 0
         self._joint_initial_product_prior_state_sha256: str | None = None
         self.last_joint_station_unique_ancestor_count: int | None = None
         self.last_joint_cumulative_unique_ancestor_count: int | None = None
@@ -1049,9 +1046,6 @@ class RotatingShieldPFEstimator(
         for isotope in self.joint_isotope_order():
             filt = self.filters[isotope]
             filt.set_joint_target_evaluator(self._joint_structural_target_evaluator)
-            filt.set_joint_history_tree_evaluator(
-                self._joint_structural_history_tree_evaluator
-            )
             filt.set_joint_strength_grid_target_evaluator(
                 self._joint_structural_strength_grid_target_evaluator
             )

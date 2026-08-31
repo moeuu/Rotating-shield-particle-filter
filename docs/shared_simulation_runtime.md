@@ -20,8 +20,8 @@ uv run rotating-shield-sim generate-scenario /private/run-001.json \
   --truth-manifest-output /private/truth/run-001.json \
   --measurement-log-output /private/logs/run-001 \
   --run-id run-001 \
-  --experiment-profile multi_isotope_surface_search \
-  --scene-variant mix9 \
+  --experiment-profile cs4_co3_surface_search \
+  --scene-variant cs4-co3 \
   --runtime-config configs/geant4/variance_reduction_external_no_isaac_32threads.json
 
 # Runtime serves the private scenario over an opaque local socket

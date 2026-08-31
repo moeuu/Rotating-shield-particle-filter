@@ -18,10 +18,7 @@ from pf.cardinality_policy import (
 )
 from pf.estimator_sampling import _stratified_joint_cardinality_draws
 from pf.estimator_types import JointStationObservation
-from pf.history_tree import (
-    TPHTProposalDecision,
-    run_tpht_hierarchical_exact_acceptance_torch,
-)
+from pf.exact_mh import ExactMHDecision, run_exact_mh_acceptance_torch
 from pf.particle_filter import (
     IsotopeParticle,
     IsotopeParticleFilter,
@@ -242,67 +239,7 @@ class JointRejuvenationMixin:
             raise RuntimeError("Joint CUDA rejuvenation has no random generator.")
         return generator
 
-    def _joint_tpht_generator_required(self) -> "torch.Generator":
-        """Return the independent joint CUDA TPHT refinement generator."""
-        import torch
-
-        generator = self._joint_tpht_generator
-        if not isinstance(generator, torch.Generator):
-            raise RuntimeError("Joint CUDA rejuvenation has no TPHT generator.")
-        return generator
-
-    def _record_joint_tpht_decision_torch(
-        self,
-        move_family: str,
-        decision: TPHTProposalDecision,
-    ) -> None:
-        """Accumulate device-side TPHT refinement counters for one joint move."""
-        import torch
-
-        if not isinstance(move_family, str) or not move_family:
-            raise ValueError("Joint TPHT move_family must be nonempty.")
-        if not torch.is_tensor(decision.accepted):
-            raise TypeError("Joint TPHT diagnostics require Torch decisions.")
-        prefix = str(move_family)
-        counters = self.last_joint_tpht_diagnostics
-        row_count = int(decision.accepted.numel())
-        values = {
-            "proposal_rows": row_count,
-            "refinement_bound_rejected_rows": int(
-                torch.count_nonzero(
-                    decision.refinement_bound_rejected
-                ).item()
-            ),
-            "full_history_rows": int(
-                torch.count_nonzero(decision.likelihood_exact).item()
-            ),
-            "exact_rejected_rows": int(
-                torch.count_nonzero(decision.exact_rejected).item()
-            ),
-            "accepted_rows": int(torch.count_nonzero(decision.accepted).item()),
-            "station_evaluations": int(
-                torch.sum(decision.evaluated_station_count).item()
-            ),
-            "first_stage_station_evaluations": int(
-                torch.sum(decision.first_stage_station_count).item()
-            ),
-            "first_stage_rejected_rows": int(
-                torch.count_nonzero(decision.first_stage_rejected).item()
-            ),
-            "block_evaluation_calls": int(decision.block_evaluation_count),
-            "refinement_rounds": int(decision.refinement_round_count),
-            "staged_replay_rows": int(decision.staged_replay_row_count),
-        }
-        for name, value in values.items():
-            key = f"{prefix}.{name}"
-            counters[key] = int(counters.get(key, 0)) + int(value)
-        level_key = f"{prefix}.maximum_block_level"
-        counters[level_key] = max(
-            int(counters.get(level_key, 0)),
-            int(decision.maximum_block_level),
-        )
-
-    def _joint_strength_history_tree_decision_torch(
+    def _joint_strength_exact_decision_torch(
         self,
         stations: Sequence[JointStationObservation],
         *,
@@ -312,15 +249,17 @@ class JointRejuvenationMixin:
         log_non_likelihood_ratio: "torch.Tensor",
         support: "torch.Tensor",
         target_beta: float,
-    ) -> TPHTProposalDecision:
-        """Refine one all-isotope strength proposal to an exact MH decision."""
+    ) -> ExactMHDecision:
+        """Evaluate an all-isotope strength proposal with one exact MH test."""
         import torch
 
         cache = self._joint_structural_transport_cache
         if not isinstance(cache, JointTransportCache) or not torch.is_tensor(
             cache[0]
         ):
-            raise RuntimeError("Joint strength TPHT requires the fixed Torch cache.")
+            raise RuntimeError(
+                "Joint strength exact MH requires the fixed Torch cache."
+            )
         rows = particle_indices.to(device=cache[0].device, dtype=torch.long)
         scale = scale_ps.to(device=cache[0].device, dtype=cache[0].dtype)
         base = base_target_log_likelihood.reshape(-1)
@@ -336,104 +275,53 @@ class JointRejuvenationMixin:
             or tuple(feasible.shape) != (row_count,)
             or cache.station_count != len(stations)
         ):
-            raise ValueError("Joint strength TPHT arrays are not aligned.")
-        generator = self._joint_torch_generator_required()
-        uniforms = torch.rand(
-                (row_count,),
-                device=base.device,
-                dtype=base.dtype,
-                generator=generator,
-            )
-        log_uniform = torch.log(uniforms)
-        log_refinement_uniform = torch.log(
-            torch.rand(
-                (row_count,),
-                device=base.device,
-                dtype=base.dtype,
-                generator=self._joint_tpht_generator_required(),
-            )
-        )
-        current_station = torch.index_select(
+            raise ValueError("Joint strength exact-MH arrays are not aligned.")
+        filt = self.filters[self.joint_isotope_order()[0]]
+        feasible_rows = torch.nonzero(feasible, as_tuple=False).reshape(-1)
+        proposed_target = torch.full_like(base, float("-inf"))
+        proposed_station = torch.index_select(
             cache.station_log_likelihood[:, : cache.station_count],
             0,
             rows,
-        )
-        filt = self.filters[self.joint_isotope_order()[0]]
-
-        def _evaluate_scaled_station_block(
-            local_rows: object,
-            station_start: int,
-            station_stop: int,
-        ) -> object:
-            """Evaluate scaled cached transport for one station interval."""
-            local = torch.as_tensor(
-                local_rows,
-                device=rows.device,
-                dtype=torch.long,
-            ).reshape(-1)
-            selected_rows = torch.index_select(rows, 0, local)
-            selected_scale = torch.index_select(scale, 0, local)[
+        ).clone()
+        if int(feasible_rows.numel()):
+            selected_rows = torch.index_select(rows, 0, feasible_rows)
+            selected_scale = torch.index_select(scale, 0, feasible_rows)[
                 :, None, :, None
             ]
-            view_start = int(cache.station_offsets[station_start])
-            view_stop = int(cache.station_offsets[station_stop])
-            _, station_values = self._joint_history_log_likelihood_torch(
-                filt=filt,
-                stations=tuple(stations[station_start:station_stop]),
-                total_nvsl=(
-                    torch.index_select(
-                        cache[0][:, view_start:view_stop],
+            selected_target, selected_station = (
+                self._joint_history_log_likelihood_torch(
+                    filt=filt,
+                    stations=stations,
+                    total_nvsl=(
+                        torch.index_select(cache[0], 0, selected_rows)
+                        * selected_scale
+                    ),
+                    uncollided_nvsl=(
+                        torch.index_select(cache[1], 0, selected_rows)
+                        * selected_scale
+                    ),
+                    features_nvslf=torch.index_select(
+                        cache[2],
                         0,
                         selected_rows,
-                    )
-                    * selected_scale
-                ),
-                uncollided_nvsl=(
-                    torch.index_select(
-                        cache[1][:, view_start:view_stop],
-                        0,
-                        selected_rows,
-                    )
-                    * selected_scale
-                ),
-                features_nvslf=torch.index_select(
-                    cache[2][:, view_start:view_stop],
-                    0,
-                    selected_rows,
-                ),
-                target_beta=1.0,
-                return_station_log_likelihood=True,
+                    ),
+                    target_beta=float(target_beta),
+                    return_station_log_likelihood=True,
+                )
             )
-            return station_values
-
-        def _evaluate_station_block(
-            local_rows: object,
-            station_start: int,
-            station_stop: int,
-            exact_full_history: bool,
-        ) -> object:
-            """Evaluate one exact full-spectrum strength block."""
-            del exact_full_history
-            return _evaluate_scaled_station_block(
-                local_rows,
-                station_start,
-                station_stop,
-            )
-
-        decision = run_tpht_hierarchical_exact_acceptance_torch(
-            current_station_log_likelihood_ps=current_station,
-            base_target_log_likelihood_p=base,
-            log_non_likelihood_ratio_p=non_likelihood,
-            log_uniform_p=log_uniform,
-            log_refinement_uniform_p=log_refinement_uniform,
-            support_p=feasible,
-            target_beta=float(target_beta),
-            evaluate_station_block=_evaluate_station_block,
-            stage_accepted_rows=False,
+            proposed_target.index_copy_(0, feasible_rows, selected_target)
+            proposed_station.index_copy_(0, feasible_rows, selected_station)
+        decision = run_exact_mh_acceptance_torch(
+            current_target_log_likelihood=base,
+            proposed_target_log_likelihood=proposed_target,
+            proposed_station_log_likelihood=proposed_station,
+            log_non_likelihood_ratio=non_likelihood,
+            support=feasible,
+            generator=self._joint_torch_generator_required(),
         )
         self.last_joint_device_mh_acceptance_calls += 1
         self.last_joint_device_mh_acceptance_rows += row_count
-        self._record_joint_tpht_decision_torch("joint_strength", decision)
         return decision
 
     def _commit_joint_strength_block_torch(
@@ -588,7 +476,7 @@ class JointRejuvenationMixin:
             log_proposal_ratio
         )
         scale = torch.where(mask, proposed / old, torch.ones_like(old))
-        decision = self._joint_strength_history_tree_decision_torch(
+        decision = self._joint_strength_exact_decision_torch(
             stations,
             particle_indices=rows,
             scale_ps=scale,
@@ -610,7 +498,7 @@ class JointRejuvenationMixin:
             current_target[accepted_rows] = proposed_target[accepted]
             cache = self._joint_structural_transport_cache
             if not isinstance(cache, JointTransportCache):
-                raise RuntimeError("Joint strength TPHT cache disappeared.")
+                raise RuntimeError("Joint strength exact-MH cache disappeared.")
             cache.set_station_likelihood(
                 decision.proposed_station_log_likelihood[accepted],
                 rows=accepted_rows,
@@ -685,7 +573,7 @@ class JointRejuvenationMixin:
         minimum = float(filt._strength_prior.minimum)
         return minimum + (locations - minimum) / float(cardinality)
 
-    def _joint_cross_isotope_history_tree_decision_torch(
+    def _joint_cross_isotope_exact_decision_torch(
         self,
         stations: Sequence[JointStationObservation],
         *,
@@ -697,12 +585,11 @@ class JointRejuvenationMixin:
         support: "torch.Tensor",
         target_beta: float,
     ) -> tuple[
-        TPHTProposalDecision,
+        ExactMHDecision,
+        tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"],
         "torch.Tensor",
-        tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"] | None,
-        "torch.Tensor" | None,
     ]:
-        """Evaluate a joint state proposal through certified TPHT refinement."""
+        """Evaluate a joint state proposal with one exact full-history test."""
         import torch
 
         cache = self._joint_structural_transport_cache
@@ -710,7 +597,7 @@ class JointRejuvenationMixin:
             cache[0]
         ):
             raise RuntimeError(
-                "Cross-isotope TPHT requires the fixed exact Torch cache."
+                "Cross-isotope exact MH requires the fixed Torch cache."
             )
         rows = particle_rows.to(device=cache[0].device, dtype=torch.long)
         base = base_target_log_likelihood.reshape(-1)
@@ -724,47 +611,56 @@ class JointRejuvenationMixin:
             or tuple(feasible.shape) != (row_count,)
             or cache.station_count != len(stations)
         ):
-            raise ValueError("Cross-isotope TPHT arrays are not aligned.")
+            raise ValueError("Cross-isotope exact-MH arrays are not aligned.")
         isotope_order = self.joint_isotope_order()
         replacement_active_slot_mask = torch.cat(
             [proposed_states[isotope]["mask"] for isotope in isotope_order],
             dim=1,
         ).contiguous()
-        full_exact_local_rows = torch.empty(
-            0,
-            device=rows.device,
-            dtype=torch.long,
+        feasible_local = torch.nonzero(feasible, as_tuple=False).reshape(-1)
+        view_count = sum(int(station.fe_indices.size) for station in stations)
+        slot_count = int(cache[0].shape[2])
+        line_count = int(cache[0].shape[3])
+        feature_count = int(cache[2].shape[4])
+        replacement = (
+            torch.zeros(
+                (row_count, view_count, slot_count, line_count),
+                device=cache[0].device,
+                dtype=cache[0].dtype,
+            ),
+            torch.zeros(
+                (row_count, view_count, slot_count, line_count),
+                device=cache[1].device,
+                dtype=cache[1].dtype,
+            ),
+            torch.zeros(
+                (
+                    row_count,
+                    view_count,
+                    slot_count,
+                    line_count,
+                    feature_count,
+                ),
+                device=cache[2].device,
+                dtype=cache[2].dtype,
+            ),
         )
-        full_exact_replacement: (
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
-        ) = None
-        full_exact_active_mask: torch.Tensor | None = None
-        def _evaluate_proposed_station_block(
-            local_rows: object,
-            station_start: int,
-            station_stop: int,
-            exact_full_history: bool,
-        ) -> object:
-            """Generate and score proposed transport for one tree block."""
-            nonlocal full_exact_active_mask
-            nonlocal full_exact_local_rows
-            nonlocal full_exact_replacement
-
-            local = torch.as_tensor(
-                local_rows,
-                device=rows.device,
-                dtype=torch.long,
-            ).reshape(-1)
-            selected_rows = torch.index_select(rows, 0, local)
+        proposed_target = torch.full_like(base, float("-inf"))
+        proposed_station = torch.index_select(
+            cache.station_log_likelihood[:, : cache.station_count],
+            0,
+            rows,
+        ).clone()
+        if int(feasible_local.numel()):
+            selected_rows = torch.index_select(rows, 0, feasible_local)
             selected_host = selected_rows.detach().cpu().numpy().astype(
                 np.int64,
                 copy=False,
             )
-            block_stations = tuple(stations[station_start:station_stop])
             self._assign_joint_state_rows_torch(
                 proposed_states,
                 rows,
-                local_rows=local,
+                local_rows=feasible_local,
             )
             try:
                 isotope_replacements: list[
@@ -777,7 +673,7 @@ class JointRejuvenationMixin:
                             isotope,
                             particle_indices=selected_host,
                         )
-                        for station in block_stations
+                        for station in stations
                     ]
                     isotope_replacements.append(
                         tuple(
@@ -791,7 +687,7 @@ class JointRejuvenationMixin:
                             for index in range(3)
                         )
                     )
-                replacement = tuple(
+                selected_replacement = tuple(
                     torch.cat(
                         [
                             components[index]
@@ -805,106 +701,49 @@ class JointRejuvenationMixin:
                 self._assign_joint_state_rows_torch(
                     old_states,
                     rows,
-                    local_rows=local,
+                    local_rows=feasible_local,
                 )
-            active_mask = torch.index_select(
-                replacement_active_slot_mask,
-                0,
-                local,
-            )
-            if exact_full_history:
-                full_exact_local_rows = local.clone()
-                full_exact_replacement = replacement
-                full_exact_active_mask = active_mask
-            view_start = int(cache.station_offsets[station_start])
-            view_stop = int(cache.station_offsets[station_stop])
-            _, station_values = (
+            selected_target, selected_station = (
                 self._joint_history_slot_overlay_log_likelihood_torch(
                     filt=self.filters[isotope_order[0]],
-                    stations=block_stations,
-                    accepted_total_nvsl=cache[0][:, view_start:view_stop],
-                    accepted_uncollided_nvsl=cache[1][:, view_start:view_stop],
-                    accepted_features_nvslf=cache[2][:, view_start:view_stop],
-                    replacement_total_nvrl=replacement[0],
-                    replacement_uncollided_nvrl=replacement[1],
-                    replacement_features_nvrlf=replacement[2],
+                    stations=stations,
+                    accepted_total_nvsl=cache[0],
+                    accepted_uncollided_nvsl=cache[1],
+                    accepted_features_nvslf=cache[2],
+                    replacement_total_nvrl=selected_replacement[0],
+                    replacement_uncollided_nvrl=selected_replacement[1],
+                    replacement_features_nvrlf=selected_replacement[2],
                     particle_indices=selected_rows,
                     slot_start=0,
-                    slot_stop=int(cache[0].shape[2]),
-                    replacement_active_slot_mask=active_mask,
-                    target_beta=1.0,
+                    slot_stop=slot_count,
+                    replacement_active_slot_mask=torch.index_select(
+                        replacement_active_slot_mask,
+                        0,
+                        feasible_local,
+                    ),
+                    target_beta=float(target_beta),
                     return_station_log_likelihood=True,
                 )
             )
-            return station_values
-
-        def _evaluate_station_block(
-            local_rows: object,
-            station_start: int,
-            station_stop: int,
-            exact_full_history: bool,
-        ) -> object:
-            """Evaluate one exact full-spectrum cross-isotope block."""
-            return _evaluate_proposed_station_block(
-                local_rows,
-                station_start,
-                station_stop,
-                exact_full_history,
-            )
-
-        generator = self._joint_torch_generator_required()
-        uniforms = torch.rand(
-                (row_count,),
-                device=base.device,
-                dtype=base.dtype,
-                generator=generator,
-            )
-        log_uniform = torch.log(uniforms)
-        log_refinement_uniform = torch.log(
-            torch.rand(
-                (row_count,),
-                device=base.device,
-                dtype=base.dtype,
-                generator=self._joint_tpht_generator_required(),
-            )
+            proposed_target.index_copy_(0, feasible_local, selected_target)
+            proposed_station.index_copy_(0, feasible_local, selected_station)
+            for destination, selected in zip(
+                replacement,
+                selected_replacement,
+                strict=True,
+            ):
+                destination.index_copy_(0, feasible_local, selected)
+        decision = run_exact_mh_acceptance_torch(
+            current_target_log_likelihood=base,
+            proposed_target_log_likelihood=proposed_target,
+            proposed_station_log_likelihood=proposed_station,
+            log_non_likelihood_ratio=non_likelihood,
+            support=feasible,
+            generator=self._joint_torch_generator_required(),
         )
-        current_station = torch.index_select(
-            cache.station_log_likelihood[:, : cache.station_count],
-            0,
-            rows,
-        )
-        decision = run_tpht_hierarchical_exact_acceptance_torch(
-            current_station_log_likelihood_ps=current_station,
-            base_target_log_likelihood_p=base,
-            log_non_likelihood_ratio_p=non_likelihood,
-            log_uniform_p=log_uniform,
-            log_refinement_uniform_p=log_refinement_uniform,
-            support_p=feasible,
-            target_beta=float(target_beta),
-            evaluate_station_block=_evaluate_station_block,
-            stage_accepted_rows=True,
-        )
-        expected_exact_rows = torch.nonzero(
-            decision.accepted,
-            as_tuple=False,
-        ).reshape(-1)
-        if int(expected_exact_rows.numel()) == 0:
-            full_exact_local_rows = expected_exact_rows
-            full_exact_replacement = None
-            full_exact_active_mask = None
-        elif not torch.equal(full_exact_local_rows, expected_exact_rows):
-            raise RuntimeError(
-                "Cross-isotope TPHT lost its exact replacement row mapping."
-            )
         self.last_joint_device_mh_acceptance_calls += 1
         self.last_joint_device_mh_acceptance_rows += row_count
-        self._record_joint_tpht_decision_torch("cross_isotope", decision)
-        return (
-            decision,
-            full_exact_local_rows,
-            full_exact_replacement,
-            full_exact_active_mask,
-        )
+        return decision, replacement, replacement_active_slot_mask
 
     def _apply_joint_cross_isotope_state_block_torch(
         self,
@@ -1173,20 +1012,17 @@ class JointRejuvenationMixin:
             & torch.isfinite(proposed_log_prior)
             & torch.isfinite(proposed_log_proposal)
         )
-        (
-            decision,
-            full_exact_local_rows,
-            full_exact_replacement,
-            full_exact_active_mask,
-        ) = self._joint_cross_isotope_history_tree_decision_torch(
-            stations,
-            particle_rows=rows,
-            old_states=old_states,
-            proposed_states=proposed_states,
-            base_target_log_likelihood=current_target[rows],
-            log_non_likelihood_ratio=delta_prior + proposal_ratio,
-            support=support,
-            target_beta=float(target_beta),
+        decision, exact_replacement, exact_active_mask = (
+            self._joint_cross_isotope_exact_decision_torch(
+                stations,
+                particle_rows=rows,
+                old_states=old_states,
+                proposed_states=proposed_states,
+                base_target_log_likelihood=current_target[rows],
+                log_non_likelihood_ratio=delta_prior + proposal_ratio,
+                support=support,
+                target_beta=float(target_beta),
+            )
         )
         proposed_target = decision.proposed_target_log_likelihood
         delta_likelihood = decision.diagnostic_delta_log_likelihood
@@ -1207,21 +1043,10 @@ class JointRejuvenationMixin:
                 np.int64,
                 copy=False,
             )
-            if (
-                full_exact_replacement is None
-                or full_exact_active_mask is None
-            ):
-                raise RuntimeError(
-                    "Accepted cross-isotope TPHT rows lack exact transport."
-                )
-            accepted_within_exact = decision.accepted[full_exact_local_rows]
             accepted_replacement = tuple(
-                values[accepted_within_exact]
-                for values in full_exact_replacement
+                values[accepted] for values in exact_replacement
             )
-            accepted_active_slot_mask = full_exact_active_mask[
-                accepted_within_exact
-            ]
+            accepted_active_slot_mask = exact_active_mask[accepted]
             cache.replace_slot_rows(
                 rows=accepted_rows,
                 slot_start=0,
@@ -1253,7 +1078,6 @@ class JointRejuvenationMixin:
                 log_ratio,
                 support.to(dtype=current_target.dtype),
                 accepted.to(dtype=current_target.dtype),
-                decision.likelihood_exact.to(dtype=current_target.dtype),
             ),
             dim=1,
         ).detach().cpu().numpy()
@@ -1282,15 +1106,10 @@ class JointRejuvenationMixin:
 
         support_host = diagnostic_payload[:, 4] != 0.0
         accepted_mask_host = diagnostic_payload[:, 5] != 0.0
-        likelihood_exact_host = diagnostic_payload[:, 6] != 0.0
         finite_ratio = np.isfinite(diagnostic_payload[:, 3])
         self.last_joint_cross_isotope_state_rejection_diagnostics = {
             "attempted": row_count,
             "accepted": int(np.count_nonzero(accepted_mask_host)),
-            "likelihood_exact": int(np.count_nonzero(likelihood_exact_host)),
-            "tpht_certified_early_rejected": int(
-                np.count_nonzero(support_host & ~likelihood_exact_host)
-            ),
             "support_rejected": int(np.count_nonzero(~support_host)),
             "nonfinite_rejected": int(
                 np.count_nonzero(support_host & ~finite_ratio)
@@ -1299,7 +1118,6 @@ class JointRejuvenationMixin:
                 np.count_nonzero(
                     support_host
                     & finite_ratio
-                    & likelihood_exact_host
                     & ~accepted_mask_host
                 )
             ),
@@ -2775,7 +2593,6 @@ class JointRejuvenationMixin:
         strength_block_accepted_start = float(
             self.last_joint_strength_block_accepted_weight_mass
         )
-        joint_tpht_start = dict(self.last_joint_tpht_diagnostics)
         active_station_ids = tuple(id(station) for station in active)
         if active_station_ids != self._joint_torch_context_station_ids:
             self._joint_torch_observation_context_cache.clear()
@@ -2831,11 +2648,6 @@ class JointRejuvenationMixin:
                     joint_generator = torch.Generator(device=cache[0].device)
                     joint_generator.manual_seed(joint_seed)
                     self._joint_torch_generator = joint_generator
-                    tpht_generator = torch.Generator(device=cache[0].device)
-                    tpht_generator.manual_seed(
-                        joint_seed ^ 0x2F4B6D183A5C7091
-                    )
-                    self._joint_tpht_generator = tpht_generator
                     current_target_log_likelihood = current_target_tensor
                 else:
                     current_target_log_likelihood = (
@@ -2914,7 +2726,7 @@ class JointRejuvenationMixin:
                 )
                 if cache_is_cuda and updated_station_target is None:
                     raise RuntimeError(
-                        "CUDA structural sweep did not return its TPHT station cache."
+                        "CUDA structural sweep did not return its station cache."
                     )
                 changed_rows = self._joint_changed_cache_rows(
                     cache_state_before,
@@ -2938,7 +2750,7 @@ class JointRejuvenationMixin:
                         )
                         if not isinstance(cache, JointTransportCache):
                             raise RuntimeError(
-                                "CUDA TPHT commit requires JointTransportCache."
+                                "CUDA exact-MH commit requires JointTransportCache."
                             )
                         import torch
 
@@ -3081,131 +2893,6 @@ class JointRejuvenationMixin:
             diagnostics["wall_s.initial_target"] = float(initial_target_wall_s)
             for isotope, elapsed_s in isotope_wall_s.items():
                 diagnostics[f"wall_s.isotope.{isotope}"] = float(elapsed_s)
-                filt = self.filters[isotope]
-                for name, value in filt.last_structural_timing_s.items():
-                    if name.startswith("device_tpht_"):
-                        diagnostics[
-                            f"tpht.{isotope}.{name.removeprefix('device_tpht_')}"
-                        ] = float(value)
-            for name, value in self.last_joint_tpht_diagnostics.items():
-                diagnostics[f"tpht.joint.{name}"] = float(
-                    int(value) - int(joint_tpht_start.get(name, 0))
-                )
-            tpht_proposal_rows = sum(
-                value
-                for name, value in diagnostics.items()
-                if name.endswith(".proposal_rows") and name.startswith("tpht.")
-            )
-            tpht_station_evaluations = sum(
-                value
-                for name, value in diagnostics.items()
-                if (
-                    name.endswith(".station_evaluations")
-                    or name.endswith(".exact_station_evaluations")
-                )
-                and "first_stage" not in name
-            )
-            tpht_first_stage_station_evaluations = sum(
-                value
-                for name, value in diagnostics.items()
-                if name.endswith(".first_stage_station_evaluations")
-            )
-            tpht_full_history_rows = sum(
-                value
-                for name, value in diagnostics.items()
-                if name.endswith(".full_history_rows")
-            )
-            tpht_refinement_bound_rejected_rows = sum(
-                value
-                for name, value in diagnostics.items()
-                if name.endswith(".refinement_bound_rejected_rows")
-            )
-            tpht_first_stage_rejected_rows = sum(
-                value
-                for name, value in diagnostics.items()
-                if name.endswith(".first_stage_rejected_rows")
-            )
-            tpht_exact_rejected_rows = sum(
-                value
-                for name, value in diagnostics.items()
-                if name.endswith(".exact_rejected_rows")
-            )
-            diagnostics["tpht.proposal_rows"] = float(tpht_proposal_rows)
-            diagnostics["tpht.station_evaluations"] = float(
-                tpht_station_evaluations
-            )
-            diagnostics["tpht.first_stage_station_evaluations"] = float(
-                tpht_first_stage_station_evaluations
-            )
-            diagnostics["tpht.full_history_rows"] = float(
-                tpht_full_history_rows
-            )
-            diagnostics["tpht.refinement_bound_rejected_rows"] = float(
-                tpht_refinement_bound_rejected_rows
-            )
-            diagnostics["tpht.first_stage_rejected_rows"] = float(
-                tpht_first_stage_rejected_rows
-            )
-            diagnostics["tpht.exact_rejected_rows"] = float(
-                tpht_exact_rejected_rows
-            )
-            if tpht_proposal_rows > 0.0:
-                mean_evaluations = tpht_station_evaluations / tpht_proposal_rows
-                full_fraction = tpht_full_history_rows / tpht_proposal_rows
-                mean_first_stage_evaluations = (
-                    tpht_first_stage_station_evaluations
-                    / tpht_proposal_rows
-                )
-            else:
-                mean_evaluations = 0.0
-                full_fraction = 0.0
-                mean_first_stage_evaluations = 0.0
-            refinement_bound_rejection_fraction = (
-                tpht_refinement_bound_rejected_rows / tpht_proposal_rows
-                if tpht_proposal_rows > 0.0
-                else 0.0
-            )
-            first_stage_rejection_fraction = (
-                tpht_first_stage_rejected_rows / tpht_proposal_rows
-                if tpht_proposal_rows > 0.0
-                else 0.0
-            )
-            exact_rejection_fraction = (
-                tpht_exact_rejected_rows / tpht_full_history_rows
-                if tpht_full_history_rows > 0.0
-                else 0.0
-            )
-            diagnostics["tpht.mean_station_evaluations_per_proposal"] = float(
-                mean_evaluations
-            )
-            diagnostics[
-                "tpht.mean_first_stage_station_evaluations_per_proposal"
-            ] = float(mean_first_stage_evaluations)
-            diagnostics["tpht.full_history_fraction"] = float(full_fraction)
-            diagnostics["tpht.refinement_bound_rejection_fraction"] = float(
-                refinement_bound_rejection_fraction
-            )
-            diagnostics["tpht.first_stage_rejection_fraction"] = float(
-                first_stage_rejection_fraction
-            )
-            diagnostics["tpht.exact_rejection_fraction"] = float(
-                exact_rejection_fraction
-            )
-            linear_work = bool(
-                len(active) >= 8
-                and mean_evaluations >= 0.8 * float(len(active))
-            )
-            self._joint_tpht_linear_scaling_streak = (
-                int(self._joint_tpht_linear_scaling_streak) + 1
-                if linear_work
-                else 0
-            )
-            diagnostics["tpht.linear_scaling_streak"] = float(
-                self._joint_tpht_linear_scaling_streak
-            )
-            diagnostics["tpht.history_scaling_warning"] = float(
-                self._joint_tpht_linear_scaling_streak >= 2
-            )
             diagnostics["wall_s.joint_strength"] = float(strength_wall_s)
             diagnostics["wall_s.cross_isotope"] = float(cross_isotope_wall_s)
             diagnostics["wall_s.station_likelihood_rebase"] = float(
@@ -3238,7 +2925,6 @@ class JointRejuvenationMixin:
             self._joint_structural_transport_cache = None
             self._active_joint_station_history = None
             self._joint_torch_generator = None
-            self._joint_tpht_generator = None
         return diagnostics
 
     def _joint_inward_move_rejection_summary(self) -> dict[str, object]:
@@ -3581,14 +3267,6 @@ class JointRejuvenationMixin:
                 f"isotopes_s={isotope_wall_s:.3f} "
                 "staged_rows="
                 f"{int(diagnostics.get('staged_transport_commit_rows', 0.0))} "
-                "tpht_mean_stations="
-                f"{diagnostics.get('tpht.mean_station_evaluations_per_proposal', 0.0):.3f} "
-                "tpht_full_fraction="
-                f"{diagnostics.get('tpht.full_history_fraction', 0.0):.3f} "
-                "tpht_first_stage_reject_fraction="
-                f"{diagnostics.get('tpht.first_stage_rejection_fraction', 0.0):.3f} "
-                "tpht_scaling_warning="
-                f"{int(diagnostics.get('tpht.history_scaling_warning', 0.0))} "
                 f"strength_s={diagnostics.get('wall_s.joint_strength', 0.0):.3f} "
                 f"cross_s={diagnostics.get('wall_s.cross_isotope', 0.0):.3f}",
                 flush=True,
@@ -3838,15 +3516,15 @@ class JointRejuvenationMixin:
                     isotope: isotope in hard_boundary_failures
                     for isotope in isotope_order
                 }
-                raise RuntimeError(
-                    "Joint SMC final target saturated the hard cardinality "
-                    "boundary; waiting for a posterior fluctuation is invalid: "
+                record["terminated_at_hard_cap"] = 1.0
+                print(
+                    "[joint-smc] sampler-quality-failed "
+                    "reason=hard-cardinality-cap "
                     f"target_beta={target_beta:.12g}, "
                     "hard_cap_posterior_mass_limit="
                     f"{HARD_CAP_POSTERIOR_MASS_LIMIT:.12g}, "
-                    f"diagnostics_by_isotope={structural_diagnostics_by_isotope}, "
-                    "latest_inward_moves="
-                    f"{self._joint_inward_move_rejection_summary()}."
+                    f"diagnostics_by_isotope={structural_diagnostics_by_isotope}",
+                    flush=True,
                 )
             inward_integrity_failures = {
                 isotope: structural_diagnostics_by_isotope[isotope]
@@ -3871,6 +3549,8 @@ class JointRejuvenationMixin:
                     "latest_inward_moves="
                     f"{self._joint_inward_move_rejection_summary()}."
                 )
+            if hard_boundary_failures:
+                break
             unmet_gate_progress: dict[str, float] = {}
             if not continuous_movement_sufficient:
                 state_threshold = float(
@@ -3959,19 +3639,17 @@ class JointRejuvenationMixin:
                     self.last_joint_structural_mixing_incomplete_by_isotope = {
                         isotope: False for isotope in isotope_order
                     }
-                    raise RuntimeError(
-                        "Joint SMC mixing gate made no measurable progress; "
-                        "continuing to the station wall-time limit would be "
-                        "invalid: "
+                    record["terminated_after_no_progress"] = 1.0
+                    print(
+                        "[joint-smc] sampler-quality-warning "
+                        "reason=mixing-no-progress "
                         f"target_beta={target_beta:.12g}, "
                         f"unmet_gates={unmet_gate_progress}, "
                         f"no_progress_sweeps={no_progress_sweeps}, "
-                        f"no_progress_elapsed_s={no_progress_elapsed_s:.3f}, "
-                        "structural_diagnostics_by_isotope="
-                        f"{structural_diagnostics_by_isotope}, "
-                        "latest_inward_moves="
-                        f"{self._joint_inward_move_rejection_summary()}."
+                        f"no_progress_elapsed_s={no_progress_elapsed_s:.3f}",
+                        flush=True,
                     )
+                    break
             if station_elapsed >= wall_time_limit_s:
                 self.last_joint_smc_wall_time_limit_exceeded = True
                 self.last_joint_rejuvenation_mixing_incomplete = True
@@ -3979,27 +3657,16 @@ class JointRejuvenationMixin:
                 self.last_joint_structural_mixing_incomplete_by_isotope = {
                     isotope: False for isotope in isotope_order
                 }
-                raise RuntimeError(
-                    "Joint SMC exceeded its rejuvenation wall-time contract "
-                    "before satisfying mixing gates: "
+                record["terminated_at_wall_time_limit"] = 1.0
+                print(
+                    "[joint-smc] sampler-quality-warning "
+                    "reason=rejuvenation-wall-time-limit "
                     f"elapsed_s={station_elapsed:.3f}, "
                     f"limit_s={wall_time_limit_s:.3f}, "
-                    "continuous_movement_sufficient="
-                    f"{continuous_movement_sufficient}, "
-                    "inward_proposal_integrity_by_isotope="
-                    f"{inward_proposal_integrity_by_isotope}, "
-                    "lineage_recovery_required="
-                    f"{enforce_lineage_recovery}, "
-                    "lineage_recovery_sufficient_by_isotope="
-                    f"{recovery_sufficient_by_isotope}, "
-                    "certified_recovery_by_isotope="
-                    f"{recovery_summary}, "
-                    "structural_diagnostics_by_isotope="
-                    f"{structural_diagnostics_by_isotope}, "
-                    "latest_inward_moves="
-                    f"{self._joint_inward_move_rejection_summary()}, "
-                    f"sweeps={sweep_index + 1}."
+                    f"sweeps={sweep_index + 1}",
+                    flush=True,
                 )
+                break
             if (
                 continuous_movement_sufficient
                 and lineage_recovery_sufficient

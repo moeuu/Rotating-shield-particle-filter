@@ -17,7 +17,11 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _write_completed_run(root: Path, *, status: str = "complete") -> Path:
+def _write_completed_run(
+    root: Path,
+    *,
+    execution_status: str = "complete",
+) -> Path:
     """Write one minimal durable completed-run artifact set."""
     run_id = "fixture-run"
     pf_output = root / "pf_output"
@@ -27,7 +31,9 @@ def _write_completed_run(root: Path, *, status: str = "complete") -> Path:
     _write_json(
         pf_output / "closed_loop_result.json",
         {
-            "status": status,
+            "schema_version": 2,
+            "execution_status": execution_status,
+            "sampler_quality_status": "failed",
             "run_id": run_id,
             "record_count": 4,
             "station_count": 2,
@@ -205,7 +211,10 @@ def test_completed_run_loader_and_figure_are_auditable(tmp_path: Path) -> None:
 
 def test_completed_run_loader_fails_closed_on_incomplete_run(tmp_path: Path) -> None:
     """Incomplete runs must not be rendered as completed paper evidence."""
-    run_dir = _write_completed_run(tmp_path / "run", status="failed")
+    run_dir = _write_completed_run(
+        tmp_path / "run",
+        execution_status="failed",
+    )
 
     with pytest.raises(ValueError, match="not complete"):
         figures.load_completed_run(run_dir)

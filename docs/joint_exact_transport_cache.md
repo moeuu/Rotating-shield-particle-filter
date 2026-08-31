@@ -6,7 +6,7 @@ The production PF remains a causal 16-station particle filter. It does not
 rerun inference over a finalized log and it does not replace the hierarchical
 full-spectrum likelihood with an MLE or an approximate sufficient statistic.
 The optimization changes only how source-resolved transport is stored and how
-an exact-RJ proposal is scheduled.
+an exact-RJ proposal is materialized.
 
 The live contract has fixed capacity for 16 stations and 128 views. Before the
 first acquisition, the PF reserves two CUDA float64 buffers for that complete
@@ -37,11 +37,11 @@ Accepted untempered likelihoods are retained per station. On a normal station
 append, only the new station column is evaluated; earlier station likelihoods
 are neither rescanned nor reconstructed. A changed proposal still evaluates
 its exact response over every acquired view before it can be accepted. The
-[Transition-Preserving History Tree](transition_preserving_history_tree.md)
-first evaluates the actual latest station, then generates transport for exact
-dyadic child blocks only while the proposal remains viable. No representative
-station or block-size weight exists. Accepted changed rows are rebased per
-station before the sweep completes.
+complete replacement block is overlaid once, and the one-stage MH/RJ decision
+uses the resulting exact full-history likelihood difference and one uniform
+draw. No representative station, history screening, or block-size weight
+exists. Accepted changed rows are rebased per station before the sweep
+completes.
 
 Every station signature covers its detector position, integer spectrum, energy
 axis, Fe/Pb program, live times, station identifiers, and model-contract hash.
@@ -107,9 +107,7 @@ Position moves still recompute the changed source across all acquired views and
 the exact likelihood still reads the bounded history, so no larger speed claim
 is made without end-to-end profiling.
 
-This is an inference scheduling change. It does not change Geant4 physics,
-transport values, likelihood equations, priors, or the posterior target. TPHT
-does change the RJ transition kernel and consumes a second delayed-acceptance
-uniform, so finite-chain samples need not be bitwise identical. Its invariant
-target remains the exact full-history posterior. It therefore requires
-transition and numerical tests rather than a new Geant4 acceptance campaign.
+This is a storage and materialization change. It does not change Geant4
+physics, transport values, likelihood equations, priors, the one-stage RJ
+transition rule, or the posterior target. Numerical equivalence and transition
+tests are therefore required, but a new Geant4 acceptance campaign is not.

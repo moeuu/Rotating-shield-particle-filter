@@ -29,7 +29,7 @@ for import_root in (ROOT, SRC):
 
 from scripts.ral_figure_common import LATEX_ROOT  # noqa: E402
 from runtime.experiment_profiles import (  # noqa: E402
-    MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE,
+    CS_CO_SURFACE_SEARCH_PROFILE,
 )
 from sim.isaacsim_app.app import IsaacSimApplication  # noqa: E402
 from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription  # noqa: E402
@@ -51,14 +51,18 @@ def _obstacle_cells() -> list[tuple[int, int]]:
 def _scene_description() -> SceneDescription:
     """Create the deterministic Isaac Sim scene used for all captures."""
     room_size = (
-        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment.size_x,
-        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment.size_y,
-        MULTI_ISOTOPE_SURFACE_SEARCH_PROFILE.environment.size_z,
+        CS_CO_SURFACE_SEARCH_PROFILE.environment.size_x,
+        CS_CO_SURFACE_SEARCH_PROFILE.environment.size_y,
+        CS_CO_SURFACE_SEARCH_PROFILE.environment.size_z,
     )
     sources = [
         SourceDescription("Cs-137", (8.2, 13.3, 0.85), 30000.0),
+        SourceDescription("Cs-137", (1.2, 13.8, 2.8), 26000.0),
+        SourceDescription("Cs-137", (8.8, 2.0, 1.7), 24000.0),
+        SourceDescription("Cs-137", (4.5, 0.2, 3.5), 22000.0),
         SourceDescription("Co-60", (2.1, 11.6, 0.85), 18000.0),
-        SourceDescription("Eu-154", (7.4, 5.8, 0.85), 12000.0),
+        SourceDescription("Co-60", (9.8, 7.0, 2.4), 16000.0),
+        SourceDescription("Co-60", (5.5, 14.8, 4.2), 14000.0),
     ]
     return SceneDescription(
         room_size_xyz=room_size,

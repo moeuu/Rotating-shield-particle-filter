@@ -314,8 +314,19 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     truth = read_json(root / "truth_manifest.json")
     environment = read_json(root / "measurement_log" / "environment.json")
     posterior = read_json(root / "pf_output" / "pf_posterior.json")
-    if result.get("status") != "complete":
+    if (
+        result.get("schema_version") != 2
+        or result.get("execution_status") != "complete"
+    ):
         raise ValueError("The requested full-simulation result is not complete.")
+    if result.get("sampler_quality_status") not in {
+        "pass",
+        "warning",
+        "failed",
+    }:
+        raise ValueError(
+            "Completed result has an invalid sampler_quality_status."
+        )
     run_id = result.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("Completed result must contain one nonempty run_id.")
@@ -709,8 +720,8 @@ def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
         (bottom_x[2], bottom_y),
         box_width,
         box_height,
-        "TPHT scheduler",
-        ("recent factor first", "survivor exact replay"),
+        "One-stage exact RJ",
+        ("full-history target", "one MH decision"),
         facecolor="#edf7ed",
     )
     _flow_box(
