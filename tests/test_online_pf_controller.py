@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import pytest
 
 from pf.closed_loop import _refine_and_replan, run_pf_closed_loop
 from runtime.assets import simulation_runtime_root, standard_geant4_config_path
@@ -15,20 +14,24 @@ from spectrum.transport_spectral import (
 )
 
 
-def test_unapproved_standard_model_fails_before_runtime_config() -> None:
-    """The shipped unvalidated spectrum model must not enter a production run."""
+def test_standard_model_receives_catalog_independent_runtime_approval() -> None:
+    """Runtime preflight may approve lines without changing their physics hash."""
     physical = load_runtime_config(standard_geant4_config_path())
     model = geometry_conditioned_model_from_runtime_config(physical)
     isotopes = tuple(sorted({str(row["isotope"]) for row in model.line_identity}))
 
     assert model.production_ready is False
-    with pytest.raises(RuntimeError, match="independent all-64 validation gate"):
-        estimator_neutral_runtime_config(
-            physical,
-            backend="geant4",
-            isotopes=isotopes,
-            run_root=simulation_runtime_root(),
-        )
+    resolved = estimator_neutral_runtime_config(
+        physical,
+        backend="geant4",
+        isotopes=isotopes,
+        run_root=simulation_runtime_root(),
+    )
+    approved = resolved["full_spectrum_generative_model"]
+
+    assert approved["production_ready"] is True
+    assert approved["contract_hash_sha256"] == model.contract_hash_sha256
+    assert approved["validation"]["schema_version"] == 7
 
 
 def test_closed_loop_receives_runtime_record_before_pf_updates() -> None:

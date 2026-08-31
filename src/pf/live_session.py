@@ -843,6 +843,14 @@ def _build_live_estimator_from_forward_context(
         max_stations=JOINT_EXACT_MAX_STATIONS,
         dtype_bytes=8,
     )
+    reindex_scratch_bytes = JointTransportCache.reindex_scratch_bytes(
+        particle_count=int(pf_config.num_particles),
+        source_slots=len(isotopes) * source_capacity,
+        line_count=len(tuple(model.line_identity)),
+        feature_count=len(tuple(model.transport_feature_order)),
+        max_stations=JOINT_EXACT_MAX_STATIONS,
+        dtype_bytes=8,
+    )
     minimum_state_chunk = min(32, int(pf_config.num_particles))
     minimum_likelihood_workspace_bytes = int(
         model.estimate_cross_likelihood_working_set_bytes(
@@ -869,7 +877,9 @@ def _build_live_estimator_from_forward_context(
         minimum_likelihood_workspace_bytes + minimum_overlay_scratch_bytes
     )
     required_live_cuda_bytes = (
-        required_cache_bytes + 2 * minimum_overlay_workspace_bytes
+        required_cache_bytes
+        + reindex_scratch_bytes
+        + 2 * minimum_overlay_workspace_bytes
     )
     try:
         cache_preflight = preflight_cuda_allocation_capacity(
@@ -928,6 +938,7 @@ def _build_live_estimator_from_forward_context(
     estimator.joint_transport_cache_preflight.update(
         {
             "cache_required_bytes": int(required_cache_bytes),
+            "reindex_scratch_bytes": int(reindex_scratch_bytes),
             "minimum_state_chunk": int(minimum_state_chunk),
             "minimum_overlay_workspace_bytes": int(
                 minimum_overlay_workspace_bytes
@@ -952,6 +963,23 @@ def _build_live_estimator_from_forward_context(
     estimator.joint_transport_cache_preflight["allocated_bytes"] = int(
         allocated_cache_bytes
     )
+    remaining_workspace_bytes = (
+        reindex_scratch_bytes + 2 * minimum_overlay_workspace_bytes
+    )
+    try:
+        post_allocation_preflight = preflight_cuda_allocation_capacity(
+            device=str(pf_config.gpu_device),
+            required_bytes=remaining_workspace_bytes,
+            allocation_name="post-cache exact PF workspace",
+        )
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise PFLiveSessionError(
+            "The fixed cache left insufficient CUDA memory for exact PF "
+            "workspace before acquisition."
+        ) from exc
+    estimator.joint_transport_cache_preflight[
+        "post_allocation_workspace_preflight"
+    ] = dict(post_allocation_preflight)
     return estimator
 
 

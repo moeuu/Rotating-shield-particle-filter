@@ -211,8 +211,8 @@ def test_torch_cache_matches_numpy_commit_and_reindex() -> None:
     )
 
 
-def test_required_storage_accounts_for_atomic_resampling_buffer() -> None:
-    """Capacity preflight must include both persistent cache buffers."""
+def test_required_storage_excludes_bounded_reindex_scratch() -> None:
+    """Capacity preflight separates persistent state from bounded scratch."""
     cache = JointTransportCache.allocate(
         _numpy_station(1.0),
         station_signature="station-0",
@@ -229,8 +229,17 @@ def test_required_storage_accounts_for_atomic_resampling_buffer() -> None:
         max_stations=16,
         dtype_bytes=8,
     )
+    scratch = JointTransportCache.reindex_scratch_bytes(
+        particle_count=3,
+        source_slots=4,
+        line_count=2,
+        feature_count=3,
+        max_stations=16,
+        dtype_bytes=8,
+    )
 
     assert cache.allocated_bytes == required
+    assert scratch < required
 
 
 def test_inactive_slot_nonzero_transport_fails_before_commit() -> None:

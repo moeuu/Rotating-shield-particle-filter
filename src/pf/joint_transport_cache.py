@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 
 JOINT_EXACT_MAX_STATIONS = 16
 JOINT_EXACT_MAX_VIEWS = 128
+JOINT_REINDEX_VIEW_CHUNK_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -124,9 +125,7 @@ class JointTransportCache(Sequence[object]):
     """
 
     _storage: tuple[object, object, object]
-    _resample_storage: tuple[object, object, object]
     station_log_likelihood: object
-    _resample_station_log_likelihood: object
     valid_view_count: int
     station_offsets: tuple[int, ...]
     station_signatures: tuple[str, ...]
@@ -138,6 +137,7 @@ class JointTransportCache(Sequence[object]):
     ancestor_reindex_count: int = 0
     slot_overlay_commit_count: int = 0
     _staged_ancestor_sha256: str | None = None
+    _staged_ancestor_indices_n: NDArray[np.int64] | None = None
 
     @staticmethod
     def required_storage_bytes(
@@ -150,7 +150,7 @@ class JointTransportCache(Sequence[object]):
         max_stations: int,
         dtype_bytes: int = 8,
     ) -> int:
-        """Return bytes for accepted and atomic-resampling cache buffers."""
+        """Return bytes for the accepted fixed-capacity cache."""
         dimensions = (
             particle_count,
             max_views,
@@ -172,9 +172,43 @@ class JointTransportCache(Sequence[object]):
         )
         transport_elements = line_elements * (2 + feature_count)
         station_elements = particle_count * max_stations
-        # Accepted and resampling buffers are both persistent. This lets row
-        # gathers finish before any accepted cache pointer is replaced.
-        return int(2 * (transport_elements + station_elements) * dtype_bytes)
+        return int((transport_elements + station_elements) * dtype_bytes)
+
+    @staticmethod
+    def reindex_scratch_bytes(
+        *,
+        particle_count: int,
+        source_slots: int,
+        line_count: int,
+        feature_count: int,
+        max_stations: int,
+        dtype_bytes: int = 8,
+    ) -> int:
+        """Return peak scratch bytes for one exact chunked ancestor commit."""
+        dimensions = (
+            particle_count,
+            source_slots,
+            line_count,
+            feature_count,
+            max_stations,
+            dtype_bytes,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in dimensions
+        ):
+            raise ValueError(
+                "Joint transport reindex dimensions must be positive integers."
+            )
+        view_chunk_elements = (
+            particle_count
+            * source_slots
+            * line_count
+            * (2 + feature_count)
+            * JOINT_REINDEX_VIEW_CHUNK_SIZE
+        )
+        station_elements = particle_count * max_stations
+        return int((view_chunk_elements + station_elements) * dtype_bytes)
 
     @classmethod
     def allocate_empty_torch(
@@ -232,17 +266,12 @@ class JointTransportCache(Sequence[object]):
                 torch.empty(shape, device=resolved_device, dtype=dtype)
                 for shape in storage_shapes
             )
-            resample_storage = tuple(
-                torch.empty(shape, device=resolved_device, dtype=dtype)
-                for shape in storage_shapes
-            )
             station_ll = torch.full(
                 (particle_count, max_stations),
                 float("nan"),
                 device=resolved_device,
                 dtype=dtype,
             )
-            resample_station_ll = torch.full_like(station_ll, float("nan"))
         except torch.cuda.OutOfMemoryError as exc:
             raise RuntimeError(
                 "Fixed joint exact cache allocation failed before acquisition; "
@@ -250,9 +279,7 @@ class JointTransportCache(Sequence[object]):
             ) from exc
         return cls(
             _storage=storage,
-            _resample_storage=resample_storage,
             station_log_likelihood=station_ll,
-            _resample_station_log_likelihood=resample_station_ll,
             valid_view_count=0,
             station_offsets=(0,),
             station_signatures=(),
@@ -333,21 +360,12 @@ class JointTransportCache(Sequence[object]):
                 )
                 for shape in storage_shapes
             )
-            resample_storage = tuple(
-                torch.empty(
-                    shape,
-                    device=total.device,
-                    dtype=total.dtype,
-                )
-                for shape in storage_shapes
-            )
             station_ll = torch.full(
                 (particle_count, station_capacity),
                 float("nan"),
                 device=total.device,
                 dtype=total.dtype,
             )
-            resample_station_ll = torch.full_like(station_ll, float("nan"))
         else:
             arrays = tuple(np.asarray(value) for value in station_components)
             if any(value.dtype != np.float64 for value in arrays):
@@ -372,20 +390,14 @@ class JointTransportCache(Sequence[object]):
                     dtype=np.float64,
                 ),
             )
-            resample_storage = tuple(
-                np.empty_like(value) for value in storage
-            )
             station_ll = np.full(
                 (particle_count, station_capacity),
                 np.nan,
                 dtype=np.float64,
             )
-            resample_station_ll = np.full_like(station_ll, np.nan)
         cache = cls(
             _storage=storage,
-            _resample_storage=resample_storage,
             station_log_likelihood=station_ll,
-            _resample_station_log_likelihood=resample_station_ll,
             valid_view_count=0,
             station_offsets=(0,),
             station_signatures=(),
@@ -463,9 +475,7 @@ class JointTransportCache(Sequence[object]):
         """Return bytes owned by transport and per-station likelihood storage."""
         return int(
             sum(_tensor_nbytes(value) for value in self._storage)
-            + sum(_tensor_nbytes(value) for value in self._resample_storage)
             + _tensor_nbytes(self.station_log_likelihood)
-            + _tensor_nbytes(self._resample_station_log_likelihood)
         )
 
     def __len__(self) -> int:
@@ -878,7 +888,7 @@ class JointTransportCache(Sequence[object]):
         self.commit_staged_reindex()
 
     def stage_reindex_rows(self, indices_n: NDArray[np.int64]) -> None:
-        """Gather one ancestor vector without changing accepted cache pointers."""
+        """Validate and stage one ancestor vector without mutating the cache."""
         raw = np.asarray(indices_n)
         if self._staged_ancestor_sha256 is not None:
             raise RuntimeError("A cache ancestor reindex is already staged.")
@@ -886,6 +896,16 @@ class JointTransportCache(Sequence[object]):
             raise ValueError("Ancestor indices must be one aligned int64 vector.")
         if np.any(raw < 0) or np.any(raw >= self.particle_count):
             raise IndexError("Ancestor index is outside cache rows.")
+        self._staged_ancestor_indices_n = np.ascontiguousarray(raw).copy()
+        self._staged_ancestor_sha256 = hashlib.sha256(
+            np.ascontiguousarray(raw).tobytes(order="C")
+        ).hexdigest()
+
+    def commit_staged_reindex(self) -> None:
+        """Commit a staged ancestor vector with bounded exact scratch memory."""
+        raw = self._staged_ancestor_indices_n
+        if self._staged_ancestor_sha256 is None or raw is None:
+            raise RuntimeError("No complete cache ancestor reindex is staged.")
         if _is_torch_tensor(self._storage[0]):
             import torch
 
@@ -894,65 +914,83 @@ class JointTransportCache(Sequence[object]):
                 device=self._storage[0].device,
                 dtype=torch.long,
             )
-            for source, destination in zip(
+            scratch_view_count = max(
+                1,
+                min(JOINT_REINDEX_VIEW_CHUNK_SIZE, self.valid_view_count),
+            )
+            transport_scratch = tuple(
+                torch.empty_like(source[:, :scratch_view_count, ...])
+                for source in self._storage
+            )
+            station_scratch = torch.empty_like(
+                self.station_log_likelihood[:, : self.station_count]
+            )
+            for source, scratch in zip(
                 self._storage,
-                self._resample_storage,
+                transport_scratch,
                 strict=True,
             ):
-                torch.index_select(
-                    source[:, : self.valid_view_count, ...],
+                for view_start in range(
                     0,
-                    indices,
-                    out=destination[:, : self.valid_view_count, ...],
-                )
+                    self.valid_view_count,
+                    JOINT_REINDEX_VIEW_CHUNK_SIZE,
+                ):
+                    view_stop = min(
+                        view_start + JOINT_REINDEX_VIEW_CHUNK_SIZE,
+                        self.valid_view_count,
+                    )
+                    view = source[:, view_start:view_stop, ...]
+                    active_scratch = scratch[:, : view_stop - view_start, ...]
+                    torch.index_select(view, 0, indices, out=active_scratch)
+                    view.copy_(active_scratch)
             torch.index_select(
                 self.station_log_likelihood[:, : self.station_count],
                 0,
                 indices,
-                out=self._resample_station_log_likelihood[
-                    :, : self.station_count
-                ],
+                out=station_scratch,
+            )
+            self.station_log_likelihood[:, : self.station_count].copy_(
+                station_scratch
             )
             if bool(self._storage[0].is_cuda):
                 torch.cuda.synchronize(self._storage[0].device)
         else:
-            for source, destination in zip(
+            scratch_view_count = max(
+                1,
+                min(JOINT_REINDEX_VIEW_CHUNK_SIZE, self.valid_view_count),
+            )
+            transport_scratch = tuple(
+                np.empty_like(source[:, :scratch_view_count, ...])
+                for source in self._storage
+            )
+            station_scratch = np.empty_like(
+                self.station_log_likelihood[:, : self.station_count]
+            )
+            for source, scratch in zip(
                 self._storage,
-                self._resample_storage,
+                transport_scratch,
                 strict=True,
             ):
-                np.take(
-                    source[:, : self.valid_view_count, ...],
-                    raw,
-                    axis=0,
-                    out=destination[:, : self.valid_view_count, ...],
-                )
+                for view_start in range(
+                    0,
+                    self.valid_view_count,
+                    JOINT_REINDEX_VIEW_CHUNK_SIZE,
+                ):
+                    view_stop = min(
+                        view_start + JOINT_REINDEX_VIEW_CHUNK_SIZE,
+                        self.valid_view_count,
+                    )
+                    view = source[:, view_start:view_stop, ...]
+                    active_scratch = scratch[:, : view_stop - view_start, ...]
+                    np.take(view, raw, axis=0, out=active_scratch)
+                    view[...] = active_scratch
             np.take(
                 self.station_log_likelihood[:, : self.station_count],
                 raw,
                 axis=0,
-                out=self._resample_station_log_likelihood[
-                    :, : self.station_count
-                ],
+                out=station_scratch,
             )
-        self._staged_ancestor_sha256 = hashlib.sha256(
-            np.ascontiguousarray(raw).tobytes(order="C")
-        ).hexdigest()
-
-    def commit_staged_reindex(self) -> None:
-        """Publish one completely staged transport and likelihood reindex."""
-        if self._staged_ancestor_sha256 is None:
-            raise RuntimeError("No complete cache ancestor reindex is staged.")
-        self._storage, self._resample_storage = (
-            self._resample_storage,
-            self._storage,
-        )
-        (
-            self.station_log_likelihood,
-            self._resample_station_log_likelihood,
-        ) = (
-            self._resample_station_log_likelihood,
-            self.station_log_likelihood,
-        )
+            self.station_log_likelihood[:, : self.station_count] = station_scratch
+        self._staged_ancestor_indices_n = None
         self._staged_ancestor_sha256 = None
         self.ancestor_reindex_count += 1
