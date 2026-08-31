@@ -1548,81 +1548,9 @@ class EstimatorStructuralProposalMixin:
                 device=reference.device,
                 dtype=reference.dtype,
             ),
-            "pending": None,
         }
         cache_by_key[key] = cached
         return cached
-
-    @staticmethod
-    def _joint_promote_pending_cuda_unit_transport(
-        *,
-        filt: IsotopeParticleFilter,
-        cache: dict[str, object],
-        final_state: Mapping[str, object] | None = None,
-    ) -> None:
-        """Commit pending unit columns only when their proposal was accepted."""
-        import torch
-
-        pending = cache.get("pending")
-        if not isinstance(pending, dict):
-            return
-        state = final_state
-        if state is None:
-            state = getattr(filt, "_structural_rj_device_state", None)
-        if state is None:
-            raise RuntimeError(
-                "Pending CUDA unit transport has no accepted-state mirror."
-            )
-        indices = pending["particle_indices"]
-        cardinality = int(pending["cardinality"])
-        current_cardinality = torch.index_select(
-            state["cardinalities"],
-            0,
-            indices,
-        )
-        accepted = current_cardinality == cardinality
-        if cardinality:
-            current_positions = torch.index_select(
-                state["positions"],
-                0,
-                indices,
-            )[:, :cardinality]
-            current_charts = torch.index_select(
-                state["chart_ids"],
-                0,
-                indices,
-            )[:, :cardinality]
-            accepted &= torch.all(
-                current_positions == pending["positions"],
-                dim=(1, 2),
-            )
-            accepted &= torch.all(
-                current_charts == pending["chart_ids"],
-                dim=1,
-            )
-        accepted_indices = indices[accepted]
-        cache["mask"][accepted_indices] = False
-        cache["total"][accepted_indices] = 0.0
-        cache["uncollided"][accepted_indices] = 0.0
-        cache["features"][accepted_indices] = 0.0
-        if cardinality:
-            cache["mask"][accepted_indices, :cardinality] = True
-            cache["positions"][accepted_indices, :cardinality] = pending["positions"][
-                accepted
-            ]
-            cache["chart_ids"][accepted_indices, :cardinality] = pending["chart_ids"][
-                accepted
-            ]
-            cache["total"][accepted_indices, :, :cardinality] = pending["total"][
-                accepted
-            ]
-            cache["uncollided"][accepted_indices, :, :cardinality] = pending[
-                "uncollided"
-            ][accepted]
-            cache["features"][accepted_indices, :, :cardinality] = pending["features"][
-                accepted
-            ]
-        cache["pending"] = None
 
     def _joint_commit_staged_cuda_transport_cache_isotope(
         self,
@@ -1731,12 +1659,6 @@ class EstimatorStructuralProposalMixin:
             positive_line_indices=local_indices,
             reference=cached_total,
         )
-        self._joint_promote_pending_cuda_unit_transport(
-            filt=filt,
-            cache=accepted_cache,
-            final_state=final_state,
-        )
-
         slots_per_isotope = int(filt.config.hard_max_sources or 0)
         slot_start = order.index(isotope) * slots_per_isotope
         slot_stop = slot_start + slots_per_isotope
@@ -2050,7 +1972,7 @@ class EstimatorStructuralProposalMixin:
         return matched, matched_slots, gathered
 
     @staticmethod
-    def _joint_stage_cuda_unit_transport(
+    def _joint_commit_cuda_accepted_unit_transport(
         *,
         cache: dict[str, object],
         particle_indices: object,
@@ -2060,31 +1982,41 @@ class EstimatorStructuralProposalMixin:
         unit_uncollided: "torch.Tensor",
         unit_features: "torch.Tensor",
     ) -> None:
-        """Stage exact proposal columns for acceptance detection next call."""
+        """Commit exact TPHT-replayed columns for already accepted rows."""
         import torch
 
         reference = unit_total
-        cache["pending"] = {
-            "particle_indices": torch.as_tensor(
-                particle_indices,
-                device=reference.device,
-                dtype=torch.long,
-            ),
-            "cardinality": int(positions_pks.shape[1]),
-            "positions": torch.as_tensor(
+        indices = torch.as_tensor(
+            particle_indices,
+            device=reference.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        cardinality = int(positions_pks.shape[1])
+        if int(indices.numel()) != int(positions_pks.shape[0]):
+            raise ValueError("Accepted unit transport rows are misaligned.")
+        cache["mask"][indices] = False
+        cache["total"][indices] = 0.0
+        cache["uncollided"][indices] = 0.0
+        cache["features"][indices] = 0.0
+        if cardinality:
+            cache["mask"][indices, :cardinality] = True
+            cache["positions"][indices, :cardinality] = torch.as_tensor(
                 positions_pks,
                 device=reference.device,
                 dtype=reference.dtype,
-            ).clone(),
-            "chart_ids": torch.as_tensor(
+            )
+            cache["chart_ids"][indices, :cardinality] = torch.as_tensor(
                 chart_ids_pk,
                 device=reference.device,
                 dtype=torch.long,
-            ).clone(),
-            "total": unit_total.detach().clone(),
-            "uncollided": unit_uncollided.detach().clone(),
-            "features": unit_features.detach().clone(),
-        }
+            )
+            cache["total"][indices, :, :cardinality] = unit_total.detach()
+            cache["uncollided"][indices, :, :cardinality] = (
+                unit_uncollided.detach()
+            )
+            cache["features"][indices, :, :cardinality] = (
+                unit_features.detach()
+            )
 
     def _joint_structural_target_evaluator(
         self,
@@ -2100,7 +2032,7 @@ class EstimatorStructuralProposalMixin:
         station_start: int | None = None,
         station_stop: int | None = None,
         return_station_log_likelihood: bool = False,
-        stage_unit_transport: bool = True,
+        stage_unit_transport: bool = False,
     ) -> object:
         """Evaluate a conditional isotope proposal on one exact history block."""
         full_stations = self._active_joint_station_history
@@ -2273,10 +2205,6 @@ class EstimatorStructuralProposalMixin:
                 data=data,
                 positive_line_indices=local_indices,
                 reference=cached_total,
-            )
-            self._joint_promote_pending_cuda_unit_transport(
-                filt=filt,
-                cache=accepted_unit_cache,
             )
             accepted_matched, _, accepted_unit_components = (
                 self._joint_match_cuda_accepted_unit_transport(
@@ -2534,7 +2462,7 @@ class EstimatorStructuralProposalMixin:
                 dtype=cached_total.dtype,
             )[:, None, :, None]
             if stage_unit_transport:
-                self._joint_stage_cuda_unit_transport(
+                self._joint_commit_cuda_accepted_unit_transport(
                     cache=accepted_unit_cache,
                     particle_indices=index_tensor,
                     positions_pks=positions,
@@ -3186,10 +3114,6 @@ class EstimatorStructuralProposalMixin:
                 data=data,
                 positive_line_indices=local_indices,
                 reference=cached_total,
-            )
-            self._joint_promote_pending_cuda_unit_transport(
-                filt=filt,
-                cache=accepted_unit_cache,
             )
             accepted_matched, _, accepted_unit_components = (
                 self._joint_match_cuda_accepted_unit_transport(

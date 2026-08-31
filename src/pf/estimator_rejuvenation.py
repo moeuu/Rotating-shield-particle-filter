@@ -2928,7 +2928,7 @@ class JointRejuvenationMixin:
                     changed_rows=changed_rows,
                 )
                 if changed_rows.size:
-                    if cache_is_torch:
+                    if cache_is_cuda:
                         self._joint_commit_staged_cuda_transport_cache_isotope(
                             filt=filt,
                             data=evidence,

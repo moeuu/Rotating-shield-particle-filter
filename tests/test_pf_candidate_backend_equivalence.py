@@ -324,6 +324,7 @@ def test_staged_accepted_transport_commits_without_recomputation(
         particle_indices=np.arange(2, dtype=np.int64),
         target_beta=1.0,
         tempering_start_row=0,
+        stage_unit_transport=True,
     )
     for row, particle in enumerate(filt.continuous_particles):
         particle.state = IsotopeState(
@@ -744,10 +745,10 @@ def test_device_delta_reuses_unchanged_positions_exactly(
     np.testing.assert_allclose(actual, expected, rtol=2.0e-12, atol=1.0e-8)
 
 
-def test_sweep_local_unit_cache_promotes_only_accepted_geometry(
+def test_sweep_local_unit_cache_commits_only_accepted_replay_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only accepted proposal columns may enter the sweep-local unit cache."""
+    """Only TPHT accepted-replay columns may enter the sweep-local cache."""
     pytest.importorskip("torch")
     estimator = _estimator(use_gpu=True)
     station = _station()
@@ -800,6 +801,17 @@ def test_sweep_local_unit_cache_promotes_only_accepted_geometry(
             target_beta=0.7,
             tempering_start_row=0,
         )
+        estimator._joint_structural_target_evaluator(
+            filt=filt,
+            data=evidence,
+            positions_pks=positions[:1],
+            chart_ids_pk=chart_ids[:1],
+            strengths_pk=strengths[:1],
+            particle_indices=indices[:1],
+            target_beta=0.7,
+            tempering_start_row=0,
+            stage_unit_transport=True,
+        )
         filt._commit_continuous_rj_states(
             indices,
             np.asarray([True, False]),
@@ -823,7 +835,7 @@ def test_sweep_local_unit_cache_promotes_only_accepted_geometry(
         estimator._active_joint_station_history = None
         filt._clear_continuous_rj_device_state()
 
-    assert call_rows == [2, 1]
+    assert call_rows == [2, 1, 1]
     np.testing.assert_allclose(second, first, rtol=2.0e-12, atol=1.0e-8)
 
 
@@ -1425,11 +1437,19 @@ def test_unit_transport_cache_retains_reused_state_during_proposal_churn(
     assert estimator.last_joint_structural_unit_cache_misses == misses_before_reuse
 
 
-@pytest.mark.parametrize("use_gpu", [False, True])
+@pytest.mark.parametrize(
+    ("use_gpu", "gpu_device"),
+    [(False, "cpu"), (True, "cpu"), (True, "cuda")],
+)
 def test_raw_spectrum_joint_smc_concentrates_on_physical_truth(
     use_gpu: bool,
+    gpu_device: str,
 ) -> None:
     """An exact raw-spectrum update must retain truth support and target ESS."""
+    if gpu_device == "cuda":
+        torch = pytest.importorskip("torch")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is not available.")
     model = approved_full_spectrum_model()
     particle_count = 48
     estimator = RotatingShieldPFEstimator(
@@ -1446,9 +1466,9 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth(
             max_sources=1,
             hard_max_sources=2,
             variable_cardinality=True,
-            init_num_sources=(0, 1),
-            use_gpu=use_gpu,
-            gpu_device="cpu",
+                init_num_sources=(0, 1),
+                use_gpu=use_gpu,
+                gpu_device=gpu_device,
             position_max=(3.0, 3.0, 3.0),
             structural_rj_surface_chart_max_edge_m=2.0,
             strength_prior=BoundedUniformStrengthPriorTestConfig(
@@ -1613,8 +1633,10 @@ def test_raw_spectrum_joint_smc_concentrates_on_physical_truth(
     assert cs_filter.last_ess >= 0.25 * particle_count - 1.0e-9
     assert estimator.last_joint_temper_steps[-1]["beta_total"] == 1.0
     assert 1 <= estimator.last_joint_station_unique_ancestor_count <= particle_count
-    if use_gpu:
+    if gpu_device == "cuda":
         assert estimator.last_joint_staged_transport_commit_rows > 0
+    elif use_gpu:
+        assert estimator.last_joint_staged_transport_commit_rows == 0
 
 
 def test_cuda_joint_moves_keep_state_and_mh_on_device() -> None:
