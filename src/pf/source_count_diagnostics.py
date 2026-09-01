@@ -743,6 +743,50 @@ def _overall_residual_summary(
     }
 
 
+def _figure_energy_metadata(stations: Sequence[Any]) -> dict[str, object]:
+    """Return validated energy-bin coordinates and model provenance for plots."""
+    axis = np.asarray(stations[0].energy_axis_keV, dtype=np.float64)
+    contract_hash = stations[0].generative_contract_hash_sha256
+    if (
+        axis.ndim != 1
+        or axis.size < 2
+        or np.any(~np.isfinite(axis))
+        or not isinstance(contract_hash, str)
+        or not contract_hash
+    ):
+        raise RuntimeError("Diagnostic energy metadata is invalid.")
+    widths = np.diff(axis)
+    bin_width = float(widths[0])
+    if bin_width <= 0.0 or not np.allclose(
+        widths,
+        bin_width,
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
+        raise RuntimeError("Diagnostic energy bins must be uniformly spaced.")
+    for station in stations[1:]:
+        if (
+            station.generative_contract_hash_sha256 != contract_hash
+            or not np.array_equal(
+                np.asarray(station.energy_axis_keV, dtype=np.float64),
+                axis,
+            )
+        ):
+            raise RuntimeError(
+                "Diagnostic stations do not share one energy/model contract."
+            )
+    edges = np.concatenate(
+        (axis, np.asarray([axis[-1] + bin_width], dtype=np.float64))
+    )
+    return {
+        "generative_contract_hash_sha256": contract_hash,
+        "energy_axis_keV": axis.tolist(),
+        "energy_bin_left_edges_keV": axis.tolist(),
+        "energy_bin_edges_keV": edges.tolist(),
+        "energy_bin_width_keV": bin_width,
+    }
+
+
 def conditional_source_count_residual_diagnostics(
     estimator: Any,
     *,
@@ -788,6 +832,7 @@ def conditional_source_count_residual_diagnostics(
             "changes_inference": False,
             "candidate_pairs": [],
         }
+    energy_metadata = _figure_energy_metadata(stations)
     state = _representative_state(estimator)
     pairs = _eligible_pairs(
         estimator,
@@ -803,10 +848,7 @@ def conditional_source_count_residual_diagnostics(
         "available": True,
         "truth_used": False,
         "changes_inference": False,
-        "energy_axis_keV": np.asarray(
-            stations[0].energy_axis_keV,
-            dtype=np.float64,
-        ).tolist(),
+        **energy_metadata,
         "pair_selection": {
             "same_or_physically_adjacent_face": True,
             "maximum_surface_path_distance_m": maximum_distance,
@@ -834,6 +876,38 @@ def conditional_source_count_residual_diagnostics(
     }
     if pairs.count == 0:
         return base_payload
+    base_payload["figure_reconstruction"] = {
+        "schema_version": 1,
+        "scope": "conditional_one_source_versus_two_component_diagnostic",
+        "raw_observation_storage": (
+            "two_component_reference.views[].observed_spectrum_count_by_bin"
+        ),
+        "two_component_prediction_storage": (
+            "two_component_reference.views[].predicted_mean_count_by_bin"
+        ),
+        "one_source_prediction_storage": (
+            "candidate_pairs[].views[].one_source.predicted_mean_count_by_bin"
+        ),
+        "energy_coordinate_semantics": "left_bin_edge_keV",
+        "count_semantics": "unit_weight_detected_event_count_per_energy_bin",
+        "predicted_mean_semantics": (
+            "full_spectrum_generative_model_expected_count_per_energy_bin"
+        ),
+        "residual_formula": "observed_count_minus_predicted_mean_count",
+        "view_join_key": [
+            "station_sequence_id",
+            "view_index",
+        ],
+        "transformations": {
+            "energy_rebinning": "none",
+            "count_normalization": "none",
+            "smoothing": "none",
+            "energy_bin_exclusion": "none",
+            "view_exclusion": "none",
+        },
+        "missing_value_semantics": "no_missing_values",
+        "randomness": "none_terminal_deterministic_diagnostic",
+    }
     data = estimator._joint_history_structural_geometry(
         state.isotope_order[0],
         stations,
@@ -1054,6 +1128,12 @@ def conditional_source_count_residual_diagnostics(
                 "pb_orientation_index": int(pb_indices[view_index]),
                 "live_time_s": float(live_times[view_index]),
                 "observed_total_count": float(observed_totals[view_index]),
+                "observed_spectrum_count_by_bin": observed[
+                    view_index
+                ].astype(np.int64).tolist(),
+                "predicted_mean_count_by_bin": reference_mean[
+                    view_index
+                ].tolist(),
                 "residual": reference_view,
             }
         )
@@ -1079,6 +1159,9 @@ def conditional_source_count_residual_diagnostics(
                 for name, values in one_metrics.items()
             }
             one_view["full_spectrum_residual_count_by_bin"] = one_residual[
+                pair_index, view_index
+            ].tolist()
+            one_view["predicted_mean_count_by_bin"] = final_means[
                 pair_index, view_index
             ].tolist()
             view_rows.append(

@@ -244,9 +244,74 @@ def test_conditional_source_count_diagnostic_is_batched_and_nonmutating() -> Non
     assert pair["two_component_reference_id"] == "posterior_representative"
     assert [row["station_sequence_id"] for row in pair["views"]] == [0, 1]
     assert [row["view_index"] for row in pair["views"]] == [0, 0]
-    assert len(batched["energy_axis_keV"]) == len(
-        pair["views"][0]["one_source"]["full_spectrum_residual_count_by_bin"]
+    energy_axis = np.asarray(batched["energy_axis_keV"], dtype=np.float64)
+    energy_edges = np.asarray(
+        batched["energy_bin_edges_keV"],
+        dtype=np.float64,
     )
+    assert energy_edges.size == energy_axis.size + 1
+    np.testing.assert_array_equal(energy_edges[:-1], energy_axis)
+    np.testing.assert_allclose(np.diff(energy_edges), 2.0, rtol=0.0, atol=0.0)
+    assert batched["energy_bin_left_edges_keV"] == batched["energy_axis_keV"]
+    assert batched["generative_contract_hash_sha256"] == (
+        estimator._full_spectrum_model().contract_hash_sha256
+    )
+    reconstruction = batched["figure_reconstruction"]
+    assert reconstruction["residual_formula"] == (
+        "observed_count_minus_predicted_mean_count"
+    )
+    assert reconstruction["transformations"] == {
+        "energy_rebinning": "none",
+        "count_normalization": "none",
+        "smoothing": "none",
+        "energy_bin_exclusion": "none",
+        "view_exclusion": "none",
+    }
+    reference_views = batched["two_component_reference"]["views"]
+    for reference_view, pair_view in zip(
+        reference_views,
+        pair["views"],
+        strict=True,
+    ):
+        observed = np.asarray(
+            reference_view["observed_spectrum_count_by_bin"],
+            dtype=np.float64,
+        )
+        two_prediction = np.asarray(
+            reference_view["predicted_mean_count_by_bin"],
+            dtype=np.float64,
+        )
+        two_residual = np.asarray(
+            reference_view["residual"][
+                "full_spectrum_residual_count_by_bin"
+            ],
+            dtype=np.float64,
+        )
+        one_prediction = np.asarray(
+            pair_view["one_source"]["predicted_mean_count_by_bin"],
+            dtype=np.float64,
+        )
+        one_residual = np.asarray(
+            pair_view["one_source"][
+                "full_spectrum_residual_count_by_bin"
+            ],
+            dtype=np.float64,
+        )
+        assert observed.size == energy_axis.size
+        assert two_prediction.size == energy_axis.size
+        assert one_prediction.size == energy_axis.size
+        np.testing.assert_allclose(
+            observed - two_prediction,
+            two_residual,
+            rtol=0.0,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            observed - one_prediction,
+            one_residual,
+            rtol=0.0,
+            atol=0.0,
+        )
     assert pair["conditional_one_source_fit"][
         "full_history_log_likelihood"
     ] == pytest.approx(

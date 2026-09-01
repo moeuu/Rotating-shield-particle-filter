@@ -95,6 +95,27 @@ consistent body font size across adjacent result tables, preferably `\small`;
 if a table only fits with `\scriptsize`, simplify column labels or split
 content before accepting it.
 
+## Figure-Source Data Preservation
+
+Every result figure must remain reproducible after the run without rerunning
+Geant4 or PF inference. Keep the numerical source data separate from rendered
+PNG/PDF/SVG assets, and retain enough information to change axes, aggregation,
+color, panel layout, normalization, or residual presentation later.
+
+For full-simulation results, preserve the authenticated MeasurementLog
+artifacts (including full spectra, exact energy-bin edges, detector poses,
+shield indices, live times, and environment geometry), the final posterior and
+weighted particle snapshot, the station/planner trace, and the evaluation
+inputs. Diagnostics that introduce derived values must additionally save their
+model predictions and the raw values from which residuals or summaries were
+calculated; a rendered curve or aggregate statistic alone is insufficient.
+
+Every derived figure-data payload must state units, bin coordinates, residual
+or normalization formulas, filtering/exclusion rules, missing-value semantics,
+and stochastic provenance. Preserve unrounded numerical values and apply
+rounding only in the presentation layer. Publication artifact inventories must
+hash the machine-readable source data together with the other run artifacts.
+
 ## Review Artifacts
 
 `scripts/build_ral_figures.py` writes raster review copies by default to:
