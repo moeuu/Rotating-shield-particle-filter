@@ -112,9 +112,13 @@ def test_completed_run_evaluation_joins_exact_truth_and_reports_each_source(
     assert result["execution_status"] == "complete"
     assert result["sampler_quality_status"] == "pass"
     assert result["accuracy_status"] == "pass"
+    assert result["schema_version"] == 3
     assert result["run_identity"]["run_id"] == "run-1"
     source = result["isotopes"]["Cs-137"]["truth_sources"][0]
-    assert source["representative_position_error_m"] == pytest.approx(0.1)
+    assert source["merged_centroid_position_error_m"] == pytest.approx(0.1)
+    assert source["strength_weighted_rms_position_error_m"] == pytest.approx(
+        0.1
+    )
     assert source["combined_relative_strength_error"] == pytest.approx(0.05)
 
 
@@ -197,7 +201,7 @@ def test_private_session_runner_always_publishes_post_run_evaluation(
         """Record the private post-run join without reading fake artifacts."""
         calls.append(dict(kwargs))
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "execution_status": "complete",
             "sampler_quality_status": "pass",
             "accuracy_status": "pass",
@@ -234,5 +238,5 @@ def test_private_session_runner_always_publishes_post_run_evaluation(
         "accuracy_status": "pass",
         "execution_status": "complete",
         "sampler_quality_status": "pass",
-        "schema_version": 2,
+        "schema_version": 3,
     }

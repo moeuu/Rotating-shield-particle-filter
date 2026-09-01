@@ -247,8 +247,9 @@ accuracy or comparative advantage.
 
 Report the paired four-run batch with the fixed policy in
 `docs/post_run_cluster_accuracy_policy.md`. The main outcomes are true-source
-cluster recall; per-source 3-D position and relative strength error; the joint
-0.5 m/25% pass fraction; response-distinct remote-component count; hard-cap
+association recall; per-source merged-centroid error, strength-weighted RMS
+3-D position error, split dispersion, and relative strength error; the joint
+0.5 m RMS/25% pass fraction; response-distinct remote-component count; hard-cap
 mass; and station/time to a stable pass. Raw RJ component count is diagnostic,
 not a success target, because nearby components may represent one physical
 source cluster. Also report mission motion time separately from the fixed

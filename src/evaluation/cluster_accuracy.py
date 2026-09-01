@@ -20,18 +20,21 @@ from pf.cardinality_policy import (
 
 @dataclass(frozen=True, slots=True)
 class ClusterAccuracyCriteria:
-    """Declare fixed operational tolerances for cluster-level PF scoring."""
+    """Declare fixed prospective targets for split-aware PF scoring."""
 
-    cluster_assignment_radius_m: float = 0.5
-    maximum_position_error_m: float = 0.5
+    position_target_m: float = 0.5
+    split_assignment_radius_multiplier: float = 3.0
+    same_isotope_separation_fraction: float = 0.5
     maximum_relative_strength_error: float = 0.25
     response_indistinguishable_cosine: float = 0.995
 
     def __post_init__(self) -> None:
         """Reject invalid or non-finite evaluation tolerances."""
         positive = {
-            "cluster_assignment_radius_m": self.cluster_assignment_radius_m,
-            "maximum_position_error_m": self.maximum_position_error_m,
+            "position_target_m": self.position_target_m,
+            "split_assignment_radius_multiplier": (
+                self.split_assignment_radius_multiplier
+            ),
             "maximum_relative_strength_error": (
                 self.maximum_relative_strength_error
             ),
@@ -41,7 +44,14 @@ class ClusterAccuracyCriteria:
             if not np.isfinite(resolved) or resolved <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
             object.__setattr__(self, name, resolved)
+        if self.split_assignment_radius_multiplier <= 1.0:
+            raise ValueError(
+                "split_assignment_radius_multiplier must exceed one."
+            )
         probabilities = {
+            "same_isotope_separation_fraction": (
+                self.same_isotope_separation_fraction
+            ),
             "response_indistinguishable_cosine": (
                 self.response_indistinguishable_cosine
             ),
@@ -51,13 +61,31 @@ class ClusterAccuracyCriteria:
             if not np.isfinite(resolved) or not 0.0 <= resolved <= 1.0:
                 raise ValueError(f"{name} must lie in [0, 1].")
             object.__setattr__(self, name, resolved)
+        if self.same_isotope_separation_fraction <= 0.0:
+            raise ValueError(
+                "same_isotope_separation_fraction must be positive."
+            )
+        if self.same_isotope_separation_fraction > 0.5:
+            raise ValueError(
+                "same_isotope_separation_fraction must not exceed 0.5."
+            )
 
     def to_dict(self) -> dict[str, float | str | bool]:
         """Return the canonical outcome-independent policy payload."""
         return {
-            "policy_name": "cluster_accuracy_without_raw_cardinality_scoring",
-            "cluster_assignment_radius_m": self.cluster_assignment_radius_m,
-            "maximum_position_error_m": self.maximum_position_error_m,
+            "policy_name": (
+                "split_aware_cluster_accuracy_without_raw_cardinality_scoring"
+            ),
+            "position_target_m": self.position_target_m,
+            "split_assignment_radius_multiplier": (
+                self.split_assignment_radius_multiplier
+            ),
+            "maximum_split_assignment_radius_m": (
+                self.maximum_split_assignment_radius_m
+            ),
+            "same_isotope_separation_fraction": (
+                self.same_isotope_separation_fraction
+            ),
             "maximum_relative_strength_error": (
                 self.maximum_relative_strength_error
             ),
@@ -66,7 +94,17 @@ class ClusterAccuracyCriteria:
             ),
             "maximum_hard_cap_posterior_mass": HARD_CAP_POSTERIOR_MASS_LIMIT,
             "raw_component_cardinality_is_accuracy_target": False,
+            "split_assignment_uses_response_signatures": False,
+            "merged_position_summary": "strength_weighted_centroid",
+            "position_target_metric": (
+                "strength_weighted_rms_distance_to_truth"
+            ),
         }
+
+    @property
+    def maximum_split_assignment_radius_m(self) -> float:
+        """Return the largest distance eligible for split assignment."""
+        return self.position_target_m * self.split_assignment_radius_multiplier
 
     @property
     def maximum_hard_cap_posterior_mass(self) -> float:
@@ -227,7 +265,7 @@ def _cluster_representative_index(
     estimates: Sequence[Source],
     member_indices: NDArray[np.int64],
 ) -> int:
-    """Return a truth-independent strength-weighted medoid for one cluster."""
+    """Return a truth-independent display medoid for one cluster."""
     members = np.asarray(member_indices, dtype=np.int64).reshape(-1)
     positions = np.asarray(
         [estimates[int(index)].pos for index in members],
@@ -241,6 +279,104 @@ def _cluster_representative_index(
     weights = strengths if float(np.sum(strengths)) > 0.0 else np.ones_like(strengths)
     costs = np.sum(distances * weights[None, :], axis=1)
     return int(members[int(np.argmin(costs))])
+
+
+def _truth_assignment_radii(
+    truth_positions: NDArray[np.float64],
+    criteria: ClusterAccuracyCriteria,
+) -> NDArray[np.float64]:
+    """Return nonoverlapping split-assignment radii for true sources."""
+    positions = np.asarray(truth_positions, dtype=np.float64).reshape(-1, 3)
+    radii = np.full(
+        positions.shape[0],
+        criteria.maximum_split_assignment_radius_m,
+        dtype=np.float64,
+    )
+    if positions.shape[0] <= 1:
+        return radii
+    separations = _pairwise_euclidean(positions, positions)
+    np.fill_diagonal(separations, np.inf)
+    nearest_separation = np.min(separations, axis=1)
+    return np.minimum(
+        radii,
+        criteria.same_isotope_separation_fraction * nearest_separation,
+    )
+
+
+def _unique_nearest_truth_mask(
+    distances: NDArray[np.float64],
+    nearest_distance: NDArray[np.float64],
+) -> NDArray[np.bool_]:
+    """Return estimates with one numerically unique nearest true source."""
+    matrix = np.asarray(distances, dtype=np.float64)
+    nearest = np.asarray(nearest_distance, dtype=np.float64).reshape(-1)
+    if matrix.shape[1] != nearest.size:
+        raise ValueError("Nearest-distance arrays are not aligned.")
+    if matrix.shape[0] <= 1:
+        return np.ones(nearest.size, dtype=np.bool_)
+    ties = np.isclose(
+        matrix,
+        nearest[None, :],
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    return np.sum(ties, axis=0) == 1
+
+
+def _weighted_cluster_geometry(
+    estimates: Sequence[Source],
+    member_indices: NDArray[np.int64],
+    truth_position: NDArray[np.float64],
+    position_target_m: float,
+) -> dict[str, object]:
+    """Return centroid, spread, and truth-RMS geometry for one split cluster."""
+    members = np.asarray(member_indices, dtype=np.int64).reshape(-1)
+    positions = np.asarray(
+        [estimates[int(index)].pos for index in members],
+        dtype=np.float64,
+    )
+    strengths = np.asarray(
+        [estimates[int(index)].strength for index in members],
+        dtype=np.float64,
+    )
+    total_strength = float(np.sum(strengths, dtype=np.float64))
+    if total_strength <= 0.0:
+        raise ValueError("Split-cluster strength must be positive.")
+    normalized_weights = strengths / total_strength
+    centroid = np.sum(
+        positions * normalized_weights[:, None],
+        axis=0,
+    )
+    truth = np.asarray(truth_position, dtype=np.float64).reshape(3)
+    centroid_error_vector = centroid - truth
+    centroid_error = float(np.linalg.norm(centroid_error_vector))
+    truth_distances = np.linalg.norm(positions - truth[None, :], axis=1)
+    rms_truth_error = float(
+        np.sqrt(np.sum(normalized_weights * np.square(truth_distances)))
+    )
+    centroid_distances = np.linalg.norm(
+        positions - centroid[None, :],
+        axis=1,
+    )
+    rms_dispersion = float(
+        np.sqrt(np.sum(normalized_weights * np.square(centroid_distances)))
+    )
+    within_target_fraction = float(
+        np.sum(
+            normalized_weights[truth_distances <= float(position_target_m)],
+            dtype=np.float64,
+        )
+    )
+    return {
+        "centroid": centroid,
+        "centroid_error_vector": centroid_error_vector,
+        "centroid_error": centroid_error,
+        "rms_truth_error": rms_truth_error,
+        "rms_dispersion": rms_dispersion,
+        "maximum_component_truth_error": float(np.max(truth_distances)),
+        "within_target_strength_fraction": within_target_fraction,
+        "total_strength": total_strength,
+    }
 
 
 def _hard_cap_mass(
@@ -283,7 +419,7 @@ def compute_cluster_accuracy_evaluation(
     *,
     criteria: ClusterAccuracyCriteria = DEFAULT_CLUSTER_ACCURACY_CRITERIA,
 ) -> dict[str, Any]:
-    """Score every true source against a local aggregate of estimated modes.
+    """Score every true source against a bounded split-aware mode aggregate.
 
     The small source-count loops only serialize per-source audit rows; all
     distance, response, and aggregation calculations are vectorized.  Truth is
@@ -347,9 +483,12 @@ def compute_cluster_accuracy_evaluation(
         | set(str(value) for value in evaluation_isotopes)
     )
     isotope_results: dict[str, object] = {}
-    all_position_errors: list[float] = []
+    all_centroid_position_errors: list[float] = []
+    all_rms_position_errors: list[float] = []
+    all_spatial_dispersions: list[float] = []
     all_relative_strength_errors: list[float] = []
     global_accuracy_failures: list[str] = []
+    global_detection_failures: list[str] = []
     global_hard_cap_failures: list[str] = []
     raw_truth_count = 0
     raw_estimate_count = 0
@@ -374,59 +513,99 @@ def compute_cluster_accuracy_evaluation(
             dtype=np.float64,
         ).reshape(len(estimates), 3)
         distances = _pairwise_euclidean(truth_positions, estimate_positions)
+        assignment_radii = _truth_assignment_radii(truth_positions, criteria)
         nearest_truth = np.full(len(estimates), -1, dtype=np.int64)
         nearest_distance = np.full(len(estimates), np.inf, dtype=np.float64)
+        assignment_radius_by_estimate = np.full(
+            len(estimates),
+            np.nan,
+            dtype=np.float64,
+        )
+        unique_nearest_truth = np.zeros(len(estimates), dtype=np.bool_)
         if truth and estimates:
             nearest_truth = np.argmin(distances, axis=0).astype(np.int64)
             nearest_distance = distances[
                 nearest_truth,
                 np.arange(len(estimates), dtype=np.int64),
             ]
-        assigned = (
-            np.isfinite(nearest_distance)
-            & (nearest_distance <= criteria.cluster_assignment_radius_m)
+            assignment_radius_by_estimate = assignment_radii[nearest_truth]
+            unique_nearest_truth = _unique_nearest_truth_mask(
+                distances,
+                nearest_distance,
+            )
+        assigned = unique_nearest_truth & (
+            nearest_distance <= assignment_radius_by_estimate
         )
         truth_rows: list[dict[str, object]] = []
         cluster_signatures: list[NDArray[np.float64]] = []
-        covered_truth_indices: list[int] = []
+        associated_truth_indices: list[int] = []
         isotope_accuracy_failures: list[str] = []
-        isotope_position_errors: list[float] = []
+        isotope_detection_failures: list[str] = []
+        isotope_centroid_position_errors: list[float] = []
+        isotope_rms_position_errors: list[float] = []
+        isotope_spatial_dispersions: list[float] = []
         isotope_relative_strength_errors: list[float] = []
         for truth_index, truth_source in enumerate(truth):
             members = np.flatnonzero(assigned & (nearest_truth == truth_index)).astype(
                 np.int64,
                 copy=False,
             )
-            covered = bool(members.size)
-            representative_index: int | None = None
-            position_error: float | None = None
+            core_members = members[
+                nearest_distance[members] <= criteria.position_target_m
+            ]
+            extended_members = members[
+                nearest_distance[members] > criteria.position_target_m
+            ]
+            associated = bool(members.size)
+            display_medoid_index: int | None = None
+            display_medoid_position: list[float] | None = None
+            display_medoid_error: float | None = None
+            merged_position: list[float] | None = None
+            merged_position_error_vector: list[float] | None = None
+            centroid_position_error: float | None = None
+            rms_position_error: float | None = None
+            spatial_dispersion: float | None = None
+            maximum_component_position_error: float | None = None
+            within_target_strength_fraction: float | None = None
             estimated_strength = 0.0
             relative_strength_error: float | None = None
-            representative_position: list[float] | None = None
-            position_error_vector: list[float] | None = None
             absolute_strength_error: float | None = None
-            if covered:
-                representative_index = _cluster_representative_index(
+            if associated:
+                display_medoid_index = _cluster_representative_index(
                     estimates,
                     members,
                 )
-                position_error = float(
-                    np.linalg.norm(
-                        estimates[representative_index].pos - truth_source.pos
-                    )
-                )
-                representative_position = estimates[
-                    representative_index
+                display_medoid_position = estimates[
+                    display_medoid_index
                 ].pos.tolist()
-                position_error_vector = (
-                    estimates[representative_index].pos - truth_source.pos
-                ).tolist()
-                estimated_strength = float(
-                    np.sum(
-                        [estimates[int(index)].strength for index in members],
-                        dtype=np.float64,
+                display_medoid_error = float(
+                    np.linalg.norm(
+                        estimates[display_medoid_index].pos - truth_source.pos
                     )
                 )
+                geometry = _weighted_cluster_geometry(
+                    estimates,
+                    members,
+                    truth_source.pos,
+                    criteria.position_target_m,
+                )
+                centroid = np.asarray(geometry["centroid"], dtype=np.float64)
+                centroid_error_vector = np.asarray(
+                    geometry["centroid_error_vector"],
+                    dtype=np.float64,
+                )
+                merged_position = centroid.tolist()
+                merged_position_error_vector = centroid_error_vector.tolist()
+                centroid_position_error = float(geometry["centroid_error"])
+                rms_position_error = float(geometry["rms_truth_error"])
+                spatial_dispersion = float(geometry["rms_dispersion"])
+                maximum_component_position_error = float(
+                    geometry["maximum_component_truth_error"]
+                )
+                within_target_strength_fraction = float(
+                    geometry["within_target_strength_fraction"]
+                )
+                estimated_strength = float(geometry["total_strength"])
                 relative_strength_error = abs(
                     estimated_strength - truth_source.strength
                 ) / truth_source.strength
@@ -443,58 +622,101 @@ def compute_cluster_accuracy_evaluation(
                     keepdims=True,
                 )
                 cluster_signatures.append(_normalized_columns(combined_signature)[:, 0])
-                covered_truth_indices.append(truth_index)
-                all_position_errors.append(position_error)
+                associated_truth_indices.append(truth_index)
+                all_centroid_position_errors.append(centroid_position_error)
+                all_rms_position_errors.append(rms_position_error)
+                all_spatial_dispersions.append(spatial_dispersion)
                 all_relative_strength_errors.append(relative_strength_error)
-                isotope_position_errors.append(position_error)
+                isotope_centroid_position_errors.append(
+                    centroid_position_error
+                )
+                isotope_rms_position_errors.append(rms_position_error)
+                isotope_spatial_dispersions.append(spatial_dispersion)
                 isotope_relative_strength_errors.append(
                     relative_strength_error
                 )
-            position_passed = bool(
-                position_error is not None
-                and position_error <= criteria.maximum_position_error_m
+            centroid_target_met = bool(
+                centroid_position_error is not None
+                and centroid_position_error <= criteria.position_target_m
             )
-            strength_passed = bool(
+            position_target_met = bool(
+                rms_position_error is not None
+                and rms_position_error <= criteria.position_target_m
+            )
+            strength_target_met = bool(
                 relative_strength_error is not None
                 and relative_strength_error
                 <= criteria.maximum_relative_strength_error
             )
-            if not covered:
-                isotope_accuracy_failures.append(
-                    f"missing_truth_cluster:{truth_index}"
-                )
+            if not associated:
+                failure = f"missing_truth_cluster:{truth_index}"
+                isotope_detection_failures.append(failure)
+                isotope_accuracy_failures.append(failure)
             else:
-                if not position_passed:
+                if not position_target_met:
                     isotope_accuracy_failures.append(
-                        f"position_error:{truth_index}"
+                        f"position_target_not_met:{truth_index}"
                     )
-                if not strength_passed:
+                if not strength_target_met:
                     isotope_accuracy_failures.append(
-                        f"strength_error:{truth_index}"
+                        f"strength_target_not_met:{truth_index}"
                     )
             truth_rows.append(
                 {
                     "truth_source_index": truth_index,
                     "truth_position_xyz_m": truth_source.pos.tolist(),
                     "truth_strength_cps_1m": truth_source.strength,
-                    "assigned_estimate_indices": [int(value) for value in members],
-                    "assigned_raw_component_count": int(members.size),
-                    "representative_estimate_index": representative_index,
-                    "representative_estimated_position_xyz_m": (
-                        representative_position
+                    "effective_split_assignment_radius_m": float(
+                        assignment_radii[truth_index]
                     ),
-                    "position_error_xyz_m": position_error_vector,
-                    "representative_position_error_m": position_error,
+                    "assigned_estimate_indices": [int(value) for value in members],
+                    "core_estimate_indices": [
+                        int(value) for value in core_members
+                    ],
+                    "extended_split_estimate_indices": [
+                        int(value) for value in extended_members
+                    ],
+                    "assigned_component_truth_distances_m": [
+                        float(nearest_distance[int(value)]) for value in members
+                    ],
+                    "assigned_raw_component_count": int(members.size),
+                    "display_medoid_estimate_index": display_medoid_index,
+                    "display_medoid_position_xyz_m": display_medoid_position,
+                    "display_medoid_position_error_m": display_medoid_error,
+                    "merged_position_xyz_m": merged_position,
+                    "merged_position_error_xyz_m": (
+                        merged_position_error_vector
+                    ),
+                    "merged_centroid_position_error_m": (
+                        centroid_position_error
+                    ),
+                    "strength_weighted_rms_position_error_m": (
+                        rms_position_error
+                    ),
+                    "strength_weighted_spatial_dispersion_m": (
+                        spatial_dispersion
+                    ),
+                    "maximum_assigned_component_position_error_m": (
+                        maximum_component_position_error
+                    ),
+                    "within_position_target_strength_fraction": (
+                        within_target_strength_fraction
+                    ),
                     "combined_estimated_strength_cps_1m": estimated_strength,
                     "combined_absolute_strength_error_cps_1m": (
                         absolute_strength_error
                     ),
                     "combined_relative_strength_error": relative_strength_error,
-                    "covered": covered,
-                    "position_accuracy_passed": position_passed,
-                    "strength_accuracy_passed": strength_passed,
-                    "source_accuracy_passed": bool(
-                        covered and position_passed and strength_passed
+                    "associated": associated,
+                    "merged_centroid_position_target_met": (
+                        centroid_target_met
+                    ),
+                    "position_target_met": position_target_met,
+                    "strength_target_met": strength_target_met,
+                    "source_accuracy_target_met": bool(
+                        associated
+                        and position_target_met
+                        and strength_target_met
                     ),
                 }
             )
@@ -507,6 +729,12 @@ def compute_cluster_accuracy_evaluation(
         remote_rows: list[dict[str, object]] = []
         response_distinct_remote_count = 0
         for estimate_index in remote_indices.tolist():
+            if nearest_truth[estimate_index] < 0:
+                exclusion_reason = "no_same_isotope_truth"
+            elif not unique_nearest_truth[estimate_index]:
+                exclusion_reason = "equidistant_truth_ambiguity"
+            else:
+                exclusion_reason = "outside_split_assignment_radius"
             maximum_cosine = (
                 float(np.max(signatures[:, estimate_index] @ cluster_signature_matrix))
                 if cluster_signature_matrix.shape[1]
@@ -531,7 +759,17 @@ def compute_cluster_accuracy_evaluation(
                         if np.isfinite(nearest_distance[estimate_index])
                         else None
                     ),
-                    "maximum_cosine_to_covered_cluster_response": maximum_cosine,
+                    "effective_split_assignment_radius_m": (
+                        float(assignment_radius_by_estimate[estimate_index])
+                        if np.isfinite(
+                            assignment_radius_by_estimate[estimate_index]
+                        )
+                        else None
+                    ),
+                    "assignment_exclusion_reason": exclusion_reason,
+                    "maximum_cosine_to_associated_cluster_response": (
+                        maximum_cosine
+                    ),
                     "response_distinct": response_distinct,
                 }
             )
@@ -548,6 +786,12 @@ def compute_cluster_accuracy_evaluation(
             [] if hard_cap_passed else ["hard_cardinality_cap_saturation"]
         )
         isotope_results[isotope] = {
+            "truth_source_detection_status": (
+                "pass" if not isotope_detection_failures else "failed"
+            ),
+            "truth_source_detection_failure_reasons": (
+                isotope_detection_failures
+            ),
             "accuracy_status": (
                 "pass" if not isotope_accuracy_failures else "failed"
             ),
@@ -561,22 +805,53 @@ def compute_cluster_accuracy_evaluation(
             "raw_truth_count": len(truth),
             "raw_estimate_component_count": len(estimates),
             "raw_component_cardinality_scored": False,
-            "covered_truth_cluster_count": len(covered_truth_indices),
+            "associated_truth_source_count": len(associated_truth_indices),
+            "core_covered_truth_source_count": sum(
+                bool(row["core_estimate_indices"]) for row in truth_rows
+            ),
+            "position_target_met_truth_source_count": sum(
+                bool(row["position_target_met"]) for row in truth_rows
+            ),
+            "strength_target_met_truth_source_count": sum(
+                bool(row["strength_target_met"]) for row in truth_rows
+            ),
             "response_distinct_remote_component_count": (
                 response_distinct_remote_count
             ),
             "hard_cap_posterior_mass": hard_cap_mass,
             "hard_cap_saturation_passed": hard_cap_passed,
             "metrics": {
-                "matched_truth_source_count": len(isotope_position_errors),
-                "position_error_mean_m": (
-                    float(np.mean(isotope_position_errors))
-                    if isotope_position_errors
+                "associated_truth_source_count": len(
+                    isotope_rms_position_errors
+                ),
+                "merged_centroid_position_error_mean_m": (
+                    float(np.mean(isotope_centroid_position_errors))
+                    if isotope_centroid_position_errors
                     else None
                 ),
-                "position_error_max_m": (
-                    float(np.max(isotope_position_errors))
-                    if isotope_position_errors
+                "merged_centroid_position_error_max_m": (
+                    float(np.max(isotope_centroid_position_errors))
+                    if isotope_centroid_position_errors
+                    else None
+                ),
+                "strength_weighted_rms_position_error_mean_m": (
+                    float(np.mean(isotope_rms_position_errors))
+                    if isotope_rms_position_errors
+                    else None
+                ),
+                "strength_weighted_rms_position_error_max_m": (
+                    float(np.max(isotope_rms_position_errors))
+                    if isotope_rms_position_errors
+                    else None
+                ),
+                "strength_weighted_spatial_dispersion_mean_m": (
+                    float(np.mean(isotope_spatial_dispersions))
+                    if isotope_spatial_dispersions
+                    else None
+                ),
+                "strength_weighted_spatial_dispersion_max_m": (
+                    float(np.max(isotope_spatial_dispersions))
+                    if isotope_spatial_dispersions
                     else None
                 ),
                 "relative_strength_error_mean": (
@@ -596,20 +871,35 @@ def compute_cluster_accuracy_evaluation(
         global_accuracy_failures.extend(
             f"{isotope}:{reason}" for reason in isotope_accuracy_failures
         )
+        global_detection_failures.extend(
+            f"{isotope}:{reason}" for reason in isotope_detection_failures
+        )
         global_hard_cap_failures.extend(
             f"{isotope}:{reason}" for reason in isotope_hard_cap_failures
         )
         raw_truth_count += len(truth)
         raw_estimate_count += len(estimates)
-    position_array = np.asarray(all_position_errors, dtype=np.float64)
+    centroid_position_array = np.asarray(
+        all_centroid_position_errors,
+        dtype=np.float64,
+    )
+    rms_position_array = np.asarray(all_rms_position_errors, dtype=np.float64)
+    spatial_dispersion_array = np.asarray(
+        all_spatial_dispersions,
+        dtype=np.float64,
+    )
     strength_array = np.asarray(all_relative_strength_errors, dtype=np.float64)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "artifact_family": "completed_pf_cluster_accuracy_evaluation",
         "criteria": criteria.to_dict(),
         "criteria_sha256": criteria.sha256,
         "truth_used_only_after_completion": True,
         "changes_pf_state_or_cardinality": False,
+        "truth_source_detection_status": (
+            "pass" if not global_detection_failures else "failed"
+        ),
+        "truth_source_detection_failure_reasons": global_detection_failures,
         "accuracy_status": (
             "pass" if not global_accuracy_failures else "failed"
         ),
@@ -622,12 +912,36 @@ def compute_cluster_accuracy_evaluation(
             "truth_source_count": raw_truth_count,
             "raw_estimate_component_count": raw_estimate_count,
             "raw_component_cardinality_scored": False,
-            "matched_truth_source_count": int(position_array.size),
-            "position_error_mean_m": (
-                float(np.mean(position_array)) if position_array.size else None
+            "associated_truth_source_count": int(rms_position_array.size),
+            "merged_centroid_position_error_mean_m": (
+                float(np.mean(centroid_position_array))
+                if centroid_position_array.size
+                else None
             ),
-            "position_error_max_m": (
-                float(np.max(position_array)) if position_array.size else None
+            "merged_centroid_position_error_max_m": (
+                float(np.max(centroid_position_array))
+                if centroid_position_array.size
+                else None
+            ),
+            "strength_weighted_rms_position_error_mean_m": (
+                float(np.mean(rms_position_array))
+                if rms_position_array.size
+                else None
+            ),
+            "strength_weighted_rms_position_error_max_m": (
+                float(np.max(rms_position_array))
+                if rms_position_array.size
+                else None
+            ),
+            "strength_weighted_spatial_dispersion_mean_m": (
+                float(np.mean(spatial_dispersion_array))
+                if spatial_dispersion_array.size
+                else None
+            ),
+            "strength_weighted_spatial_dispersion_max_m": (
+                float(np.max(spatial_dispersion_array))
+                if spatial_dispersion_array.size
+                else None
             ),
             "relative_strength_error_mean": (
                 float(np.mean(strength_array)) if strength_array.size else None

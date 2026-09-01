@@ -7,31 +7,88 @@ truth may be joined only after the run has completed and only when the exact
 
 ## What counts as a source estimate
 
-PF components are first assigned to the nearest same-isotope true source when
-their 3-D distance is at most 0.5 m. Multiple local components may be assigned
-to one true source. Their strengths are summed, and their representative
-position is the strength-weighted medoid selected without looking at truth.
+The 0.5 m value is a localization target, not the cutoff for deciding whether a
+true source was detected. Truth association and target attainment are separate
+results.
+
+For each true source, the maximum split-assignment radius is
+
+```text
+min(3 * position_target, 0.5 * nearest_same_isotope_truth_separation).
+```
+
+With the standard 0.5 m target, the unconstrained maximum is 1.5 m. The
+same-isotope-separation term prevents assignment regions from overlapping when
+two physical sources are close. If there is no other true source of that
+isotope, the separation term is infinite.
+
+Every PF component is assigned to a true source only when that source is its
+unique nearest same-isotope truth and the component lies within that source's
+split-assignment radius. A component is assigned at most once. Exact
+nearest-truth ties remain unassigned. Response signatures are not used to pick
+which components are favorable to a truth source.
+
+Assigned components at most 0.5 m from truth are labelled `core`; assigned
+components farther than 0.5 m are labelled `extended_split`. Both groups
+contribute fully to strength and position scoring. Thus a component just beyond
+the position target is not reported as a missing detection, while a broad split
+still carries an explicit accuracy cost.
 
 The raw PF cardinality is reported but is not an accuracy target. A result with
 four physical source clusters may therefore pass with raw K=5 or K=6 when one
-or more clusters contain a local corner or surface split.
+or more clusters contain a corner or surface split.
+
+## Position and strength of an assigned split cluster
+
+For assigned component positions `x_i` and positive reported strengths `w_i`,
+the merged position is the strength-weighted centroid
+
+```text
+x_bar = sum(w_i * x_i) / sum(w_i).
+```
+
+The centroid-to-truth distance is reported as the merged localization bias, but
+it is not sufficient by itself: components on opposite sides of truth can
+cancel to an apparently perfect centroid. The position target is therefore
+scored with the strength-weighted RMS distance to truth
+
+```text
+e_rms = sqrt(sum(w_i * ||x_i - x_truth||^2) / sum(w_i)).
+```
+
+The report also records the strength-weighted spatial dispersion about the
+centroid. These values obey
+
+```text
+e_rms^2 = ||x_bar - x_truth||^2 + dispersion^2.
+```
+
+This decomposition distinguishes a coherently displaced cluster from a
+truth-centered but widely fragmented cluster. The strength-weighted medoid is
+retained only as a display/audit component and is never used for position
+scoring. Cluster strength is the sum of every assigned component strength.
 
 For every isotope and every true source, the report records:
 
-- true and representative estimated 3-D position;
-- signed x/y/z error and Euclidean position error;
+- true position, merged centroid, and signed centroid error;
+- centroid error, spatial dispersion, and strength-weighted RMS position error;
+- the fraction of assigned strength lying within the 0.5 m target;
 - true strength and summed cluster strength;
 - absolute and relative strength error;
-- all raw PF component indices assigned to the cluster; and
-- an individual position, strength, and combined pass/fail result.
+- core and extended-split raw component indices and their truth distances; and
+- individual association, position-target, strength-target, and joint results.
 
-The fixed accuracy limits are 0.5 m position error and 25% relative cluster
-strength error. These are predeclared operational tolerances, not values fitted
-to a seed or failed run.
+The predeclared accuracy targets are at most 0.5 m strength-weighted RMS
+position error and at most 25% relative cluster-strength error. Association is
+reported separately as `truth_source_detection_status`. Consequently, an
+associated source can be described as detected even when one or both accuracy
+targets are not met.
 
 ## Remote components
 
-An estimated component outside every 0.5 m source cluster is remote. The PF
+An estimate is remote when it has no same-isotope truth, has an equidistant
+nearest-truth ambiguity, or lies outside its nearest truth's split-assignment
+radius. The report records the exclusion reason and applicable radius. The PF
 publication includes a truth-free response signature for every reported mode:
 the normalized same-isotope expected-count vector across all completed
 measurements.
@@ -70,9 +127,13 @@ Every result reports three separate statuses:
 
 `accuracy_status=pass` requires all of the following:
 
-1. every true same-isotope source has a local estimated cluster;
-2. every cluster meets the position and summed-strength limits;
+1. every true same-isotope source has an assigned estimated cluster;
+2. every cluster meets the RMS-position and summed-strength targets;
 3. no response-distinct remote component remains.
+
+`truth_source_detection_status=pass` requires only item 1. A position-target
+failure does not erase evidence that the source was detected; it states that
+the requested localization quality was not achieved.
 
 Hard-cap saturation belongs only to `sampler_quality_status`. A run may
 therefore have `execution_status=complete`, `sampler_quality_status=failed`,
@@ -89,10 +150,16 @@ contract. Unknown or missing fields, a mismatched run or MeasurementLog hash,
 reordered modes, duplicate mode labels, and zero or non-normalized response
 columns are errors. They are never ignored or replaced with defaults.
 
-The truth-bearing evaluation report uses schema v2 and cross-checks its
-hard-cap evidence against the published sampler-quality status. A contradiction
-is an artifact-integrity error rather than a status that can be silently
-reconciled.
+The split-aware truth-bearing evaluation report uses schema v3 and
+cross-checks its hard-cap evidence against the published sampler-quality
+status. A contradiction is an artifact-integrity error rather than a status
+that can be silently reconciled.
+
+Schema-v3 rules apply prospectively to comparison batches evaluated after this
+policy change. Existing schema-v2 reports remain immutable and must not be
+overwritten or relabelled. A separately named retrospective schema-v3 diagnostic
+may explain an older run, but it is not independent acceptance evidence and must
+not be mixed with a prospective comparison table.
 
 The private RA-L session orchestrator runs this evaluation after every
 successful full simulation. It does not pass truth to the PF controller and it
