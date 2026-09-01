@@ -1,4 +1,4 @@
-# Pure PF architecture
+# Pure PF Architecture
 
 ## Estimator boundary
 
@@ -22,8 +22,8 @@ continuous surface position, and strength remain particle state throughout
 live ingestion, planning, and reporting.
 
 There are no position MLE, batch fit, strength refit, surface-map rescue,
-count-extraction rescue, or report-time optimization paths. Unknown, retired,
-or incomplete runtime settings fail closed.
+count-extraction rescue, or report-time optimization paths. Unknown or
+incomplete runtime settings fail closed.
 
 ## Joint full-spectrum observation model
 
@@ -52,17 +52,19 @@ mismatched, or contract-mismatched spectra are rejected.
 
 ## Continuous physical source support
 
-Random ground truth and the PF use the same exposed physical surface union:
+PF reconstructs the authenticated exposed physical surface union supplied by
+the runtime environment contract:
 
 - floor and ceiling portions not hidden by touching transport solids;
 - all exposed room-wall portions;
 - all exposed faces of transport components, including the underside of a
   raised component.
 
-Blocked navigation cells do not invent source surfaces. Truth positions are
-independent continuous draws from normalized physical surface area, with no
-height, visibility, ceiling-count, separation, or response-observability
-conditioning.
+Blocked navigation cells do not invent source surfaces. The sibling runtime
+owns private truth sampling and any predeclared experiment-level geometric
+conditioning. PF receives neither those truth locations nor their RNG
+provenance; its configured surface-area prior and proposal support remain
+truth-free.
 
 Rectangular surface charts define atlas topology only. A PF source stores
 `(chart_id, u, v, strength)` with continuous `u,v` in the chart unit square;
@@ -86,12 +88,11 @@ The initial distribution is the independent product of each isotope's
 predeclared cardinality, surface-area, and strength priors. All isotope
 containers share one outer weight and one resampling ancestry.
 
-The strict profile uses a shifted-Gamma source-strength prior.  Its support is
-`[300 kcps, infinity)`, so a physically supported multi-merge cannot be rejected
-only because the combined source exceeds the former 2 Mcps ceiling.  The Gamma
-shape and scale are predeclared physical-prior parameters, not fitted to a
-diagnostic run. Finite strength grids are proposal design points only and never
-truncate the PF state space.
+The strict profile uses a shifted-Gamma source-strength prior with support
+`[300 kcps, infinity)`. A physically supported multi-merge is therefore not
+rejected by an artificial upper strength ceiling. The Gamma shape and scale are
+predeclared physical-prior parameters, not fitted to a diagnostic run. Finite
+strength grids are proposal design points only and never truncate PF state.
 
 Same-isotope pair and multi-component split/merge kernels remain reversible.
 Pair merge selection favors a near-floor donor and a receiver with similar
@@ -102,21 +103,15 @@ the RJ ratio, so distant or strong donors retain positive support. A separate
 all-isotope strength block changes every active strength in one batched
 likelihood evaluation. It imposes no conservation law between isotopes:
 simultaneous increases and decreases are merely proposals judged by the shared
-mixed-spectrum posterior. The retired scalar isotope-identity transfer kernel
-is not present in the production package.
+mixed-spectrum posterior.
 
 The standard cardinality policy is
 `independent_poisson_with_thin_geometric_capacity_tail_v1`: independently for
 each isotope, a Poisson source-count prior with predeclared mean 2.0 defines
 `K = 0, ..., 5`, followed by the fixed geometric capacity tail through `K = 8`.
-This encodes the design assumption of sparse surface contamination while
-keeping positive mass above the ordinary range; it is fixed before any
-observation and was not selected from a failed diagnostic run. Every result
-manifest records the policy name, mean, support, tail ratio, and complete
-normalized probability vector. Ground-truth isotope counts and strengths are
-checked against PF support before any external Geant4 process starts. The
-policy remains subject to the designated independent holdout acceptance gate;
-a failed holdout does not authorize retuning it on that holdout.
+It is fixed before observation, retains positive mass above the ordinary range,
+and is fully recorded in result provenance. A failed holdout does not authorize
+retuning it on that holdout.
 
 Each complete station joint likelihood is tempered from `beta = 0` to
 `beta = 1` through one bridge. Views are never assimilated as ordered prefixes
@@ -128,7 +123,7 @@ temper-step safety bound before `beta = 1`, or finishing below the ESS contract,
 is an error rather than a forced likelihood application.
 
 Exact-RJ history evaluation uses the fixed-capacity, source-resolved CUDA cache
-described in [Fixed-horizon exact transport cache](joint_exact_transport_cache.md).
+described in [Fixed-horizon exact transport cache](transport_cache.md).
 It replaces changed isotope slot blocks without copying unchanged history and
 evaluates the complete acquired history once for every supported proposal. The
 one-stage MH/RJ decision uses that exact target difference and one uniform
@@ -151,48 +146,28 @@ kernel includes:
 - an exact joint isotope-state block whose isotope priors remain independent
   while the shared full-spectrum likelihood decides one simultaneous move.
 
-The ordinary cardinality model is defined through `K=5`. A proper geometric
-tail gives `K=6..8` nonzero support so `K=5` is not an artificial absorbing
-boundary; `K=8` is the explicit memory/capacity limit. The standard tail ratio
-is fixed before evaluation and is not changed in response to a run.
-
 Proposal scoring may use observations to improve mixing, but it does not alter
 the target likelihood and every non-prior proposal density appears in the MH/RJ
 ratio. Accepted rejuvenation moves leave outer particle weights unchanged.
 
-An in-process caller may optionally stage an immutable external surface-density grid
-for one exact incoming record prefix. This is a proposal contract, not an estimator
-contract: PF maps the grid to its own chart atlas in one batched neighbor query and
-mixes it with the native residual proposal. The positive area-prior component retains
-full support, and the same frozen proposal density is used in every forward/reverse
-MH/RJ term. Standalone PF does not stage this value; the MLE-guided hybrid orchestrator
-uses it to alter the accepted finite particle realization without changing the PF
-target or weights directly.
+An in-process caller may stage an immutable surface-density grid bound to one
+exact incoming record prefix. PF maps it to its chart atlas and mixes it only
+into the structural proposal. A positive area-prior component retains full
+support, and the same frozen density appears in every forward/reverse MH/RJ
+term. The grid never becomes a likelihood or directly changes particle weights.
 
-Diagnostics report the current ESS after all applied likelihood, the number of
-surviving station-start ancestors, and attempted/accepted posterior weight mass
-for every structural move. Rejections also retain quantiles of the likelihood,
-prior, reverse-minus-forward proposal, Jacobian, support, nonfinite, and MH
-random terms. Counts of unweighted moved particles are retained only as
-secondary diagnostics. Structural mixing is gated independently per isotope;
-motion in Co-60 cannot satisfy a stalled Cs-137 boundary transition. Hard-cap
-saturation, cumulative-lineage collapse, incomplete recovery, and incomplete
-mixing are recorded as isotope-specific sampler-quality evidence; they do not
-discard an otherwise complete acquisition. Exact full-support moves certify
-only rows whose isotope state actually changed, and those certificates follow
-the same batched ancestor vector through later resampling. The PF does not
-require an unrelated fresh global acceptance at every later station. Missing
-proposal attempts, invalid support, non-finite MH ratios, or malformed
-provenance remain kernel-integrity errors and fail closed.
+Diagnostics retain ESS, surviving station-start ancestry, direction-resolved
+cardinality transitions, and attempted/accepted posterior mass for structural
+moves. Structural mixing is gated independently per isotope. Hard-cap
+saturation, lineage collapse, incomplete recovery, and incomplete mixing are
+sampler-quality evidence rather than reasons to discard a completed
+acquisition. Invalid support, non-finite MH terms, or malformed provenance are
+kernel-integrity errors and fail closed.
 
-Accepted birth moves count as full-support recovery evidence because their
-position and strength proposal retains a positive physical-prior component over
-the complete configured support. Rejuvenation has no independent fixed sweep
-ceiling: it continues until the movement and lineage diagnostics pass, until
-progress stalls for the configured number of sweeps, or until the explicit
-station wall-time guard is reached. The latter two outcomes end rejuvenation
-with a sampler-quality warning and allow acquisition to continue; they are not
-relabelled as execution failures.
+Rejuvenation continues until movement and lineage diagnostics pass, progress
+stalls, or the explicit station wall-time guard is reached. The latter two
+outcomes produce a sampler-quality warning and allow acquisition to continue;
+they are not relabelled as execution failures.
 
 ## Posterior reporting and stopping
 
@@ -210,15 +185,14 @@ diagnostic, not evidence that the physical posterior has converged. A
 rank-deficient three-dimensional covariance determinant is not treated as
 surface convergence.
 
-The controller starts adaptive-stop assessment at the configured station and
-requires a configured number of consecutive ready posterior generations. The
-standard contract assesses stations 10 onward and requires three consecutive
-ready generations, so the earliest adaptive stop is station 12. The runtime
-acquisition contract remains the sole owner of the hard station limit.
+The standard controller assesses adaptive stopping from station 10 and requires
+three consecutive ready generations, making station 12 the earliest adaptive
+stop. The runtime acquisition contract owns the hard station limit.
 
 ## Planner
 
-DSS-PP receives aligned PF particles without renormalizing away `P(K=0)`.
+The [conditional-greedy DSS-PP planner](planner.md) receives aligned PF
+particles without renormalizing away `P(K=0)`.
 Modes use existing surface representatives, and the planner retains at least
 the PF source-slot limit for every isotope.
 
@@ -235,17 +209,10 @@ exploration absorbing state.
 Particle, source-slot, line, view, spectrum-bin, candidate, and shield-program
 dimensions use batched NumPy/Torch kernels with explicit chunks and caches.
 CUDA uses float64 for the production likelihood. CPU and GPU paths implement
-the same distribution and have equivalence tests. CPU execution uses batched
-NumPy or multithreaded Torch-CPU kernels; there is no separate Python-worker
-count. Geant4 uses native worker threads. Scalar implementations are limited
-to tiny deterministic test or debug oracles.
-
-GPU DSS keeps selected-pair transport, source/line packing, exact predictive
-spectra, cross likelihoods, and EIG aggregation on one Torch device. Only the
-final action-score vector returns to the host. A bounded control-plane loop
-constructs one canonical generator per action so memory chunking and action
-ordering cannot change its random stream; it does not iterate over particles,
-source slots, views, or spectrum bins.
+the same distribution and have equivalence tests. Chunking cannot change the
+random stream or scientific result. Scalar forms are limited to deterministic
+test/debug oracles. New heavy paths follow the
+[PF compute policy](../policies/compute.md).
 
 ## Live MeasurementLog ingestion
 
@@ -262,24 +229,13 @@ proposes the next reachable pose and shield program. Production acquisition is
 fresh-run only: an interruption aborts without publishing a partial log, and no
 resume, prefix-replay, or finalized-log inference entrypoint exists.
 
-`PFLiveSession` owns this in-process causal boundary. It holds the estimator and
-ordered durable records together, uses the same canonical station assimilation
-helper as the standalone controller, and rejects record delivery after completion.
-Optional surface guidance is accepted only at a station boundary and must identify the
-run, station, final step, record count, and ordered-prefix digest exactly. The returned
-receipt records the mapped chart count and all isotopes for which the proposal evaluator
-consumed the guide.
-Its planning DTO copies particle arrays into read-only storage and includes a
-canonical, truth-free PF posterior summary. The DTO deliberately preserves PF
-particle semantics; it is not reshaped into an MLE-style surface grid. The current
-estimator has no public deterministic latest predicted-spectrum snapshot, so the
-facade does not derive a surrogate from private model state or stochastic posterior
-predictive diagnostics.
+`PFLiveSession` owns this in-process causal boundary and rejects record delivery
+after completion. Optional proposal guidance must bind the exact station and
+ordered-prefix digest. Its planning DTO copies particle arrays into read-only
+storage and preserves native PF semantics; it does not invent an
+estimator-neutral grid or deterministic spectrum surrogate.
 
-At termination PF asks the runtime to publish the immutable MeasurementLog,
-validates its exact ordered-record digest against the stations assimilated in
-that live session, and binds the posterior provenance to the published bundle
-digest. `complete_live_state()` seals the inference state before publication;
-`bind_published_log()` then changes only final provenance identities and exposes
-canonical posterior/state bytes through `PFBoundLiveState`. Contract mismatches
-fail before publication.
+At termination `complete_live_state()` seals inference before runtime
+publication. PF then validates the immutable MeasurementLog's ordered-record
+digest and `bind_published_log()` changes only final provenance identities.
+Contract mismatches fail before publication.

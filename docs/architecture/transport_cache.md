@@ -1,4 +1,4 @@
-# Fixed-horizon exact transport cache
+# Fixed-Horizon Exact Transport Cache
 
 ## Scope
 
@@ -54,11 +54,9 @@ into that buffer, synchronizes CUDA, and swaps buffers only after all gathers
 succeed. Thus resampling does not allocate a history-sized temporary and cannot
 publish a partially reindexed cache.
 
-For the current 4,096-particle Cs-137/Co-60 profile (16 slots, three lines,
-13 transport features), the two persistent buffers occupy 5.626 GiB. Including
-the conservative minimum exact-overlay headroom makes the live preflight
-require 5.709 GiB. These byte counts are computed from the authenticated active
-line basis at handshake time rather than stored as profile-specific constants.
+Required bytes are computed from the authenticated particle count, source-slot
+capacity, active line basis, feature count, and acquisition limits at handshake
+time. Profile-specific memory totals are not stored as architecture constants.
 
 ## Exact slot overlay
 
@@ -81,31 +79,19 @@ and target value under the same mask. Rejected rows remain untouched. Invalid
 station likelihood rows are then recomputed from committed transport and must
 match the proposal target within the declared float64 tolerance.
 
-The former complete-history clone and accepted-history rebuild are not part of
-the production CUDA lifecycle. Small NumPy/materialized forms remain only as
-deterministic test oracles.
+The production CUDA lifecycle does not clone or rebuild the complete accepted
+history. Small NumPy/materialized forms remain only as deterministic test
+oracles.
 
-## Verification and performance evidence
+## Verification
 
 Tests compare slot overlay with a materialized full replacement for both the
 plain renewal likelihood and hierarchical finite-MC/component uncertainty.
 They also cover proposal families, accepted/rejected masks, cache commit,
 ancestor alignment, fixed capacity, inactive slots, CPU oracle/CUDA numerical
-equivalence, and production-path selection.
-
-A local RTX 5090 benchmark used 4,096 accepted states, 16 source slots, three
-gamma lines, and the hierarchical model. At 4,096 simultaneous proposal states:
-
-| History | Materialized | Slot overlay | Overlay change | Peak scratch change |
-| --- | ---: | ---: | ---: | ---: |
-| 64 views | 1.0935 s | 1.0988 s | 0.995x | 11,817 to 8,578 MiB |
-| 128 views | 2.6159 s | 2.1911 s | 1.194x faster | 16,139 to 9,658 MiB |
-
-The main demonstrated benefit is bounded peak memory and removal of allocator
-failures. The 128-view case also improved likelihood wall time by about 19%.
-Position moves still recompute the changed source across all acquired views and
-the exact likelihood still reads the bounded history, so no larger speed claim
-is made without end-to-end profiling.
+equivalence, and production-path selection. Performance claims belong in a
+versioned benchmark artifact that records its command, configuration, hardware,
+raw measurements, and repository revision.
 
 This is a storage and materialization change. It does not change Geant4
 physics, transport values, likelihood equations, priors, the one-stage RJ

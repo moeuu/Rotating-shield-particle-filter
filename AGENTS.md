@@ -50,10 +50,8 @@
   reproducibility, accessibility, and rendered-artifact quality when preparing
   a paper.
 - For every RA-L manuscript figure task, explicitly load and follow both
-  `$scientific-visualization` and `$matplotlib`, and read both
-  `docs/ral_figure_quality_policy.md` and
-  `docs/ral_experiment_figure_policy.md` before changing or generating the
-  figure.
+  `$scientific-visualization` and `$matplotlib`, and read
+  `docs/ral/figures.md` before changing or generating the figure.
 - Do not use `$imagegen` or another generative raster-image skill for RA-L
   manuscript figures. Construct them from authenticated source data, recorded
   simulation artifacts, repository geometry, and deterministic plotting code.
@@ -99,13 +97,15 @@
 ## RA-L paper ablation plan
 
 - Before running RA-L paper ablations, read
-  `docs/ral_minimal_ablation_plan.md`.
+  `docs/ral/experiment_protocol.md`.
 - Before changing RA-L manuscript content, acknowledgments, figures, tables, or
-  layout, read `docs/ral_manuscript_policy.md`.
+  layout, read `docs/ral/manuscript.md`.
 - Before changing RA-L manuscript figures or layout, read
-  `docs/ral_figure_quality_policy.md`. The manuscript should use the eighth
+  `docs/ral/figures.md`. The manuscript should use the eighth
   page effectively while staying within the eight-page RA-L limit; do not leave
   the final page mostly blank when necessary explanation can be restored.
+- Before evaluating or re-evaluating a completed full simulation, read
+  `docs/policies/post_run_evaluation.md`.
 - The anonymous RA-L manuscript must keep the masked sponsor footnote
   `This work was in part supported by XXX.` as a first-page `\thanks`
   acknowledgment. Do not remove it or move it into the main text unless the
@@ -137,8 +137,7 @@
 
 - Before creating or modifying RA-L manuscript figures, load
   `$scientific-visualization` and `$matplotlib`, then read
-  `docs/ral_figure_quality_policy.md` and
-  `docs/ral_experiment_figure_policy.md`.
+  `docs/ral/figures.md`.
 - After generating any manuscript figure, inspect the rendered image itself
   before reporting completion. Do not rely only on code, LaTeX source, or file
   existence.
@@ -166,7 +165,7 @@
 ## Compute parallelism policy
 
 - Before adding PF, planning, spectrum-processing, obstacle-attenuation, or
-  Geant4 orchestration features, read `docs/compute_parallelism_policy.md`.
+  diagnostic features, read `docs/policies/compute.md`.
 - Implement compute-heavy features in a batched, GPU, Geant4-threaded, or
   process-parallel form from the first version when the operation spans PF
   particles, source slots, candidate locations, shield postures, spectrum bins,
@@ -216,8 +215,10 @@
   proposes the next station and shield program, and binds its posterior to the
   runtime's finalized MeasurementLog. Do not add batch inference over a completed
   log or simulator modes to this repository.
-- Before changing simulation, Geant4, spectrum-generation, or PF observation
-  ingestion code, read `docs/simulation_fidelity_policy.md`.
+- Before changing PF live ingestion, likelihood, planning response, or
+  publication code, read `docs/policies/inference_fidelity.md`. Simulation,
+  Geant4, spectrum-generation, and MeasurementLog changes belong in the sibling
+  runtime repository and follow its local policy.
 - Do not introduce runtime shortcuts that lower physical fidelity for speed:
   surrogate transport, expected-count observations, weighted or capped Geant4
   histories, deterministic background smoothing, unlabelled source-rate

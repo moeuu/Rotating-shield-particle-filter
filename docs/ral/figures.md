@@ -1,4 +1,4 @@
-# RA-L Figure Quality Policy
+# RA-L Figure Policy
 
 This note defines mandatory checks before any generated figure is described as
 ready for the RA-L manuscript.
@@ -34,40 +34,19 @@ Reject and revise the figure if any of the following are visible:
 
 ## Logical QA
 
-Every panel must answer a specific manuscript question. If a panel only shows a
-decorative component, a generic workflow, or an unlabeled implementation detail,
-replace it with a figure that directly supports a claim in the paper.
+Every panel must answer a manuscript question and directly support a claim. Use
+figures for geometry, motion, occlusion, response signatures, uncertainty,
+model-order behavior, or quantitative comparison rather than as text
+containers. Before redesign, inspect the closest PF-surveying,
+scene-attenuation, or source-separation figures in prior work and record what
+the new design adds: the Fe/Pb attenuation code and its coupling to
+surface-constrained PF updates and active station selection.
 
-Do not use a figure as a text container. A figure is justified only when it
-clarifies something that is hard to understand from prose alone: geometry,
-motion, occlusion, response signatures, uncertainty, model-order behavior, or
-quantitative comparisons. If the content can be expressed equally well as a
-short paragraph or an itemized list, keep it in the text instead of making a
-text-only diagram.
+Use the eighth page effectively. Inspect page 8 before reporting the manuscript
+ready and restore necessary discussion, limitations, interpretation, or
+references if it is mostly blank while remaining within the page limit.
 
-Before redesigning a manuscript figure, inspect the closest related figures or
-tables from prior work and record the design decision in the working notes or
-commit message. For this RA-L manuscript, the default comparison set is:
-
-- recursive Bayesian/PF radiation surveying figures showing algorithm stages,
-  particle behavior, measurement paths, and convergence metrics;
-- scene-aware attenuation or sparse reconstruction figures showing LiDAR/voxel
-  geometry, source truth/estimates, detector trajectories, and count traces;
-- source-separation result tables reporting cardinality, localization error,
-  strength error, and runtime.
-
-The new figure should explain what is visually missing from these prior figures
-for this paper, namely the controlled Fe/Pb shield-time code and its coupling
-to surface-constrained PF updates and active station selection.
-
-For RA-L page budgeting, "eight pages" means the paper should use the eighth
-page effectively, not merely stay below the limit. Do not create artificial
-white space by over-compressing explanations or figures. Before reporting the
-manuscript ready, inspect page 8 of the compiled PDF and revise if it is mostly
-blank; use the space for necessary discussion, limitations, experimental
-interpretation, or references while staying within eight pages.
-
-For the current RA-L figures:
+## Figure Roles
 
 - Fig. 1 should show the problem setting and why rotating Fe/Pb postures create
   a temporal response code for separating surface sources.
@@ -89,6 +68,44 @@ For the current RA-L figures:
   When the reported metric is 3-D localization, the main result panels should
   include a 3-D view or an equivalent paired projection that makes height
   errors visible.
+
+The attenuation-code response matrix belongs in the method figure rather than
+the result figure. This gives it a distinct explanatory role and leaves result
+space for truth-estimate accuracy.
+
+## Main Result Figure
+
+The main result is the split-aware proposed-method PF result for the current
+Cs4/Co3 task, not a generic dashboard. Use this five-panel grammar:
+
+1. A metric floor projection with 2 m tick spacing, equal x-y aspect, known
+   obstacles, saved obstacle-aware route, final PF particle support, truth,
+   reported estimates, and truth-estimate match segments.
+2. A metric height projection with 2 m tick spacing and equal scaling so wall,
+   floor, obstacle, and high-surface errors remain visible.
+3. A compact numerical source panel containing truth ID, merged raw-component
+   count, 3-D centroid and RMS position errors, and signed aggregate strength
+   error. Do not add a redundant pass/fail column.
+4. An online diagnostic panel showing isotope-wise cardinality evolution and
+   the hard-cap threshold. Raw cardinality is diagnostic only.
+5. A per-true-source panel showing RMS position and relative strength error
+   against the predeclared 0.5 m and 25% targets.
+
+Identify sources by isotope and stable truth index. Include a clear marker
+legend for stations, route, PF particles, truth, estimates, and isotope colors.
+Keep the particle cloud visually secondary to truth and final estimates.
+
+Do not connect stations with straight line segments. Draw a route only from
+persisted obstacle-aware path waypoints; otherwise show station markers without
+implying an unrecorded collision-free trajectory.
+
+## Obstacle Rendering
+
+Render obstacles from the authenticated environment artifact used by the run.
+For grid environments, draw occupied-cell footprints. For component-based
+environments, draw available component footprints and traversal-blocking
+occupancy. Geometry that affects attenuation or reachability must remain
+visible above background fills.
 
 Main-paper result tables should not be made unreadable to save space. Use a
 consistent body font size across adjacent result tables, preferably `\small`;
@@ -118,7 +135,18 @@ hash the machine-readable source data together with the other run artifacts.
 
 ## Review Artifacts
 
-`scripts/build_ral_figures.py` writes raster review copies by default to:
+Build current figures from an authenticated completed-run bundle and its exact
+split-aware evaluation. Run-specific bundle construction and private paths
+belong with that run, not in this policy. The reusable entry point is:
+
+```bash
+uv run python scripts/build_ral_figures.py \
+  --completed-run-dir COMPLETED_BUNDLE \
+  --split-aware-evaluation EVALUATION_JSON
+```
+
+Use `--skip-concepts` when only the result figure should change. The script
+writes raster review copies by default to:
 
 ```bash
 results/ral_figure_review/

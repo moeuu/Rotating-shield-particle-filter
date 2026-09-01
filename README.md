@@ -64,13 +64,25 @@ physical pose and proxy/exact subset-evaluation counts, the EIG leader, compact
 top-ranked actions, and resolved EIG seeds. When the fixed-eight shadow audit is
 enabled, it additionally retains all-pose proxy `I_2/I_4/I_8`, paired exact
 uncertainty/LCBs, health reasons, hypothetical actions, and the actual fixed-eight
-execution state. Legacy 48-program counters, proxy-rank placeholders, repeated
-policy prose, runtime chunk telemetry, and derivable fields are not persisted.
+execution state. Repeated policy prose, runtime chunk telemetry, and derivable
+fields are not persisted.
 
 The live command fails closed if the runtime context, source-rate semantics, model
 identity, energy axis, environment geometry, or full-spectrum contract is
-incompatible. Source truth is never accepted as estimator input. See
-[the repository boundary](docs/shared_simulation_runtime.md).
+incompatible. Source truth is never accepted as estimator input.
+
+The sibling runtime is the sole owner of Geant4 transport, environment/source
+realization, detector and Fe/Pb shield physics, observation generation, and
+MeasurementLog writing. Its private scenario contains no PF action list or stop
+rule. Conversely, this repository does not expose a simulation backend or accept a
+finalized log as a new batch-inference input. Each planner variant therefore runs
+its own causal acquisition after its actions diverge.
+
+A private evaluation truth overlay may be delivered only to a runtime-owned
+asynchronous renderer through a separate owner-only endpoint. It is unavailable to
+the adaptive client, PF state, planner, MeasurementLog, checkpoint, and published
+PF artifacts. The [documentation map](docs/README.md) separates this boundary from
+the current [PF architecture](docs/architecture/pf.md) and normative policies.
 
 For in-process integrations, `pf.PFLiveSession` is the package-owned lifecycle
 boundary. Construct it from the runtime `RunContext`, PF configuration/profile,

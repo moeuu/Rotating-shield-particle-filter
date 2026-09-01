@@ -1,4 +1,4 @@
-# Post-run PF cluster accuracy policy
+# Post-Run PF Evaluation Policy
 
 This policy is the standard detailed evaluation for every completed full
 simulation. It is an evaluation contract, not part of the PF target. Private
@@ -148,7 +148,7 @@ the requested localization quality was not achieved.
 Hard-cap saturation belongs only to `sampler_quality_status`. A run may
 therefore have `execution_status=complete`, `sampler_quality_status=failed`,
 and `accuracy_status=pass`, or any other evidence-consistent combination. No
-aggregate legacy `passed` field is emitted.
+aggregate `passed` field is emitted.
 
 The criteria payload and its SHA-256 digest are written into every evaluation
 artifact. Changing a criterion requires changing this policy before evaluating
