@@ -881,6 +881,20 @@ def test_particle_diagnostics_omit_deep_rejection_payloads() -> None:
     estimator = SimpleNamespace(
         isotopes=("Cs-137",),
         pf_config=SimpleNamespace(num_particles=100, target_ess_ratio=0.4),
+        latest_station_adjacent_cardinality_transition_counts=lambda: {
+            "Cs-137": {
+                "count_semantics": (
+                    "raw_proposal_rows_across_latest_station_"
+                    "rejuvenation_sweeps"
+                ),
+                "k_to_k_minus_1": {"attempted": 5, "accepted": 2},
+                "k_minus_1_to_k": {"attempted": 7, "accepted": 3},
+                "by_cardinality_transition": {
+                    "2->1": {"attempted": 5, "accepted": 2},
+                    "1->2": {"attempted": 7, "accepted": 3},
+                },
+            }
+        },
         step_diagnostics=lambda **_kwargs: {
             "Cs-137": {
                 "particle_count": 100,
@@ -921,6 +935,17 @@ def test_particle_diagnostics_omit_deep_rejection_payloads() -> None:
     assert isotope["structural_transition_weight_mass"] == {
         "attempted": 1.0,
         "accepted": pytest.approx(0.3),
+    }
+    assert isotope["adjacent_cardinality_transition_counts"] == {
+        "count_semantics": (
+            "raw_proposal_rows_across_latest_station_rejuvenation_sweeps"
+        ),
+        "k_to_k_minus_1": {"attempted": 5, "accepted": 2},
+        "k_minus_1_to_k": {"attempted": 7, "accepted": 3},
+        "by_cardinality_transition": {
+            "2->1": {"attempted": 5, "accepted": 2},
+            "1->2": {"attempted": 7, "accepted": 3},
+        },
     }
     assert payload["sampler_health"] == {
         "smc_rejuvenation_wall_time_respected": True,

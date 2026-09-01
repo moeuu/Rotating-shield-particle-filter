@@ -670,6 +670,33 @@ class _SpyEstimator:
         """Return one unavailable predictive-check result."""
         return {"available": False}
 
+    def conditional_source_count_residual_diagnostics(self) -> dict[str, object]:
+        """Return one unavailable conditional source-count comparison."""
+        return {
+            "available": False,
+            "reason": "no_assimilated_station_history",
+            "truth_used": False,
+            "changes_inference": False,
+            "candidate_pairs": [],
+        }
+
+    def latest_station_adjacent_cardinality_transition_counts(
+        self,
+    ) -> dict[str, object]:
+        """Return stable direction-resolved proposal counters."""
+        return {
+            isotope: {
+                "count_semantics": (
+                    "raw_proposal_rows_across_latest_station_"
+                    "rejuvenation_sweeps"
+                ),
+                "k_to_k_minus_1": {"attempted": 0, "accepted": 0},
+                "k_minus_1_to_k": {"attempted": 0, "accepted": 0},
+                "by_cardinality_transition": {},
+            }
+            for isotope in self.isotopes
+        }
+
 
 def test_compact_diagnostics_encodes_validated_cardinality_keys() -> None:
     """The live schema must explicitly encode known integer cardinalities."""
@@ -681,6 +708,16 @@ def test_compact_diagnostics_encodes_validated_cardinality_keys() -> None:
         "cardinality_distribution"
     ]
     assert distribution == {"0": 0.1, "1": 0.9}
+    assert payload["conditional_source_count_residual_diagnostics"] == {
+        "available": False,
+        "reason": "no_assimilated_station_history",
+        "truth_used": False,
+        "changes_inference": False,
+        "candidate_pairs": [],
+    }
+    assert payload["adjacent_cardinality_transition_counts"]["Cs-137"][
+        "k_to_k_minus_1"
+    ] == {"attempted": 0, "accepted": 0}
     _strict_live_artifact_json_bytes(
         payload,
         artifact_name="PF diagnostics",

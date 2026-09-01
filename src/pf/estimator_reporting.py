@@ -36,10 +36,151 @@ from pf.posterior import (
 )
 from pf.posterior_uncertainty import posterior_mode_uncertainty_batched
 from pf.randomness import named_random_generator
+from pf.source_count_diagnostics import (
+    conditional_source_count_residual_diagnostics as _source_count_diagnostics,
+)
 
 
 class EstimatorReportingMixin:
     """Provide posterior reporting, uncertainty, and stopping diagnostics."""
+
+    def latest_station_adjacent_cardinality_transition_counts(
+        self,
+    ) -> dict[str, dict[str, object]]:
+        """Return direction-resolved proposal counts for the latest station.
+
+        Counts are raw proposal-row attempts and acceptances accumulated over
+        every rejuvenation sweep used by the latest station update. They are
+        distinct from posterior transition weight mass and do not influence
+        sampler stopping or quality gates.
+        """
+        directions = ("k_to_k_minus_1", "k_minus_1_to_k")
+        result = {
+            str(isotope): {
+                "count_semantics": (
+                    "raw_proposal_rows_across_latest_station_rejuvenation_sweeps"
+                ),
+                **{
+                    direction: {"attempted": 0, "accepted": 0}
+                    for direction in directions
+                },
+                "by_cardinality_transition": {},
+            }
+            for isotope in self.joint_isotope_order()
+        }
+        records = getattr(self, "last_joint_rejuvenation_diagnostics", ())
+        if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+            return result
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            for isotope in result:
+                for direction in directions:
+                    for outcome in ("attempted", "accepted"):
+                        key = f"{direction}_{outcome}_count.{isotope}"
+                        raw_value = record.get(key, 0.0)
+                        if (
+                            isinstance(raw_value, (bool, np.bool_))
+                            or not isinstance(
+                                raw_value,
+                                (int, float, np.integer, np.floating),
+                            )
+                            or not np.isfinite(float(raw_value))
+                            or not float(raw_value).is_integer()
+                            or float(raw_value) < 0.0
+                        ):
+                            raise RuntimeError(
+                                "Adjacent-cardinality transition count is invalid."
+                            )
+                        result[isotope][direction][outcome] += int(raw_value)
+                key_suffix = f"_count.{isotope}"
+                for key, raw_value in record.items():
+                    key_text = str(key)
+                    if not key_text.startswith("k_transition_") or not (
+                        key_text.endswith(key_suffix)
+                    ):
+                        continue
+                    encoded = key_text[
+                        len("k_transition_") : -len(key_suffix)
+                    ]
+                    try:
+                        cardinalities, outcome = encoded.rsplit("_", maxsplit=1)
+                        current_text, proposed_text = cardinalities.split(
+                            "_to_",
+                            maxsplit=1,
+                        )
+                        current = int(current_text)
+                        proposed = int(proposed_text)
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        outcome not in {"attempted", "accepted"}
+                        or abs(proposed - current) != 1
+                    ):
+                        continue
+                    if (
+                        isinstance(raw_value, (bool, np.bool_))
+                        or not isinstance(
+                            raw_value,
+                            (int, float, np.integer, np.floating),
+                        )
+                        or not np.isfinite(float(raw_value))
+                        or not float(raw_value).is_integer()
+                        or float(raw_value) < 0.0
+                    ):
+                        raise RuntimeError(
+                            "Adjacent-cardinality transition count is invalid."
+                        )
+                    transition = f"{current}->{proposed}"
+                    transition_rows = result[isotope][
+                        "by_cardinality_transition"
+                    ]
+                    row = transition_rows.setdefault(
+                        transition,
+                        {"attempted": 0, "accepted": 0},
+                    )
+                    row[outcome] += int(raw_value)
+        for isotope in result:
+            for direction in directions:
+                attempted = result[isotope][direction]["attempted"]
+                accepted = result[isotope][direction]["accepted"]
+                if accepted > attempted:
+                    raise RuntimeError(
+                        "Accepted cardinality transitions exceed attempts."
+                    )
+            transition_rows = result[isotope]["by_cardinality_transition"]
+            for transition, row in transition_rows.items():
+                if row["accepted"] > row["attempted"]:
+                    raise RuntimeError(
+                        "Accepted cardinality transitions exceed attempts."
+                    )
+            result[isotope]["by_cardinality_transition"] = {
+                transition: transition_rows[transition]
+                for transition in sorted(
+                    transition_rows,
+                    key=lambda value: tuple(
+                        int(part) for part in value.split("->", maxsplit=1)
+                    ),
+                )
+            }
+        return result
+
+    def conditional_source_count_residual_diagnostics(
+        self,
+        *,
+        maximum_surface_distance_m: float = 2.0,
+        strength_grid_size: int = 33,
+        local_uv_grid_size: int = 5,
+        candidate_batch_size: int | None = None,
+    ) -> dict[str, object]:
+        """Return a truth-free conditional one-source residual comparison."""
+        return _source_count_diagnostics(
+            self,
+            maximum_surface_distance_m=maximum_surface_distance_m,
+            strength_grid_size=strength_grid_size,
+            local_uv_grid_size=local_uv_grid_size,
+            candidate_batch_size=candidate_batch_size,
+        )
 
     @staticmethod
     def _station_sequence_ids_for_records(

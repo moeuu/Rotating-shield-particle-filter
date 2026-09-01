@@ -545,6 +545,18 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         str(isotope): {key: values.get(key) for key in keep}
         for isotope, values in raw.items()
     }
+    transition_count_method = getattr(
+        estimator,
+        "latest_station_adjacent_cardinality_transition_counts",
+        None,
+    )
+    transition_counts = (
+        transition_count_method() if callable(transition_count_method) else {}
+    )
+    if not isinstance(transition_counts, Mapping):
+        raise TypeError(
+            "PF adjacent-cardinality transition counts must be a mapping."
+        )
     sampler_fields = (
         "joint_smc_wall_time_limit_exceeded",
         "joint_rejuvenation_mixing_incomplete",
@@ -593,6 +605,9 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
             "cardinality_distribution": values["r_probability_by_count"],
             "structural_transition_weight_mass": (
                 aggregate_transition_mass or None
+            ),
+            "adjacent_cardinality_transition_counts": transition_counts.get(
+                isotope
             ),
             "sampler_health": {
                 "smc_rejuvenation_wall_time_respected": bool(

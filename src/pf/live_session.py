@@ -588,16 +588,26 @@ def _compact_pf_diagnostics(estimator: object) -> dict[str, object]:
         None,
     )
     predictive_method = getattr(estimator, "posterior_predictive_check", None)
+    source_count_method = getattr(
+        estimator,
+        "conditional_source_count_residual_diagnostics",
+        None,
+    )
     if not callable(convergence_method) or not callable(predictive_method):
         raise PFLiveSessionError(
             "PF estimator does not expose final diagnostic methods."
         )
     raw_convergence = convergence_method()
     raw_predictive = predictive_method()
+    raw_source_count = (
+        source_count_method()
+        if callable(source_count_method)
+        else {"available": False}
+    )
     if not isinstance(raw_convergence, Mapping) or not isinstance(
         raw_predictive,
         Mapping,
-    ):
+    ) or not isinstance(raw_source_count, Mapping):
         raise PFLiveSessionError("PF final diagnostics must serialize objects.")
     convergence = dict(raw_convergence)
     if "sampler_health" not in convergence:
@@ -685,6 +695,18 @@ def _compact_pf_diagnostics(estimator: object) -> dict[str, object]:
         if sampler_quality_reasons
         else "pass"
     )
+    transition_count_method = getattr(
+        estimator,
+        "latest_station_adjacent_cardinality_transition_counts",
+        None,
+    )
+    transition_counts = (
+        transition_count_method() if callable(transition_count_method) else {}
+    )
+    if not isinstance(transition_counts, Mapping):
+        raise PFLiveSessionError(
+            "PF adjacent-cardinality transition counts must serialize an object."
+        )
     return {
         "schema_version": 3,
         "estimator_family": "pure_particle_filter",
@@ -693,6 +715,10 @@ def _compact_pf_diagnostics(estimator: object) -> dict[str, object]:
         "sampler_quality_reasons": sorted(set(sampler_quality_reasons)),
         "posterior_convergence": convergence,
         "posterior_predictive_check": dict(raw_predictive),
+        "conditional_source_count_residual_diagnostics": dict(
+            raw_source_count
+        ),
+        "adjacent_cardinality_transition_counts": dict(transition_counts),
         "sampler_health": dict(sampler_health),
     }
 

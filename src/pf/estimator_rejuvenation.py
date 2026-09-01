@@ -47,6 +47,75 @@ _JOINT_GATE_NO_PROGRESS_WALL_TIME_S = 900.0
 class JointRejuvenationMixin:
     """Provide joint state moves, resampling, mixing, and tempering."""
 
+    @staticmethod
+    def _adjacent_cardinality_transition_counts(
+        rejection_diagnostics: object,
+    ) -> dict[str, int]:
+        """Count attempted and accepted adjacent-cardinality proposal rows.
+
+        Structural kernels already summarize their vectorized MH rows by
+        current and proposed cardinality. This helper only packages those
+        existing summaries; it neither evaluates a target nor changes a move.
+        """
+        counts = {
+            "k_to_k_minus_1_attempted_count": 0,
+            "k_to_k_minus_1_accepted_count": 0,
+            "k_minus_1_to_k_attempted_count": 0,
+            "k_minus_1_to_k_accepted_count": 0,
+        }
+        if not isinstance(rejection_diagnostics, Mapping):
+            return counts
+        for raw_move in rejection_diagnostics.values():
+            if not isinstance(raw_move, Mapping):
+                continue
+            transitions = raw_move.get("by_cardinality_transition", {})
+            if not isinstance(transitions, Mapping):
+                continue
+            for transition, raw_summary in transitions.items():
+                if not isinstance(raw_summary, Mapping):
+                    continue
+                parts = str(transition).split("->", maxsplit=1)
+                if len(parts) != 2:
+                    continue
+                try:
+                    current = int(parts[0])
+                    proposed = int(parts[1])
+                except ValueError:
+                    continue
+                if abs(proposed - current) != 1:
+                    continue
+                attempted = raw_summary.get("attempted", 0)
+                accepted = raw_summary.get("accepted", 0)
+                if (
+                    isinstance(attempted, (bool, np.bool_))
+                    or not isinstance(attempted, (int, np.integer))
+                    or int(attempted) < 0
+                    or isinstance(accepted, (bool, np.bool_))
+                    or not isinstance(accepted, (int, np.integer))
+                    or int(accepted) < 0
+                    or int(accepted) > int(attempted)
+                ):
+                    raise RuntimeError(
+                        "Structural cardinality-transition counts are invalid."
+                    )
+                direction = (
+                    "k_to_k_minus_1"
+                    if proposed == current - 1
+                    else "k_minus_1_to_k"
+                )
+                counts[f"{direction}_attempted_count"] += int(attempted)
+                counts[f"{direction}_accepted_count"] += int(accepted)
+                transition = f"k_transition_{current}_to_{proposed}"
+                attempted_key = f"{transition}_attempted_count"
+                accepted_key = f"{transition}_accepted_count"
+                counts[attempted_key] = counts.get(attempted_key, 0) + int(
+                    attempted
+                )
+                counts[accepted_key] = counts.get(accepted_key, 0) + int(
+                    accepted
+                )
+        return counts
+
     def _joint_lineage_recovery_masks(
         self,
         *,
@@ -2687,6 +2756,10 @@ class JointRejuvenationMixin:
                     dtype=np.float64,
                 ).copy()
             isotope_wall_s: dict[str, float] = {}
+            adjacent_transition_counts_by_isotope: dict[
+                str,
+                dict[str, int],
+            ] = {}
             for isotope in isotope_order:
                 isotope_start_s = time.perf_counter()
                 filt = self.filters[isotope]
@@ -2710,6 +2783,11 @@ class JointRejuvenationMixin:
                     )
                 finally:
                     self._active_joint_structural_geometry = None
+                adjacent_transition_counts_by_isotope[str(isotope)] = (
+                    self._adjacent_cardinality_transition_counts(
+                        filt.last_structural_rejection_diagnostics
+                    )
+                )
                 self._assert_joint_particle_alignment()
                 updated_target = (
                     filt.last_structural_target_log_likelihood_device
@@ -2873,6 +2951,11 @@ class JointRejuvenationMixin:
                 target_before=target_before,
                 target_after=target_after,
             )
+            for isotope, transition_counts in (
+                adjacent_transition_counts_by_isotope.items()
+            ):
+                for name, value in transition_counts.items():
+                    diagnostics[f"{name}.{isotope}"] = float(value)
             diagnostics["cross_isotope_state_attempted_weight_mass"] = float(
                 self.last_joint_cross_isotope_state_attempted_weight_mass
                 - cross_state_attempted_start
