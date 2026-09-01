@@ -14,15 +14,11 @@ plt.rcParams["pdf.fonttype"] = 42
 plt.rcParams["ps.fonttype"] = 42
 
 ROOT = Path(__file__).resolve().parents[1]
-LATEX_ROOT = (
-    ROOT.parent / "ai-latex-workspace" / "projects" / "ieee-ra-l-letter"
-)
+LATEX_ROOT = ROOT.parent / "ai-latex-workspace" / "projects" / "ieee-ra-l-letter"
 FIG1_PATH = LATEX_ROOT / "sections/01_introduction/figures/ral_problem_shield_code.pdf"
 FIG2_PATH = LATEX_ROOT / "sections/03_system_model/figures/ral_method_loop.pdf"
-EXPERIMENT_FIG_PATH = (
-    LATEX_ROOT / "sections/05_experiments/figures/ral_result_overview.pdf"
-)
 REVIEW_DIR = ROOT / "results" / "ral_figure_review"
+EXPERIMENT_FIG_PATH = REVIEW_DIR / "ral_result_case_audit.pdf"
 ISAAC_FIGURE_DIR = ROOT / "results" / "ral_isaac_figures"
 ISAAC_PROBLEM_RENDER = ISAAC_FIGURE_DIR / "capture_problem_setting" / "rgb_0000.png"
 ISAAC_DETECTOR_RENDER = ISAAC_FIGURE_DIR / "capture_detector_module" / "rgb_0000.png"
@@ -35,10 +31,10 @@ ISAAC_SHIELD_PROGRAM_RENDERS = (
     ISAAC_FIGURE_DIR / "capture_shield_selection_02" / "rgb_0000.png",
     ISAAC_FIGURE_DIR / "capture_shield_selection_03" / "rgb_0000.png",
 )
-FIG_TITLE_SIZE = 8.2
-FIG_LABEL_SIZE = 7.2
-FIG_TICK_SIZE = 7.0
-FIG_PANEL_SIZE = 9.0
+FIG_TITLE_SIZE = 8.6
+FIG_LABEL_SIZE = 7.8
+FIG_TICK_SIZE = 7.2
+FIG_PANEL_SIZE = 9.2
 ISOTOPE_COLORS = {
     "Cs-137": "#d62728",
     "Co-60": "#1f77b4",

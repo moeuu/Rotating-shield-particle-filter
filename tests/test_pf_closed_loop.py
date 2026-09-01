@@ -107,9 +107,7 @@ def test_refinement_rejects_changed_state_or_prior_quote(mismatch: str) -> None:
 
 def test_refinement_top_k_must_fit_authenticated_candidate_snapshot() -> None:
     """An impossible refinement count must fail immediately after handshake."""
-    candidates = AdaptiveCandidateSnapshot.from_payload(
-        _candidate_snapshot_payload()
-    )
+    candidates = AdaptiveCandidateSnapshot.from_payload(_candidate_snapshot_payload())
 
     with pytest.raises(ValueError, match="exceeds the authenticated candidate"):
         _require_refinement_seed_capacity(
@@ -224,9 +222,7 @@ def test_full_support_rejuvenation_recovers_collapsed_lineage() -> None:
             joint_lineage_recovery_min_surviving_weight_mass=1.0e-4,
         ),
         last_joint_rejuvenation_diagnostics=[final_rejuvenation],
-        step_diagnostics=lambda **_kwargs: {
-            isotope: _row() for isotope in isotopes
-        },
+        step_diagnostics=lambda **_kwargs: {isotope: _row() for isotope in isotopes},
     )
 
     diagnostics = _particle_diagnostics(estimator)
@@ -285,9 +281,7 @@ def test_lineage_recovery_warning_is_isotope_specific() -> None:
                 "lineage_recovery_sufficient.Co-60": 0.0,
             }
         ],
-        step_diagnostics=lambda **_kwargs: {
-            isotope: _row() for isotope in isotopes
-        },
+        step_diagnostics=lambda **_kwargs: {isotope: _row() for isotope in isotopes},
     )
 
     diagnostics = _particle_diagnostics(estimator)
@@ -584,7 +578,10 @@ def test_planner_mode_mismatch_fails_before_runtime_connection(
 
     settings = _production_settings()
     policy = None
-    if mode in {"native_with_disabled_sentinels", "round_robin_with_disabled_sentinels"}:
+    if mode in {
+        "native_with_disabled_sentinels",
+        "round_robin_with_disabled_sentinels",
+    }:
         settings["dss_pp"] = None
         settings["planning_eig_samples"] = None
     if mode == "round_robin_with_disabled_sentinels":
@@ -884,8 +881,7 @@ def test_particle_diagnostics_omit_deep_rejection_payloads() -> None:
         latest_station_adjacent_cardinality_transition_counts=lambda: {
             "Cs-137": {
                 "count_semantics": (
-                    "raw_proposal_rows_across_latest_station_"
-                    "rejuvenation_sweeps"
+                    "raw_proposal_rows_across_latest_station_rejuvenation_sweeps"
                 ),
                 "k_to_k_minus_1": {"attempted": 5, "accepted": 2},
                 "k_minus_1_to_k": {"attempted": 7, "accepted": 3},
@@ -918,12 +914,8 @@ def test_particle_diagnostics_omit_deep_rejection_payloads() -> None:
                     "block_cardinality_changed_weight_mass": 0.05,
                 },
                 "structural_rejection_diagnostics": {"large": [1] * 100},
-                "joint_cross_isotope_rejection_diagnostics": {
-                    "large": [1] * 100
-                },
-                "joint_cross_isotope_state_rejection_diagnostics": {
-                    "large": [1] * 100
-                },
+                "joint_cross_isotope_rejection_diagnostics": {"large": [1] * 100},
+                "joint_cross_isotope_state_rejection_diagnostics": {"large": [1] * 100},
             }
         },
     )
@@ -1018,16 +1010,14 @@ class _FakeRuntimeClient:
     def request(self, payload: dict[str, object]) -> dict[str, object]:
         """Return an exact integer raw spectrum for the chosen PF action."""
         self.requests.append(dict(payload))
-        request_candidates = AdaptiveCandidateSnapshot.from_payload(
-            self.candidates
-        )
+        request_candidates = AdaptiveCandidateSnapshot.from_payload(self.candidates)
         candidate_index = int(payload["candidate_index"])
         pair_id = int(payload["fe_orientation_index"]) * 8 + int(
             payload["pb_orientation_index"]
         )
         travel_time_s = request_candidates.travel_costs[candidate_index]
-        shield_actuation_time_s = (
-            request_candidates.quote_shield_program_time_s((pair_id,))
+        shield_actuation_time_s = request_candidates.quote_shield_program_time_s(
+            (pair_id,)
         )
         self.candidates["current_pair_id"] = pair_id
         return {
@@ -1105,7 +1095,6 @@ class _FakeRuntimeClient:
     def abort(self) -> None:
         """Expose the runtime cleanup method."""
         self.aborted = True
-
 
 
 class _FakeEstimator:
@@ -1217,9 +1206,7 @@ class _FakePFLiveSession:
         next_candidates: AdaptiveCandidateSnapshot,
     ) -> bool:
         """Verify controller request wiring before accepting one fake record."""
-        requested_pose = request_candidates.candidate_poses_xyz[
-            request.candidate_index
-        ]
+        requested_pose = request_candidates.candidate_poses_xyz[request.candidate_index]
         assert int(record.step_id) == len(self.records)
         assert int(record.action_id) == len(self.records)
         assert int(record.station_id) == request.station_id
@@ -1227,9 +1214,10 @@ class _FakePFLiveSession:
         assert int(record.fe_orientation_index) == request.fe_orientation_index
         assert int(record.pb_orientation_index) == request.pb_orientation_index
         assert float(record.live_time_s) == request.dwell_time_s
-        assert float(record.travel_time_s) == request_candidates.travel_costs[
-            request.candidate_index
-        ]
+        assert (
+            float(record.travel_time_s)
+            == request_candidates.travel_costs[request.candidate_index]
+        )
         requested_pair_id = (
             request.fe_orientation_index * 8 + request.pb_orientation_index
         )
@@ -1286,6 +1274,7 @@ class _FakeLog:
 
     path = Path("/tmp/pf-live-log")
     run_id = "pf-live-test"
+    log_sha256 = "a" * 64
     records = (SimpleNamespace(station_id=0),)
 
     def station_view(self) -> SimpleNamespace:
@@ -1293,8 +1282,7 @@ class _FakeLog:
         return SimpleNamespace(station_count=1)
 
 
-def test_final_diagnostics_keep_one_compact_copy_of_each_diagnostic(
-) -> None:
+def test_final_diagnostics_keep_one_compact_copy_of_each_diagnostic() -> None:
     """Controller completion adds only stop and fixed-budget provenance."""
     budget = PFControlBudget(
         max_stations=1,
@@ -1316,9 +1304,7 @@ def test_final_diagnostics_keep_one_compact_copy_of_each_diagnostic(
             "stop_ready": False,
             "posterior_convergence": {"duplicated": True},
         },
-        particle_adequacy={
-            "sampler_quality": {"status": "pass", "reasons": []}
-        },
+        particle_adequacy={"sampler_quality": {"status": "pass", "reasons": []}},
     )
 
     assert diagnostics["stop"]["adaptive"] == {
@@ -1609,8 +1595,29 @@ def test_pf_closed_loop_owns_budget_and_shield_program(
         "pf_particles.npz",
         "pf_station_performance.jsonl",
         "closed_loop_result.json",
+        "pf_figure_data.json",
     ):
         assert (tmp_path / "output" / name).is_file()
+    figure_data = json.loads(
+        (tmp_path / "output" / "pf_figure_data.json").read_text(encoding="utf-8")
+    )
+    assert figure_data["artifact_family"] == "pf_result_figure_data"
+    assert figure_data["truth_included"] is False
+    assert figure_data["run_identity"] == {
+        "run_id": "pf-live-test",
+        "measurement_log_sha256": "a" * 64,
+    }
+    assert figure_data["route"]["travel_path_segments_xyz"] == [
+        [[0.25, 0.5, 0.5], [0.5, 0.5, 0.5]]
+    ]
+    assert figure_data["route"]["measurement_stations"] == [
+        {
+            "station_id": 0,
+            "step_id": 0,
+            "position_xyz": [0.5, 0.5, 0.5],
+            "visit_count": 1,
+        }
+    ]
     performance = json.loads(
         (tmp_path / "output" / "pf_station_performance.jsonl")
         .read_text(encoding="utf-8")
@@ -1665,9 +1672,7 @@ def test_failed_acquisition_never_publishes_a_partial_result(
     assert not list(tmp_path.glob(".output.failed-*"))
     failure_receipts = list(tmp_path.glob(".output.failure-*.json"))
     assert len(failure_receipts) == 1
-    failure = json.loads(
-        failure_receipts[0].read_text(encoding="utf-8")
-    )
+    failure = json.loads(failure_receipts[0].read_text(encoding="utf-8"))
     assert failure["status"] == "failed"
     assert failure["output_bundle_published"] is False
     assert failure["error_type"] == "AssertionError"
@@ -1676,9 +1681,7 @@ def test_failed_acquisition_never_publishes_a_partial_result(
     assert diagnostic_root.parent == tmp_path
     assert diagnostic_root.name.startswith("output.failure-diagnostics-")
     posterior = json.loads(
-        (diagnostic_root / "truth_free_posterior.json").read_text(
-            encoding="utf-8"
-        )
+        (diagnostic_root / "truth_free_posterior.json").read_text(encoding="utf-8")
     )
     assert posterior["publishable"] is False
     assert (diagnostic_root / "planner_audit.jsonl").is_file()
@@ -1795,13 +1798,13 @@ def test_abort_cleanup_failures_preserve_primary_error_and_failure_evidence(
     assert not list(tmp_path.glob(".output.failed-*"))
     failure_receipts = list(tmp_path.glob(".output.failure-*.json"))
     assert len(failure_receipts) == 1
-    failure = json.loads(
-        failure_receipts[0].read_text(encoding="utf-8")
-    )
+    failure = json.loads(failure_receipts[0].read_text(encoding="utf-8"))
     assert failure["error_type"] == "AssertionError"
-    assert [
-        row["operation"] for row in failure["secondary_failures"]
-    ] == ["runtime_abort", "resource_close", "cui_close"]
+    assert [row["operation"] for row in failure["secondary_failures"]] == [
+        "runtime_abort",
+        "resource_close",
+        "cui_close",
+    ]
     client = _CleanupFailRuntimeClient.instance
     assert client is not None
     assert client.aborted is True
@@ -1867,7 +1870,6 @@ def test_failure_receipt_error_preserves_primary_error_and_diagnostics(
     diagnostic_roots = list(tmp_path.glob("output.failure-diagnostics-*"))
     assert len(diagnostic_roots) == 1
     assert (diagnostic_roots[0] / "truth_free_posterior.json").is_file()
-
 
 
 def test_closed_loop_has_one_pf_without_isotope_gate_rebuild() -> None:

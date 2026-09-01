@@ -70,6 +70,7 @@ from visualization.realtime_viz import (
     build_frame_from_pf,
 )
 
+
 def _exact_integer(value: object, *, name: str, minimum: int) -> int:
     """Return one exact integer satisfying an inclusive lower bound."""
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -228,14 +229,10 @@ def _compact_adaptive_stop_status(
     compact = {
         "assessed": status.get("assessed"),
         "instantaneous_ready": status.get("instantaneous_ready"),
-        "consecutive_ready_stations": status.get(
-            "consecutive_ready_stations"
-        ),
+        "consecutive_ready_stations": status.get("consecutive_ready_stations"),
         "stop_ready": status.get("stop_ready"),
     }
-    retained = {
-        key: value for key, value in compact.items() if value is not None
-    }
+    retained = {key: value for key, value in compact.items() if value is not None}
     return retained or None
 
 
@@ -334,9 +331,7 @@ def _strict_cui_public_host(settings: Mapping[str, object]) -> str:
     """Return the explicit browser-facing host for the CUI server."""
     value = settings["cui_split_view_public_host"]
     if not isinstance(value, str) or not value or value == "auto":
-        raise TypeError(
-            "cui_split_view_public_host must be an explicit host string."
-        )
+        raise TypeError("cui_split_view_public_host must be an explicit host string.")
     return value
 
 
@@ -359,16 +354,13 @@ def _bind_cui_view_server(
         non_inert = [name for name in network_fields if settings[name] is not None]
         if non_inert:
             raise ValueError(
-                "Non-serving CUI requires null network fields: "
-                f"{non_inert}."
+                f"Non-serving CUI requires null network fields: {non_inert}."
             )
         if not enabled and (
             _strict_cui_bool(settings, "cui_split_view_save_step_history")
             or settings["cui_split_view_max_particles_per_isotope"] is not None
         ):
-            raise ValueError(
-                "Disabled CUI requires inert renderer-only settings."
-            )
+            raise ValueError("Disabled CUI requires inert renderer-only settings.")
         return None
     return start_cui_view_server(
         output_dir,
@@ -392,9 +384,7 @@ def _start_cui_split_view(
     """Start the renderer after context resolution and a successful server bind."""
     if not resolve_cui_split_view_enabled(settings):
         if truth_overlay_socket_path is not None:
-            raise ValueError(
-                "A CUI truth overlay socket requires cui_split_view=true."
-            )
+            raise ValueError("A CUI truth overlay socket requires cui_split_view=true.")
         if server_handle is not None:
             raise RuntimeError("Disabled CUI unexpectedly owns a server handle.")
         return None
@@ -509,6 +499,63 @@ def _publish_cui_frame(
     return frame
 
 
+def _pf_result_figure_data_payload(
+    route: CUIRoute,
+    *,
+    run_id: str,
+    measurement_log_sha256: str,
+) -> dict[str, object]:
+    """Build truth-free numeric data needed to redraw PF result figures."""
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("PF figure data requires a nonempty run identifier.")
+    if not isinstance(measurement_log_sha256, str) or not measurement_log_sha256:
+        raise ValueError("PF figure data requires a MeasurementLog identity.")
+    return {
+        "schema_version": 1,
+        "artifact_family": "pf_result_figure_data",
+        "run_identity": {
+            "run_id": run_id,
+            "measurement_log_sha256": measurement_log_sha256,
+        },
+        "coordinate_system": {
+            "frame": "MeasurementLog world frame",
+            "axis_order": ["x", "y", "z"],
+            "length_unit": "m",
+        },
+        "route": route.to_payload(),
+        "source_artifacts": {
+            "measurement_log": [
+                "environment.json",
+                "forward_model_manifest.json",
+                "run_manifest.json",
+                "runtime_config.resolved.json",
+                "observations.npz",
+                "observation_metadata.jsonl",
+            ],
+            "pf_output": [
+                "pf_posterior.json",
+                "pf_diagnostics.json",
+                "pf_particles.npz",
+                "pf_post_run_evaluation_input.json",
+                "pf_station_trace.jsonl",
+                "pf_station_performance.jsonl",
+                "planner_audit.jsonl",
+            ],
+        },
+        "presentation_contract": {
+            "numeric_values_rounded": False,
+            "route_line_semantics": (
+                "Only persisted MeasurementLog travel_waypoints_xyz segments "
+                "may be connected as a route."
+            ),
+            "station_semantics": (
+                "Measurement stations are retained independently of route availability."
+            ),
+        },
+        "truth_included": False,
+    }
+
+
 def _particle_diagnostics(estimator: object) -> dict[str, object]:
     """Extract particle-adequacy evidence without simulation truth."""
     raw = estimator.step_diagnostics(
@@ -554,9 +601,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         transition_count_method() if callable(transition_count_method) else {}
     )
     if not isinstance(transition_counts, Mapping):
-        raise TypeError(
-            "PF adjacent-cardinality transition counts must be a mapping."
-        )
+        raise TypeError("PF adjacent-cardinality transition counts must be a mapping.")
     sampler_fields = (
         "joint_smc_wall_time_limit_exceeded",
         "joint_rejuvenation_mixing_incomplete",
@@ -583,8 +628,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
                 if str(name).endswith("_accepted_weight_mass")
             )
             if any(
-                str(name).endswith("_attempted_weight_mass")
-                for name in transition_mass
+                str(name).endswith("_attempted_weight_mass") for name in transition_mass
             ):
                 aggregate_transition_mass = {
                     "attempted": float(attempted),
@@ -596,19 +640,13 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
             "current_ess_ratio": values["current_ess_ratio"],
             "temper_resamples": values["temper_resamples"],
             "temper_min_ess": values["temper_min_ess"],
-            "station_unique_ancestor_count": values[
-                "station_unique_ancestor_count"
-            ],
+            "station_unique_ancestor_count": values["station_unique_ancestor_count"],
             "cumulative_unique_ancestor_count": values[
                 "cumulative_unique_ancestor_count"
             ],
             "cardinality_distribution": values["r_probability_by_count"],
-            "structural_transition_weight_mass": (
-                aggregate_transition_mass or None
-            ),
-            "adjacent_cardinality_transition_counts": transition_counts.get(
-                isotope
-            ),
+            "structural_transition_weight_mass": (aggregate_transition_mass or None),
+            "adjacent_cardinality_transition_counts": transition_counts.get(isotope),
             "sampler_health": {
                 "smc_rejuvenation_wall_time_respected": bool(
                     values["joint_smc_wall_time_limit_exceeded"] is False
@@ -697,9 +735,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
             "lineage_recovery_min_surviving_weight_mass"
         )
         recovery_epoch = final_rejuvenation.get("lineage_recovery_epoch")
-        distinct_joint_states = final_rejuvenation.get(
-            "distinct_joint_state_count"
-        )
+        distinct_joint_states = final_rejuvenation.get("distinct_joint_state_count")
         minimum_distinct_joint_states = final_rejuvenation.get(
             "minimum_distinct_joint_states"
         )
@@ -725,8 +761,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
             recovery_record_complete
             and distinct_state_record_valid
             and minimum_state_record_valid
-            and float(distinct_joint_states)
-            >= float(minimum_distinct_joint_states)
+            and float(distinct_joint_states) >= float(minimum_distinct_joint_states)
             and isinstance(recorded_recovery_mass, (int, float))
             and not isinstance(recorded_recovery_mass, bool)
             and np.isfinite(float(recorded_recovery_mass))
@@ -765,8 +800,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
                 and float(surviving_mass) >= configured_recovery_mass
             )
             row_complete = bool(
-                row_complete
-                and bool(sufficient == 1.0) is expected_sufficient
+                row_complete and bool(sufficient == 1.0) is expected_sufficient
             )
             recovery_record_complete = recovery_record_complete and row_complete
             recovery_by_isotope[isotope] = {
@@ -793,10 +827,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
         and recovery_record_complete
         and recovery_required_recorded
         and recovery_sufficient_recorded
-        and all(
-            row["sufficient"] is True
-            for row in recovery_by_isotope.values()
-        )
+        and all(row["sufficient"] is True for row in recovery_by_isotope.values())
     )
     evidence = {
         "configured_particle_count": configured_count,
@@ -832,9 +863,7 @@ def _particle_diagnostics(estimator: object) -> dict[str, object]:
             )
         ),
     }
-    evidence = {
-        key: value for key, value in evidence.items() if value is not None
-    }
+    evidence = {key: value for key, value in evidence.items() if value is not None}
     sampler_health = {
         "smc_rejuvenation_wall_time_respected": all(
             values.get("joint_smc_wall_time_limit_exceeded") is False
@@ -877,9 +906,10 @@ def _require_plannable_sampler_health(
     assessment = particle_adequacy.get("assessment")
     if not isinstance(assessment, Mapping):
         raise TypeError("PF particle diagnostics must contain diversity assessment.")
-    if type(assessment.get("diversity_evidence_available")) is not bool or type(
-        assessment.get("diversity_warning")
-    ) is not bool:
+    if (
+        type(assessment.get("diversity_evidence_available")) is not bool
+        or type(assessment.get("diversity_warning")) is not bool
+    ):
         raise TypeError("PF diversity assessment must contain Boolean evidence.")
     quality = particle_adequacy.get("sampler_quality")
     if quality is None:
@@ -902,13 +932,15 @@ def _sampler_quality_summary(
     raw_health = particle_adequacy.get("sampler_health")
     assessment = particle_adequacy.get("assessment")
     isotopes = particle_adequacy.get("isotopes")
-    if not isinstance(raw_health, Mapping) or not isinstance(
-        assessment, Mapping
-    ) or not isinstance(isotopes, Mapping):
-        raise TypeError("PF sampler quality requires health, diversity, and isotope rows.")
-    reasons = sorted(
-        name for name, value in raw_health.items() if value is not True
-    )
+    if (
+        not isinstance(raw_health, Mapping)
+        or not isinstance(assessment, Mapping)
+        or not isinstance(isotopes, Mapping)
+    ):
+        raise TypeError(
+            "PF sampler quality requires health, diversity, and isotope rows."
+        )
+    reasons = sorted(name for name, value in raw_health.items() if value is not True)
     if assessment.get("diversity_evidence_available") is not True:
         reasons.append("particle_diversity_evidence_unavailable")
     elif assessment.get("diversity_warning") is not False:
@@ -934,13 +966,7 @@ def _sampler_quality_summary(
         f"hard_cap_posterior_mass_exceeded.{isotope}"
         for isotope in sorted(hard_cap_isotopes)
     )
-    status = (
-        "failed"
-        if hard_cap_isotopes
-        else "warning"
-        if reasons
-        else "pass"
-    )
+    status = "failed" if hard_cap_isotopes else "warning" if reasons else "pass"
     return {
         "status": status,
         "reasons": sorted(set(reasons)),
@@ -1282,9 +1308,7 @@ def _require_native_planner_settings(settings: Mapping[str, object]) -> None:
         or not isinstance(planning_samples, int)
         or planning_samples < 2
     ):
-        raise ValueError(
-            "Native DSS-PP control requires planning_eig_samples>=2."
-        )
+        raise ValueError("Native DSS-PP control requires planning_eig_samples>=2.")
 
 
 def _planner_audit_for_mode(
@@ -1336,9 +1360,7 @@ def _refine_and_replan(
     if not isinstance(ranked, Sequence) or isinstance(ranked, (str, bytes)):
         raise TypeError("Candidate refinement ranked_nodes must be a sequence.")
     if not ranked:
-        raise ValueError(
-            "Candidate refinement is enabled but ranked_nodes is empty."
-        )
+        raise ValueError("Candidate refinement is enabled but ranked_nodes is empty.")
     seed_indices: list[int] = []
     for node in ranked:
         if not isinstance(node, Mapping):
@@ -1470,8 +1492,7 @@ def _publish_failure_diagnostics(
         station_trace_path.is_file() and not station_trace_path.is_symlink()
     )
     performance_trace_available = bool(
-        performance_trace_path.is_file()
-        and not performance_trace_path.is_symlink()
+        performance_trace_path.is_file() and not performance_trace_path.is_symlink()
     )
     cui_image_available = bool(
         cui_image_path.is_file() and not cui_image_path.is_symlink()
@@ -1517,9 +1538,7 @@ def _publish_failure_diagnostics(
                     "posterior_source": posterior_source,
                     "planner_audit_available": planner_available,
                     "station_trace_available": station_trace_available,
-                    "performance_trace_available": (
-                        performance_trace_available
-                    ),
+                    "performance_trace_available": (performance_trace_available),
                     "last_cui_image_available": cui_image_available,
                     "error_type": type(primary_error).__name__,
                     "message": str(primary_error),
@@ -1691,9 +1710,7 @@ def run_pf_closed_loop(
             )
             planner_writer.append(bootstrap_audit)
         else:
-            raise RuntimeError(
-                "PF live acquisition requires fresh protocol schema 1."
-            )
+            raise RuntimeError("PF live acquisition requires fresh protocol schema 1.")
         while continue_acquisition and station_id < budget.max_stations:
             if record_count + len(current_program.pair_ids) > budget.max_measurements:
                 stop_reason = "maximum_measurement_budget"
@@ -1714,9 +1731,7 @@ def run_pf_closed_loop(
                     pb_orientation_index=pb_index,
                     dwell_time_s=budget.live_time_s,
                     station_id=station_id,
-                    station_complete=(
-                        view_index == len(current_program.pair_ids) - 1
-                    ),
+                    station_complete=(view_index == len(current_program.pair_ids) - 1),
                 )
                 event = client.acquire(request)
                 record = event.record
@@ -1753,9 +1768,7 @@ def run_pf_closed_loop(
                         elapsed_time_s=cui_elapsed_time_s,
                         record_measurement=True,
                         reusable_frame=(
-                            None
-                            if rebuild_particle_frame
-                            else reusable_cui_frame
+                            None if rebuild_particle_frame else reusable_cui_frame
                         ),
                     )
                     station_cui_enqueue_elapsed_s += (
@@ -1766,8 +1779,12 @@ def run_pf_closed_loop(
                     else:
                         station_cui_particle_reuses += 1
                     cui_frame_enqueued = True
+                else:
+                    cui_route_records.append(record)
             if assimilation_start_s is None:
-                raise RuntimeError("PF station completed without an assimilation start.")
+                raise RuntimeError(
+                    "PF station completed without an assimilation start."
+                )
             assimilation_elapsed_s = time.perf_counter() - assimilation_start_s
             current_pose = np.asarray(
                 station_records[-1].detector_pose_xyz,
@@ -1804,9 +1821,7 @@ def run_pf_closed_loop(
                 "particle_adequacy": particle_adequacy,
                 "posterior_snapshot": posterior_snapshot,
             }
-            compact_stop = _compact_adaptive_stop_status(
-                latest_adaptive_stop_status
-            )
+            compact_stop = _compact_adaptive_stop_status(latest_adaptive_stop_status)
             if compact_stop is not None:
                 station_trace["adaptive_stop"] = compact_stop
             phase_start_s = time.perf_counter()
@@ -1841,9 +1856,7 @@ def run_pf_closed_loop(
                 {},
             )
             if not isinstance(assimilation_stage, Mapping):
-                raise TypeError(
-                    "PF station assimilation timing must be a mapping."
-                )
+                raise TypeError("PF station assimilation timing must be a mapping.")
             performance_record: dict[str, object] = {
                 "schema_version": 1,
                 "station_id": int(station_id),
@@ -1855,18 +1868,12 @@ def run_pf_closed_loop(
                     ),
                     "pf_update": float(assimilation_elapsed_s),
                     "pf_update_breakdown": dict(assimilation_stage),
-                    "boundary_diagnostics": float(
-                        boundary_diagnostics_elapsed_s
-                    ),
+                    "boundary_diagnostics": float(boundary_diagnostics_elapsed_s),
                     "adaptive_stop": float(adaptive_stop_elapsed_s),
                     "particle_health": float(particle_diagnostics_elapsed_s),
                     "shadow_health": float(shadow_health_elapsed_s),
-                    "posterior_snapshot": float(
-                        posterior_snapshot_elapsed_s
-                    ),
-                    "station_trace_write": float(
-                        station_trace_write_elapsed_s
-                    ),
+                    "posterior_snapshot": float(posterior_snapshot_elapsed_s),
+                    "station_trace_write": float(station_trace_write_elapsed_s),
                     "stop_request_poll": float(stop_request_elapsed_s),
                     "cui_enqueue": float(station_cui_enqueue_elapsed_s),
                 },
@@ -1931,9 +1938,7 @@ def run_pf_closed_loop(
             current_program = planned.shield_program
             timing = performance_record["timing_s"]
             assert isinstance(timing, dict)
-            timing["sampler_health_gate"] = float(
-                sampler_health_gate_elapsed_s
-            )
+            timing["sampler_health_gate"] = float(sampler_health_gate_elapsed_s)
             timing["planning"] = float(planning_elapsed_s)
             timing["planning_breakdown"] = planning_stage_wall_s
             timing["station_wall_including_planning"] = float(
@@ -1960,9 +1965,7 @@ def run_pf_closed_loop(
             record_count=len(log.records),
             station_count=log.station_view().station_count,
             stop_reason=stop_reason,
-            sampler_quality_status=str(
-                particle_adequacy["sampler_quality"]["status"]
-            ),
+            sampler_quality_status=str(particle_adequacy["sampler_quality"]["status"]),
         )
         resources.close()
         if cui_split_viz is not None:
@@ -1996,14 +1999,10 @@ def run_pf_closed_loop(
                 source_pf_path=artifact_paths[2],
                 source_pf_labeled_path=artifact_paths[3],
                 source_spectrum_path=artifact_paths[4],
-                final_overview_path=(
-                    staging_dir / "final_experiment_overview.png"
-                ),
+                final_overview_path=(staging_dir / "final_experiment_overview.png"),
                 final_robot_path=staging_dir / "final_robot_2d.png",
                 final_pf_path=staging_dir / "final_pf_3d.png",
-                final_pf_labeled_path=(
-                    staging_dir / "final_pf_3d_labeled.png"
-                ),
+                final_pf_labeled_path=(staging_dir / "final_pf_3d_labeled.png"),
                 final_spectrum_path=staging_dir / "final_spectrum.png",
             )
         if cui_server_handle is not None:
@@ -2015,6 +2014,22 @@ def run_pf_closed_loop(
             _strict_live_artifact_json_bytes(
                 result.to_dict(),
                 artifact_name="PF closed-loop result",
+            ),
+        )
+        if len(cui_route_records) != len(log.records):
+            raise RuntimeError(
+                "PF figure route record count differs from the finalized log."
+            )
+        figure_route = cui_route_from_records(cui_route_records)
+        atomic_write_bytes(
+            staging_dir / "pf_figure_data.json",
+            _strict_live_artifact_json_bytes(
+                _pf_result_figure_data_payload(
+                    figure_route,
+                    run_id=log.run_id,
+                    measurement_log_sha256=log.log_sha256,
+                ),
+                artifact_name="PF result figure data",
             ),
         )
         live_session._publish_bound_result_into_staging(staging_dir)

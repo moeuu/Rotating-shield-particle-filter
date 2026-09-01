@@ -24,7 +24,7 @@ SANS_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.ral_figure_common import LATEX_ROOT  # noqa: E402
+from scripts.ral_figure_common import REVIEW_DIR  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -88,13 +88,12 @@ def discover_storyboard_segments(root: Path = ROOT) -> list[VideoSegment]:
             image_path=figure_root / "geant4_obstacle_scatter.png",
         ),
         VideoSegment(
-            title="Cs4/Co3 PF output",
+            title="Cs4/Co3 completed-run case audit",
             caption=(
-                "The final figure summarizes source-term estimates, ground truth, "
-                "PF support, and the robot trajectory for the main multi-isotope run."
+                "The numeric audit combines physical 3-D obstacles, orthogonal "
+                "projections, split-aware source summaries, and online cardinality."
             ),
-            image_path=LATEX_ROOT
-            / "sections/05_experiments/figures/ral_result_overview.png",
+            image_path=REVIEW_DIR / "ral_result_case_audit.png",
         ),
     ]
     return [segment for segment in candidates if segment.image_path.exists()]

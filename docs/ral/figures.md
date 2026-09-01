@@ -1,158 +1,196 @@
 # RA-L Figure Policy
 
-This note defines mandatory checks before any generated figure is described as
-ready for the RA-L manuscript.
+This document defines the permanent evidence, design, and review contract for
+RA-L figures. Run-specific paths and conclusions belong in the run bundle, not
+in this policy.
 
-## Mandatory Visual QA
+## Evidence-only rendering
 
-After generating or updating a manuscript figure, always inspect the rendered
-image, not only the source code or the LaTeX include command. For PDF figures,
-also generate a raster review copy and inspect that copy at the approximate
-paper size.
+Scientific figures must be rendered deterministically from authenticated
+numeric artifacts. AI-generated or AI-edited imagery is prohibited. Do not
+invent a route, obstacle height, posterior sample, uncertainty region,
+measurement, or response curve for presentation. Simulation camera images may
+be used only when they are reproducible outputs of the declared simulation
+scene and their role is contextual rather than quantitative.
 
-Reject and revise the figure if any of the following are visible:
+Keep source arrays, transformations, and presentation separate. Rounding,
+normalization, resampling for display, alpha, color, and camera selection are
+presentation operations and must not overwrite source data.
 
-- text, legends, panel labels, markers, axes, or arrows overlap in a way that
-  makes either item hard to read;
-- a panel label covers data, annotations, axes, or title text;
-- axis aspect ratios or tick spacing distort the metric geometry;
-- floor/background fills visually cover obstacles, sources, paths, or
-  particles; geometry-bearing layers must be drawn above the background with a
-  clear z-order;
-- a 2-D map has redundant room frames or double borders from both a drawn room
-  rectangle and axis spines;
-- a plotted path implies motion through obstacles when only station locations
-  are known;
-- a panel does not make a concrete scientific point that is explained by the
-  caption or main text;
-- schematic elements imply physics, geometry, measurement counts, or algorithm
-  behavior that is not actually used by the method or experiment.
-- labels in the standalone figure or compiled PDF are below the readable
-  RA-L/IEEE two-column scale. Unless there is a documented reason, generated
-  figure labels, ticks, and legends should be at least 7 pt at final inclusion
-  size, with panel titles around 8 pt and panel labels around 9 pt.
+## Design basis from prior 3-D radiation mapping work
 
-## Logical QA
+Use the following precedent as a design basis, not as evidence for this
+project's performance:
 
-Every panel must answer a manuscript question and directly support a claim. Use
-figures for geometry, motion, occlusion, response signatures, uncertainty,
-model-order behavior, or quantitative comparison rather than as text
-containers. Before redesign, inspect the closest PF-surveying,
-scene-attenuation, or source-separation figures in prior work and record what
-the new design adds: the Fe/Pb attenuation code and its coupling to
-surface-constrained PF updates and active station selection.
+- Vavrek et al.'s
+  [3-D scene-data-fusion source reconstruction](https://arxiv.org/abs/2009.07303)
+  combines contextual plan views with a separate 3-D source reconstruction
+  and orthogonal quantitative projections.
+- Bandstra et al.'s
+  [free-moving quantitative gamma-ray imaging](https://arxiv.org/abs/2104.11318)
+  shows detector motion and 3-D material occupancy for context, then uses
+  top/side views and spatial confidence information for quantitative reading.
+- Lee et al.'s
+  [mobile robot radiation mapping](https://arxiv.org/abs/1802.06072) uses the
+  reconstructed 3-D scene, robot trajectory, and different shapes for truth
+  and estimates in the same spatial frame.
+- Pavlovsky et al.'s
+  [3-D radiation mapping in real time](https://arxiv.org/abs/1908.06114)
+  demonstrates the value of fusing radiation results with contextual 3-D scene
+  geometry rather than showing radiation coordinates in an empty box.
 
-Use the eighth page effectively. Inspect page 8 before reporting the manuscript
-ready and restore necessary discussion, limitations, interpretation, or
-references if it is mostly blank while remaining within the page limit.
+The resulting project rule is: a 3-D panel establishes physical context and
+occlusion, but it is never the sole localization-accuracy display. Pair it with
+equal-scale orthogonal projections and a compact numerical panel. Perspective
+occlusion and camera angle must not determine whether an error is visible.
 
-## Figure Roles
+## Geometry semantics
 
-- Fig. 1 should show the problem setting and why rotating Fe/Pb postures create
-  a temporal response code for separating surface sources.
-- Fig. 2 should show how one station window turns known surfaces, obstacle
-  paths, shield postures, spectra, and residual PF ambiguity into the next
-  station/program decision. It must use rendered or explicitly 3-D views when
-  explaining the Fe/Pb shield posture or 3-D obstacle/source geometry, and it
-  must contain geometry, response signatures, or posterior/diagnostic graphics,
-  not only text boxes.
-- Fig. 1 and Fig. 2 must not spend their main panel on the same rendered view.
-  Fig. 1 should establish the robotic problem setting; Fig. 2 should explain
-  the shield hardware/program and inference mechanism.
-- Experiment figures should show metric source-estimation results, obstacle
-  geometry, final PF particle support, the saved obstacle-aware robot route,
-  online model-order behavior, and compact ablation metrics.
-  Result-map panels must state whether the plotted estimates are from the
-  proposed method or a baseline and must include a marker legend for stations,
-  saved route, PF particles, truth, estimates, and isotope colors.
-  When the reported metric is 3-D localization, the main result panels should
-  include a 3-D view or an equivalent paired projection that makes height
-  errors visible.
+Navigation occupancy and physical obstacle geometry are different data:
 
-The attenuation-code response matrix belongs in the method figure rather than
-the result figure. This gives it a distinct explanatory role and leaves result
-space for truth-estimate accuracy.
+- navigation occupancy states where the robot may travel;
+- collision geometry states the physical volumes that block traversal; and
+- transport geometry states the material volumes used for attenuation.
 
-## Main Result Figure
+In a 3-D overview, render the exact authenticated transport components when
+available, otherwise exact collision components. Use translucent solid faces
+and visible edges so nested or hollow structures remain legible. Preserve the
+physical x-y-z aspect ratio and use an orthographic camera by default. Do not
+flatten components into floor patches.
 
-The main result is the split-aware proposed-method PF result for the current
-Cs4/Co3 task, not a generic dashboard. Use this five-panel grammar:
+In the floor projection, navigation cells may appear as a faint background,
+while physical component footprints use a separate darker encoding. In the
+height projection, show component z extents. If only grid occupancy exists, an
+extruded grid fallback is allowed only when the figure or caption explicitly
+labels it as an occupancy-derived approximation; it must not be described as
+the true obstacle shape.
 
-1. A metric floor projection with 2 m tick spacing, equal x-y aspect, known
-   obstacles, saved obstacle-aware route, final PF particle support, truth,
-   reported estimates, and truth-estimate match segments.
-2. A metric height projection with 2 m tick spacing and equal scaling so wall,
-   floor, obstacle, and high-surface errors remain visible.
-3. A compact numerical source panel containing truth ID, merged raw-component
-   count, 3-D centroid and RMS position errors, and signed aggregate strength
-   error. Do not add a redundant pass/fail column.
-4. An online diagnostic panel showing isotope-wise cardinality evolution and
-   the hard-cap threshold. Raw cardinality is diagnostic only.
-5. A per-true-source panel showing RMS position and relative strength error
-   against the predeclared 0.5 m and 25% targets.
+The room floor or axes must not obscure obstacles, sources, paths, or posterior
+support. Metric axes require equal scale in each displayed coordinate pair.
 
-Identify sources by isotope and stable truth index. Include a clear marker
-legend for stations, route, PF particles, truth, estimates, and isotope colors.
-Keep the particle cloud visually secondary to truth and final estimates.
+## Live CUI and final run views
 
-Do not connect stations with straight line segments. Draw a route only from
-persisted obstacle-aware path waypoints; otherwise show station markers without
-implying an unrecorded collision-free trajectory.
+The truth-free CUI and the saved final CUI images must use the same scene
+semantics:
 
-## Obstacle Rendering
+- exact physical obstacle components in the 3-D PF view;
+- a distinct navigation-occupancy layer in the plan view;
+- current detector pose, measurement stations, and only the persisted runtime
+  travel waypoints as the route;
+- isotope color plus marker shape for posterior components and point estimates;
+- metric axes, physical box aspect, and an orthographic 3-D camera; and
+- truth only in the separately authorized evaluation overlay, never in the PF
+  control view.
 
-Render obstacles from the authenticated environment artifact used by the run.
-For grid environments, draw occupied-cell footprints. For component-based
-environments, draw available component footprints and traversal-blocking
-occupancy. Geometry that affects attenuation or reachability must remain
-visible above background fills.
+Do not connect station locations with straight segments. When no persisted
+travel waypoints exist, show station markers and state that the route is
+unavailable. A line must never imply motion through an obstacle merely because
+the endpoints are measurement stations.
 
-Main-paper result tables should not be made unreadable to save space. Use a
-consistent body font size across adjacent result tables, preferably `\small`;
-if a table only fits with `\scriptsize`, simplify column labels or split
-content before accepting it.
+## Completed-run case audit
 
-## Figure-Source Data Preservation
+The deterministic completed-run audit uses six panels:
 
-Every result figure must remain reproducible after the run without rerunning
-Geant4 or PF inference. Keep the numerical source data separate from rendered
-PNG/PDF/SVG assets, and retain enough information to change axes, aggregation,
-color, panel layout, normalization, or residual presentation later.
+1. an authenticated 3-D scene containing physical obstacles, stations, any
+   saved route, posterior support, truth, raw PF components, merged centroids,
+   and truth-to-centroid links;
+2. an equal-scale floor projection that distinguishes navigation occupancy
+   from physical component footprints;
+3. an equal-scale depth-height projection that exposes vertical error and
+   obstacle height;
+4. a compact numerical source table with truth ID, assigned raw-component
+   count, merged-centroid error, split-width-sensitive RMS position error, and
+   signed aggregate strength error, without a redundant pass/fail column;
+5. online isotope-wise cardinality and hard-cap diagnostics; and
+6. per-source RMS position and strength errors normalized by the declared
+   0.5 m and 25% targets.
 
-For full-simulation results, preserve the authenticated MeasurementLog
-artifacts (including full spectra, exact energy-bin edges, detector poses,
-shield indices, live times, and environment geometry), the final posterior and
-weighted particle snapshot, the station/planner trace, and the evaluation
-inputs. Diagnostics that introduce derived values must additionally save their
-model predictions and the raw values from which residuals or summaries were
-calculated; a rendered curve or aggregate statistic alone is insufficient.
+Raw components remain visible because they explain splitting; the merged
+centroid is the one-source summary. Particle support must remain visually
+secondary. Use isotope color and marker shape redundantly, and provide one
+shared legend for obstacles, stations, route when present, PF support, truth,
+raw components, merged centroids, and error links.
 
-Every derived figure-data payload must state units, bin coordinates, residual
-or normalization formulas, filtering/exclusion rules, missing-value semantics,
-and stochastic provenance. Preserve unrounded numerical values and apply
-rounding only in the presentation layer. Publication artifact inventories must
-hash the machine-readable source data together with the other run artifacts.
+This case audit is not automatically a headline manuscript result. Until all
+four prespecified variants in one valid comparison batch are complete, keep it
+as a review or supplementary artifact. Do not let a proposed-only run imply a
+completed ablation comparison.
 
-## Review Artifacts
+## Final manuscript comparison
 
-Build current figures from an authenticated completed-run bundle and its exact
-split-aware evaluation. Run-specific bundle construction and private paths
-belong with that run, not in this policy. The reusable entry point is:
+The final comparison must be comparison-first and use the same environment,
+scales, evaluation rule, and visual encodings for all four variants. Show
+source-level distributions or paired values together with aggregate summaries;
+do not reduce the evidence to one favorable scene image. A compact shared-scene
+3-D context panel may accompany the comparison, but orthogonal projections or
+explicit 3-D error metrics remain mandatory for a 3-D localization claim.
+
+The current manuscript has two live figure roles. Adding a result figure later
+requires a deliberate manuscript-budget decision: replace or restructure an
+existing figure, or explicitly revise the budget after the complete comparison
+exists. Do not silently publish the current case audit as a third figure.
+
+The attenuation-code response matrix belongs in the method figure, not the
+result figure. This preserves result space for localization, uncertainty,
+model-order behavior, and the four-variant comparison.
+
+## Figure-source data preservation
+
+Every result must remain redrawable without rerunning Geant4 or PF inference.
+Retain and hash:
+
+- the authenticated MeasurementLog, including full spectra, exact energy-bin
+  edges, detector poses, shield indices, live times, station identities, route
+  waypoint metadata, and environment geometry;
+- the final posterior and weighted particle snapshot;
+- station, planner, residual, cardinality-transition, and performance traces;
+- the exact evaluation input and evaluation artifact; and
+- `pf_figure_data.json`, which binds truth-free route and station display data
+  to the run ID and MeasurementLog digest.
+
+For legacy runs without `pf_figure_data.json`, the renderer may read exact
+`travel_waypoints_xyz` values from authenticated `observation_metadata.jsonl`.
+When both forms exist, they must agree exactly or figure generation fails.
+
+Derived diagnostic payloads must preserve predictions and raw observations,
+not only residual plots or aggregate values. State units, bin coordinates,
+formulas, filtering rules, missing-value semantics, and stochastic provenance.
+Save unrounded values and round only in the renderer.
+
+## Mandatory visual QA
+
+After every figure change, inspect the rendered image itself at approximate
+paper size. For a PDF, also inspect a raster review copy and the compiled paper
+page when the figure is live. Reject and revise if:
+
+- text, legends, titles, markers, axes, or arrows overlap;
+- the metric aspect ratio or tick spacing is distorted;
+- obstacle faces hide the sources or make component shape unreadable;
+- translucent layers combine into an opaque mass that conceals evidence;
+- a route crosses obstacles because unsaved segments were inferred;
+- the 3-D camera hides a source/error that the companion projections do not
+  recover;
+- color is the only distinction between scientific categories;
+- a panel does not support a stated manuscript question; or
+- any element implies physics, geometry, counts, uncertainty, or algorithm
+  behavior not present in the authenticated data.
+
+At final inclusion size, labels, ticks, and legends should normally be at least
+7 pt, panel titles about 8 pt, and panel labels about 9 pt. Simplify content
+before reducing below those sizes.
+
+## Reusable build path
+
+Build the case audit from an authenticated completed-run bundle and its exact
+split-aware evaluation:
 
 ```bash
 uv run python scripts/build_ral_figures.py \
+  --skip-concepts \
   --completed-run-dir COMPLETED_BUNDLE \
   --split-aware-evaluation EVALUATION_JSON
 ```
 
-Use `--skip-concepts` when only the result figure should change. The script
-writes raster review copies by default to:
-
-```bash
-results/ral_figure_review/
-```
-
-Inspect these PNG files before reporting that the figure update is finished.
-If the LaTeX PDF is rebuilt, inspect the compiled page as well, because a figure
-that is readable as a standalone asset can still be too small or crowded in the
-paper layout.
+The default output and raster review copies stay in
+`results/ral_figure_review/`. Promotion into the external manuscript workspace
+is a separate, explicit step after the comparison and page budget are ready.

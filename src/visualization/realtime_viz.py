@@ -31,6 +31,7 @@ from runtime.cui_components import (
 )
 
 from visualization.frame import PFFrame
+from visualization.obstacle_geometry import axis_aligned_box_faces
 
 DEFAULT_ISOTOPE_COLORS = {
     "Cs-137": "tab:red",
@@ -100,6 +101,18 @@ def _metric_ticks(vmin: float, vmax: float, step: float = 2.0) -> NDArray[np.flo
     if ticks.size == 0:
         return np.asarray([lo, hi], dtype=float)
     return ticks
+
+
+def _padded_metric_bounds(
+    lower: float,
+    upper: float,
+    *,
+    fraction: float = 0.025,
+) -> tuple[float, float]:
+    """Return small finite display margins around physical metric bounds."""
+    span = max(float(upper) - float(lower), 1.0e-9)
+    padding = float(fraction) * span
+    return float(lower) - padding, float(upper) + padding
 
 
 def _apply_metric_ticks_2d(
@@ -266,8 +279,6 @@ def _batched_particle_display_arrays(
         np.asarray(representative_positions, dtype=float),
         weights[nonempty],
     )
-
-
 
 
 class CUISplitPFVisualizer:
@@ -440,9 +451,7 @@ class CUISplitPFVisualizer:
         self.measurement_station_ids = [
             int(value) for value in route.measurement_station_ids
         ]
-        self.measurement_steps = [
-            int(value) for value in route.measurement_step_ids
-        ]
+        self.measurement_steps = [int(value) for value in route.measurement_step_ids]
         self.measurement_visit_counts = [
             int(value) for value in route.measurement_visit_counts
         ]
@@ -514,9 +523,7 @@ class CUISplitPFVisualizer:
         """Return a title suffix that separates measurement, render, and station progress."""
         update_idx = int(getattr(frame, "_cui_update_index", 0))
         station_id = (
-            self.measurement_station_ids[-1]
-            if self.measurement_station_ids
-            else 0
+            self.measurement_station_ids[-1] if self.measurement_station_ids else 0
         )
         visit_count = (
             int(self.measurement_visit_counts[-1])
@@ -585,7 +592,7 @@ class CUISplitPFVisualizer:
         """Draw canonical runtime obstacle footprints on a 2-D axis."""
         from matplotlib.patches import Polygon
 
-        for footprint in self.cui_scene.obstacle_footprints_xy:
+        for index, footprint in enumerate(self.cui_scene.obstacle_footprints_xy):
             ax.add_patch(
                 Polygon(
                     footprint,
@@ -593,26 +600,79 @@ class CUISplitPFVisualizer:
                     facecolor="black",
                     edgecolor="none",
                     alpha=0.75,
+                    label="physical obstacle" if index == 0 else None,
+                )
+            )
+
+    def _draw_navigation_occupancy_2d(self, ax: plt.Axes) -> None:
+        """Draw robot-blocked cells behind physical obstacle footprints."""
+        from matplotlib.patches import Rectangle
+
+        if self.obstacle_grid is None:
+            return
+        origin_x, origin_y = self.obstacle_grid.origin
+        cell_size = float(self.obstacle_grid.cell_size)
+        for index, (cell_x, cell_y) in enumerate(self.obstacle_grid.blocked_cells):
+            ax.add_patch(
+                Rectangle(
+                    (
+                        float(origin_x) + int(cell_x) * cell_size,
+                        float(origin_y) + int(cell_y) * cell_size,
+                    ),
+                    cell_size,
+                    cell_size,
+                    facecolor="#e4e7ea",
+                    edgecolor="#c6cbd0",
+                    linewidth=0.35,
+                    alpha=0.72,
+                    label="navigation occupancy" if index == 0 else None,
+                    zorder=-1,
                 )
             )
 
     def _draw_obstacles_3d(self, ax: plt.Axes) -> None:
-        """Draw canonical runtime obstacles as flat 3-D floor patches."""
-        patches = []
-        z0 = float(self.world_bounds[4])
-        for footprint in self.cui_scene.obstacle_footprints_xy:
-            patches.append(
-                [(float(x), float(y), z0) for x, y in footprint]
-            )
-        if not patches:
+        """Draw the exact runtime attenuation components as translucent solids."""
+        faces = axis_aligned_box_faces(self.cui_scene.obstacle_boxes_xyz)
+        if not faces:
             return
         collection = Poly3DCollection(
-            patches,
-            facecolor="black",
-            edgecolor="none",
-            alpha=0.25,
+            faces,
+            facecolor="#737b84",
+            edgecolor="#343a40",
+            linewidth=0.22,
+            alpha=0.20,
+            zsort="average",
+            label="physical obstacle",
         )
         ax.add_collection3d(collection)
+
+    def _draw_obstacles_xz(self, ax: plt.Axes) -> None:
+        """Draw exact runtime obstacle x-z extents in an elevation view."""
+        from matplotlib.patches import Rectangle
+
+        seen: set[tuple[float, float, float, float]] = set()
+        for x0, _y0, z0, x1, _y1, z1 in self.cui_scene.obstacle_boxes_xyz:
+            rectangle = (
+                round(float(x0), 9),
+                round(float(z0), 9),
+                round(float(x1 - x0), 9),
+                round(float(z1 - z0), 9),
+            )
+            if rectangle in seen:
+                continue
+            seen.add(rectangle)
+            ax.add_patch(
+                Rectangle(
+                    rectangle[:2],
+                    rectangle[2],
+                    rectangle[3],
+                    facecolor="#737b84",
+                    edgecolor="#343a40",
+                    linewidth=0.35,
+                    alpha=0.24,
+                    zorder=1,
+                )
+            )
 
     def _plot_true_sources_2d(self, ax: plt.Axes) -> None:
         """Plot numbered true sources and XYZ labels on a top-down view."""
@@ -644,7 +704,7 @@ class CUISplitPFVisualizer:
                     )
                 )
                 ax.annotate(
-                    self._truth_source_label(iso, index, position),
+                    self._truth_source_id_label(iso, index),
                     xy=(float(position[0]), float(position[1])),
                     xytext=(offset_x, offset_y),
                     textcoords="offset points",
@@ -1041,34 +1101,32 @@ class CUISplitPFVisualizer:
                     *position,
                     ax.get_proj(),
                 )
-                offset_x = -4 if projected_x >= 0.0 else 4
-                offset_y_magnitude = 5 + 3 * (index % 2)
+                offset_x = -5 if projected_x >= 0.0 else 5
+                offset_y_magnitude = 6 + 4 * (index % 2)
                 offset_y = (
-                    -offset_y_magnitude
-                    if projected_y >= 0.0
-                    else offset_y_magnitude
+                    -offset_y_magnitude if projected_y >= 0.0 else offset_y_magnitude
                 )
                 annotation = ax.annotate(
-                    label,
+                    label.split("\n", maxsplit=1)[0],
                     xy=(projected_x, projected_y),
                     xytext=(offset_x, offset_y),
                     textcoords="offset points",
                     ha="right" if offset_x < 0 else "left",
                     va="top" if offset_y < 0 else "bottom",
-                    fontsize=6.2,
+                    fontsize=5.9,
                     fontweight="bold",
                     color=color,
                     bbox={
-                        "boxstyle": "round,pad=0.18",
+                        "boxstyle": "round,pad=0.14",
                         "facecolor": "white",
                         "edgecolor": color,
-                        "linewidth": 0.65,
-                        "alpha": 0.88,
+                        "linewidth": 0.55,
+                        "alpha": 0.86,
                     },
                     zorder=30,
                 )
                 annotation.set_path_effects(
-                    [path_effects.withStroke(linewidth=0.6, foreground="white")]
+                    [path_effects.withStroke(linewidth=0.5, foreground="white")]
                 )
             visible_estimate_entries = estimate_entries if include_estimates else []
             for position, label in visible_estimate_entries:
@@ -1127,6 +1185,7 @@ class CUISplitPFVisualizer:
         """Save the current robot position and trajectory as a 2D PNG."""
         xmin, xmax, ymin, ymax, _, _ = self.world_bounds
         fig, ax = plt.subplots(figsize=(7.0, 6.0))
+        self._draw_navigation_occupancy_2d(ax)
         self._draw_obstacles_2d(ax)
         self._plot_true_sources_2d(ax)
         for idx, segment in enumerate(self.path_segments):
@@ -1200,8 +1259,8 @@ class CUISplitPFVisualizer:
             zorder=10,
         )
         self._plot_estimated_sources_2d(ax, frame)
-        ax.set_xlim(float(xmin), float(xmax))
-        ax.set_ylim(float(ymin), float(ymax))
+        ax.set_xlim(*_padded_metric_bounds(xmin, xmax))
+        ax.set_ylim(*_padded_metric_bounds(ymin, ymax))
         _apply_metric_ticks_2d(
             ax,
             xlim=(float(xmin), float(xmax)),
@@ -1237,6 +1296,7 @@ class CUISplitPFVisualizer:
         elev_ax = fig.add_subplot(grid[0, 1])
         info_ax = fig.add_subplot(grid[1, 1])
         info_ax.axis("off")
+        self._draw_navigation_occupancy_2d(map_ax)
         self._draw_obstacles_2d(map_ax)
         self._plot_source_match_segments_2d(map_ax, frame)
         self._plot_true_sources_2d(map_ax)
@@ -1277,8 +1337,8 @@ class CUISplitPFVisualizer:
             zorder=13,
         )
         self._plot_estimated_sources_2d(map_ax, frame)
-        map_ax.set_xlim(float(xmin), float(xmax))
-        map_ax.set_ylim(float(ymin), float(ymax))
+        map_ax.set_xlim(*_padded_metric_bounds(xmin, xmax))
+        map_ax.set_ylim(*_padded_metric_bounds(ymin, ymax))
         _apply_metric_ticks_2d(
             map_ax,
             xlim=(float(xmin), float(xmax)),
@@ -1287,9 +1347,10 @@ class CUISplitPFVisualizer:
         map_ax.set_aspect("equal", adjustable="box")
         map_ax.set_xlabel("x [m]")
         map_ax.set_ylabel("y [m]")
-        map_ax.set_title("Top-down map: obstacles, path, truth, and estimates")
+        map_ax.set_title("Top-down acquisition and source map")
         map_ax.grid(True, alpha=0.25)
 
+        self._draw_obstacles_xz(elev_ax)
         self._plot_source_match_segments_xz(elev_ax, frame)
         self._plot_true_sources_xz(elev_ax)
         self._plot_estimated_sources_xz(elev_ax, frame)
@@ -1308,8 +1369,8 @@ class CUISplitPFVisualizer:
             )
         elev_ax.axhline(float(zmin), color="black", linewidth=0.8, alpha=0.45)
         elev_ax.axhline(float(zmax), color="black", linewidth=0.8, alpha=0.25)
-        elev_ax.set_xlim(float(xmin), float(xmax))
-        elev_ax.set_ylim(float(zmin), float(zmax))
+        elev_ax.set_xlim(*_padded_metric_bounds(xmin, xmax))
+        elev_ax.set_ylim(*_padded_metric_bounds(zmin, zmax, fraction=0.04))
         _apply_metric_ticks_2d(
             elev_ax,
             xlim=(float(xmin), float(xmax)),
@@ -1318,7 +1379,7 @@ class CUISplitPFVisualizer:
         elev_ax.set_aspect("equal", adjustable="box")
         elev_ax.set_xlabel("x [m]")
         elev_ax.set_ylabel("z [m]")
-        elev_ax.set_title("Elevation projection: height ambiguity")
+        elev_ax.set_title("Elevation: physical obstacles and source height")
         elev_ax.grid(True, alpha=0.25)
         handles, labels = map_ax.get_legend_handles_labels()
         elev_handles, elev_labels = elev_ax.get_legend_handles_labels()
@@ -1328,7 +1389,10 @@ class CUISplitPFVisualizer:
                 legend_by_label.values(),
                 legend_by_label.keys(),
                 loc="upper left",
-                fontsize=7,
+                ncol=2,
+                fontsize=6.5,
+                columnspacing=0.8,
+                handletextpad=0.45,
                 frameon=True,
             )
         info_ax.text(
@@ -1540,6 +1604,10 @@ class CUISplitPFVisualizer:
         ax.set_ylabel("y [m]")
         ax.set_zlabel("z [m]")
         ax.set_title(title, fontsize=10)
+        try:
+            ax.set_proj_type("ortho")
+        except AttributeError:
+            pass
         ax.view_init(elev=26.0, azim=-58.0)
 
     @staticmethod
@@ -1577,7 +1645,7 @@ class CUISplitPFVisualizer:
         self._draw_pf_scene_context(
             ax_representatives,
             frame,
-            show_legend_context=False,
+            show_legend_context=True,
         )
         for iso in self.isotopes:
             color = self.colors.get(iso, "gray")
@@ -1742,23 +1810,17 @@ def _async_cui_split_worker(
         while True:
             message, operation_id, payload = frame_queue.get()
             if message == "close":
-                status_queue.put(
-                    ("closed", operation_id, "close", run_token)
-                )
+                status_queue.put(("closed", operation_id, "close", run_token))
                 return
             if message == "truth":
                 true_sources, true_strengths = pickle.loads(payload)
                 visualizer.set_truth(true_sources, true_strengths)
                 if last_frame is not None:
                     visualizer.update(last_frame)
-                status_queue.put(
-                    ("ack", operation_id, "truth", run_token)
-                )
+                status_queue.put(("ack", operation_id, "truth", run_token))
                 continue
             if message != "frame":
-                raise RuntimeError(
-                    f"Unknown asynchronous CUI message {message!r}."
-                )
+                raise RuntimeError(f"Unknown asynchronous CUI message {message!r}.")
             frame = pickle.loads(payload)
             last_frame = frame
             visualizer.update(frame)
@@ -1898,16 +1960,11 @@ class AsyncCUISplitPFVisualizer:
                     "Async CUI worker reported an invalid failure status."
                 )
             self._worker_error = RuntimeError(
-                "Async CUI worker failed at operation "
-                f"{operation_id}: {detail}"
+                f"Async CUI worker failed at operation {operation_id}: {detail}"
             )
             raise self._worker_error
         if kind == "ready":
-            if (
-                self._ready_acknowledged
-                or operation_id != -1
-                or detail != "startup"
-            ):
+            if self._ready_acknowledged or operation_id != -1 or detail != "startup":
                 raise RuntimeError(
                     "Async CUI worker returned a mismatched startup acknowledgement."
                 )
@@ -1915,9 +1972,7 @@ class AsyncCUISplitPFVisualizer:
             return kind
         if kind == "ack":
             if not self._ready_acknowledged:
-                raise RuntimeError(
-                    "Async CUI worker acknowledged work before startup."
-                )
+                raise RuntimeError("Async CUI worker acknowledged work before startup.")
             expected_kind = self._operation_kinds.get(operation_id)
             if expected_kind is None or detail != expected_kind:
                 raise RuntimeError(
@@ -1931,8 +1986,7 @@ class AsyncCUISplitPFVisualizer:
         if kind == "closed":
             if (
                 not self._ready_acknowledged
-                or
-                self._close_acknowledged
+                or self._close_acknowledged
                 or self._close_operation_id is None
                 or operation_id != self._close_operation_id
                 or detail != "close"
@@ -2086,9 +2140,7 @@ class AsyncCUISplitPFVisualizer:
                     timeout=max(0.1, float(timeout_s)),
                 )
             except queue.Full as exc:
-                raise RuntimeError(
-                    "Async CUI worker did not accept close."
-                ) from exc
+                raise RuntimeError("Async CUI worker did not accept close.") from exc
             self._closed = True
             self._process.join(timeout=max(0.1, float(timeout_s)))
             if self._process.is_alive():
@@ -2197,8 +2249,7 @@ def build_frame_from_pf(
             )
         if np.any(~np.isfinite(est_pos)) or np.any(~np.isfinite(est_str)):
             raise ValueError(
-                "PF visualization_estimates() returned non-finite values "
-                f"for {iso}."
+                f"PF visualization_estimates() returned non-finite values for {iso}."
             )
         estimated_sources[iso] = est_pos
         estimated_strengths[iso] = est_str

@@ -24,6 +24,7 @@ from visualization.realtime_viz import (
     build_frame_from_pf,
     pf_cui_panel_specs,
 )
+from visualization.obstacle_geometry import axis_aligned_box_faces
 
 
 def test_frame_builder_rejects_legacy_estimate_interfaces() -> None:
@@ -301,9 +302,7 @@ def test_cui_scene_preserves_asymmetric_obstacle_xy_order(tmp_path: Path) -> Non
         obstacle_grid=obstacle_grid,
     )
 
-    expected_xy = np.asarray(
-        [[3.25, 3.0], [3.75, 3.0], [3.75, 3.5], [3.25, 3.5]]
-    )
+    expected_xy = np.asarray([[3.25, 3.0], [3.75, 3.0], [3.75, 3.5], [3.25, 3.5]])
     np.testing.assert_array_equal(
         visualizer.cui_scene.obstacle_footprints_xy[0],
         expected_xy,
@@ -317,6 +316,52 @@ def test_cui_scene_preserves_asymmetric_obstacle_xy_order(tmp_path: Path) -> Non
         )
     finally:
         plt.close(figure)
+    figure, axis = plt.subplots()
+    try:
+        visualizer._draw_navigation_occupancy_2d(axis)
+        occupancy = axis.patches[0]
+        assert occupancy.get_x() == pytest.approx(3.25)
+        assert occupancy.get_y() == pytest.approx(3.0)
+        assert occupancy.get_width() == pytest.approx(0.5)
+        assert occupancy.get_height() == pytest.approx(0.5)
+    finally:
+        plt.close(figure)
+
+
+def test_cui_3d_obstacles_preserve_physical_component_height(
+    tmp_path: Path,
+) -> None:
+    """A CUI overview must render exact component heights, not floor patches."""
+    component = (1.2, 2.3, 0.4, 1.8, 3.1, 2.7)
+    obstacle_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(5, 5),
+        blocked_cells=((1, 2),),
+        transport_boxes_m=(component,),
+    )
+    visualizer = CUISplitPFVisualizer(
+        isotopes=["Cs-137"],
+        output_dir=tmp_path,
+        world_bounds=(0.0, 5.0, 0.0, 5.0, 0.0, 3.0),
+        obstacle_grid=obstacle_grid,
+    )
+
+    faces = axis_aligned_box_faces(visualizer.cui_scene.obstacle_boxes_xyz)
+    figure, axis = plt.subplots()
+    try:
+        visualizer._draw_obstacles_xz(axis)
+        elevation_rectangle = axis.patches[0]
+        assert elevation_rectangle.get_x() == pytest.approx(1.2)
+        assert elevation_rectangle.get_y() == pytest.approx(0.4)
+        assert elevation_rectangle.get_width() == pytest.approx(0.6)
+        assert elevation_rectangle.get_height() == pytest.approx(2.3)
+    finally:
+        plt.close(figure)
+
+    assert len(faces) == 6
+    assert {point[2] for face in faces for point in face} == {0.4, 2.7}
+    assert any(len({point[2] for point in face}) == 2 for face in faces)
 
 
 def test_cui_writes_plain_and_neighborhood_labeled_pf_images(
@@ -352,9 +397,7 @@ def test_cui_writes_plain_and_neighborhood_labeled_pf_images(
                 dtype=float,
             )
         },
-        estimated_strengths={
-            "Co-60": np.asarray([1.0, 1.0, 1.0], dtype=float)
-        },
+        estimated_strengths={"Co-60": np.asarray([1.0, 1.0, 1.0], dtype=float)},
         cui_route=CUIRoute(
             measurement_stations_xyz=np.asarray([[2.0, 2.0, 0.5]]),
             measurement_station_ids=np.asarray([0], dtype=np.int64),
@@ -383,12 +426,13 @@ def test_cui_writes_plain_and_neighborhood_labeled_pf_images(
     try:
         visualizer._plot_true_sources_2d(axis)
         assert [value.get_text() for value in axis.texts] == [
-            "Co-1 T\n(1.00, 1.00, 0.50) m",
-            "Co-2 T\n(5.00, 5.00, 0.50) m",
+            "Co-1 T",
+            "Co-2 T",
         ]
-        assert [
-            (value.get_ha(), value.get_va()) for value in axis.texts
-        ] == [("left", "bottom"), ("right", "top")]
+        assert [(value.get_ha(), value.get_va()) for value in axis.texts] == [
+            ("left", "bottom"),
+            ("right", "top"),
+        ]
     finally:
         plt.close(figure)
 
@@ -429,9 +473,7 @@ def test_cui_step_history_requires_explicit_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """History mode should retain each rendered panel only when requested."""
-    route = cui_route_from_records(
-        (_route_record(0, 0, pose_xyz=(1.0, 2.0, 0.5)),)
-    )
+    route = cui_route_from_records((_route_record(0, 0, pose_xyz=(1.0, 2.0, 0.5)),))
     visualizer = CUISplitPFVisualizer(
         isotopes=["Cs-137"],
         output_dir=tmp_path,
@@ -652,9 +694,7 @@ def test_async_cui_process_start_failure_reaps_a_partially_started_child(
 
 def test_async_cui_update_propagates_worker_render_failure() -> None:
     """A child render error must fail before another frame can be accepted."""
-    route = cui_route_from_records(
-        (_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),)
-    )
+    route = cui_route_from_records((_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),))
     visualizer = _queue_only_async_visualizer()
     visualizer.update(_empty_frame(0, route))
     visualizer._status_queue.put(
@@ -672,9 +712,7 @@ def test_async_cui_update_propagates_worker_render_failure() -> None:
 
 def test_async_cui_update_rejects_mismatched_operation_ack() -> None:
     """An ACK for the wrong operation kind must never advance CUI state."""
-    route = cui_route_from_records(
-        (_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),)
-    )
+    route = cui_route_from_records((_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),))
     visualizer = _queue_only_async_visualizer()
     visualizer.update(_empty_frame(0, route))
     visualizer._status_queue.put(("ack", 0, "truth", "test-run"))
@@ -689,9 +727,7 @@ def test_async_cui_update_rejects_mismatched_operation_ack() -> None:
 
 def test_async_cui_close_requires_latest_frame_ack() -> None:
     """A close ACK cannot conceal an unacknowledged final render operation."""
-    route = cui_route_from_records(
-        (_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),)
-    )
+    route = cui_route_from_records((_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),))
     visualizer = _queue_only_async_visualizer()
     visualizer.update(_empty_frame(0, route))
 
@@ -720,9 +756,7 @@ def test_async_cui_close_requires_latest_frame_ack() -> None:
 
 def test_async_cui_close_rejects_mismatched_close_ack() -> None:
     """A stale or future close ACK must fail even after the frame was rendered."""
-    route = cui_route_from_records(
-        (_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),)
-    )
+    route = cui_route_from_records((_route_record(0, 0, pose_xyz=(1.0, 1.0, 0.5)),))
     visualizer = _queue_only_async_visualizer()
     visualizer.update(_empty_frame(0, route))
 
@@ -734,9 +768,7 @@ def test_async_cui_close_rejects_mismatched_close_ack() -> None:
             except queue.Empty:
                 return
             if kind == "frame":
-                visualizer._status_queue.put(
-                    ("ack", operation_id, "frame", "test-run")
-                )
+                visualizer._status_queue.put(("ack", operation_id, "frame", "test-run"))
             elif kind == "close":
                 visualizer._status_queue.put(
                     ("closed", operation_id + 1, "close", "test-run")

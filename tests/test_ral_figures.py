@@ -147,6 +147,30 @@ def _write_completed_run(
         pb_orientation_index=np.asarray([4, 5, 6, 7], dtype=np.int64),
         live_time_s=np.full(4, 20.0, dtype=np.float64),
     )
+    metadata_rows = [
+        {
+            "run_id": run_id,
+            "step_id": step_id,
+            "array_index": step_id,
+            "station_id": 0 if step_id < 2 else 1,
+            "metadata": (
+                {
+                    "travel_waypoints_xyz": [
+                        [1.0, 1.0, 0.5],
+                        [1.4, 1.5, 0.5],
+                        [2.0, 3.0, 0.5],
+                    ]
+                }
+                if step_id == 2
+                else {}
+            ),
+        }
+        for step_id in range(4)
+    ]
+    (measurement_log / "observation_metadata.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in metadata_rows) + "\n",
+        encoding="utf-8",
+    )
     positions_cs = np.asarray(
         [
             [[1.1, 2.0, 3.0], [7.0, 1.0, 5.0]],
@@ -176,6 +200,34 @@ def _write_completed_run(
             [[True, False], [True, False], [True, False], [True, False]],
             dtype=bool,
         ),
+    )
+    _write_json(
+        pf_output / "pf_figure_data.json",
+        {
+            "schema_version": 1,
+            "artifact_family": "pf_result_figure_data",
+            "run_identity": {
+                "run_id": run_id,
+                "measurement_log_sha256": "fixture-log",
+            },
+            "coordinate_system": {
+                "frame": "MeasurementLog world frame",
+                "axis_order": ["x", "y", "z"],
+                "length_unit": "m",
+            },
+            "route": {
+                "schema_version": 1,
+                "travel_path_segments_xyz": [
+                    [[1.0, 1.0, 0.5], [1.4, 1.5, 0.5], [2.0, 3.0, 0.5]]
+                ],
+                "measurement_stations": [],
+                "current_detector_position_xyz": [2.0, 3.0, 0.5],
+                "latest_spectrum_counts": None,
+                "energy_bin_edges_keV": None,
+                "latest_step_id": 3,
+            },
+            "truth_included": False,
+        },
     )
     return root
 
@@ -286,6 +338,17 @@ def test_completed_run_loader_and_figure_are_auditable(tmp_path: Path) -> None:
     assert metrics["position_pass_count"] == 2
     assert metrics["joint_position_strength_pass_count"] == 2
     assert metrics["final_hard_cap_mass"]["Cs-137"] == pytest.approx(0.1)
+    assert len(bundle.route_segments_xyz) == 1
+    np.testing.assert_allclose(
+        bundle.route_segments_xyz[0],
+        np.asarray([[1.0, 1.0, 0.5], [1.4, 1.5, 0.5], [2.0, 3.0, 0.5]]),
+    )
+    source_paths = {
+        row["path"]
+        for row in json.loads(provenance.read_text(encoding="utf-8"))["source_files"]
+    }
+    figure_data_path = run_dir / "pf_output" / "pf_figure_data.json"
+    assert figure_data_path.resolve().as_posix() in source_paths
 
 
 def test_split_aware_current_run_figure_uses_merged_source_metrics(
@@ -348,6 +411,24 @@ def test_completed_run_loader_fails_closed_on_incomplete_run(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="not complete"):
         figures.load_completed_run(run_dir)
+
+
+def test_completed_run_loader_uses_authenticated_log_route_fallback(
+    tmp_path: Path,
+) -> None:
+    """A legacy run may recover only exact waypoints saved in its MeasurementLog."""
+    run_dir = _write_completed_run(tmp_path / "run")
+    (run_dir / "pf_output" / "pf_figure_data.json").unlink()
+
+    bundle = figures.load_completed_run(run_dir)
+
+    assert len(bundle.route_segments_xyz) == 1
+    np.testing.assert_array_equal(
+        bundle.route_segments_xyz[0],
+        np.asarray(
+            [[1.0, 1.0, 0.5], [1.4, 1.5, 0.5], [2.0, 3.0, 0.5]]
+        ),
+    )
 
 
 def test_completed_run_loader_fails_closed_on_run_id_mismatch(tmp_path: Path) -> None:

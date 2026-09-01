@@ -17,8 +17,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
+from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Rectangle
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.optimize import linear_sum_assignment
+
+from visualization.obstacle_geometry import (
+    axis_aligned_box_faces,
+    blocked_cell_boxes,
+    validated_axis_aligned_boxes,
+)
 
 try:
     from scripts.ral_figure_common import (
@@ -114,6 +122,7 @@ class CompletedRunBundle:
     map_cardinality: dict[str, np.ndarray]
     hard_cap_mass: dict[str, np.ndarray]
     split_aware_results: tuple[SplitAwareSourceResult, ...] = ()
+    route_segments_xyz: tuple[np.ndarray, ...] = ()
 
 
 def _as_position(value: object, *, name: str) -> np.ndarray:
@@ -322,6 +331,102 @@ def _cardinality_trace(
     return station_indices, map_cardinality, hard_cap_mass
 
 
+def _load_figure_route_segments(
+    path: Path,
+    *,
+    run_id: str,
+    measurement_log_sha256: str,
+) -> tuple[np.ndarray, ...]:
+    """Load an optional truth-free route artifact bound to one completed run."""
+    if not path.is_file():
+        return ()
+    payload = read_json(path)
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("artifact_family") != "pf_result_figure_data"
+        or payload.get("truth_included") is not False
+    ):
+        raise ValueError("PF figure data has an unsupported or unsafe schema.")
+    identity = payload.get("run_identity")
+    if not isinstance(identity, dict) or identity.get("run_id") != run_id:
+        raise ValueError("PF figure data run identity differs from the result.")
+    if identity.get("measurement_log_sha256") != measurement_log_sha256:
+        raise ValueError("PF figure data MeasurementLog identity differs from PF.")
+    route = payload.get("route")
+    if not isinstance(route, dict) or route.get("schema_version") != 1:
+        raise ValueError("PF figure data route must use schema version 1.")
+    raw_segments = route.get("travel_path_segments_xyz")
+    if not isinstance(raw_segments, list):
+        raise TypeError("PF figure route segments must be a list.")
+    segments: list[np.ndarray] = []
+    for raw_segment in raw_segments:
+        segment = np.asarray(raw_segment, dtype=np.float64)
+        if (
+            segment.ndim != 2
+            or segment.shape[1:] != (3,)
+            or segment.shape[0] < 2
+            or np.any(~np.isfinite(segment))
+        ):
+            raise ValueError("PF figure route segments must be finite XYZ paths.")
+        segments.append(segment)
+    return tuple(segments)
+
+
+def _load_measurement_log_route_segments(
+    path: Path,
+    *,
+    run_id: str,
+) -> tuple[np.ndarray, ...]:
+    """Load exact runtime travel waypoints from authenticated log metadata."""
+    rows = _load_json_lines(path)
+    segments: list[np.ndarray] = []
+    for row_index, row in enumerate(rows):
+        if row.get("run_id") != run_id:
+            raise ValueError("MeasurementLog route row has a different run ID.")
+        if row.get("step_id") != row_index or row.get("array_index") != row_index:
+            raise ValueError("MeasurementLog route rows must be causally contiguous.")
+        metadata = row.get("metadata")
+        if not isinstance(metadata, dict):
+            raise TypeError("MeasurementLog route metadata must be an object.")
+        raw_segment = metadata.get("travel_waypoints_xyz")
+        if raw_segment is None:
+            continue
+        segment = np.asarray(raw_segment, dtype=np.float64)
+        if (
+            segment.ndim != 2
+            or segment.shape[1:] != (3,)
+            or segment.shape[0] < 2
+            or np.any(~np.isfinite(segment))
+        ):
+            raise ValueError("MeasurementLog route segments must be finite XYZ paths.")
+        if (
+            segments
+            and segments[-1].shape == segment.shape
+            and np.array_equal(segments[-1], segment)
+        ):
+            continue
+        if segments and not np.allclose(
+            segments[-1][-1],
+            segment[0],
+            rtol=0.0,
+            atol=1.0e-6,
+        ):
+            raise ValueError("MeasurementLog route segments are not continuous.")
+        segments.append(segment)
+    return tuple(segments)
+
+
+def _route_segments_equal(
+    left: tuple[np.ndarray, ...],
+    right: tuple[np.ndarray, ...],
+) -> bool:
+    """Return whether two persisted route representations agree exactly."""
+    return len(left) == len(right) and all(
+        np.array_equal(left_segment, right_segment)
+        for left_segment, right_segment in zip(left, right, strict=True)
+    )
+
+
 def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     """Load and cross-check one durable completed full-simulation bundle."""
     root = Path(run_dir).expanduser().resolve()
@@ -396,6 +501,27 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     if not isinstance(provenance, dict):
         raise TypeError("Posterior provenance must be a JSON object.")
     estimator_commit = str(provenance.get("estimator_commit", "unknown"))
+    measurement_log_sha256 = provenance.get("measurement_log_sha256")
+    if not isinstance(measurement_log_sha256, str) or not measurement_log_sha256:
+        raise ValueError("PF posterior lacks its MeasurementLog identity.")
+    figure_data_path = root / "pf_output" / "pf_figure_data.json"
+    figure_route_segments = _load_figure_route_segments(
+        figure_data_path,
+        run_id=run_id,
+        measurement_log_sha256=measurement_log_sha256,
+    )
+    log_route_segments = _load_measurement_log_route_segments(
+        root / "measurement_log" / "observation_metadata.jsonl",
+        run_id=run_id,
+    )
+    if figure_data_path.is_file() and not _route_segments_equal(
+        figure_route_segments,
+        log_route_segments,
+    ):
+        raise ValueError("PF figure route differs from the authenticated log route.")
+    route_segments = (
+        figure_route_segments if figure_data_path.is_file() else log_route_segments
+    )
     room_xyz = tuple(
         _positive_float(environment.get(field), name=field)
         for field in ("size_x", "size_y", "size_z")
@@ -417,6 +543,7 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
         station_indices=station_indices,
         map_cardinality=map_cardinality,
         hard_cap_mass=hard_cap_mass,
+        route_segments_xyz=route_segments,
     )
 
 
@@ -739,7 +866,12 @@ def write_figure_provenance(
     split_aware_evaluation: Path | None = None,
 ) -> Path:
     """Write a machine-readable source and transformation manifest."""
-    inputs = [ISAAC_PROBLEM_RENDER, ISAAC_DETECTOR_RENDER]
+    concept_outputs = {FIG1_PATH.resolve(), FIG2_PATH.resolve()}
+    inputs = (
+        [ISAAC_PROBLEM_RENDER, ISAAC_DETECTOR_RENDER]
+        if any(Path(path).resolve() in concept_outputs for path in generated)
+        else []
+    )
     bundle: CompletedRunBundle | None = None
     if completed_run_dir is not None:
         bundle = (
@@ -755,12 +887,18 @@ def write_figure_provenance(
                 bundle.root / "truth_manifest.json",
                 bundle.root / "measurement_log" / "environment.json",
                 bundle.root / "measurement_log" / "observations.npz",
+                bundle.root
+                / "measurement_log"
+                / "observation_metadata.jsonl",
                 bundle.root / "pf_output" / "closed_loop_result.json",
                 bundle.root / "pf_output" / "pf_posterior.json",
                 bundle.root / "pf_output" / "pf_particles.npz",
                 bundle.root / "pf_output" / "pf_station_trace.jsonl",
             )
         )
+        figure_data_path = bundle.root / "pf_output" / "pf_figure_data.json"
+        if figure_data_path.is_file():
+            inputs.append(figure_data_path)
         if split_aware_evaluation is not None:
             inputs.append(Path(split_aware_evaluation))
     experiment_transformation = (
@@ -770,8 +908,10 @@ def write_figure_provenance(
         if split_aware_evaluation is None
         else "Schema-v3 truth-associated split clusters; raw PF components "
         "remain visible, physical-source markers use strength-weighted "
-        "centroids, and the error panel uses strength-weighted RMS position "
-        "and aggregate strength against the 0.5 m and 25% performance targets."
+        "centroids, exact physical obstacle components are rendered in 3-D, "
+        "saved route segments are used only when available, and the error "
+        "panel uses strength-weighted RMS position and aggregate strength "
+        "against the 0.5 m and 25% performance targets."
     )
     payload: dict[str, object] = {
         "schema_version": 1,
@@ -1091,41 +1231,92 @@ def _projection(position: np.ndarray, projection: str) -> tuple[float, float]:
     raise ValueError(f"Unsupported projection {projection!r}.")
 
 
-def _draw_obstacles(ax: Axes, bundle: CompletedRunBundle, projection: str) -> None:
-    """Draw the authenticated obstacle geometry in one metric projection."""
+def _obstacle_boxes(bundle: CompletedRunBundle) -> np.ndarray:
+    """Return exact physical components, with a disclosed grid-only fallback."""
+    obstacle_grid = bundle.environment.get("obstacle_grid", {})
+    if not isinstance(obstacle_grid, dict):
+        return np.zeros((0, 6), dtype=np.float64)
+    for field in ("transport_boxes_m", "collision_boxes_m"):
+        raw_boxes = obstacle_grid.get(field, [])
+        if isinstance(raw_boxes, list) and raw_boxes:
+            return validated_axis_aligned_boxes(raw_boxes)
+    blocked = obstacle_grid.get("blocked_cells", [])
+    if not isinstance(blocked, list) or not blocked:
+        return np.zeros((0, 6), dtype=np.float64)
+    origin = obstacle_grid.get("origin", [0.0, 0.0])
+    if not isinstance(origin, (list, tuple)):
+        raise TypeError("Obstacle-grid origin must be an XY sequence.")
+    return blocked_cell_boxes(
+        blocked,
+        origin_xy=origin,
+        cell_size_m=float(obstacle_grid.get("cell_size", 1.0)),
+        z_bounds_m=(0.0, min(2.0, float(bundle.room_xyz_m[2]))),
+    )
+
+
+def _draw_navigation_occupancy(ax: Axes, bundle: CompletedRunBundle) -> None:
+    """Draw navigation occupancy faintly behind physical obstacle components."""
     obstacle_grid = bundle.environment.get("obstacle_grid", {})
     if not isinstance(obstacle_grid, dict):
         return
+    cell_size = float(obstacle_grid.get("cell_size", 1.0))
+    origin = obstacle_grid.get("origin", [0.0, 0.0])
+    if not isinstance(origin, (list, tuple)) or len(origin) != 2:
+        raise ValueError("Obstacle-grid origin must contain two coordinates.")
+    blocked = obstacle_grid.get("blocked_cells", [])
+    if not isinstance(blocked, list):
+        raise TypeError("Obstacle-grid blocked_cells must be a list.")
+    for cell in blocked:
+        if not isinstance(cell, list) or len(cell) != 2:
+            raise ValueError("Every blocked cell must contain two indices.")
+        ax.add_patch(
+            Rectangle(
+                (
+                    float(origin[0]) + int(cell[0]) * cell_size,
+                    float(origin[1]) + int(cell[1]) * cell_size,
+                ),
+                cell_size,
+                cell_size,
+                facecolor="#e4e7ea",
+                edgecolor="#c6cbd0",
+                linewidth=0.20,
+                alpha=0.72,
+                zorder=-1,
+            )
+        )
+
+
+def _draw_obstacles(ax: Axes, bundle: CompletedRunBundle, projection: str) -> None:
+    """Draw the authenticated obstacle geometry in one metric projection."""
+    boxes = _obstacle_boxes(bundle)
     if projection == "xy":
-        cell_size = float(obstacle_grid.get("cell_size", 1.0))
-        origin = obstacle_grid.get("origin", [0.0, 0.0])
-        if not isinstance(origin, list) or len(origin) < 2:
-            origin = [0.0, 0.0]
-        for cell in obstacle_grid.get("blocked_cells", []):
-            if not isinstance(cell, list) or len(cell) != 2:
+        _draw_navigation_occupancy(ax, bundle)
+        seen_xy: set[tuple[float, float, float, float]] = set()
+        for x0, y0, _z0, x1, y1, _z1 in boxes:
+            rectangle = (
+                round(float(x0), 6),
+                round(float(y0), 6),
+                round(float(x1 - x0), 6),
+                round(float(y1 - y0), 6),
+            )
+            if rectangle in seen_xy:
                 continue
+            seen_xy.add(rectangle)
             ax.add_patch(
                 Rectangle(
-                    (
-                        float(origin[0]) + int(cell[0]) * cell_size,
-                        float(origin[1]) + int(cell[1]) * cell_size,
-                    ),
-                    cell_size,
-                    cell_size,
-                    facecolor="#b8bdc3",
-                    edgecolor="#777d84",
-                    linewidth=0.25,
-                    alpha=0.62,
-                    zorder=0,
+                    rectangle[:2],
+                    rectangle[2],
+                    rectangle[3],
+                    facecolor="#747c84",
+                    edgecolor="#343a40",
+                    linewidth=0.24,
+                    alpha=0.58,
+                    zorder=0.2,
                 )
             )
         return
-    boxes = obstacle_grid.get("transport_boxes_m", [])
     seen: set[tuple[float, float, float, float]] = set()
-    for raw in boxes:
-        values = np.asarray(raw, dtype=np.float64)
-        if values.shape != (6,) or np.any(~np.isfinite(values)):
-            continue
+    for values in boxes:
         rectangle = (
             round(float(values[1]), 3),
             round(float(values[2]), 3),
@@ -1140,13 +1331,186 @@ def _draw_obstacles(ax: Axes, bundle: CompletedRunBundle, projection: str) -> No
                 rectangle[:2],
                 rectangle[2],
                 rectangle[3],
-                facecolor="#b8bdc3",
-                edgecolor="#777d84",
-                linewidth=0.15,
-                alpha=0.12,
+                facecolor="#747c84",
+                edgecolor="#343a40",
+                linewidth=0.18,
+                alpha=0.20,
                 zorder=0,
             )
         )
+
+
+def _draw_obstacles_3d(ax: Axes, bundle: CompletedRunBundle) -> None:
+    """Draw exact authenticated physical obstacle components in three dimensions."""
+    faces = axis_aligned_box_faces(_obstacle_boxes(bundle))
+    if not faces:
+        return
+    ax.add_collection3d(
+        Poly3DCollection(
+            faces,
+            facecolor="#737b84",
+            edgecolor="#343a40",
+            linewidth=0.18,
+            alpha=0.20,
+            zsort="average",
+        )
+    )
+
+
+def _plot_scene_overview_3d(
+    ax: Axes,
+    bundle: CompletedRunBundle,
+    *,
+    title: str,
+) -> None:
+    """Plot physical geometry and source inference in one metric 3-D overview."""
+    room_x, room_y, room_z = bundle.room_xyz_m
+    ax.plot(
+        [0.0, room_x, room_x, 0.0, 0.0],
+        [0.0, 0.0, room_y, room_y, 0.0],
+        [0.0] * 5,
+        color="#70757a",
+        linewidth=0.55,
+        alpha=0.72,
+    )
+    _draw_obstacles_3d(ax, bundle)
+    for isotope, support in bundle.posterior_support.items():
+        if support.size == 0:
+            continue
+        ax.scatter(
+            support[:, 0],
+            support[:, 1],
+            support[:, 2],
+            s=1.6,
+            color=ISOTOPE_COLORS.get(isotope, "#666666"),
+            alpha=0.055,
+            linewidths=0.0,
+            depthshade=False,
+            rasterized=True,
+        )
+    for index, segment in enumerate(bundle.route_segments_xyz):
+        ax.plot(
+            segment[:, 0],
+            segment[:, 1],
+            segment[:, 2],
+            color="#009eae",
+            linewidth=0.75,
+            alpha=0.82,
+            label="saved route" if index == 0 else None,
+        )
+    ax.scatter(
+        bundle.station_positions_xyz[:, 0],
+        bundle.station_positions_xyz[:, 1],
+        bundle.station_positions_xyz[:, 2],
+        s=7.5,
+        marker="o",
+        facecolor="#222222",
+        edgecolor="white",
+        linewidth=0.25,
+        alpha=0.76,
+        depthshade=False,
+    )
+    if bundle.split_aware_results:
+        for result in bundle.split_aware_results:
+            truth = result.truth.position_xyz
+            centroid = result.merged_centroid_position_xyz
+            ax.plot(
+                (truth[0], centroid[0]),
+                (truth[1], centroid[1]),
+                (truth[2], centroid[2]),
+                color="#333333",
+                linestyle="--",
+                linewidth=0.55,
+                alpha=0.75,
+            )
+    else:
+        for match in bundle.matches:
+            truth = match.truth.position_xyz
+            estimate = match.estimate.position_xyz
+            ax.plot(
+                (truth[0], estimate[0]),
+                (truth[1], estimate[1]),
+                (truth[2], estimate[2]),
+                color="#333333",
+                linestyle="--",
+                linewidth=0.55,
+                alpha=0.75,
+            )
+    for source in bundle.truth_sources:
+        color = ISOTOPE_COLORS.get(source.isotope, "#555555")
+        ax.scatter(
+            *source.position_xyz,
+            marker=_truth_marker(source.isotope),
+            s=38 if source.isotope == "Cs-137" else 27,
+            facecolor=color,
+            edgecolor="#111111",
+            linewidth=0.45,
+            depthshade=False,
+        )
+    assigned_ids = {
+        (result.truth.isotope, index)
+        for result in bundle.split_aware_results
+        for index in result.assigned_component_indices
+    }
+    for estimate in bundle.estimated_sources:
+        color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
+        assigned = (
+            not bundle.split_aware_results
+            or (
+                estimate.isotope,
+                estimate.index,
+            )
+            in assigned_ids
+        )
+        if assigned:
+            ax.scatter(
+                *estimate.position_xyz,
+                marker="x",
+                s=15,
+                color=color,
+                linewidth=0.65,
+                alpha=0.80,
+                depthshade=False,
+            )
+        else:
+            ax.scatter(
+                *estimate.position_xyz,
+                marker="D",
+                s=15,
+                facecolor="none",
+                edgecolor=color,
+                linewidth=0.65,
+                alpha=0.80,
+                depthshade=False,
+            )
+    for result in bundle.split_aware_results:
+        color = ISOTOPE_COLORS.get(result.truth.isotope, "#555555")
+        ax.scatter(
+            *result.merged_centroid_position_xyz,
+            marker="X",
+            s=28,
+            facecolor=color,
+            edgecolor="#111111",
+            linewidth=0.35,
+            depthshade=False,
+        )
+    ax.set_xlim(0.0, room_x)
+    ax.set_ylim(0.0, room_y)
+    ax.set_zlim(0.0, room_z)
+    ax.set_xticks(np.arange(0.0, room_x + 0.1, 5.0))
+    ax.set_yticks(np.arange(0.0, room_y + 0.1, 5.0))
+    ax.set_zticks(np.arange(0.0, room_z + 0.1, 2.0))
+    ax.tick_params(labelsize=FIG_TICK_SIZE, pad=0.5)
+    ax.set_xlabel("x [m]", fontsize=FIG_LABEL_SIZE, labelpad=1.5)
+    ax.set_ylabel("y [m]", fontsize=FIG_LABEL_SIZE, labelpad=1.5)
+    ax.set_zlabel("z [m]", fontsize=FIG_LABEL_SIZE, labelpad=1.5)
+    ax.set_box_aspect((room_x, room_y, room_z))
+    try:
+        ax.set_proj_type("ortho")
+    except AttributeError:
+        pass
+    ax.view_init(elev=25.0, azim=-57.0)
+    ax.set_title(title, fontsize=FIG_TITLE_SIZE, fontweight="bold", pad=0)
 
 
 def _plot_projection(
@@ -1155,6 +1519,7 @@ def _plot_projection(
     *,
     projection: str,
     title: str,
+    label_truth_ids: bool,
 ) -> None:
     """Plot truth, modes, posterior support, stations, and authenticated obstacles."""
     room_x, room_y, room_z = bundle.room_xyz_m
@@ -1185,6 +1550,18 @@ def _plot_projection(
             alpha=0.055,
             linewidths=0.0,
             zorder=1,
+        )
+    for segment in bundle.route_segments_xyz:
+        projected_route = np.asarray(
+            [_projection(position, projection) for position in segment]
+        )
+        ax.plot(
+            projected_route[:, 0],
+            projected_route[:, 1],
+            color="#009eae",
+            linewidth=1.0,
+            alpha=0.82,
+            zorder=2,
         )
     station_projection = np.asarray(
         [_projection(position, projection) for position in bundle.station_positions_xyz]
@@ -1243,21 +1620,22 @@ def _plot_projection(
             linewidth=0.55,
             zorder=7,
         )
-        x_inward = x_value > 0.86 * limits[0]
-        y_inward = y_value > 0.86 * limits[1]
-        ax.annotate(
-            str(source.index),
-            xy=(x_value, y_value),
-            xytext=(-3 if x_inward else 3, -3 if y_inward else 3),
-            textcoords="offset points",
-            ha="right" if x_inward else "left",
-            va="top" if y_inward else "bottom",
-            fontsize=FIG_TICK_SIZE,
-            color=color,
-            fontweight="bold",
-            bbox={"fc": "white", "ec": "none", "alpha": 0.72, "pad": 0.2},
-            zorder=8,
-        )
+        if label_truth_ids:
+            x_inward = x_value > 0.86 * limits[0]
+            y_inward = y_value > 0.86 * limits[1]
+            ax.annotate(
+                str(source.index),
+                xy=(x_value, y_value),
+                xytext=(-3 if x_inward else 3, -3 if y_inward else 3),
+                textcoords="offset points",
+                ha="right" if x_inward else "left",
+                va="top" if y_inward else "bottom",
+                fontsize=FIG_TICK_SIZE,
+                color=color,
+                fontweight="bold",
+                bbox={"fc": "white", "ec": "none", "alpha": 0.72, "pad": 0.2},
+                zorder=8,
+            )
     if bundle.split_aware_results:
         assigned_ids = {
             (result.truth.isotope, index)
@@ -1385,7 +1763,7 @@ def _plot_cardinality(ax: Axes, bundle: CompletedRunBundle) -> None:
     ax.grid(True, linewidth=0.25, alpha=0.35)
     ax.legend(fontsize=FIG_TICK_SIZE, loc="lower right", framealpha=0.94)
     ax.set_title(
-        "(d) Online structural diagnostic", fontsize=FIG_TITLE_SIZE, fontweight="bold"
+        "(e) Online structural diagnostic", fontsize=FIG_TITLE_SIZE, fontweight="bold"
     )
 
 
@@ -1398,7 +1776,7 @@ def _plot_source_key(ax: Axes, bundle: CompletedRunBundle) -> None:
         ax.text(
             0.0,
             0.98,
-            "(c) Numerical source result",
+            "(d) Numerical source result",
             ha="left",
             va="top",
             fontsize=FIG_TITLE_SIZE,
@@ -1447,7 +1825,7 @@ def _plot_source_key(ax: Axes, bundle: CompletedRunBundle) -> None:
     ax.text(
         0.0,
         0.98,
-        "(c) Truth coordinates [m]",
+        "(d) Truth coordinates [m]",
         ha="left",
         va="top",
         fontsize=FIG_TITLE_SIZE,
@@ -1513,7 +1891,7 @@ def _plot_errors(ax: Axes, bundle: CompletedRunBundle) -> None:
             ]
         )
         position_label = "RMS position / 0.5 m"
-        title = "(e) Split-aware source errors"
+        title = "(f) Source errors / targets"
     else:
         labels = [
             f"{_isotope_short_name(match.truth.isotope)}{match.truth.index}"
@@ -1535,7 +1913,7 @@ def _plot_errors(ax: Axes, bundle: CompletedRunBundle) -> None:
         position_label = "position / 0.5 m"
         metrics = completed_run_metrics(bundle)
         title = (
-            "(e) Accuracy: "
+            "(f) Accuracy: "
             f"{metrics['position_pass_count']}/{metrics['source_count']} position; "
             f"{metrics['joint_position_strength_pass_count']}/"
             f"{metrics['source_count']} joint"
@@ -1580,8 +1958,120 @@ def _plot_errors(ax: Axes, bundle: CompletedRunBundle) -> None:
         framealpha=0.92,
     )
     if bundle.split_aware_results:
-        title = "(e) Target-normalized source errors"
+        title = "(f) Source errors / targets"
     ax.set_title(title, fontsize=FIG_TITLE_SIZE, fontweight="bold")
+
+
+def _scene_legend_handles(bundle: CompletedRunBundle) -> list[Line2D]:
+    """Return compact, redundant shape-and-color keys for scene panels."""
+    handles = [
+        Line2D(
+            [],
+            [],
+            marker="s",
+            markersize=5.0,
+            markerfacecolor="#e4e7ea",
+            markeredgecolor="#c6cbd0",
+            linestyle="none",
+            label="navigation occupancy",
+        ),
+        Line2D(
+            [],
+            [],
+            marker="s",
+            markersize=5.0,
+            markerfacecolor="#747c84",
+            markeredgecolor="#343a40",
+            linestyle="none",
+            label="physical obstacle",
+        ),
+        Line2D(
+            [],
+            [],
+            marker="o",
+            markersize=4.0,
+            markerfacecolor="#222222",
+            markeredgecolor="white",
+            linestyle="none",
+            label="station",
+        ),
+    ]
+    if bundle.route_segments_xyz:
+        handles.append(
+            Line2D(
+                [],
+                [],
+                color="#009eae",
+                linewidth=1.2,
+                label="saved route",
+            )
+        )
+    else:
+        handles.append(
+            Line2D(
+                [],
+                [],
+                color="none",
+                linewidth=0.0,
+                label="route not saved",
+            )
+        )
+    handles.append(
+        Line2D(
+            [],
+            [],
+            marker=".",
+            markersize=5.0,
+            color="#777777",
+            linestyle="none",
+            label="PF support",
+        )
+    )
+    for isotope in sorted({source.isotope for source in bundle.truth_sources}):
+        handles.append(
+            Line2D(
+                [],
+                [],
+                marker=_truth_marker(isotope),
+                markersize=6.0,
+                markerfacecolor=ISOTOPE_COLORS.get(isotope, "#555555"),
+                markeredgecolor="#111111",
+                linestyle="none",
+                label=f"{isotope} truth",
+            )
+        )
+    handles.extend(
+        (
+            Line2D(
+                [],
+                [],
+                marker="x",
+                markersize=5.0,
+                color="#444444",
+                linestyle="none",
+                label="raw PF component",
+            ),
+            Line2D(
+                [],
+                [],
+                marker="X",
+                markersize=5.5,
+                markerfacecolor="#777777",
+                markeredgecolor="#111111",
+                linestyle="none",
+                label="merged centroid",
+            ),
+            Line2D(
+                [],
+                [],
+                color="#444444",
+                linestyle="--",
+                linewidth=0.8,
+                label="truth--centroid",
+            ),
+        )
+    )
+    return handles
 
 
 def render_completed_run_summary(
@@ -1596,32 +2086,49 @@ def render_completed_run_summary(
         if split_aware_evaluation is None
         else load_split_aware_completed_run(run_dir, split_aware_evaluation)
     )
-    fig = plt.figure(figsize=(7.15, 2.98))
+    fig = plt.figure(figsize=(7.15, 4.60))
     grid = fig.add_gridspec(
         2,
         12,
-        height_ratios=(1.0, 0.94),
+        height_ratios=(1.18, 0.92),
         width_ratios=(1.0,) * 12,
-        hspace=0.52,
-        wspace=0.58,
+        hspace=0.38,
+        wspace=0.72,
+    )
+    _plot_scene_overview_3d(
+        fig.add_subplot(grid[0, 0:5], projection="3d"),
+        bundle,
+        title="(a) Authenticated 3-D scene",
     )
     _plot_projection(
-        fig.add_subplot(grid[:, 0:3]),
+        fig.add_subplot(grid[0, 5:8]),
         bundle,
         projection="xy",
-        title="(a) Floor projection",
+        title="(b) Floor projection",
+        label_truth_ids=True,
     )
     _plot_projection(
-        fig.add_subplot(grid[0, 3:8]),
+        fig.add_subplot(grid[0, 8:12]),
         bundle,
         projection="yz",
-        title="(b) Depth--height projection",
+        title="(c) Depth--height projection",
+        label_truth_ids=False,
     )
-    _plot_source_key(fig.add_subplot(grid[0, 8:12]), bundle)
-    _plot_cardinality(fig.add_subplot(grid[1, 3:8]), bundle)
+    _plot_source_key(fig.add_subplot(grid[1, 0:4]), bundle)
+    _plot_cardinality(fig.add_subplot(grid[1, 4:8]), bundle)
     _plot_errors(fig.add_subplot(grid[1, 8:12]), bundle)
 
-    fig.subplots_adjust(left=0.060, right=0.985, top=0.92, bottom=0.14)
+    fig.legend(
+        handles=_scene_legend_handles(bundle),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.006),
+        ncol=5,
+        fontsize=FIG_TICK_SIZE,
+        frameon=False,
+        handletextpad=0.35,
+        columnspacing=0.85,
+    )
+    fig.subplots_adjust(left=0.055, right=0.985, top=0.965, bottom=0.205)
     return save_figure(fig, output_path)
 
 
