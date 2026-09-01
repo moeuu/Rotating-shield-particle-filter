@@ -14,10 +14,10 @@ results.
 For each true source, the maximum split-assignment radius is
 
 ```text
-min(3 * position_target, 0.5 * nearest_same_isotope_truth_separation).
+min(4 * position_target, 0.5 * nearest_same_isotope_truth_separation).
 ```
 
-With the standard 0.5 m target, the unconstrained maximum is 1.5 m. The
+With the standard 0.5 m target, the unconstrained maximum is 2.0 m. The
 same-isotope-separation term prevents assignment regions from overlapping when
 two physical sources are close. If there is no other true source of that
 isotope, the separation term is infinite.

@@ -23,7 +23,7 @@ class ClusterAccuracyCriteria:
     """Declare fixed prospective targets for split-aware PF scoring."""
 
     position_target_m: float = 0.5
-    split_assignment_radius_multiplier: float = 3.0
+    split_assignment_radius_multiplier: float = 4.0
     same_isotope_separation_fraction: float = 0.5
     maximum_relative_strength_error: float = 0.25
     response_indistinguishable_cosine: float = 0.995

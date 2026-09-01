@@ -126,7 +126,7 @@ def test_extended_splits_contribute_to_strength_and_position_metrics() -> None:
     }
     modes = [
         ([0.1, 0.0, 0.0], 60.0),
-        ([1.2, 0.0, 0.0], 40.0),
+        ([1.8, 0.0, 0.0], 40.0),
     ]
 
     result = compute_cluster_accuracy_evaluation(
@@ -147,11 +147,11 @@ def test_extended_splits_contribute_to_strength_and_position_metrics() -> None:
     assert source["assigned_estimate_indices"] == [0, 1]
     assert source["core_estimate_indices"] == [0]
     assert source["extended_split_estimate_indices"] == [1]
-    assert source["effective_split_assignment_radius_m"] == pytest.approx(1.5)
+    assert source["effective_split_assignment_radius_m"] == pytest.approx(2.0)
     assert source["combined_estimated_strength_cps_1m"] == pytest.approx(100.0)
-    assert source["merged_position_xyz_m"] == pytest.approx([0.54, 0.0, 0.0])
+    assert source["merged_position_xyz_m"] == pytest.approx([0.78, 0.0, 0.0])
     assert source["strength_weighted_rms_position_error_m"] == pytest.approx(
-        0.7628892449
+        1.141052146
     )
     assert source["position_target_met"] is False
     assert "position_target_not_met:0" in isotope["accuracy_failure_reasons"]
