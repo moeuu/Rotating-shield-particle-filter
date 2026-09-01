@@ -247,13 +247,14 @@ accuracy or comparative advantage.
 
 Report the paired four-run batch with the fixed policy in
 `docs/post_run_cluster_accuracy_policy.md`. The main outcomes are true-source
-association recall; per-source merged-centroid error, strength-weighted RMS
-3-D position error, split dispersion, and relative strength error; the joint
-0.5 m RMS/25% pass fraction; response-distinct remote-component count; hard-cap
-mass; and station/time to a stable pass. Raw RJ component count is diagnostic,
-not a success target, because nearby components may represent one physical
-source cluster. Also report mission motion time separately from the fixed
-2560 s detector live-time budget.
+association recall; the merged estimated source count with each split cluster
+counted once; per-source merged-centroid error, strength-weighted RMS 3-D
+position error, split dispersion, and relative strength error; the joint 0.5 m
+RMS/25% pass fraction; response-distinct remote-component count; hard-cap mass;
+and station/time to a stable pass. Raw RJ component count is diagnostic, not a
+success target, because nearby components may represent one physical source
+cluster. Also report mission motion time separately from the fixed 2560 s
+detector live-time budget.
 
 The four variants share one scene within one fresh batch, so report paired
 descriptive differences. Do not treat seven sources as independent experiments

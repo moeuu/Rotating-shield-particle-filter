@@ -34,9 +34,18 @@ contribute fully to strength and position scoring. Thus a component just beyond
 the position target is not reported as a missing detection, while a broad split
 still carries an explicit accuracy cost.
 
-The raw PF cardinality is reported but is not an accuracy target. A result with
-four physical source clusters may therefore pass with raw K=5 or K=6 when one
-or more clusters contain a corner or surface split.
+The truth-aware merged source count treats each nonempty assigned cluster as
+exactly one source, regardless of how many raw PF components it contains. A
+response-distinct remote component contributes one additional estimated source;
+a response-indistinguishable remote remains a separately reported ambiguity and
+does not increment the merged physical-source count. The report records the
+number of split clusters and the raw-component count reduction produced by
+merging.
+
+Raw PF cardinality remains a diagnostic and is not an accuracy target. A result
+with four truth-associated physical source clusters is therefore counted as four
+sources even when raw K=5 or K=6 because one or more clusters contain a corner
+or surface split.
 
 ## Position and strength of an assigned split cluster
 
@@ -76,6 +85,7 @@ For every isotope and every true source, the report records:
 - true strength and summed cluster strength;
 - absolute and relative strength error;
 - core and extended-split raw component indices and their truth distances; and
+- whether the cluster counts as one merged source; and
 - individual association, position-target, strength-target, and joint results.
 
 The predeclared accuracy targets are at most 0.5 m strength-weighted RMS

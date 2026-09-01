@@ -97,8 +97,15 @@ def test_local_splits_are_aggregated_without_scoring_raw_cardinality() -> None:
     assert isotope["raw_estimate_component_count"] == 3
     assert isotope["raw_component_cardinality_scored"] is False
     assert isotope["associated_truth_source_count"] == 2
+    assert isotope["truth_associated_merged_source_count"] == 2
+    assert isotope["merged_estimated_source_count"] == 2
+    assert isotope["split_truth_cluster_count"] == 1
+    assert isotope["raw_component_count_reduction_by_merging"] == 1
+    assert result["global"]["merged_estimated_source_count"] == 2
     first = isotope["truth_sources"][0]
     assert first["assigned_raw_component_count"] == 2
+    assert first["is_split_cluster"] is True
+    assert first["merged_source_count_contribution"] == 1
     assert first["core_estimate_indices"] == [0, 1]
     assert first["extended_split_estimate_indices"] == []
     assert first["combined_estimated_strength_cps_1m"] == 100.0
@@ -154,6 +161,8 @@ def test_extended_splits_contribute_to_strength_and_position_metrics() -> None:
         1.141052146
     )
     assert source["position_target_met"] is False
+    assert isotope["merged_estimated_source_count"] == 1
+    assert isotope["raw_component_count_reduction_by_merging"] == 1
     assert "position_target_not_met:0" in isotope["accuracy_failure_reasons"]
 
 
@@ -220,6 +229,8 @@ def test_split_assignment_is_capped_by_same_isotope_truth_separation() -> None:
     assert isotope["remote_estimates"][0][
         "assignment_exclusion_reason"
     ] == "outside_split_assignment_radius"
+    assert isotope["merged_estimated_source_count"] == 2
+    assert isotope["unassigned_remote_component_count"] == 1
 
 
 def test_equidistant_component_remains_an_audited_remote_ambiguity() -> None:
@@ -279,6 +290,8 @@ def test_response_distinct_remote_component_fails_cluster_accuracy() -> None:
     assert result["hard_cap_sampler_quality_status"] == "pass"
     isotope = result["isotopes"]["Cs-137"]
     assert isotope["response_distinct_remote_component_count"] == 1
+    assert isotope["truth_associated_merged_source_count"] == 1
+    assert isotope["merged_estimated_source_count"] == 2
     assert "response_distinct_remote_components" in isotope[
         "accuracy_failure_reasons"
     ]

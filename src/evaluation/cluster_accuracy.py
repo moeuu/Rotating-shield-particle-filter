@@ -94,6 +94,10 @@ class ClusterAccuracyCriteria:
             ),
             "maximum_hard_cap_posterior_mass": HARD_CAP_POSTERIOR_MASS_LIMIT,
             "raw_component_cardinality_is_accuracy_target": False,
+            "merged_source_count_semantics": (
+                "one_per_truth_cluster_plus_response_distinct_remote"
+            ),
+            "response_indistinguishable_remote_counts_as_source": False,
             "split_assignment_uses_response_signatures": False,
             "merged_position_summary": "strength_weighted_centroid",
             "position_target_metric": (
@@ -492,6 +496,12 @@ def compute_cluster_accuracy_evaluation(
     global_hard_cap_failures: list[str] = []
     raw_truth_count = 0
     raw_estimate_count = 0
+    total_truth_associated_merged_source_count = 0
+    total_merged_estimated_source_count = 0
+    total_split_truth_cluster_count = 0
+    total_raw_assigned_component_count = 0
+    total_raw_component_count_reduction_by_merging = 0
+    total_unassigned_remote_component_count = 0
     for isotope in isotope_names:
         truth = normalize_sources(truth_by_isotope.get(isotope, ()))
         if any(source.strength <= 0.0 for source in truth):
@@ -545,6 +555,8 @@ def compute_cluster_accuracy_evaluation(
         isotope_rms_position_errors: list[float] = []
         isotope_spatial_dispersions: list[float] = []
         isotope_relative_strength_errors: list[float] = []
+        split_truth_cluster_count = 0
+        raw_assigned_component_count = 0
         for truth_index, truth_source in enumerate(truth):
             members = np.flatnonzero(assigned & (nearest_truth == truth_index)).astype(
                 np.int64,
@@ -557,6 +569,9 @@ def compute_cluster_accuracy_evaluation(
                 nearest_distance[members] > criteria.position_target_m
             ]
             associated = bool(members.size)
+            is_split_cluster = bool(members.size > 1)
+            split_truth_cluster_count += int(is_split_cluster)
+            raw_assigned_component_count += int(members.size)
             display_medoid_index: int | None = None
             display_medoid_position: list[float] | None = None
             display_medoid_error: float | None = None
@@ -680,6 +695,8 @@ def compute_cluster_accuracy_evaluation(
                         float(nearest_distance[int(value)]) for value in members
                     ],
                     "assigned_raw_component_count": int(members.size),
+                    "is_split_cluster": is_split_cluster,
+                    "merged_source_count_contribution": int(associated),
                     "display_medoid_estimate_index": display_medoid_index,
                     "display_medoid_position_xyz_m": display_medoid_position,
                     "display_medoid_position_error_m": display_medoid_error,
@@ -777,6 +794,15 @@ def compute_cluster_accuracy_evaluation(
             isotope_accuracy_failures.append(
                 "response_distinct_remote_components"
             )
+        truth_associated_merged_source_count = len(associated_truth_indices)
+        merged_estimated_source_count = (
+            truth_associated_merged_source_count
+            + response_distinct_remote_count
+        )
+        raw_component_count_reduction_by_merging = (
+            raw_assigned_component_count
+            - truth_associated_merged_source_count
+        )
         hard_cap_mass = _hard_cap_mass(
             cardinality_distribution,
             hard_max_sources,
@@ -806,6 +832,16 @@ def compute_cluster_accuracy_evaluation(
             "raw_estimate_component_count": len(estimates),
             "raw_component_cardinality_scored": False,
             "associated_truth_source_count": len(associated_truth_indices),
+            "truth_associated_merged_source_count": (
+                truth_associated_merged_source_count
+            ),
+            "merged_estimated_source_count": merged_estimated_source_count,
+            "split_truth_cluster_count": split_truth_cluster_count,
+            "raw_assigned_component_count": raw_assigned_component_count,
+            "raw_component_count_reduction_by_merging": (
+                raw_component_count_reduction_by_merging
+            ),
+            "unassigned_remote_component_count": int(remote_indices.size),
             "core_covered_truth_source_count": sum(
                 bool(row["core_estimate_indices"]) for row in truth_rows
             ),
@@ -879,6 +915,16 @@ def compute_cluster_accuracy_evaluation(
         )
         raw_truth_count += len(truth)
         raw_estimate_count += len(estimates)
+        total_truth_associated_merged_source_count += (
+            truth_associated_merged_source_count
+        )
+        total_merged_estimated_source_count += merged_estimated_source_count
+        total_split_truth_cluster_count += split_truth_cluster_count
+        total_raw_assigned_component_count += raw_assigned_component_count
+        total_raw_component_count_reduction_by_merging += (
+            raw_component_count_reduction_by_merging
+        )
+        total_unassigned_remote_component_count += int(remote_indices.size)
     centroid_position_array = np.asarray(
         all_centroid_position_errors,
         dtype=np.float64,
@@ -913,6 +959,22 @@ def compute_cluster_accuracy_evaluation(
             "raw_estimate_component_count": raw_estimate_count,
             "raw_component_cardinality_scored": False,
             "associated_truth_source_count": int(rms_position_array.size),
+            "truth_associated_merged_source_count": (
+                total_truth_associated_merged_source_count
+            ),
+            "merged_estimated_source_count": (
+                total_merged_estimated_source_count
+            ),
+            "split_truth_cluster_count": total_split_truth_cluster_count,
+            "raw_assigned_component_count": (
+                total_raw_assigned_component_count
+            ),
+            "raw_component_count_reduction_by_merging": (
+                total_raw_component_count_reduction_by_merging
+            ),
+            "unassigned_remote_component_count": (
+                total_unassigned_remote_component_count
+            ),
             "merged_centroid_position_error_mean_m": (
                 float(np.mean(centroid_position_array))
                 if centroid_position_array.size

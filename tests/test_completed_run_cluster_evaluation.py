@@ -120,6 +120,7 @@ def test_completed_run_evaluation_joins_exact_truth_and_reports_each_source(
         0.1
     )
     assert source["combined_relative_strength_error"] == pytest.approx(0.05)
+    assert result["global"]["merged_estimated_source_count"] == 1
 
 
 @pytest.mark.parametrize(
