@@ -16,7 +16,7 @@ should show where the robot measured, where the sources actually were, where
 the proposed PF/reporting pipeline placed the final estimates, and whether the
 final PF particle support is consistent with the reported result.
 
-Use the following four-panel grammar:
+Use the following five-panel grammar:
 
 1. A metric floor projection with 2 m tick spacing, equal x-y aspect, known
    obstacles, saved obstacle-aware robot route, final PF particle support,
@@ -25,11 +25,14 @@ Use the following four-panel grammar:
 2. A metric height projection (`y-z` or `x-z`, whichever better separates the
    sources) with 2 m tick spacing and equal axis scaling so wall, floor,
    obstacle, and high-surface errors are visible.
-3. An online diagnostic panel showing isotope-wise cardinality posterior or MAP
+3. A compact numerical source-result panel showing the truth ID, number of raw
+   components in its merged cluster, 3-D centroid and RMS position errors, and
+   signed aggregate strength error. Do not add a redundant pass/fail column.
+4. An online diagnostic panel showing isotope-wise cardinality posterior or MAP
    evolution and the hard-cap threshold. Raw cardinality is diagnostic only.
-4. A per-true-source error panel showing 3-D position error and relative
-   strength error against the fixed 0.5 m and 25% thresholds. Identify sources
-   by isotope and stable truth index.
+5. A per-true-source error panel showing 3-D position error and relative
+   strength error against the prespecified 0.5 m and 25% performance targets.
+   Identify sources by isotope and stable truth index.
 
 The floor and height projections are the primary result panels. Together they
 make the 3-D localization error auditable at RA-L print scale without relying
@@ -55,12 +58,22 @@ occlusion, planning, and PF attenuation.
 
 ## Rebuild Command
 
-For the temporary predecessor-code diagnostic, regenerate the main figure
-directly from its completed durable run bundle:
+For the completed proposed run, bind the durable PF output, truth-free
+MeasurementLog, and private truth manifest into a temporary read-only bundle,
+then render it with the schema-v3 split-aware evaluation:
 
 ```bash
+bundle_dir="$(mktemp -d /tmp/ral-paper-result.XXXXXX)"
+ln -s "$PWD/results/ral_ablation/runs/ral_a3fde7067c4ac222_proposed" \
+  "$bundle_dir/pf_output"
+ln -s "$PWD/results/ral_ablation/measurement_logs/ral_a3fde7067c4ac222_proposed" \
+  "$bundle_dir/measurement_log"
+ln -s "$PWD/../Rotating-shield-simulation-runtime/private_runs/ral_ablation/truth_manifests/ral_a3fde7067c4ac222_proposed.json" \
+  "$bundle_dir/truth_manifest.json"
 uv run python scripts/build_ral_figures.py \
-  --completed-run-dir ../Rotating-shield-simulation-runtime/private_runs/full_simulations/cs4_co3_20260827_175045
+  --skip-concepts \
+  --completed-run-dir "$bundle_dir" \
+  --split-aware-evaluation ../Rotating-shield-simulation-runtime/private_runs/ral_ablation/evaluations/ral_a3fde7067c4ac222_proposed_split_aware_v3.json
 ```
 
 After the fresh Cs4/Co3 batch is complete, generate the main paper result from the

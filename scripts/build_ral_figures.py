@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -17,7 +17,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
-from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Rectangle
 from scipy.optimize import linear_sum_assignment
 
@@ -82,6 +81,19 @@ class SourceMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class SplitAwareSourceResult:
+    """Represent one truth-associated physical source after split merging."""
+
+    truth: SourceRecord
+    assigned_component_indices: tuple[int, ...]
+    merged_centroid_position_xyz: np.ndarray
+    combined_strength_cps_1m: float
+    centroid_position_error_m: float
+    rms_position_error_m: float
+    signed_relative_strength_error: float
+
+
+@dataclass(frozen=True, slots=True)
 class CompletedRunBundle:
     """Contain the verified data needed for one completed-run figure."""
 
@@ -101,6 +113,7 @@ class CompletedRunBundle:
     station_indices: np.ndarray
     map_cardinality: dict[str, np.ndarray]
     hard_cap_mass: dict[str, np.ndarray]
+    split_aware_results: tuple[SplitAwareSourceResult, ...] = ()
 
 
 def _as_position(value: object, *, name: str) -> np.ndarray:
@@ -245,7 +258,9 @@ def _match_sources(
                     / truth.strength_cps_1m,
                 )
             )
-    return tuple(sorted(matches, key=lambda match: (match.truth.isotope, match.truth.index)))
+    return tuple(
+        sorted(matches, key=lambda match: (match.truth.isotope, match.truth.index))
+    )
 
 
 def _posterior_support(path: Path, *, sample_count: int = 192) -> dict[str, np.ndarray]:
@@ -324,16 +339,16 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
         "warning",
         "failed",
     }:
-        raise ValueError(
-            "Completed result has an invalid sampler_quality_status."
-        )
+        raise ValueError("Completed result has an invalid sampler_quality_status.")
     run_id = result.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("Completed result must contain one nonempty run_id.")
     if truth.get("run_id") != run_id:
         raise ValueError("Completed result and truth manifest run_id values differ.")
 
-    with np.load(root / "measurement_log" / "observations.npz", allow_pickle=False) as obs:
+    with np.load(
+        root / "measurement_log" / "observations.npz", allow_pickle=False
+    ) as obs:
         station_ids = np.asarray(obs["station_id"], dtype=np.int64)
         poses = np.asarray(obs["detector_pose_xyz"], dtype=np.float64)
         fe = np.asarray(obs["fe_orientation_index"], dtype=np.int64)
@@ -345,9 +360,13 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
         raise ValueError("Observation rows differ from closed-loop record_count.")
     expected_stations = np.arange(station_count, dtype=np.int64)
     if not np.array_equal(np.unique(station_ids), expected_stations):
-        raise ValueError("Observation station IDs differ from closed-loop station_count.")
-    if np.any(~np.isfinite(poses)) or np.any((fe < 0) | (fe >= 8)) or np.any(
-        (pb < 0) | (pb >= 8)
+        raise ValueError(
+            "Observation station IDs differ from closed-loop station_count."
+        )
+    if (
+        np.any(~np.isfinite(poses))
+        or np.any((fe < 0) | (fe >= 8))
+        or np.any((pb < 0) | (pb >= 8))
     ):
         raise ValueError("Observation pose or Fe/Pb orientation data are invalid.")
     if live_times.shape != (record_count,) or not np.allclose(
@@ -358,7 +377,10 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     ):
         raise ValueError("Completed-run figure requires one fixed live time per view.")
     first_rows = np.asarray(
-        [int(np.flatnonzero(station_ids == station)[0]) for station in expected_stations]
+        [
+            int(np.flatnonzero(station_ids == station)[0])
+            for station in expected_stations
+        ]
     )
     station_positions = poses[first_rows]
 
@@ -366,7 +388,9 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     matches = _match_sources(truth_sources, estimated_sources)
     trace_rows = _load_json_lines(root / "pf_output" / "pf_station_trace.jsonl")
     if len(trace_rows) != station_count:
-        raise ValueError("PF station trace length differs from completed station_count.")
+        raise ValueError(
+            "PF station trace length differs from completed station_count."
+        )
     station_indices, map_cardinality, hard_cap_mass = _cardinality_trace(trace_rows)
     provenance = posterior.get("provenance", {})
     if not isinstance(provenance, dict):
@@ -396,22 +420,288 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     )
 
 
+def _load_split_aware_source_results(
+    bundle: CompletedRunBundle,
+    evaluation_path: Path,
+) -> tuple[SplitAwareSourceResult, ...]:
+    """Load and validate schema-v3 split-aware source results for one run."""
+    evaluation = read_json(Path(evaluation_path).expanduser().resolve())
+    if (
+        evaluation.get("schema_version") != 3
+        or evaluation.get("artifact_family")
+        != "completed_pf_cluster_accuracy_evaluation"
+    ):
+        raise ValueError("Split-aware figure input must be one schema-v3 evaluation.")
+    if evaluation.get("execution_status") != "complete":
+        raise ValueError("Split-aware figure input must describe a completed run.")
+    if evaluation.get("changes_pf_state_or_cardinality") is not False:
+        raise ValueError("Split-aware evaluation must not modify the PF posterior.")
+    identity = evaluation.get("run_identity")
+    if not isinstance(identity, dict) or identity.get("run_id") != bundle.run_id:
+        raise ValueError("Split-aware evaluation and completed run_id values differ.")
+    criteria = evaluation.get("criteria")
+    if not isinstance(criteria, dict):
+        raise TypeError("Split-aware evaluation criteria must be an object.")
+    if (
+        criteria.get("merged_position_summary") != "strength_weighted_centroid"
+        or criteria.get("position_target_metric")
+        != "strength_weighted_rms_distance_to_truth"
+        or criteria.get("merged_source_count_semantics")
+        != "one_per_truth_cluster_plus_response_distinct_remote"
+    ):
+        raise ValueError("Split-aware evaluation uses unsupported metric semantics.")
+    provenance = read_json(bundle.root / "pf_output" / "pf_posterior.json").get(
+        "provenance",
+        {},
+    )
+    if not isinstance(provenance, dict):
+        raise TypeError("PF posterior provenance must be an object.")
+    if identity.get("measurement_log_sha256") != provenance.get(
+        "measurement_log_sha256"
+    ):
+        raise ValueError("Split-aware evaluation MeasurementLog hash differs from PF.")
+
+    truth_by_key = {
+        (source.isotope, source.index - 1): source for source in bundle.truth_sources
+    }
+    estimates_by_key = {
+        (source.isotope, source.index - 1): source
+        for source in bundle.estimated_sources
+    }
+    isotope_payload = evaluation.get("isotopes")
+    if not isinstance(isotope_payload, dict):
+        raise TypeError("Split-aware evaluation isotopes must be an object.")
+    results: list[SplitAwareSourceResult] = []
+    seen_truth_keys: set[tuple[str, int]] = set()
+    seen_component_keys: set[tuple[str, int]] = set()
+    for isotope in sorted(isotope_payload):
+        report = isotope_payload[isotope]
+        if not isinstance(report, dict):
+            raise TypeError("Every split-aware isotope report must be an object.")
+        truth_rows = report.get("truth_sources")
+        if not isinstance(truth_rows, list):
+            raise TypeError("Every split-aware isotope must contain truth sources.")
+        for row in truth_rows:
+            if not isinstance(row, dict):
+                raise TypeError("Every split-aware truth row must be an object.")
+            raw_truth_index = row.get("truth_source_index")
+            if isinstance(raw_truth_index, bool) or not isinstance(
+                raw_truth_index,
+                int,
+            ):
+                raise TypeError("Split-aware truth_source_index must be an integer.")
+            truth_index = int(raw_truth_index)
+            truth_key = (str(isotope), truth_index)
+            truth = truth_by_key.get(truth_key)
+            if truth is None:
+                raise ValueError(
+                    "Split-aware truth source is absent from the manifest."
+                )
+            if truth_key in seen_truth_keys:
+                raise ValueError("Split-aware evaluation repeats a truth source.")
+            seen_truth_keys.add(truth_key)
+            raw_indices = row.get("assigned_estimate_indices")
+            if not isinstance(raw_indices, list) or not raw_indices:
+                raise ValueError(
+                    "Every plotted truth source needs assigned components."
+                )
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in raw_indices
+            ):
+                raise TypeError(
+                    "Split-aware assigned estimate indices must be integers."
+                )
+            assigned_indices = tuple(int(value) + 1 for value in raw_indices)
+            if len(assigned_indices) != int(
+                row.get("assigned_raw_component_count", -1)
+            ):
+                raise ValueError("Split-aware component count and indices differ.")
+            if any(
+                (str(isotope), index - 1) not in estimates_by_key
+                for index in assigned_indices
+            ):
+                raise ValueError(
+                    "Split-aware result references an absent PF component."
+                )
+            component_keys = {(str(isotope), index - 1) for index in assigned_indices}
+            if len(component_keys) != len(assigned_indices):
+                raise ValueError("Split-aware result repeats one PF component.")
+            if seen_component_keys.intersection(component_keys):
+                raise ValueError(
+                    "One PF component cannot belong to multiple truth clusters."
+                )
+            seen_component_keys.update(component_keys)
+            assigned_components = [
+                estimates_by_key[(str(isotope), index - 1)]
+                for index in assigned_indices
+            ]
+            component_strengths = np.asarray(
+                [component.strength_cps_1m for component in assigned_components],
+                dtype=np.float64,
+            )
+            component_positions = np.stack(
+                [component.position_xyz for component in assigned_components]
+            )
+            centroid = _as_position(
+                row.get("merged_position_xyz_m"),
+                name=f"split-aware {isotope} centroid",
+            )
+            combined_strength = _positive_float(
+                row.get("combined_estimated_strength_cps_1m"),
+                name=f"split-aware {isotope} strength",
+            )
+            recomputed_strength = float(np.sum(component_strengths))
+            if not np.isclose(
+                combined_strength,
+                recomputed_strength,
+                rtol=1.0e-12,
+                atol=1.0e-8,
+            ):
+                raise ValueError(
+                    "Split-aware combined strength differs from assigned PF components."
+                )
+            recomputed_centroid = (
+                np.sum(
+                    component_strengths[:, None] * component_positions,
+                    axis=0,
+                )
+                / recomputed_strength
+            )
+            if not np.allclose(
+                centroid,
+                recomputed_centroid,
+                rtol=1.0e-12,
+                atol=1.0e-10,
+            ):
+                raise ValueError(
+                    "Split-aware centroid differs from assigned PF components."
+                )
+            centroid_error = float(row.get("merged_centroid_position_error_m"))
+            rms_error = float(row.get("strength_weighted_rms_position_error_m"))
+            if (
+                not np.isfinite(centroid_error)
+                or centroid_error < 0.0
+                or not np.isfinite(rms_error)
+                or rms_error < 0.0
+            ):
+                raise ValueError("Split-aware position errors must be nonnegative.")
+            recomputed_centroid_error = float(
+                np.linalg.norm(centroid - truth.position_xyz)
+            )
+            if not np.isclose(
+                centroid_error,
+                recomputed_centroid_error,
+                rtol=0.0,
+                atol=1.0e-10,
+            ):
+                raise ValueError(
+                    "Split-aware centroid error is internally inconsistent."
+                )
+            recomputed_rms_error = float(
+                np.sqrt(
+                    np.sum(
+                        component_strengths
+                        * np.sum(
+                            np.square(component_positions - truth.position_xyz),
+                            axis=1,
+                        )
+                    )
+                    / recomputed_strength
+                )
+            )
+            if not np.isclose(
+                rms_error,
+                recomputed_rms_error,
+                rtol=1.0e-12,
+                atol=1.0e-10,
+            ):
+                raise ValueError(
+                    "Split-aware RMS error differs from assigned PF components."
+                )
+            signed_strength_error = (
+                combined_strength - truth.strength_cps_1m
+            ) / truth.strength_cps_1m
+            if not np.isclose(
+                abs(signed_strength_error),
+                float(row.get("combined_relative_strength_error")),
+                rtol=0.0,
+                atol=1.0e-10,
+            ):
+                raise ValueError(
+                    "Split-aware strength error is internally inconsistent."
+                )
+            results.append(
+                SplitAwareSourceResult(
+                    truth=truth,
+                    assigned_component_indices=assigned_indices,
+                    merged_centroid_position_xyz=centroid,
+                    combined_strength_cps_1m=combined_strength,
+                    centroid_position_error_m=centroid_error,
+                    rms_position_error_m=rms_error,
+                    signed_relative_strength_error=float(signed_strength_error),
+                )
+            )
+    if len(results) != len(bundle.truth_sources):
+        raise ValueError("Split-aware evaluation must cover every truth source.")
+    return tuple(results)
+
+
+def load_split_aware_completed_run(
+    run_dir: Path,
+    evaluation_path: Path,
+) -> CompletedRunBundle:
+    """Return one completed run bound to its split-aware evaluation artifact."""
+    bundle = load_completed_run(run_dir)
+    results = _load_split_aware_source_results(bundle, evaluation_path)
+    matches = tuple(
+        SourceMatch(
+            truth=result.truth,
+            estimate=SourceRecord(
+                isotope=result.truth.isotope,
+                index=result.truth.index,
+                position_xyz=result.merged_centroid_position_xyz,
+                strength_cps_1m=result.combined_strength_cps_1m,
+            ),
+            position_error_m=result.centroid_position_error_m,
+            relative_strength_error=abs(result.signed_relative_strength_error),
+        )
+        for result in results
+    )
+    return replace(
+        bundle,
+        predecessor_code=False,
+        matches=matches,
+        split_aware_results=results,
+    )
+
+
 def completed_run_metrics(bundle: CompletedRunBundle) -> dict[str, object]:
-    """Return the fixed nearest-mode diagnostic metrics for manuscript text."""
-    position_passes = [
-        match.position_error_m <= POSITION_THRESHOLD_M for match in bundle.matches
-    ]
+    """Return source-level figure metrics under the bundle's evaluation rule."""
+    if bundle.split_aware_results:
+        position_errors = [
+            result.rms_position_error_m for result in bundle.split_aware_results
+        ]
+        strength_errors = [
+            abs(result.signed_relative_strength_error)
+            for result in bundle.split_aware_results
+        ]
+        evidence_status = "completed_proposed_split_aware_result"
+    else:
+        position_errors = [match.position_error_m for match in bundle.matches]
+        strength_errors = [match.relative_strength_error for match in bundle.matches]
+        evidence_status = "completed_predecessor_code_diagnostic"
+    position_passes = [error <= POSITION_THRESHOLD_M for error in position_errors]
     joint_passes = [
-        position_pass
-        and match.relative_strength_error <= STRENGTH_THRESHOLD_FRACTION
-        for position_pass, match in zip(position_passes, bundle.matches)
+        position_pass and strength_error <= STRENGTH_THRESHOLD_FRACTION
+        for position_pass, strength_error in zip(position_passes, strength_errors)
     ]
     final_cap_mass = {
         isotope: float(values[-1]) for isotope, values in bundle.hard_cap_mass.items()
     }
     return {
         "schema_version": 1,
-        "evidence_status": "completed_predecessor_code_diagnostic",
+        "evidence_status": evidence_status,
         "run_id": bundle.run_id,
         "source_count": len(bundle.matches),
         "position_pass_count": int(sum(position_passes)),
@@ -446,12 +736,20 @@ def write_figure_provenance(
     output_path: Path,
     *,
     completed_run_dir: Path | None,
+    split_aware_evaluation: Path | None = None,
 ) -> Path:
     """Write a machine-readable source and transformation manifest."""
     inputs = [ISAAC_PROBLEM_RENDER, ISAAC_DETECTOR_RENDER]
     bundle: CompletedRunBundle | None = None
     if completed_run_dir is not None:
-        bundle = load_completed_run(completed_run_dir)
+        bundle = (
+            load_completed_run(completed_run_dir)
+            if split_aware_evaluation is None
+            else load_split_aware_completed_run(
+                completed_run_dir,
+                split_aware_evaluation,
+            )
+        )
         inputs.extend(
             (
                 bundle.root / "truth_manifest.json",
@@ -463,6 +761,18 @@ def write_figure_provenance(
                 bundle.root / "pf_output" / "pf_station_trace.jsonl",
             )
         )
+        if split_aware_evaluation is not None:
+            inputs.append(Path(split_aware_evaluation))
+    experiment_transformation = (
+        "Isotope-preserving Hungarian nearest-mode matching in 3-D; "
+        "systematic posterior-particle resampling for visual support; errors "
+        "normalized only for display by the 0.5 m and 25% performance targets."
+        if split_aware_evaluation is None
+        else "Schema-v3 truth-associated split clusters; raw PF components "
+        "remain visible, physical-source markers use strength-weighted "
+        "centroids, and the error panel uses strength-weighted RMS position "
+        "and aggregate strength against the 0.5 m and 25% performance targets."
+    )
     payload: dict[str, object] = {
         "schema_version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -474,12 +784,7 @@ def write_figure_provenance(
                 "Direct raster crops plus vector annotations; no synthetic "
                 "measurement or response data."
             ),
-            "completed_run_figure": (
-                "Isotope-preserving Hungarian nearest-mode matching in 3-D; "
-                "systematic posterior-particle resampling for visual support; "
-                "errors normalized only for display by fixed 0.5 m and 25% "
-                "acceptance thresholds."
-            ),
+            "completed_run_figure": experiment_transformation,
             "randomness": "none",
         },
     }
@@ -501,7 +806,9 @@ def _draw_image(ax: Axes, path: Path, *, title: str) -> None:
     """Draw one cropped scientific-render panel with a readable title."""
     image = plt.imread(Path(path).as_posix())
     height, width = image.shape[:2]
-    crop = image[int(0.06 * height) : int(0.92 * height), int(0.05 * width) : int(0.95 * width)]
+    crop = image[
+        int(0.06 * height) : int(0.92 * height), int(0.05 * width) : int(0.95 * width)
+    ]
     ax.imshow(crop)
     ax.set_axis_off()
     ax.text(
@@ -867,7 +1174,9 @@ def _plot_projection(
     for isotope, support in bundle.posterior_support.items():
         if support.size == 0:
             continue
-        projected = np.asarray([_projection(position, projection) for position in support])
+        projected = np.asarray(
+            [_projection(position, projection) for position in support]
+        )
         ax.scatter(
             projected[:, 0],
             projected[:, 1],
@@ -892,10 +1201,35 @@ def _plot_projection(
         zorder=3,
     )
 
-    matched_estimate_ids = {
-        (match.estimate.isotope, match.estimate.index): match.truth
-        for match in bundle.matches
-    }
+    if bundle.split_aware_results:
+        for result in bundle.split_aware_results:
+            truth_xy = _projection(result.truth.position_xyz, projection)
+            centroid_xy = _projection(
+                result.merged_centroid_position_xyz,
+                projection,
+            )
+            ax.plot(
+                (truth_xy[0], centroid_xy[0]),
+                (truth_xy[1], centroid_xy[1]),
+                color="#444444",
+                linestyle="--",
+                linewidth=0.65,
+                alpha=0.78,
+                zorder=4,
+            )
+    else:
+        for match in bundle.matches:
+            truth_xy = _projection(match.truth.position_xyz, projection)
+            estimate_xy = _projection(match.estimate.position_xyz, projection)
+            ax.plot(
+                (truth_xy[0], estimate_xy[0]),
+                (truth_xy[1], estimate_xy[1]),
+                color="#444444",
+                linestyle="--",
+                linewidth=0.65,
+                alpha=0.78,
+                zorder=4,
+            )
     for source in bundle.truth_sources:
         x_value, y_value = _projection(source.position_xyz, projection)
         color = ISOTOPE_COLORS.get(source.isotope, "#555555")
@@ -924,21 +1258,75 @@ def _plot_projection(
             bbox={"fc": "white", "ec": "none", "alpha": 0.72, "pad": 0.2},
             zorder=8,
         )
-    for estimate in bundle.estimated_sources:
-        x_value, y_value = _projection(estimate.position_xyz, projection)
-        color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
-        matched_truth = matched_estimate_ids.get((estimate.isotope, estimate.index))
-        marker = "X" if matched_truth is not None else "D"
-        ax.scatter(
-            x_value,
-            y_value,
-            marker=marker,
-            s=38 if matched_truth is not None else 24,
-            facecolor="none" if matched_truth is None else color,
-            edgecolor=color,
-            linewidth=1.0,
-            zorder=6,
-        )
+    if bundle.split_aware_results:
+        assigned_ids = {
+            (result.truth.isotope, index)
+            for result in bundle.split_aware_results
+            for index in result.assigned_component_indices
+        }
+        for estimate in bundle.estimated_sources:
+            x_value, y_value = _projection(estimate.position_xyz, projection)
+            color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
+            assigned = (estimate.isotope, estimate.index) in assigned_ids
+            if assigned:
+                ax.scatter(
+                    x_value,
+                    y_value,
+                    marker="x",
+                    s=22,
+                    color=color,
+                    linewidth=0.8,
+                    alpha=0.82,
+                    zorder=5,
+                )
+            else:
+                ax.scatter(
+                    x_value,
+                    y_value,
+                    marker="D",
+                    s=25,
+                    facecolor="none",
+                    edgecolor=color,
+                    linewidth=0.8,
+                    alpha=0.82,
+                    zorder=5,
+                )
+        for result in bundle.split_aware_results:
+            x_value, y_value = _projection(
+                result.merged_centroid_position_xyz,
+                projection,
+            )
+            color = ISOTOPE_COLORS.get(result.truth.isotope, "#555555")
+            ax.scatter(
+                x_value,
+                y_value,
+                marker="X",
+                s=42,
+                facecolor=color,
+                edgecolor="#111111",
+                linewidth=0.45,
+                zorder=6,
+            )
+    else:
+        matched_estimate_ids = {
+            (match.estimate.isotope, match.estimate.index): match.truth
+            for match in bundle.matches
+        }
+        for estimate in bundle.estimated_sources:
+            x_value, y_value = _projection(estimate.position_xyz, projection)
+            color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
+            matched_truth = matched_estimate_ids.get((estimate.isotope, estimate.index))
+            marker = "X" if matched_truth is not None else "D"
+            ax.scatter(
+                x_value,
+                y_value,
+                marker=marker,
+                s=38 if matched_truth is not None else 24,
+                facecolor="none" if matched_truth is None else color,
+                edgecolor=color,
+                linewidth=1.0,
+                zorder=6,
+            )
     ax.set_xlim(-0.15, limits[0] + 0.25)
     ax.set_ylim(-0.15, limits[1] + (0.60 if projection == "xy" else 0.35))
     ax.set_aspect("equal")
@@ -993,18 +1381,69 @@ def _plot_cardinality(ax: Axes, bundle: CompletedRunBundle) -> None:
     ax.set_xticks([1, 4, 8, 12, int(bundle.station_indices[-1])])
     ax.set_yticks(np.arange(0, HARD_CAP + 1, 2))
     ax.set_xlabel("completed station", fontsize=FIG_LABEL_SIZE)
-    ax.set_ylabel("MAP cardinality", fontsize=FIG_LABEL_SIZE, labelpad=1.0)
     ax.tick_params(labelsize=FIG_TICK_SIZE)
     ax.grid(True, linewidth=0.25, alpha=0.35)
     ax.legend(fontsize=FIG_TICK_SIZE, loc="lower right", framealpha=0.94)
-    ax.set_title("(d) Online structural diagnostic", fontsize=FIG_TITLE_SIZE, fontweight="bold")
+    ax.set_title(
+        "(d) Online structural diagnostic", fontsize=FIG_TITLE_SIZE, fontweight="bold"
+    )
 
 
-def _plot_truth_coordinates(ax: Axes, bundle: CompletedRunBundle) -> None:
-    """Draw a compact coordinate key linked to truth labels in both projections."""
+def _plot_source_key(ax: Axes, bundle: CompletedRunBundle) -> None:
+    """Draw the compact source key used by the completed-run projections."""
     ax.set_axis_off()
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 1.0)
+    if bundle.split_aware_results:
+        ax.text(
+            0.0,
+            0.98,
+            "(c) Numerical source result",
+            ha="left",
+            va="top",
+            fontsize=FIG_TITLE_SIZE,
+            fontweight="bold",
+        )
+        ax.text(
+            0.02,
+            0.83,
+            r"$\mathsf{X}$ merged   $\times$ raw   $\bullet$ station",
+            ha="left",
+            va="top",
+            fontsize=FIG_TICK_SIZE,
+            color="#333333",
+        )
+        ax.text(
+            0.02,
+            0.68,
+            "ID   n  ctr[m] RMS[m]  str.[%]",
+            ha="left",
+            va="top",
+            fontsize=FIG_TICK_SIZE,
+            family="monospace",
+            fontweight="bold",
+        )
+        for row_index, result in enumerate(bundle.split_aware_results):
+            y_value = 0.56 - 0.080 * row_index
+            color = ISOTOPE_COLORS.get(result.truth.isotope, "#555555")
+            label = f"{_isotope_short_name(result.truth.isotope)}{result.truth.index}"
+            ax.text(
+                0.02,
+                y_value,
+                (
+                    f"{label:<4} {len(result.assigned_component_indices):>1}  "
+                    f"{result.centroid_position_error_m:>5.3f}  "
+                    f"{result.rms_position_error_m:>5.3f}  "
+                    f"{100.0 * result.signed_relative_strength_error:>+7.2f}"
+                ),
+                ha="left",
+                va="center",
+                fontsize=FIG_TICK_SIZE,
+                family="monospace",
+                color=color,
+            )
+        return
+
     ax.text(
         0.0,
         0.98,
@@ -1051,37 +1490,71 @@ def _plot_truth_coordinates(ax: Axes, bundle: CompletedRunBundle) -> None:
 
 
 def _plot_errors(ax: Axes, bundle: CompletedRunBundle) -> None:
-    """Plot errors normalized by their prespecified acceptance thresholds."""
-    matches = bundle.matches
-    x_values = np.arange(len(matches), dtype=np.float64)
-    labels = [
-        f"{_isotope_short_name(match.truth.isotope)}{match.truth.index}"
-        for match in matches
-    ]
-    colors = [ISOTOPE_COLORS.get(match.truth.isotope, "#666666") for match in matches]
-    position = np.asarray(
-        [match.position_error_m / POSITION_THRESHOLD_M for match in matches]
-    )
-    strength = np.asarray(
-        [
-            match.relative_strength_error / STRENGTH_THRESHOLD_FRACTION
-            for match in matches
+    """Plot errors normalized by their prespecified performance targets."""
+    if bundle.split_aware_results:
+        labels = [
+            f"{_isotope_short_name(result.truth.isotope)}{result.truth.index}"
+            for result in bundle.split_aware_results
         ]
-    )
+        colors = [
+            ISOTOPE_COLORS.get(result.truth.isotope, "#666666")
+            for result in bundle.split_aware_results
+        ]
+        position = np.asarray(
+            [
+                result.rms_position_error_m / POSITION_THRESHOLD_M
+                for result in bundle.split_aware_results
+            ]
+        )
+        strength = np.asarray(
+            [
+                abs(result.signed_relative_strength_error) / STRENGTH_THRESHOLD_FRACTION
+                for result in bundle.split_aware_results
+            ]
+        )
+        position_label = "RMS position / 0.5 m"
+        title = "(e) Split-aware source errors"
+    else:
+        labels = [
+            f"{_isotope_short_name(match.truth.isotope)}{match.truth.index}"
+            for match in bundle.matches
+        ]
+        colors = [
+            ISOTOPE_COLORS.get(match.truth.isotope, "#666666")
+            for match in bundle.matches
+        ]
+        position = np.asarray(
+            [match.position_error_m / POSITION_THRESHOLD_M for match in bundle.matches]
+        )
+        strength = np.asarray(
+            [
+                match.relative_strength_error / STRENGTH_THRESHOLD_FRACTION
+                for match in bundle.matches
+            ]
+        )
+        position_label = "position / 0.5 m"
+        metrics = completed_run_metrics(bundle)
+        title = (
+            "(e) Accuracy: "
+            f"{metrics['position_pass_count']}/{metrics['source_count']} position; "
+            f"{metrics['joint_position_strength_pass_count']}/"
+            f"{metrics['source_count']} joint"
+        )
+    x_values = np.arange(len(labels), dtype=np.float64)
     ax.bar(
         x_values,
         position,
         color=colors,
         alpha=0.70,
         width=0.66,
-        label="position / 0.5 m",
+        label=position_label,
     )
     ax.axhline(
         1.0,
         color="#222222",
         linestyle="--",
         linewidth=0.85,
-        label="acceptance threshold",
+        label="target (=1)",
     )
     ax.plot(
         x_values,
@@ -1094,111 +1567,61 @@ def _plot_errors(ax: Axes, bundle: CompletedRunBundle) -> None:
         linewidth=1.0,
         label="strength / 25%",
     )
-    ax.set_ylabel("threshold-normalized error", fontsize=FIG_LABEL_SIZE, labelpad=1.0)
     ax.set_xticks(x_values, labels=labels, rotation=25, ha="right")
     ax.tick_params(labelsize=FIG_TICK_SIZE)
     ax.grid(True, axis="y", linewidth=0.25, alpha=0.35)
-    ax.set_ylim(0.0, max(3.4, float(np.max(np.concatenate((position, strength)))) * 1.18))
-    metrics = completed_run_metrics(bundle)
+    ax.set_ylim(
+        0.0, max(3.4, float(np.max(np.concatenate((position, strength)))) * 1.18)
+    )
     ax.legend(
         fontsize=FIG_TICK_SIZE,
         loc="upper left",
         ncol=1,
         framealpha=0.92,
     )
-    ax.set_title(
-        "(e) Accuracy: "
-        f"{metrics['position_pass_count']}/{metrics['source_count']} position; "
-        f"{metrics['joint_position_strength_pass_count']}/{metrics['source_count']} joint",
-        fontsize=FIG_TITLE_SIZE,
-        fontweight="bold",
-    )
+    if bundle.split_aware_results:
+        title = "(e) Target-normalized source errors"
+    ax.set_title(title, fontsize=FIG_TITLE_SIZE, fontweight="bold")
 
 
 def render_completed_run_summary(
     run_dir: Path,
     output_path: Path = EXPERIMENT_FIG_PATH,
+    *,
+    split_aware_evaluation: Path | None = None,
 ) -> Path:
     """Render one auditable result figure from a verified completed run."""
-    bundle = load_completed_run(run_dir)
-    fig = plt.figure(figsize=(7.15, 4.62))
+    bundle = (
+        load_completed_run(run_dir)
+        if split_aware_evaluation is None
+        else load_split_aware_completed_run(run_dir, split_aware_evaluation)
+    )
+    fig = plt.figure(figsize=(7.15, 2.98))
     grid = fig.add_gridspec(
         2,
-        8,
-        height_ratios=(1.18, 0.82),
-        width_ratios=(1.0,) * 8,
-        hspace=0.34,
-        wspace=0.46,
+        12,
+        height_ratios=(1.0, 0.94),
+        width_ratios=(1.0,) * 12,
+        hspace=0.52,
+        wspace=0.58,
     )
     _plot_projection(
-        fig.add_subplot(grid[0, 0:2]),
+        fig.add_subplot(grid[:, 0:3]),
         bundle,
         projection="xy",
         title="(a) Floor projection",
     )
     _plot_projection(
-        fig.add_subplot(grid[0, 2:5]),
+        fig.add_subplot(grid[0, 3:8]),
         bundle,
         projection="yz",
         title="(b) Depth--height projection",
     )
-    _plot_truth_coordinates(fig.add_subplot(grid[0, 5:8]), bundle)
-    _plot_cardinality(fig.add_subplot(grid[1, 0:4]), bundle)
-    _plot_errors(fig.add_subplot(grid[1, 4:8]), bundle)
+    _plot_source_key(fig.add_subplot(grid[0, 8:12]), bundle)
+    _plot_cardinality(fig.add_subplot(grid[1, 3:8]), bundle)
+    _plot_errors(fig.add_subplot(grid[1, 8:12]), bundle)
 
-    legend = [
-        Line2D(
-            [0],
-            [0],
-            marker="X",
-            color="none",
-            markerfacecolor="#666666",
-            markeredgecolor="#666666",
-            markersize=6,
-            label="matched PF mode",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="D",
-            color="none",
-            markerfacecolor="none",
-            markeredgecolor="#666666",
-            markersize=5,
-            label="unmatched PF mode",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            color="none",
-            markerfacecolor="#222222",
-            markeredgecolor="white",
-            markersize=5,
-            label="measurement station",
-        ),
-    ]
-    fig.legend(
-        handles=legend,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.005),
-        ncol=3,
-        fontsize=FIG_TICK_SIZE,
-        frameon=True,
-        borderpad=0.25,
-        columnspacing=0.9,
-        handletextpad=0.35,
-    )
-    fig.text(
-        0.5,
-        0.055,
-        "Completed predecessor-code diagnostic; nearest-mode matching is descriptive, not current four-variant evidence.",
-        ha="center",
-        va="bottom",
-        fontsize=FIG_LABEL_SIZE,
-        fontweight="bold",
-    )
-    fig.subplots_adjust(left=0.060, right=0.985, top=0.94, bottom=0.16)
+    fig.subplots_adjust(left=0.060, right=0.985, top=0.92, bottom=0.14)
     return save_figure(fig, output_path)
 
 
@@ -1214,6 +1637,14 @@ def parse_args() -> argparse.Namespace:
         "--completed-run-dir",
         type=Path,
         help="Durable completed full-simulation directory for the diagnostic figure.",
+    )
+    parser.add_argument(
+        "--split-aware-evaluation",
+        type=Path,
+        help=(
+            "Optional schema-v3 split-aware evaluation bound to the completed "
+            "run; when present, render the current physical-source result."
+        ),
     )
     parser.add_argument(
         "--skip-experiment",
@@ -1261,6 +1692,7 @@ def main() -> None:
             render_completed_run_summary(
                 args.completed_run_dir,
                 args.experiment_output,
+                split_aware_evaluation=args.split_aware_evaluation,
             )
         )
     for output in generated:
@@ -1274,6 +1706,9 @@ def main() -> None:
             args.provenance_output,
             completed_run_dir=(
                 None if args.skip_experiment else args.completed_run_dir
+            ),
+            split_aware_evaluation=(
+                None if args.skip_experiment else args.split_aware_evaluation
             ),
         )
         print(f"Wrote figure provenance {provenance}")

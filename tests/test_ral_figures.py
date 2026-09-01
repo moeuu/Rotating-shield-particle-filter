@@ -74,7 +74,10 @@ def _write_completed_run(
     _write_json(
         pf_output / "pf_posterior.json",
         {
-            "provenance": {"estimator_commit": "fixture-predecessor"},
+            "provenance": {
+                "estimator_commit": "fixture-predecessor",
+                "measurement_log_sha256": "fixture-log",
+            },
             "isotopes": {
                 "Cs-137": {
                     "modes": [
@@ -177,6 +180,82 @@ def _write_completed_run(
     return root
 
 
+def _write_split_aware_evaluation(root: Path) -> Path:
+    """Write one schema-v3 split-aware evaluation for the completed fixture."""
+    cs_truth = np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
+    cs_positions = np.asarray(
+        [[1.2, 2.1, 3.0], [7.0, 1.0, 5.0]],
+        dtype=np.float64,
+    )
+    cs_strengths = np.asarray([900_000.0, 310_000.0], dtype=np.float64)
+    cs_total = float(np.sum(cs_strengths))
+    cs_centroid = np.sum(cs_strengths[:, None] * cs_positions, axis=0) / cs_total
+    cs_centroid_error = float(np.linalg.norm(cs_centroid - cs_truth))
+    cs_rms_error = float(
+        np.sqrt(
+            np.sum(cs_strengths * np.sum(np.square(cs_positions - cs_truth), axis=1))
+            / cs_total
+        )
+    )
+    co_truth = np.asarray([8.0, 12.0, 1.0], dtype=np.float64)
+    co_position = np.asarray([8.1, 11.8, 1.1], dtype=np.float64)
+    co_error = float(np.linalg.norm(co_position - co_truth))
+    evaluation_path = root / "split_aware_evaluation.json"
+    _write_json(
+        evaluation_path,
+        {
+            "schema_version": 3,
+            "artifact_family": "completed_pf_cluster_accuracy_evaluation",
+            "execution_status": "complete",
+            "changes_pf_state_or_cardinality": False,
+            "run_identity": {
+                "run_id": "fixture-run",
+                "measurement_log_sha256": "fixture-log",
+            },
+            "criteria": {
+                "merged_position_summary": "strength_weighted_centroid",
+                "position_target_metric": ("strength_weighted_rms_distance_to_truth"),
+                "merged_source_count_semantics": (
+                    "one_per_truth_cluster_plus_response_distinct_remote"
+                ),
+            },
+            "isotopes": {
+                "Co-60": {
+                    "truth_sources": [
+                        {
+                            "truth_source_index": 0,
+                            "assigned_estimate_indices": [0],
+                            "assigned_raw_component_count": 1,
+                            "merged_position_xyz_m": co_position.tolist(),
+                            "combined_estimated_strength_cps_1m": 1_250_000.0,
+                            "merged_centroid_position_error_m": co_error,
+                            "strength_weighted_rms_position_error_m": co_error,
+                            "combined_relative_strength_error": (
+                                50_000.0 / 1_200_000.0
+                            ),
+                        }
+                    ]
+                },
+                "Cs-137": {
+                    "truth_sources": [
+                        {
+                            "truth_source_index": 0,
+                            "assigned_estimate_indices": [0, 1],
+                            "assigned_raw_component_count": 2,
+                            "merged_position_xyz_m": cs_centroid.tolist(),
+                            "combined_estimated_strength_cps_1m": cs_total,
+                            "merged_centroid_position_error_m": cs_centroid_error,
+                            "strength_weighted_rms_position_error_m": cs_rms_error,
+                            "combined_relative_strength_error": 0.21,
+                        }
+                    ]
+                },
+            },
+        },
+    )
+    return evaluation_path
+
+
 def test_render_concept_figures_write_files(tmp_path: Path) -> None:
     """Concept figure rendering should write nonempty PDF files."""
     fig1 = figures.render_problem_setting(tmp_path / "fig1.pdf")
@@ -207,6 +286,57 @@ def test_completed_run_loader_and_figure_are_auditable(tmp_path: Path) -> None:
     assert metrics["position_pass_count"] == 2
     assert metrics["joint_position_strength_pass_count"] == 2
     assert metrics["final_hard_cap_mass"]["Cs-137"] == pytest.approx(0.1)
+
+
+def test_split_aware_current_run_figure_uses_merged_source_metrics(
+    tmp_path: Path,
+) -> None:
+    """A schema-v3 result should plot raw modes but score merged RMS errors."""
+    run_dir = _write_completed_run(tmp_path / "run")
+    evaluation_path = _write_split_aware_evaluation(run_dir)
+    bundle = figures.load_split_aware_completed_run(run_dir, evaluation_path)
+    output = figures.render_completed_run_summary(
+        run_dir,
+        tmp_path / "current_result.pdf",
+        split_aware_evaluation=evaluation_path,
+    )
+    provenance = figures.write_figure_provenance(
+        [output],
+        tmp_path / "current_provenance.json",
+        completed_run_dir=run_dir,
+        split_aware_evaluation=evaluation_path,
+    )
+    metrics = figures.completed_run_metrics(bundle)
+
+    assert bundle.predecessor_code is False
+    assert len(bundle.split_aware_results) == 2
+    assert bundle.split_aware_results[1].assigned_component_indices == (1, 2)
+    assert metrics["evidence_status"] == "completed_proposed_split_aware_result"
+    assert metrics["position_pass_count"] == 1
+    assert metrics["joint_position_strength_pass_count"] == 1
+    assert output.exists()
+    assert provenance.exists()
+    source_paths = {
+        row["path"]
+        for row in json.loads(provenance.read_text(encoding="utf-8"))["source_files"]
+    }
+    assert evaluation_path.resolve().as_posix() in source_paths
+
+
+def test_split_aware_current_run_figure_rejects_altered_aggregation(
+    tmp_path: Path,
+) -> None:
+    """Figure input must recompute merged quantities from bound PF components."""
+    run_dir = _write_completed_run(tmp_path / "run")
+    evaluation_path = _write_split_aware_evaluation(run_dir)
+    evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+    evaluation["isotopes"]["Cs-137"]["truth_sources"][0][
+        "combined_estimated_strength_cps_1m"
+    ] += 1.0
+    _write_json(evaluation_path, evaluation)
+
+    with pytest.raises(ValueError, match="combined strength"):
+        figures.load_split_aware_completed_run(run_dir, evaluation_path)
 
 
 def test_completed_run_loader_fails_closed_on_incomplete_run(tmp_path: Path) -> None:
