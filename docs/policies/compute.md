@@ -62,7 +62,9 @@ Every new batched or parallel runtime path must include at least one of:
 - a test proving that the production configuration selects the batched path.
 
 The test must state its tolerance and verify the scientific output, not only
-array shapes or kernel invocation. Run `uv run pytest` after the change.
+array shapes or kernel invocation. Run focused equivalence checks during
+iteration and the full PF suite before publishing compute-path changes, as
+described in the [verification policy](verification.md).
 
 ## Narrow Exception
 

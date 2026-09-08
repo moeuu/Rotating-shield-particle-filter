@@ -47,7 +47,9 @@ a completed bundle or reuse a directory for a new implementation. Resuming an
 existing acquisition requires its recorded identity and the supported protocol.
 Keep stdout/stderr and monitor metadata together under `logs/<opaque-run-id>/`;
 use persistent sessions for long acquisitions. Tests must use pytest `tmp_path`
-or a temporary directory, never persistent `results/pf-test-*` folders.
+or an automatically cleaned temporary directory, never persistent
+`results/pf-test-*` folders. Remove disposable `tmp/` previews and exports once
+their review is complete; do not treat temporary directories as an archive.
 
 ## Retention and checks
 

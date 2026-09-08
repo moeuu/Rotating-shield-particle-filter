@@ -1083,9 +1083,10 @@ def _bind_estimator_to_published_log(
     log: MeasurementLog,
     *,
     live_records: Sequence[MeasurementLogRecord],
+    published_records_digest: DigestIdentity,
     control_policy_provenance: PFControlPolicyProvenance,
-) -> None:
-    """Bind a live PF to the immutable log after session identity checks."""
+) -> str:
+    """Bind the PF using the caller's verified published-record digest."""
     logged_isotopes = tuple(log.run_manifest["isotopes"])
     active_isotopes = tuple(estimator.joint_isotope_order())
     if active_isotopes != logged_isotopes:
@@ -1102,7 +1103,6 @@ def _bind_estimator_to_published_log(
         )
     try:
         live_records_digest = measurement_records_digest(tuple(live_records))
-        published_records_digest = measurement_records_digest(log.records)
     except (TypeError, ValueError) as exc:
         raise PFLiveSessionError(
             "Cannot authenticate the ordered live MeasurementLog records."
@@ -1126,6 +1126,7 @@ def _bind_estimator_to_published_log(
         session_hash_payload,
         artifact_name="PF resolved session identity",
     )
+    return digest
 
 
 def _context_energy_bin_edges(context: RunContext) -> NDArray[np.float64]:
@@ -2530,10 +2531,11 @@ class PFLiveSession:
                 "Published MeasurementLog records differ from the completed PF state."
             )
         before_bind = self._completed_state.checkpoint_state
-        _bind_estimator_to_published_log(
+        log_digest = _bind_estimator_to_published_log(
             self._estimator,
             log,
             live_records=self._records,
+            published_records_digest=published_digest,
             control_policy_provenance=(
                 self._completed_state.control_policy_provenance
             ),
@@ -2557,7 +2559,6 @@ class PFLiveSession:
         provenance = payload.get("provenance")
         if not isinstance(provenance, Mapping):
             raise PFLiveSessionError("Bound PF posterior lacks provenance.")
-        log_digest = log.log_sha256
         if provenance.get("measurement_log_sha256") != log_digest or (
             payload.get("record_count") != len(self._records)
         ):

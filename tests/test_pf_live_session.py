@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import pf.live_session as live_session_module
 from runtime.adaptive_client import AdaptiveCandidateSnapshot, AdaptiveStepRequest
 from runtime.assets import simulation_runtime_root
 from runtime.measurement_log import load_measurement_log
@@ -1551,7 +1552,20 @@ def test_bind_and_publication_never_advance_completed_pf(
         session.receive_persisted(log.records[-1])
     with pytest.raises(PFLiveSessionError, match="cannot plan"):
         session.planning_particle_snapshot()
+
+    record_hash_calls = []
+    original_digest = live_session_module.measurement_records_digest
+
+    def count_record_hashes(records):
+        """Count full-record passes during the publication boundary."""
+        record_hash_calls.append(len(records))
+        return original_digest(records)
+
+    monkeypatch.setattr(
+        live_session_module, "measurement_records_digest", count_record_hashes
+    )
     bound = session.bind_published_log(log)
+    assert record_hash_calls == [len(log.records), len(log.records)]
     publication = session.publication_input()
 
     assert len(estimator.update_calls) == update_count == 1

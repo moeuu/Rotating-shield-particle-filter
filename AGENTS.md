@@ -28,7 +28,10 @@
 
 ## Testing
 
-- After changing code, always run `pytest` and ensure tests pass.
+- Follow `docs/policies/verification.md`: run affected tests during iteration,
+  and the full suite for core inference/protocol changes and releases.
+- Documentation, layout, and artifact-only changes need their relevant checks;
+  do not rerun unrelated native physics tests.
 
 
 ## Git workflow

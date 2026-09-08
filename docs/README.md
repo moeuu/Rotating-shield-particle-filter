@@ -21,6 +21,9 @@ history retains them.
 
 ## Policies
 
+- [Proportionate verification](policies/verification.md): risk-based test scope,
+  digest reuse boundaries, and performance-aware validation.
+
 - [Artifact and Git policy](policies/artifacts.md): output layout, retention,
   generated-file exclusions, and read-only hygiene checks.
 

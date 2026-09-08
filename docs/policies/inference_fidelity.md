@@ -91,8 +91,10 @@ fallback for a production full simulation.
 
 ## Verification
 
-Run `uv run pytest` after every PF ingestion, likelihood, planning, diagnostic,
-or publication change. Add focused regression tests for any new option that
+Run affected tests during iteration and the full PF suite before publishing
+ingestion, likelihood, planning, or publication changes; follow the
+[verification policy](verification.md) for isolated diagnostic and presentation
+changes. Add focused regression tests for any new option that
 could weaken observation, target, geometry, truth-isolation, or causal-ordering
 contracts. Runtime-owned changes must be made and tested in the sibling runtime
 repository rather than copied here.
