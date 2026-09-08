@@ -31,6 +31,14 @@ from runtime.cui_components import (
 )
 
 from visualization.frame import PFFrame
+from visualization.metric_scene import (
+    draw_measurement_stations,
+    draw_obstacle_boxes,
+    draw_route_segments,
+    format_metric_projection_axis,
+    station_label,
+    station_label_offsets,
+)
 from visualization.obstacle_geometry import axis_aligned_box_faces
 
 DEFAULT_ISOTOPE_COLORS = {
@@ -486,38 +494,18 @@ class CUISplitPFVisualizer:
         self, points: NDArray[np.float64]
     ) -> NDArray[np.float64]:
         """Return small deterministic xy offsets for overlapping station labels."""
-        point_arr = np.asarray(points, dtype=float)
+        point_arr = np.asarray(points, dtype=np.float64)
         if point_arr.size == 0:
-            return np.zeros((0, 2), dtype=float)
-        offsets = np.zeros((point_arr.shape[0], 2), dtype=float)
-        used_counts: dict[tuple[float, float], int] = {}
-        radius = 0.16
-        for idx, point in enumerate(point_arr):
-            key = tuple(float(v) for v in np.round(point[:2], 3))
-            repeat_idx = used_counts.get(key, 0)
-            used_counts[key] = repeat_idx + 1
-            if repeat_idx == 0:
-                continue
-            angle = 2.0 * np.pi * float(repeat_idx - 1) / 6.0
-            offsets[idx, 0] = radius * np.cos(angle)
-            offsets[idx, 1] = radius * np.sin(angle)
-        return offsets
+            return np.zeros((0, 2), dtype=np.float64)
+        return station_label_offsets(point_arr[:, :2], radius=0.16)
 
     def _station_label(self, station_index: int) -> str:
         """Return a compact station label including repeated shield visits."""
-        station_id = (
-            self.measurement_station_ids[station_index]
-            if station_index < len(self.measurement_station_ids)
-            else station_index
+        return station_label(
+            station_index,
+            station_ids=self.measurement_station_ids,
+            visit_counts=self.measurement_visit_counts,
         )
-        visits = (
-            self.measurement_visit_counts[station_index]
-            if station_index < len(self.measurement_visit_counts)
-            else 1
-        )
-        if visits <= 1:
-            return str(station_id)
-        return f"{station_id}({visits})"
 
     def _frame_progress_label(self, frame: PFFrame) -> str:
         """Return a title suffix that separates measurement, render, and station progress."""
@@ -590,19 +578,17 @@ class CUISplitPFVisualizer:
 
     def _draw_obstacles_2d(self, ax: plt.Axes) -> None:
         """Draw canonical runtime obstacle footprints on a 2-D axis."""
-        from matplotlib.patches import Polygon
-
-        for index, footprint in enumerate(self.cui_scene.obstacle_footprints_xy):
-            ax.add_patch(
-                Polygon(
-                    footprint,
-                    closed=True,
-                    facecolor="black",
-                    edgecolor="none",
-                    alpha=0.75,
-                    label="physical obstacle" if index == 0 else None,
-                )
-            )
+        draw_obstacle_boxes(
+            ax,
+            self.cui_scene.obstacle_boxes_xyz,
+            projection="xy",
+            facecolor="#747c84",
+            edgecolor="#343a40",
+            linewidth=0.45,
+            alpha=0.58,
+            label="physical obstacle",
+            zorder=0.2,
+        )
 
     def _draw_navigation_occupancy_2d(self, ax: plt.Axes) -> None:
         """Draw robot-blocked cells behind physical obstacle footprints."""
@@ -648,31 +634,17 @@ class CUISplitPFVisualizer:
 
     def _draw_obstacles_xz(self, ax: plt.Axes) -> None:
         """Draw exact runtime obstacle x-z extents in an elevation view."""
-        from matplotlib.patches import Rectangle
-
-        seen: set[tuple[float, float, float, float]] = set()
-        for x0, _y0, z0, x1, _y1, z1 in self.cui_scene.obstacle_boxes_xyz:
-            rectangle = (
-                round(float(x0), 9),
-                round(float(z0), 9),
-                round(float(x1 - x0), 9),
-                round(float(z1 - z0), 9),
-            )
-            if rectangle in seen:
-                continue
-            seen.add(rectangle)
-            ax.add_patch(
-                Rectangle(
-                    rectangle[:2],
-                    rectangle[2],
-                    rectangle[3],
-                    facecolor="#737b84",
-                    edgecolor="#343a40",
-                    linewidth=0.35,
-                    alpha=0.24,
-                    zorder=1,
-                )
-            )
+        draw_obstacle_boxes(
+            ax,
+            self.cui_scene.obstacle_boxes_xyz,
+            projection="xz",
+            facecolor="#747c84",
+            edgecolor="#343a40",
+            linewidth=0.35,
+            alpha=0.30,
+            label="physical obstacle",
+            zorder=1.0,
+        )
 
     def _plot_true_sources_2d(self, ax: plt.Axes) -> None:
         """Plot numbered true sources and XYZ labels on a top-down view."""
@@ -748,35 +720,6 @@ class CUISplitPFVisualizer:
                 zorder=12,
             )
 
-    def _plot_source_match_segments_2d(self, ax: plt.Axes, frame: PFFrame) -> None:
-        """Draw nearest truth-to-estimate links for same-isotope source matches."""
-        for iso, truth_raw in self.true_sources.items():
-            truth = np.asarray(truth_raw, dtype=float)
-            est = np.asarray(
-                frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float)),
-                dtype=float,
-            )
-            if truth.size == 0 or est.size == 0:
-                continue
-            truth = truth.reshape((-1, 3))
-            est = est.reshape((-1, 3))
-            color = self.colors.get(iso, "black")
-            used_label = False
-            for src in truth:
-                distances = np.linalg.norm(est - src[None, :], axis=1)
-                nearest = est[int(np.argmin(distances))]
-                ax.plot(
-                    [src[0], nearest[0]],
-                    [src[1], nearest[1]],
-                    "--",
-                    color=color,
-                    alpha=0.45,
-                    linewidth=1.0,
-                    label="truth-estimate link" if not used_label else None,
-                    zorder=4,
-                )
-                used_label = True
-
     def _plot_true_sources_xz(self, ax: plt.Axes) -> None:
         """Plot numbered true sources and XYZ labels in x-z projection."""
         xmin, xmax, _, _, zmin, zmax = self.world_bounds
@@ -846,32 +789,6 @@ class CUISplitPFVisualizer:
                 label=f"estimate {iso}",
                 zorder=11,
             )
-
-    def _plot_source_match_segments_xz(self, ax: plt.Axes, frame: PFFrame) -> None:
-        """Draw nearest same-isotope truth-to-estimate links in x-z projection."""
-        for iso, truth_raw in self.true_sources.items():
-            truth = np.asarray(truth_raw, dtype=float)
-            est = np.asarray(
-                frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float)),
-                dtype=float,
-            )
-            if truth.size == 0 or est.size == 0:
-                continue
-            truth = truth.reshape((-1, 3))
-            est = est.reshape((-1, 3))
-            color = self.colors.get(iso, "black")
-            for src in truth:
-                distances = np.linalg.norm(est - src[None, :], axis=1)
-                nearest = est[int(np.argmin(distances))]
-                ax.plot(
-                    [src[0], nearest[0]],
-                    [src[2], nearest[2]],
-                    "--",
-                    color=color,
-                    alpha=0.45,
-                    linewidth=1.0,
-                    zorder=4,
-                )
 
     def _overview_summary_text(self, frame: PFFrame) -> str:
         """Return a compact textual source-count summary for the overview panel."""
@@ -1183,23 +1100,20 @@ class CUISplitPFVisualizer:
 
     def _save_robot_2d(self, frame: PFFrame, output_path: Path) -> None:
         """Save the current robot position and trajectory as a 2D PNG."""
-        xmin, xmax, ymin, ymax, _, _ = self.world_bounds
         fig, ax = plt.subplots(figsize=(7.0, 6.0))
         self._draw_navigation_occupancy_2d(ax)
         self._draw_obstacles_2d(ax)
         self._plot_true_sources_2d(ax)
-        for idx, segment in enumerate(self.path_segments):
-            if segment.shape[0] < 2:
-                continue
-            ax.plot(
-                segment[:, 0],
-                segment[:, 1],
-                "-",
-                color="cyan",
-                linewidth=2.0,
-                alpha=0.75,
-                label="traversed path" if idx == 0 else None,
-            )
+        draw_route_segments(
+            ax,
+            self.path_segments,
+            projection="xy",
+            color="cyan",
+            linewidth=2.0,
+            alpha=0.75,
+            label="traversed path",
+            zorder=5,
+        )
         path_waypoints = self._unique_path_waypoints()
         if path_waypoints.size:
             ax.scatter(
@@ -1216,37 +1130,17 @@ class CUISplitPFVisualizer:
             )
         if self.measurement_points:
             points = np.vstack(self.measurement_points)
-            ax.scatter(
-                points[:, 0],
-                points[:, 1],
-                s=55,
-                color="white",
+            draw_measurement_stations(
+                ax,
+                points,
+                projection="xy",
+                station_ids=self.measurement_station_ids,
+                visit_counts=self.measurement_visit_counts,
+                marker_size=55,
                 edgecolor="cyan",
                 linewidth=1.0,
-                label="measurement station",
-                zorder=9,
+                font_size=8.0,
             )
-            offsets = self._station_label_offsets(points)
-            for idx, point in enumerate(points):
-                label = self._station_label(idx)
-                text = ax.text(
-                    point[0] + offsets[idx, 0],
-                    point[1] + offsets[idx, 1],
-                    label,
-                    color="black",
-                    fontsize=8,
-                    ha="center",
-                    va="center",
-                    zorder=10,
-                )
-                text.set_path_effects(
-                    [
-                        path_effects.withStroke(
-                            linewidth=1.8,
-                            foreground="white",
-                        )
-                    ]
-                )
         robot = np.asarray(frame.robot_position, dtype=float)
         ax.scatter(
             [robot[0]],
@@ -1259,18 +1153,15 @@ class CUISplitPFVisualizer:
             zorder=10,
         )
         self._plot_estimated_sources_2d(ax, frame)
-        ax.set_xlim(*_padded_metric_bounds(xmin, xmax))
-        ax.set_ylim(*_padded_metric_bounds(ymin, ymax))
-        _apply_metric_ticks_2d(
+        format_metric_projection_axis(
             ax,
-            xlim=(float(xmin), float(xmax)),
-            ylim=(float(ymin), float(ymax)),
+            bounds_xyz=self.world_bounds,
+            projection="xy",
+            title=f"Robot 2D position - {self._frame_progress_label(frame)}",
+            title_size=10.0,
+            label_size=9.0,
+            tick_size=8.0,
         )
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("x [m]")
-        ax.set_ylabel("y [m]")
-        ax.set_title(f"Robot 2D position - {self._frame_progress_label(frame)}")
-        ax.grid(True, alpha=0.25)
         ax.legend(
             loc="upper left",
             bbox_to_anchor=(1.02, 1.0),
@@ -1284,7 +1175,6 @@ class CUISplitPFVisualizer:
 
     def _save_experiment_overview(self, frame: PFFrame, output_path: Path) -> None:
         """Save a paper-oriented overview with map, estimates, and elevation view."""
-        xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
         fig = plt.figure(figsize=(11.2, 8.0))
         grid = fig.add_gridspec(
             2,
@@ -1298,32 +1188,29 @@ class CUISplitPFVisualizer:
         info_ax.axis("off")
         self._draw_navigation_occupancy_2d(map_ax)
         self._draw_obstacles_2d(map_ax)
-        self._plot_source_match_segments_2d(map_ax, frame)
         self._plot_true_sources_2d(map_ax)
-        for idx, segment in enumerate(self.path_segments):
-            if segment.shape[0] < 2:
-                continue
-            map_ax.plot(
-                segment[:, 0],
-                segment[:, 1],
-                "-",
-                color="cyan",
-                linewidth=2.0,
-                alpha=0.72,
-                label="traversed path" if idx == 0 else None,
-                zorder=5,
-            )
+        draw_route_segments(
+            map_ax,
+            self.path_segments,
+            projection="xy",
+            color="cyan",
+            linewidth=2.0,
+            alpha=0.72,
+            label="traversed path",
+            zorder=5,
+        )
         if self.measurement_points:
             points = np.vstack(self.measurement_points)
-            map_ax.scatter(
-                points[:, 0],
-                points[:, 1],
-                s=48,
-                color="white",
+            draw_measurement_stations(
+                map_ax,
+                points,
+                projection="xy",
+                station_ids=self.measurement_station_ids,
+                visit_counts=self.measurement_visit_counts,
+                marker_size=48,
                 edgecolor="cyan",
                 linewidth=1.0,
-                label="measurement station",
-                zorder=9,
+                font_size=7.2,
             )
         robot = np.asarray(frame.robot_position, dtype=float).reshape(3)
         map_ax.scatter(
@@ -1337,50 +1224,49 @@ class CUISplitPFVisualizer:
             zorder=13,
         )
         self._plot_estimated_sources_2d(map_ax, frame)
-        map_ax.set_xlim(*_padded_metric_bounds(xmin, xmax))
-        map_ax.set_ylim(*_padded_metric_bounds(ymin, ymax))
-        _apply_metric_ticks_2d(
+        format_metric_projection_axis(
             map_ax,
-            xlim=(float(xmin), float(xmax)),
-            ylim=(float(ymin), float(ymax)),
+            bounds_xyz=self.world_bounds,
+            projection="xy",
+            title="(a) Recorded floor map",
+            title_size=10.5,
+            label_size=9.0,
+            tick_size=8.0,
+            title_weight="bold",
         )
-        map_ax.set_aspect("equal", adjustable="box")
-        map_ax.set_xlabel("x [m]")
-        map_ax.set_ylabel("y [m]")
-        map_ax.set_title("Top-down acquisition and source map")
-        map_ax.grid(True, alpha=0.25)
 
         self._draw_obstacles_xz(elev_ax)
-        self._plot_source_match_segments_xz(elev_ax, frame)
         self._plot_true_sources_xz(elev_ax)
         self._plot_estimated_sources_xz(elev_ax, frame)
         if self.measurement_points:
             points = np.vstack(self.measurement_points)
-            elev_ax.scatter(
-                points[:, 0],
-                points[:, 2],
-                s=28,
-                color="cyan",
-                edgecolor="black",
-                linewidth=0.4,
-                alpha=0.55,
-                label="station height",
+            draw_measurement_stations(
+                elev_ax,
+                points,
+                projection="xz",
+                station_ids=self.measurement_station_ids,
+                visit_counts=self.measurement_visit_counts,
+                marker_size=34,
+                facecolor="white",
+                edgecolor="#009eae",
+                linewidth=0.8,
+                alpha=0.92,
+                label="measurement station",
+                font_size=6.8,
+                label_offset_radius=0.10,
+                label_stroke_width=1.5,
                 zorder=6,
             )
-        elev_ax.axhline(float(zmin), color="black", linewidth=0.8, alpha=0.45)
-        elev_ax.axhline(float(zmax), color="black", linewidth=0.8, alpha=0.25)
-        elev_ax.set_xlim(*_padded_metric_bounds(xmin, xmax))
-        elev_ax.set_ylim(*_padded_metric_bounds(zmin, zmax, fraction=0.04))
-        _apply_metric_ticks_2d(
+        format_metric_projection_axis(
             elev_ax,
-            xlim=(float(xmin), float(xmax)),
-            ylim=(float(zmin), float(zmax)),
+            bounds_xyz=self.world_bounds,
+            projection="xz",
+            title="(b) Recorded elevation map",
+            title_size=10.5,
+            label_size=9.0,
+            tick_size=8.0,
+            title_weight="bold",
         )
-        elev_ax.set_aspect("equal", adjustable="box")
-        elev_ax.set_xlabel("x [m]")
-        elev_ax.set_ylabel("z [m]")
-        elev_ax.set_title("Elevation: physical obstacles and source height")
-        elev_ax.grid(True, alpha=0.25)
         handles, labels = map_ax.get_legend_handles_labels()
         elev_handles, elev_labels = elev_ax.get_legend_handles_labels()
         legend_by_label = dict(zip(labels + elev_labels, handles + elev_handles))

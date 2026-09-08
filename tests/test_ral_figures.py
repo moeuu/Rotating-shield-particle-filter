@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 
@@ -309,14 +311,108 @@ def _write_split_aware_evaluation(root: Path) -> Path:
 
 
 def test_render_concept_figures_write_files(tmp_path: Path) -> None:
-    """Concept figure rendering should write nonempty PDF files."""
-    fig1 = figures.render_problem_setting(tmp_path / "fig1.pdf")
-    fig2 = figures.render_method_overview(tmp_path / "fig2.pdf")
+    """Authenticated Isaac figure composition should write nonempty PDFs."""
+    capture_dir = tmp_path / "captures"
+    capture_dir.mkdir()
+    image_paths: list[Path] = []
+    for index in range(4):
+        image_path = capture_dir / f"shield_{index}.png"
+        plt.imsave(image_path, np.full((240, 320, 3), 0.5 + index * 0.05))
+        image_paths.append(image_path)
+    environment_path = capture_dir / "environment.png"
+    plt.imsave(environment_path, np.full((240, 400, 3), 0.7))
+    provenance_path = capture_dir / "provenance.json"
+    provenance_path.write_text(
+        json.dumps(
+            {
+                "detector_sequence": {
+                    "recorded_pair_ids": [1, 45, 27, 49],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fig1 = figures.render_experiment_environment(
+        tmp_path / "fig1.pdf",
+        image_path=environment_path,
+    )
+    fig2 = figures.render_detector_shield_sequence(
+        tmp_path / "fig2.pdf",
+        image_paths=tuple(image_paths),
+        provenance_path=provenance_path,
+    )
 
     assert fig1.exists()
     assert fig2.exists()
     assert fig1.stat().st_size > 1000
     assert fig2.stat().st_size > 1000
+
+
+def test_detector_sequence_arrows_are_between_adjacent_panels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each sequence arrow should occupy its own inter-panel column."""
+    image_paths: list[Path] = []
+    for index in range(4):
+        image_path = tmp_path / f"shield_{index}.png"
+        plt.imsave(image_path, np.full((240, 320, 3), 0.5 + index * 0.05))
+        image_paths.append(image_path)
+    provenance_path = tmp_path / "provenance.json"
+    _write_json(
+        provenance_path,
+        {"detector_sequence": {"recorded_pair_ids": [1, 45, 27, 49]}},
+    )
+    captured: dict[str, plt.Figure] = {}
+
+    def capture_figure(fig: plt.Figure, output_path: Path) -> Path:
+        """Retain the unsaved figure so its final layout can be inspected."""
+        captured["figure"] = fig
+        return output_path
+
+    monkeypatch.setattr(figures, "save_figure", capture_figure)
+    figures.render_detector_shield_sequence(
+        tmp_path / "fig2.pdf",
+        image_paths=tuple(image_paths),
+        provenance_path=provenance_path,
+    )
+
+    fig = captured["figure"]
+    panel_axes = [ax for ax in fig.axes if not ax.get_label().startswith("sequence-")]
+    arrow_axes = [ax for ax in fig.axes if ax.get_label().startswith("sequence-")]
+    assert len(panel_axes) == 4
+    assert len(arrow_axes) == 3
+    for index, arrow_ax in enumerate(arrow_axes):
+        left_box = panel_axes[index].get_position()
+        arrow_box = arrow_ax.get_position()
+        right_box = panel_axes[index + 1].get_position()
+        assert left_box.x1 <= arrow_box.x0 < arrow_box.x1 <= right_box.x0
+        assert len(arrow_ax.texts) == 1
+    plt.close(fig)
+
+
+def test_capture_provenance_sources_are_hash_verified(tmp_path: Path) -> None:
+    """Paper provenance must transitively bind the raw Isaac/Geant4 inputs."""
+    source = tmp_path / "actual-geant4-tracks.json"
+    source.write_text("native steps\n", encoding="utf-8")
+    provenance = tmp_path / "capture-provenance.json"
+    _write_json(
+        provenance,
+        {
+            "source_files": [
+                {
+                    "path": source.resolve().as_posix(),
+                    "sha256": figures._sha256(source),
+                }
+            ]
+        },
+    )
+
+    assert figures._verified_capture_source_paths(provenance) == [source.resolve()]
+    source.write_text("altered\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="differs from provenance"):
+        figures._verified_capture_source_paths(provenance)
 
 
 def test_completed_run_loader_and_figure_are_auditable(tmp_path: Path) -> None:
@@ -363,8 +459,13 @@ def test_split_aware_current_run_figure_uses_merged_source_metrics(
         tmp_path / "current_result.pdf",
         split_aware_evaluation=evaluation_path,
     )
+    scene_output = figures.render_completed_run_scene(
+        run_dir,
+        tmp_path / "current_scene.pdf",
+        split_aware_evaluation=evaluation_path,
+    )
     provenance = figures.write_figure_provenance(
-        [output],
+        [output, scene_output],
         tmp_path / "current_provenance.json",
         completed_run_dir=run_dir,
         split_aware_evaluation=evaluation_path,
@@ -378,12 +479,84 @@ def test_split_aware_current_run_figure_uses_merged_source_metrics(
     assert metrics["position_pass_count"] == 1
     assert metrics["joint_position_strength_pass_count"] == 1
     assert output.exists()
+    assert scene_output.exists()
     assert provenance.exists()
+    provenance_payload = json.loads(provenance.read_text(encoding="utf-8"))
+    assert "manuscript_scene" in provenance_payload["transformations"]
     source_paths = {
         row["path"]
-        for row in json.loads(provenance.read_text(encoding="utf-8"))["source_files"]
+        for row in provenance_payload["source_files"]
     }
     assert evaluation_path.resolve().as_posix() in source_paths
+
+
+def test_result_projections_share_station_order_without_duplicate_room_frame(
+    tmp_path: Path,
+) -> None:
+    """Both paper projections must share labels and avoid a mystery room box."""
+    run_dir = _write_completed_run(tmp_path / "run")
+    evaluation_path = _write_split_aware_evaluation(run_dir)
+    bundle = figures.load_split_aware_completed_run(run_dir, evaluation_path)
+    figure, (floor_axis, elevation_axis) = plt.subplots(1, 2)
+
+    with mock.patch.object(
+        floor_axis,
+        "scatter",
+        wraps=floor_axis.scatter,
+    ) as floor_scatter:
+        figures._plot_projection(
+            floor_axis,
+            bundle,
+            projection="xy",
+            title="Recorded floor map",
+            label_truth_ids=False,
+            emphasize_stations=True,
+            show_station_labels=True,
+            show_truth_estimate_links=False,
+            show_raw_components=False,
+            use_cui_source_markers=True,
+        )
+    figures._plot_projection(
+        elevation_axis,
+        bundle,
+        projection="xz",
+        title="Recorded elevation map",
+        label_truth_ids=False,
+        show_route_segments=False,
+        emphasize_stations=True,
+        show_station_labels=True,
+        show_truth_estimate_links=False,
+    )
+
+    expected_station_labels = {"0", "1"}
+    assert {text.get_text() for text in floor_axis.texts}.issuperset(
+        expected_station_labels
+    )
+    assert {text.get_text() for text in elevation_axis.texts}.issuperset(
+        expected_station_labels
+    )
+    assert len(floor_axis.lines) == 1
+    assert not elevation_axis.lines
+    source_markers = [
+        call.kwargs.get("marker")
+        for call in floor_scatter.call_args_list
+        if call.kwargs.get("marker") is not None
+    ]
+    assert source_markers.count("*") == len(bundle.truth_sources)
+    assert source_markers.count("x") == len(bundle.split_aware_results)
+    assert "P" not in source_markers
+    assert "X" not in source_markers
+    room_width, room_height, _ = bundle.room_xyz_m
+    full_room_patches = [
+        patch
+        for patch in floor_axis.patches
+        if hasattr(patch, "get_xy")
+        and tuple(float(value) for value in patch.get_xy()) == (0.0, 0.0)
+        and float(patch.get_width()) == pytest.approx(room_width)
+        and float(patch.get_height()) == pytest.approx(room_height)
+    ]
+    assert not full_room_patches
+    plt.close(figure)
 
 
 def test_split_aware_current_run_figure_rejects_altered_aggregation(

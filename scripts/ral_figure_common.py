@@ -15,22 +15,28 @@ plt.rcParams["ps.fonttype"] = 42
 
 ROOT = Path(__file__).resolve().parents[1]
 LATEX_ROOT = ROOT.parent / "ai-latex-workspace" / "projects" / "ieee-ra-l-letter"
-FIG1_PATH = LATEX_ROOT / "sections/01_introduction/figures/ral_problem_shield_code.pdf"
-FIG2_PATH = LATEX_ROOT / "sections/03_system_model/figures/ral_method_loop.pdf"
+FIG1_PATH = (
+    LATEX_ROOT
+    / "sections/01_introduction/figures/ral_experiment_environment.pdf"
+)
+FIG2_PATH = (
+    LATEX_ROOT
+    / "sections/03_system_model/figures/ral_detector_shield_sequence.pdf"
+)
 REVIEW_DIR = ROOT / "results" / "ral_figure_review"
 EXPERIMENT_FIG_PATH = REVIEW_DIR / "ral_result_case_audit.pdf"
+MANUSCRIPT_RESULT_FIG_PATH = (
+    LATEX_ROOT / "sections/05_experiments/figures/ral_robot_result.pdf"
+)
 ISAAC_FIGURE_DIR = ROOT / "results" / "ral_isaac_figures"
-ISAAC_PROBLEM_RENDER = ISAAC_FIGURE_DIR / "capture_problem_setting" / "rgb_0000.png"
-ISAAC_DETECTOR_RENDER = ISAAC_FIGURE_DIR / "capture_detector_module" / "rgb_0000.png"
-ISAAC_STATION_RENDER = (
-    ISAAC_FIGURE_DIR / "capture_simulation_environment" / "rgb_0000.png"
+ISAAC_ENVIRONMENT_RENDER = ISAAC_FIGURE_DIR / "experiment_environment.png"
+ISAAC_SHIELD_SEQUENCE_RENDERS = (
+    ISAAC_FIGURE_DIR / "shield_sequence_00.png",
+    ISAAC_FIGURE_DIR / "shield_sequence_01.png",
+    ISAAC_FIGURE_DIR / "shield_sequence_02.png",
+    ISAAC_FIGURE_DIR / "shield_sequence_03.png",
 )
-ISAAC_SHIELD_PROGRAM_RENDERS = (
-    ISAAC_FIGURE_DIR / "capture_shield_selection_00" / "rgb_0000.png",
-    ISAAC_FIGURE_DIR / "capture_shield_selection_01" / "rgb_0000.png",
-    ISAAC_FIGURE_DIR / "capture_shield_selection_02" / "rgb_0000.png",
-    ISAAC_FIGURE_DIR / "capture_shield_selection_03" / "rgb_0000.png",
-)
+ISAAC_CAPTURE_PROVENANCE = ISAAC_FIGURE_DIR / "isaac_capture_provenance.json"
 FIG_TITLE_SIZE = 8.6
 FIG_LABEL_SIZE = 7.8
 FIG_TICK_SIZE = 7.2

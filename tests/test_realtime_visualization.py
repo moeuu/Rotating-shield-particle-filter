@@ -310,10 +310,11 @@ def test_cui_scene_preserves_asymmetric_obstacle_xy_order(tmp_path: Path) -> Non
     figure, axis = plt.subplots()
     try:
         visualizer._draw_obstacles_2d(axis)
-        np.testing.assert_array_equal(
-            axis.patches[0].get_xy()[:4],
-            expected_xy,
-        )
+        obstacle = axis.patches[0]
+        assert obstacle.get_x() == pytest.approx(3.25)
+        assert obstacle.get_y() == pytest.approx(3.0)
+        assert obstacle.get_width() == pytest.approx(0.5)
+        assert obstacle.get_height() == pytest.approx(0.5)
     finally:
         plt.close(figure)
     figure, axis = plt.subplots()
@@ -362,6 +363,44 @@ def test_cui_3d_obstacles_preserve_physical_component_height(
     assert len(faces) == 6
     assert {point[2] for face in faces for point in face} == {0.4, 2.7}
     assert any(len({point[2] for point in face}) == 2 for face in faces)
+
+
+def test_cui_overview_labels_station_order_in_floor_and_elevation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CUI overview must use matching station labels in xy and xz views."""
+    route = cui_route_from_records(
+        (
+            _route_record(0, 0, pose_xyz=(1.0, 2.0, 0.5)),
+            _route_record(1, 1, pose_xyz=(3.0, 4.0, 1.5)),
+        )
+    )
+    visualizer = CUISplitPFVisualizer(
+        isotopes=["Cs-137"],
+        output_dir=tmp_path,
+    )
+    visualizer._apply_route(route)
+    projections: list[tuple[str, bool]] = []
+    original_drawer = realtime_viz.draw_measurement_stations
+
+    def record_station_projection(*args: object, **kwargs: object) -> object:
+        """Record projection and label visibility before drawing stations."""
+        projections.append(
+            (str(kwargs["projection"]), bool(kwargs.get("show_labels", True)))
+        )
+        return original_drawer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        realtime_viz,
+        "draw_measurement_stations",
+        record_station_projection,
+    )
+    output = tmp_path / "overview.png"
+    visualizer._save_experiment_overview(_empty_frame(1, route), output)
+
+    assert projections == [("xy", True), ("xz", True)]
+    assert output.is_file()
 
 
 def test_cui_writes_plain_and_neighborhood_labeled_pf_images(

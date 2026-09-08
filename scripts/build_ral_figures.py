@@ -14,11 +14,12 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.lines import Line2D
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Rectangle
+from matplotlib.patches import Rectangle
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.optimize import linear_sum_assignment
 
@@ -26,6 +27,12 @@ from visualization.obstacle_geometry import (
     axis_aligned_box_faces,
     blocked_cell_boxes,
     validated_axis_aligned_boxes,
+)
+from visualization.metric_scene import (
+    draw_measurement_stations,
+    draw_obstacle_boxes,
+    draw_route_segments,
+    format_metric_projection_axis,
 )
 
 try:
@@ -36,9 +43,11 @@ try:
         FIG_LABEL_SIZE,
         FIG_TICK_SIZE,
         FIG_TITLE_SIZE,
-        ISAAC_DETECTOR_RENDER,
-        ISAAC_PROBLEM_RENDER,
+        ISAAC_CAPTURE_PROVENANCE,
+        ISAAC_ENVIRONMENT_RENDER,
+        ISAAC_SHIELD_SEQUENCE_RENDERS,
         ISOTOPE_COLORS,
+        MANUSCRIPT_RESULT_FIG_PATH,
         REVIEW_DIR,
         read_json,
         save_figure,
@@ -52,9 +61,11 @@ except ModuleNotFoundError:
         FIG_LABEL_SIZE,
         FIG_TICK_SIZE,
         FIG_TITLE_SIZE,
-        ISAAC_DETECTOR_RENDER,
-        ISAAC_PROBLEM_RENDER,
+        ISAAC_CAPTURE_PROVENANCE,
+        ISAAC_ENVIRONMENT_RENDER,
+        ISAAC_SHIELD_SEQUENCE_RENDERS,
         ISOTOPE_COLORS,
+        MANUSCRIPT_RESULT_FIG_PATH,
         REVIEW_DIR,
         read_json,
         save_figure,
@@ -66,6 +77,7 @@ POSITION_THRESHOLD_M = 0.5
 STRENGTH_THRESHOLD_FRACTION = 0.25
 HARD_CAP = 8
 HARD_CAP_MASS_THRESHOLD = 0.05
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +118,10 @@ class CompletedRunBundle:
     """Contain the verified data needed for one completed-run figure."""
 
     root: Path
+    pf_output_dir: Path
+    measurement_log_dir: Path
+    truth_manifest_path: Path
+    planner_audit_path: Path
     run_id: str
     estimator_commit: str
     predecessor_code: bool
@@ -430,10 +446,9 @@ def _route_segments_equal(
 def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     """Load and cross-check one durable completed full-simulation bundle."""
     root = Path(run_dir).expanduser().resolve()
-    result = read_json(root / "pf_output" / "closed_loop_result.json")
-    truth = read_json(root / "truth_manifest.json")
-    environment = read_json(root / "measurement_log" / "environment.json")
-    posterior = read_json(root / "pf_output" / "pf_posterior.json")
+    staged_bundle = (root / "pf_output" / "closed_loop_result.json").is_file()
+    pf_output_dir = root / "pf_output" if staged_bundle else root
+    result = read_json(pf_output_dir / "closed_loop_result.json")
     if (
         result.get("schema_version") != 2
         or result.get("execution_status") != "complete"
@@ -448,11 +463,31 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     run_id = result.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("Completed result must contain one nonempty run_id.")
+    if staged_bundle:
+        measurement_log_dir = root / "measurement_log"
+        truth_manifest_path = root / "truth_manifest.json"
+        planner_audit_path = root / "planner_audit.jsonl"
+    else:
+        measurement_log_dir = (
+            ROOT / "results" / "ral_ablation" / "measurement_logs" / run_id
+        )
+        truth_manifest_path = (
+            ROOT.parent
+            / "Rotating-shield-simulation-runtime"
+            / "private_runs"
+            / "ral_ablation"
+            / "truth_manifests"
+            / f"{run_id}.json"
+        )
+        planner_audit_path = pf_output_dir / "planner_audit.jsonl"
+    truth = read_json(truth_manifest_path)
+    environment = read_json(measurement_log_dir / "environment.json")
+    posterior = read_json(pf_output_dir / "pf_posterior.json")
     if truth.get("run_id") != run_id:
         raise ValueError("Completed result and truth manifest run_id values differ.")
 
     with np.load(
-        root / "measurement_log" / "observations.npz", allow_pickle=False
+        measurement_log_dir / "observations.npz", allow_pickle=False
     ) as obs:
         station_ids = np.asarray(obs["station_id"], dtype=np.int64)
         poses = np.asarray(obs["detector_pose_xyz"], dtype=np.float64)
@@ -491,7 +526,7 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
 
     truth_sources, estimated_sources = _source_records(truth, posterior)
     matches = _match_sources(truth_sources, estimated_sources)
-    trace_rows = _load_json_lines(root / "pf_output" / "pf_station_trace.jsonl")
+    trace_rows = _load_json_lines(pf_output_dir / "pf_station_trace.jsonl")
     if len(trace_rows) != station_count:
         raise ValueError(
             "PF station trace length differs from completed station_count."
@@ -504,14 +539,14 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     measurement_log_sha256 = provenance.get("measurement_log_sha256")
     if not isinstance(measurement_log_sha256, str) or not measurement_log_sha256:
         raise ValueError("PF posterior lacks its MeasurementLog identity.")
-    figure_data_path = root / "pf_output" / "pf_figure_data.json"
+    figure_data_path = pf_output_dir / "pf_figure_data.json"
     figure_route_segments = _load_figure_route_segments(
         figure_data_path,
         run_id=run_id,
         measurement_log_sha256=measurement_log_sha256,
     )
     log_route_segments = _load_measurement_log_route_segments(
-        root / "measurement_log" / "observation_metadata.jsonl",
+        measurement_log_dir / "observation_metadata.jsonl",
         run_id=run_id,
     )
     if figure_data_path.is_file() and not _route_segments_equal(
@@ -528,6 +563,10 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
     )
     return CompletedRunBundle(
         root=root,
+        pf_output_dir=pf_output_dir,
+        measurement_log_dir=measurement_log_dir,
+        truth_manifest_path=truth_manifest_path,
+        planner_audit_path=planner_audit_path,
         run_id=run_id,
         estimator_commit=estimator_commit,
         predecessor_code=True,
@@ -539,7 +578,7 @@ def load_completed_run(run_dir: Path) -> CompletedRunBundle:
         truth_sources=truth_sources,
         estimated_sources=estimated_sources,
         matches=matches,
-        posterior_support=_posterior_support(root / "pf_output" / "pf_particles.npz"),
+        posterior_support=_posterior_support(pf_output_dir / "pf_particles.npz"),
         station_indices=station_indices,
         map_cardinality=map_cardinality,
         hard_cap_mass=hard_cap_mass,
@@ -577,7 +616,7 @@ def _load_split_aware_source_results(
         != "one_per_truth_cluster_plus_response_distinct_remote"
     ):
         raise ValueError("Split-aware evaluation uses unsupported metric semantics.")
-    provenance = read_json(bundle.root / "pf_output" / "pf_posterior.json").get(
+    provenance = read_json(bundle.pf_output_dir / "pf_posterior.json").get(
         "provenance",
         {},
     )
@@ -858,6 +897,40 @@ def _artifact_record(path: Path) -> dict[str, object]:
     }
 
 
+def _verified_capture_source_paths(provenance_path: Path) -> list[Path]:
+    """Return source paths whose hashes match one Isaac capture manifest."""
+    payload = read_json(Path(provenance_path).expanduser().resolve())
+    raw_records = payload.get("source_files")
+    if not isinstance(raw_records, list):
+        raise TypeError("Isaac capture provenance lacks source_files.")
+    paths: list[Path] = []
+    for record in raw_records:
+        if not isinstance(record, dict):
+            raise TypeError("Isaac capture source records must be objects.")
+        raw_path = record.get("path")
+        expected_digest = record.get("sha256")
+        if not isinstance(raw_path, str) or not isinstance(expected_digest, str):
+            raise TypeError("Isaac capture source record is incomplete.")
+        path = Path(raw_path).expanduser().resolve()
+        if not path.is_file() or _sha256(path) != expected_digest:
+            raise ValueError(f"Isaac capture source differs from provenance: {path}.")
+        paths.append(path)
+    return paths
+
+
+def _unique_resolved_paths(paths: list[Path]) -> list[Path]:
+    """Return paths once each in first-seen order."""
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = Path(path).expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return unique
+
+
 def write_figure_provenance(
     generated: list[Path],
     output_path: Path,
@@ -868,10 +941,17 @@ def write_figure_provenance(
     """Write a machine-readable source and transformation manifest."""
     concept_outputs = {FIG1_PATH.resolve(), FIG2_PATH.resolve()}
     inputs = (
-        [ISAAC_PROBLEM_RENDER, ISAAC_DETECTOR_RENDER]
+        [
+            ISAAC_CAPTURE_PROVENANCE,
+            ISAAC_ENVIRONMENT_RENDER,
+            *ISAAC_SHIELD_SEQUENCE_RENDERS,
+            ROOT / "scripts/render_isaac_ral_figures.py",
+        ]
         if any(Path(path).resolve() in concept_outputs for path in generated)
         else []
     )
+    if inputs:
+        inputs.extend(_verified_capture_source_paths(ISAAC_CAPTURE_PROVENANCE))
     bundle: CompletedRunBundle | None = None
     if completed_run_dir is not None:
         bundle = (
@@ -884,21 +964,21 @@ def write_figure_provenance(
         )
         inputs.extend(
             (
-                bundle.root / "truth_manifest.json",
-                bundle.root / "measurement_log" / "environment.json",
-                bundle.root / "measurement_log" / "observations.npz",
-                bundle.root
-                / "measurement_log"
-                / "observation_metadata.jsonl",
-                bundle.root / "pf_output" / "closed_loop_result.json",
-                bundle.root / "pf_output" / "pf_posterior.json",
-                bundle.root / "pf_output" / "pf_particles.npz",
-                bundle.root / "pf_output" / "pf_station_trace.jsonl",
+                bundle.truth_manifest_path,
+                bundle.measurement_log_dir / "environment.json",
+                bundle.measurement_log_dir / "observations.npz",
+                bundle.measurement_log_dir / "observation_metadata.jsonl",
+                bundle.pf_output_dir / "closed_loop_result.json",
+                bundle.pf_output_dir / "pf_posterior.json",
+                bundle.pf_output_dir / "pf_particles.npz",
+                bundle.pf_output_dir / "pf_station_trace.jsonl",
             )
         )
-        figure_data_path = bundle.root / "pf_output" / "pf_figure_data.json"
+        figure_data_path = bundle.pf_output_dir / "pf_figure_data.json"
         if figure_data_path.is_file():
             inputs.append(figure_data_path)
+        if bundle.planner_audit_path.is_file():
+            inputs.append(bundle.planner_audit_path)
         if split_aware_evaluation is not None:
             inputs.append(Path(split_aware_evaluation))
     experiment_transformation = (
@@ -913,19 +993,45 @@ def write_figure_provenance(
         "panel uses strength-weighted RMS position and aggregate strength "
         "against the 0.5 m and 25% performance targets."
     )
+    scene_transformation = (
+        "Authenticated physical obstacle components, persisted route segments, "
+        "measurement stations, truth sources, and posterior components are "
+        "rendered in matched metric floor and x-z elevation views, following "
+        "the saved CUI view grammar while replacing occupancy blocks with exact "
+        "physical components; "
+        "split-aware centroids are recomputed from their assigned raw components "
+        "when a schema-v3 evaluation is supplied."
+    )
     payload: dict[str, object] = {
         "schema_version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "target": "IEEE Robotics and Automation Letters, initial submission",
-        "source_files": [_artifact_record(path) for path in inputs],
+        "source_files": [
+            _artifact_record(path) for path in _unique_resolved_paths(inputs)
+        ],
         "outputs": [_artifact_record(path) for path in generated],
         "transformations": {
-            "concept_figures": (
-                "Direct raster crops plus vector annotations; no synthetic "
-                "measurement or response data."
+            "isaac_environment": (
+                "Authenticated current-scene Isaac Sim capture with vector "
+                "labels and legend. Obstacles, source positions, station poses, "
+                "and route originate from the bound run artifacts. Green lines "
+                "are selected actual isotropically emitted native-Geant4 "
+                "primary-gamma step trajectories; their raw artifact, identifiers, "
+                "and selection rule are retained by the Isaac capture provenance."
             ),
-            "completed_run_figure": experiment_transformation,
-            "randomness": "none",
+            "detector_shield_sequence": (
+                "Common crop of four Isaac Sim captures at one fixed studio pose; "
+                "Fe/Pb indices are four acquired pairs from the first adaptive "
+                "station selected for projected spatial separation and visibility. "
+                "All eight acquired candidate renders are retained. Component "
+                "labels and sequence arrows are vector overlays."
+            ),
+            "completed_run_audit": experiment_transformation,
+            "manuscript_scene": scene_transformation,
+            "randomness": (
+                "none in figure composition or Isaac capture; Geant4 display-"
+                "trajectory seeds and raw step endpoints are recorded separately"
+            ),
         },
     }
     if bundle is not None:
@@ -942,270 +1048,301 @@ def write_figure_provenance(
     return resolved_output
 
 
-def _draw_image(ax: Axes, path: Path, *, title: str) -> None:
-    """Draw one cropped scientific-render panel with a readable title."""
-    image = plt.imread(Path(path).as_posix())
-    height, width = image.shape[:2]
-    crop = image[
-        int(0.06 * height) : int(0.92 * height), int(0.05 * width) : int(0.95 * width)
+def _require_raster(path: Path) -> np.ndarray:
+    """Load one authenticated raster input or fail with an actionable message."""
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(
+            f"Missing Isaac Sim capture {resolved}; run "
+            "scripts/render_isaac_ral_figures.py first."
+        )
+    image = np.asarray(mpimg.imread(resolved))
+    if image.ndim not in (2, 3) or image.shape[0] < 100 or image.shape[1] < 100:
+        raise ValueError(f"Isaac Sim capture {resolved} has an invalid image shape.")
+    return image
+
+
+def _isaac_capture_pair_ids(provenance_path: Path) -> tuple[int, ...]:
+    """Return the four recorded pair identifiers bound to the raw captures."""
+    provenance = read_json(Path(provenance_path).expanduser().resolve())
+    detector_sequence = provenance.get("detector_sequence")
+    if not isinstance(detector_sequence, dict):
+        raise TypeError("Isaac capture provenance lacks detector_sequence.")
+    raw_pair_ids = detector_sequence.get(
+        "selected_pair_ids",
+        detector_sequence.get("recorded_pair_ids"),
+    )
+    if not isinstance(raw_pair_ids, list):
+        raise TypeError("Isaac capture provenance lacks recorded_pair_ids.")
+    pair_ids = tuple(int(value) for value in raw_pair_ids)
+    if len(pair_ids) != 4 or any(value < 0 or value >= 64 for value in pair_ids):
+        raise ValueError("Isaac shield sequence must contain four valid pair IDs.")
+    return pair_ids
+
+
+def _environment_legend_handles() -> list[Line2D]:
+    """Return compact, readable keys for the contextual Isaac scene."""
+    return [
+        Line2D(
+            [],
+            [],
+            marker="s",
+            markersize=5.5,
+            markerfacecolor="#69747d",
+            markeredgecolor="#30363b",
+            linestyle="none",
+            label="Mapped obstacles",
+        ),
+        Line2D(
+            [],
+            [],
+            marker="s",
+            markersize=5.5,
+            markerfacecolor="#26343e",
+            markeredgecolor="#111111",
+            linestyle="none",
+            label="Robot + CeBr$_3$/Fe/Pb",
+        ),
+        Line2D(
+            [],
+            [],
+            marker="o",
+            markersize=5.5,
+            markerfacecolor=ISOTOPE_COLORS["Cs-137"],
+            markeredgecolor="#751313",
+            linestyle="none",
+            label="Cs-137 source",
+        ),
+        Line2D(
+            [],
+            [],
+            color="#00a6b2",
+            marker="o",
+            markerfacecolor="#222222",
+            markeredgecolor="#222222",
+            markersize=3.5,
+            linewidth=1.6,
+            label="Route / stations",
+        ),
+        Line2D(
+            [],
+            [],
+            marker="o",
+            markersize=5.5,
+            markerfacecolor=ISOTOPE_COLORS["Co-60"],
+            markeredgecolor="#0f3f77",
+            linestyle="none",
+            label="Co-60 source",
+        ),
+        Line2D(
+            [],
+            [],
+            color="#2ed142",
+            linewidth=1.4,
+            label="Emitted gamma-ray tracks",
+        ),
     ]
-    ax.imshow(crop)
-    ax.set_axis_off()
-    ax.text(
-        0.02,
-        0.98,
-        title,
-        transform=ax.transAxes,
+
+
+def _add_environment_callout(
+    ax: Axes,
+    *,
+    label: str,
+    target_xy: tuple[float, float],
+    text_xy: tuple[float, float],
+    color: str,
+) -> None:
+    """Add one readable in-image callout to the contextual scene render."""
+    ax.annotate(
+        label,
+        xy=target_xy,
+        xycoords="axes fraction",
+        xytext=text_xy,
+        textcoords="axes fraction",
+        fontsize=7.9,
         ha="left",
-        va="top",
-        fontsize=FIG_TITLE_SIZE,
-        fontweight="bold",
-        bbox={"fc": "white", "ec": "none", "alpha": 0.90, "pad": 1.5},
+        va="center",
+        color="#16222a",
+        bbox={
+            "boxstyle": "round,pad=0.22",
+            "fc": "white",
+            "ec": color,
+            "alpha": 0.94,
+            "lw": 0.85,
+        },
+        arrowprops={
+            "arrowstyle": "-|>",
+            "color": color,
+            "lw": 0.85,
+            "shrinkA": 2,
+            "shrinkB": 3,
+        },
     )
 
 
-def _draw_pair_alphabet(ax: Axes) -> None:
-    """Draw the complete 64-pair alphabet with one example eight-pair code."""
-    selected = {(0, 0), (0, 4), (2, 1), (2, 5), (4, 2), (4, 6), (6, 3), (6, 7)}
-    values = np.zeros((8, 8), dtype=np.float64)
-    for fe_index, pb_index in selected:
-        values[fe_index, pb_index] = 1.0
-    ax.imshow(values, cmap="Blues", vmin=0.0, vmax=1.0, interpolation="none")
-    ax.set_xticks(np.arange(8), labels=[str(value) for value in range(8)])
-    ax.set_yticks(np.arange(8), labels=[str(value) for value in range(8)])
-    ax.set_xlabel("Pb octant orientation", fontsize=FIG_LABEL_SIZE)
-    ax.set_ylabel("Fe octant orientation", fontsize=FIG_LABEL_SIZE)
-    ax.tick_params(labelsize=FIG_TICK_SIZE, length=0)
-    ax.set_xticks(np.arange(-0.5, 8, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, 8, 1), minor=True)
-    ax.grid(which="minor", color="#c7c7c7", linewidth=0.45)
-    ax.tick_params(which="minor", bottom=False, left=False)
-    ax.text(
-        0.5,
-        0.98,
-        "(c) One 8-of-64 physical code",
-        transform=ax.transAxes,
-        ha="center",
-        va="top",
-        fontsize=FIG_TITLE_SIZE,
-        fontweight="bold",
-        bbox={"fc": "white", "ec": "none", "alpha": 0.90, "pad": 1.2},
+def render_experiment_environment(
+    output_path: Path = FIG1_PATH,
+    *,
+    image_path: Path = ISAAC_ENVIRONMENT_RENDER,
+) -> Path:
+    """Compose the authenticated current-scene Isaac render for the paper."""
+    image = _require_raster(image_path)
+    fig = plt.figure(figsize=(7.15, 4.60))
+    ax = fig.add_axes((0.005, 0.125, 0.99, 0.87))
+    ax.imshow(image)
+    ax.set_axis_off()
+    _add_environment_callout(
+        ax,
+        label="Mapped obstacles",
+        target_xy=(0.365, 0.455),
+        text_xy=(0.075, 0.525),
+        color="#4b555d",
     )
-
-
-def render_problem_setting(output_path: Path = FIG1_PATH) -> Path:
-    """Render the physical task and Fe/Pb attenuation-code alphabet."""
-    fig = plt.figure(figsize=(7.15, 2.10))
-    grid = fig.add_gridspec(1, 3, width_ratios=(1.55, 1.05, 1.12), wspace=0.16)
-    _draw_image(
-        fig.add_subplot(grid[0, 0]),
-        ISAAC_PROBLEM_RENDER,
-        title="(a) Surface-source search",
+    _add_environment_callout(
+        ax,
+        label="Recorded route and stations",
+        target_xy=(0.283, 0.600),
+        text_xy=(0.075, 0.705),
+        color="#007f89",
     )
-    _draw_image(
-        fig.add_subplot(grid[0, 1]),
-        ISAAC_DETECTOR_RENDER,
-        title="(b) CeBr$_3$ + Fe/Pb octants",
+    _add_environment_callout(
+        ax,
+        label="Cs-137 sources",
+        target_xy=(0.713, 0.674),
+        text_xy=(0.785, 0.735),
+        color="#b51d1d",
     )
-    _draw_pair_alphabet(fig.add_subplot(grid[0, 2]))
-    fig.text(
-        0.5,
-        0.01,
-        "Robot motion changes geometry; the selected Fe/Pb pair sequence adds a controlled attenuation code.",
-        ha="center",
-        va="bottom",
-        fontsize=FIG_LABEL_SIZE,
+    _add_environment_callout(
+        ax,
+        label="Co-60 sources",
+        target_xy=(0.744, 0.645),
+        text_xy=(0.800, 0.610),
+        color="#1767a6",
     )
-    fig.subplots_adjust(left=0.015, right=0.985, top=0.94, bottom=0.18)
+    _add_environment_callout(
+        ax,
+        label="Mobile robot and detector head",
+        target_xy=(0.540, 0.075),
+        text_xy=(0.690, 0.205),
+        color="#26343e",
+    )
+    _add_environment_callout(
+        ax,
+        label="Gamma rays emitted by all sources",
+        target_xy=(0.605, 0.255),
+        text_xy=(0.655, 0.380),
+        color="#2ed142",
+    )
+    fig.legend(
+        handles=_environment_legend_handles(),
+        loc="lower left",
+        bbox_to_anchor=(0.025, 0.006, 0.95, 0.10),
+        ncol=3,
+        fontsize=7.1,
+        frameon=False,
+        mode="expand",
+        borderaxespad=0.0,
+        handletextpad=0.45,
+        columnspacing=1.15,
+    )
     return save_figure(fig, output_path)
 
 
-def _flow_box(
-    ax: Axes,
-    xy: tuple[float, float],
-    width: float,
-    height: float,
-    title: str,
-    lines: tuple[str, ...],
+def _detector_sequence_legend_handles() -> list[Line2D]:
+    """Return component keys for the detector and rotating shields."""
+    return [
+        Line2D(
+            [],
+            [],
+            marker="o",
+            markersize=6.2,
+            markerfacecolor="#18c9d6",
+            markeredgecolor="#006b73",
+            linestyle="none",
+            label="CeBr$_3$ detector",
+        ),
+        Line2D(
+            [],
+            [],
+            marker="s",
+            markersize=6.0,
+            markerfacecolor="#edbd2c",
+            markeredgecolor="#8a6800",
+            linestyle="none",
+            label="Fe octant",
+        ),
+        Line2D(
+            [],
+            [],
+            marker="s",
+            markersize=6.0,
+            markerfacecolor="#e3e6ec",
+            markeredgecolor="#626974",
+            linestyle="none",
+            label="Pb octant",
+        ),
+    ]
+
+
+def render_detector_shield_sequence(
+    output_path: Path = FIG2_PATH,
     *,
-    facecolor: str,
-) -> None:
-    """Draw one readable method-flow box."""
-    x_value, y_value = xy
-    ax.add_patch(
-        FancyBboxPatch(
-            (x_value, y_value),
-            width,
-            height,
-            boxstyle="round,pad=0.04,rounding_size=0.08",
-            facecolor=facecolor,
-            edgecolor="#333333",
-            linewidth=0.8,
+    image_paths: tuple[Path, ...] = ISAAC_SHIELD_SEQUENCE_RENDERS,
+    provenance_path: Path = ISAAC_CAPTURE_PROVENANCE,
+) -> Path:
+    """Compose four recorded Fe/Pb orientation views around one detector."""
+    if len(image_paths) != 4:
+        raise ValueError("The detector sequence requires exactly four captures.")
+    pair_ids = _isaac_capture_pair_ids(provenance_path)
+    images = [_require_raster(path) for path in image_paths]
+    fig = plt.figure(figsize=(7.15, 2.10))
+    grid = fig.add_gridspec(
+        1,
+        7,
+        width_ratios=(1.0, 0.09, 1.0, 0.09, 1.0, 0.09, 1.0),
+        wspace=0.02,
+    )
+    for index, (image, pair_id) in enumerate(zip(images, pair_ids, strict=True)):
+        ax = fig.add_subplot(grid[0, 2 * index])
+        height, width = image.shape[:2]
+        x0 = int(round(0.23 * width))
+        x1 = int(round(0.77 * width))
+        y0 = int(round(0.08 * height))
+        y1 = int(round(0.78 * height))
+        ax.imshow(image[y0:y1, x0:x1])
+        ax.set_axis_off()
+        ax.set_title(
+            f"({chr(ord('a') + index)}) Fe {pair_id // 8} / Pb {pair_id % 8}",
+            fontsize=8.1,
+            pad=2.0,
         )
+        if index < len(images) - 1:
+            arrow_ax = fig.add_subplot(grid[0, 2 * index + 1])
+            arrow_ax.set_label(f"sequence-transition-{index}")
+            arrow_ax.set_axis_off()
+            arrow_ax.annotate(
+                "",
+                xy=(0.94, 0.50),
+                xytext=(0.06, 0.50),
+                xycoords="axes fraction",
+                arrowprops={
+                    "arrowstyle": "-|>",
+                    "color": "#4b5359",
+                    "linewidth": 0.9,
+                    "mutation_scale": 7.5,
+                },
+            )
+    fig.legend(
+        handles=_detector_sequence_legend_handles(),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.005),
+        ncol=3,
+        fontsize=7.1,
+        frameon=False,
+        handletextpad=0.40,
+        columnspacing=1.05,
     )
-    ax.text(
-        x_value + 0.12,
-        y_value + height - 0.16,
-        title,
-        ha="left",
-        va="top",
-        fontsize=FIG_TITLE_SIZE,
-        fontweight="bold",
-    )
-    ax.text(
-        x_value + 0.12,
-        y_value + height - 0.50,
-        "\n".join(lines),
-        ha="left",
-        va="top",
-        fontsize=FIG_LABEL_SIZE,
-        linespacing=1.16,
-    )
-
-
-def _flow_arrow(
-    ax: Axes,
-    start: tuple[float, float],
-    end: tuple[float, float],
-    *,
-    label: str = "",
-) -> None:
-    """Draw one method-flow arrow and optional label."""
-    ax.add_patch(
-        FancyArrowPatch(
-            start,
-            end,
-            arrowstyle="-|>",
-            mutation_scale=10,
-            linewidth=1.0,
-            color="#353535",
-            shrinkA=2,
-            shrinkB=2,
-        )
-    )
-    if label:
-        ax.text(
-            (start[0] + end[0]) / 2.0,
-            (start[1] + end[1]) / 2.0 + 0.10,
-            label,
-            ha="center",
-            va="bottom",
-            fontsize=FIG_TICK_SIZE,
-            bbox={"fc": "white", "ec": "none", "alpha": 0.92, "pad": 0.8},
-        )
-
-
-def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
-    """Render the coupled code-design, inference, and exact-history loop."""
-    fig, ax = plt.subplots(figsize=(7.15, 2.82))
-    ax.set_xlim(0.0, 12.0)
-    ax.set_ylim(0.0, 4.7)
-    ax.axis("off")
-
-    box_width = 2.42
-    box_height = 1.30
-    top_y = 3.12
-    bottom_y = 0.45
-    top_x = (0.20, 3.28, 6.36, 9.44)
-    bottom_x = (9.44, 6.36, 3.28, 0.20)
-    _flow_box(
-        ax,
-        (top_x[0], top_y),
-        box_width,
-        box_height,
-        "Joint posterior",
-        (r"state: $\{K_i,\mathbf{s}_{ij},a_{ij}\}_i$", "shared weight + ancestry"),
-        facecolor="#eaf2fb",
-    )
-    _flow_box(
-        ax,
-        (top_x[1], top_y),
-        box_width,
-        box_height,
-        "64 pair views",
-        ("all Fe/Pb orientations", "same spectral model"),
-        facecolor="#edf7ed",
-    )
-    _flow_box(
-        ax,
-        (top_x[2], top_y),
-        box_width,
-        box_height,
-        "Design 8-view code",
-        ("conditional greedy", "448 one-swap checks"),
-        facecolor="#fff4df",
-    )
-    _flow_box(
-        ax,
-        (top_x[3], top_y),
-        box_width,
-        box_height,
-        "Acquire station",
-        ("one robot pose", "8 spectra × 20 s"),
-        facecolor="#fcebec",
-    )
-    _flow_box(
-        ax,
-        (bottom_x[0], bottom_y),
-        box_width,
-        box_height,
-        "Full-station SMC",
-        (r"joint $\beta:0\rightarrow1$", "one station target"),
-        facecolor="#fcebec",
-    )
-    _flow_box(
-        ax,
-        (bottom_x[1], bottom_y),
-        box_width,
-        box_height,
-        "Shield-aware RJ",
-        ("birth, death, merge", "multiscale pose + rate"),
-        facecolor="#fff4df",
-    )
-    _flow_box(
-        ax,
-        (bottom_x[2], bottom_y),
-        box_width,
-        box_height,
-        "One-stage exact RJ",
-        ("full-history target", "one MH decision"),
-        facecolor="#edf7ed",
-    )
-    _flow_box(
-        ax,
-        (bottom_x[3], bottom_y),
-        box_width,
-        box_height,
-        "Updated posterior",
-        ("unknown isotope-wise $K$", "surface pose + rate"),
-        facecolor="#eaf2fb",
-    )
-
-    for left in top_x[:-1]:
-        _flow_arrow(
-            ax,
-            (left + box_width, top_y + box_height / 2.0),
-            (left + 3.08, top_y + box_height / 2.0),
-        )
-    _flow_arrow(
-        ax,
-        (top_x[-1] + box_width / 2.0, top_y),
-        (bottom_x[0] + box_width / 2.0, bottom_y + box_height),
-        label="shield-conditioned likelihood",
-    )
-    for right in bottom_x[:-1]:
-        _flow_arrow(
-            ax,
-            (right, bottom_y + box_height / 2.0),
-            (right - 0.66, bottom_y + box_height / 2.0),
-        )
-    _flow_arrow(
-        ax,
-        (bottom_x[-1] + box_width / 2.0, bottom_y + box_height),
-        (top_x[0] + box_width / 2.0, top_y),
-        label="posterior-adaptive redesign",
-    )
-    fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.02)
+    fig.subplots_adjust(left=0.005, right=0.995, top=0.90, bottom=0.19)
     return save_figure(fig, output_path)
 
 
@@ -1226,6 +1363,8 @@ def _projection(position: np.ndarray, projection: str) -> tuple[float, float]:
     """Project one 3-D point into the requested metric plane."""
     if projection == "xy":
         return float(position[0]), float(position[1])
+    if projection == "xz":
+        return float(position[0]), float(position[2])
     if projection == "yz":
         return float(position[1]), float(position[2])
     raise ValueError(f"Unsupported projection {projection!r}.")
@@ -1286,58 +1425,29 @@ def _draw_navigation_occupancy(ax: Axes, bundle: CompletedRunBundle) -> None:
         )
 
 
-def _draw_obstacles(ax: Axes, bundle: CompletedRunBundle, projection: str) -> None:
+def _draw_obstacles(
+    ax: Axes,
+    bundle: CompletedRunBundle,
+    projection: str,
+    *,
+    show_navigation_occupancy: bool = True,
+) -> None:
     """Draw the authenticated obstacle geometry in one metric projection."""
     boxes = _obstacle_boxes(bundle)
     if projection == "xy":
-        _draw_navigation_occupancy(ax, bundle)
-        seen_xy: set[tuple[float, float, float, float]] = set()
-        for x0, y0, _z0, x1, y1, _z1 in boxes:
-            rectangle = (
-                round(float(x0), 6),
-                round(float(y0), 6),
-                round(float(x1 - x0), 6),
-                round(float(y1 - y0), 6),
-            )
-            if rectangle in seen_xy:
-                continue
-            seen_xy.add(rectangle)
-            ax.add_patch(
-                Rectangle(
-                    rectangle[:2],
-                    rectangle[2],
-                    rectangle[3],
-                    facecolor="#747c84",
-                    edgecolor="#343a40",
-                    linewidth=0.24,
-                    alpha=0.58,
-                    zorder=0.2,
-                )
-            )
-        return
-    seen: set[tuple[float, float, float, float]] = set()
-    for values in boxes:
-        rectangle = (
-            round(float(values[1]), 3),
-            round(float(values[2]), 3),
-            round(float(values[4] - values[1]), 3),
-            round(float(values[5] - values[2]), 3),
-        )
-        if rectangle in seen or rectangle[2] <= 0.0 or rectangle[3] <= 0.0:
-            continue
-        seen.add(rectangle)
-        ax.add_patch(
-            Rectangle(
-                rectangle[:2],
-                rectangle[2],
-                rectangle[3],
-                facecolor="#747c84",
-                edgecolor="#343a40",
-                linewidth=0.18,
-                alpha=0.20,
-                zorder=0,
-            )
-        )
+        if show_navigation_occupancy:
+            _draw_navigation_occupancy(ax, bundle)
+    draw_obstacle_boxes(
+        ax,
+        boxes,
+        projection=projection,
+        facecolor="#747c84",
+        edgecolor="#343a40",
+        linewidth=0.24 if projection == "xy" else 0.18,
+        alpha=0.58 if projection == "xy" else 0.30,
+        label=None,
+        zorder=0.2 if projection == "xy" else 0.0,
+    )
 
 
 def _draw_obstacles_3d(ax: Axes, bundle: CompletedRunBundle) -> None:
@@ -1362,6 +1472,8 @@ def _plot_scene_overview_3d(
     bundle: CompletedRunBundle,
     *,
     title: str,
+    show_posterior_support: bool = True,
+    show_raw_components: bool = True,
 ) -> None:
     """Plot physical geometry and source inference in one metric 3-D overview."""
     room_x, room_y, room_z = bundle.room_xyz_m
@@ -1374,20 +1486,21 @@ def _plot_scene_overview_3d(
         alpha=0.72,
     )
     _draw_obstacles_3d(ax, bundle)
-    for isotope, support in bundle.posterior_support.items():
-        if support.size == 0:
-            continue
-        ax.scatter(
-            support[:, 0],
-            support[:, 1],
-            support[:, 2],
-            s=1.6,
-            color=ISOTOPE_COLORS.get(isotope, "#666666"),
-            alpha=0.055,
-            linewidths=0.0,
-            depthshade=False,
-            rasterized=True,
-        )
+    if show_posterior_support:
+        for isotope, support in bundle.posterior_support.items():
+            if support.size == 0:
+                continue
+            ax.scatter(
+                support[:, 0],
+                support[:, 1],
+                support[:, 2],
+                s=1.6,
+                color=ISOTOPE_COLORS.get(isotope, "#666666"),
+                alpha=0.055,
+                linewidths=0.0,
+                depthshade=False,
+                rasterized=True,
+            )
     for index, segment in enumerate(bundle.route_segments_xyz):
         ax.plot(
             segment[:, 0],
@@ -1447,42 +1560,39 @@ def _plot_scene_overview_3d(
             linewidth=0.45,
             depthshade=False,
         )
-    assigned_ids = {
-        (result.truth.isotope, index)
-        for result in bundle.split_aware_results
-        for index in result.assigned_component_indices
-    }
-    for estimate in bundle.estimated_sources:
-        color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
-        assigned = (
-            not bundle.split_aware_results
-            or (
-                estimate.isotope,
-                estimate.index,
+    if show_raw_components:
+        assigned_ids = {
+            (result.truth.isotope, index)
+            for result in bundle.split_aware_results
+            for index in result.assigned_component_indices
+        }
+        for estimate in bundle.estimated_sources:
+            color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
+            assigned = (
+                not bundle.split_aware_results
+                or (estimate.isotope, estimate.index) in assigned_ids
             )
-            in assigned_ids
-        )
-        if assigned:
-            ax.scatter(
-                *estimate.position_xyz,
-                marker="x",
-                s=15,
-                color=color,
-                linewidth=0.65,
-                alpha=0.80,
-                depthshade=False,
-            )
-        else:
-            ax.scatter(
-                *estimate.position_xyz,
-                marker="D",
-                s=15,
-                facecolor="none",
-                edgecolor=color,
-                linewidth=0.65,
-                alpha=0.80,
-                depthshade=False,
-            )
+            if assigned:
+                ax.scatter(
+                    *estimate.position_xyz,
+                    marker="x",
+                    s=15,
+                    color=color,
+                    linewidth=0.65,
+                    alpha=0.80,
+                    depthshade=False,
+                )
+            else:
+                ax.scatter(
+                    *estimate.position_xyz,
+                    marker="D",
+                    s=15,
+                    facecolor="none",
+                    edgecolor=color,
+                    linewidth=0.65,
+                    alpha=0.80,
+                    depthshade=False,
+                )
     for result in bundle.split_aware_results:
         color = ISOTOPE_COLORS.get(result.truth.isotope, "#555555")
         ax.scatter(
@@ -1520,65 +1630,82 @@ def _plot_projection(
     projection: str,
     title: str,
     label_truth_ids: bool,
+    label_source_names: bool = False,
+    show_posterior_support: bool = True,
+    show_raw_components: bool = True,
+    show_navigation_occupancy: bool = True,
+    show_route_segments: bool = True,
+    emphasize_stations: bool = False,
+    show_station_labels: bool | None = None,
+    show_truth_estimate_links: bool = True,
+    use_cui_source_markers: bool = False,
+    marker_scale: float = 1.0,
 ) -> None:
     """Plot truth, modes, posterior support, stations, and authenticated obstacles."""
     room_x, room_y, room_z = bundle.room_xyz_m
-    limits = (room_x, room_y) if projection == "xy" else (room_y, room_z)
-    ax.add_patch(
-        Rectangle(
-            (0.0, 0.0),
-            limits[0],
-            limits[1],
-            facecolor="#fbfbfb",
-            edgecolor="#222222",
-            linewidth=0.8,
-            zorder=-2,
-        )
+    if projection == "xy":
+        limits = (room_x, room_y)
+    elif projection == "xz":
+        limits = (room_x, room_z)
+    elif projection == "yz":
+        limits = (room_y, room_z)
+    else:
+        raise ValueError(f"Unsupported projection {projection!r}.")
+    _draw_obstacles(
+        ax,
+        bundle,
+        projection,
+        show_navigation_occupancy=show_navigation_occupancy,
     )
-    _draw_obstacles(ax, bundle, projection)
-    for isotope, support in bundle.posterior_support.items():
-        if support.size == 0:
-            continue
-        projected = np.asarray(
-            [_projection(position, projection) for position in support]
-        )
-        ax.scatter(
-            projected[:, 0],
-            projected[:, 1],
-            s=3.0,
-            color=ISOTOPE_COLORS.get(isotope, "#666666"),
-            alpha=0.055,
-            linewidths=0.0,
-            zorder=1,
-        )
-    for segment in bundle.route_segments_xyz:
-        projected_route = np.asarray(
-            [_projection(position, projection) for position in segment]
-        )
-        ax.plot(
-            projected_route[:, 0],
-            projected_route[:, 1],
+    if show_posterior_support:
+        for isotope, support in bundle.posterior_support.items():
+            if support.size == 0:
+                continue
+            projected = np.asarray(
+                [_projection(position, projection) for position in support]
+            )
+            ax.scatter(
+                projected[:, 0],
+                projected[:, 1],
+                s=3.0,
+                color=ISOTOPE_COLORS.get(isotope, "#666666"),
+                alpha=0.055,
+                linewidths=0.0,
+                zorder=1,
+            )
+    if show_route_segments:
+        draw_route_segments(
+            ax,
+            bundle.route_segments_xyz,
+            projection=projection,
             color="#009eae",
-            linewidth=1.0,
-            alpha=0.82,
+            linewidth=1.0 * marker_scale,
+            alpha=0.88,
             zorder=2,
         )
-    station_projection = np.asarray(
-        [_projection(position, projection) for position in bundle.station_positions_xyz]
-    )
-    ax.scatter(
-        station_projection[:, 0],
-        station_projection[:, 1],
-        s=11,
-        marker="o",
-        facecolor="#222222",
-        edgecolor="white",
-        linewidth=0.35,
-        alpha=0.72,
+    draw_measurement_stations(
+        ax,
+        bundle.station_positions_xyz,
+        projection=projection,
+        station_ids=tuple(range(len(bundle.station_positions_xyz))),
+        show_labels=(
+            projection == "xy" and emphasize_stations
+            if show_station_labels is None
+            else show_station_labels
+        ),
+        marker_size=(24 if emphasize_stations else 11) * marker_scale,
+        facecolor="white" if emphasize_stations else "#222222",
+        edgecolor="#009eae" if emphasize_stations else "white",
+        linewidth=0.85 if emphasize_stations else 0.35,
+        alpha=0.92 if emphasize_stations else 0.72,
+        label=None,
+        font_size=7.0,
+        label_offset_radius=0.14,
+        label_stroke_width=1.4,
         zorder=3,
     )
 
-    if bundle.split_aware_results:
+    if show_truth_estimate_links and bundle.split_aware_results:
         for result in bundle.split_aware_results:
             truth_xy = _projection(result.truth.position_xyz, projection)
             centroid_xy = _projection(
@@ -1594,7 +1721,7 @@ def _plot_projection(
                 alpha=0.78,
                 zorder=4,
             )
-    else:
+    elif show_truth_estimate_links:
         for match in bundle.matches:
             truth_xy = _projection(match.truth.position_xyz, projection)
             estimate_xy = _projection(match.estimate.position_xyz, projection)
@@ -1613,27 +1740,55 @@ def _plot_projection(
         ax.scatter(
             x_value,
             y_value,
-            marker=_truth_marker(source.isotope),
-            s=74 if source.isotope == "Cs-137" else 48,
+            marker=(
+                "*"
+                if use_cui_source_markers
+                else _truth_marker(source.isotope)
+            ),
+            s=(74 if use_cui_source_markers or source.isotope == "Cs-137" else 48)
+            * marker_scale,
             facecolor=color,
-            edgecolor="#111111",
-            linewidth=0.55,
+            edgecolor="white" if use_cui_source_markers else "#111111",
+            linewidth=0.60 if use_cui_source_markers else 0.55,
             zorder=7,
         )
         if label_truth_ids:
-            x_inward = x_value > 0.86 * limits[0]
-            y_inward = y_value > 0.86 * limits[1]
+            x_high = x_value > 0.80 * limits[0]
+            x_offset = -5 if x_high else 5
+            y_low = y_value < 0.18 * limits[1]
+            y_high = y_value > 0.82 * limits[1]
+            if y_high:
+                y_offset = -5
+            elif y_low:
+                y_offset = 5
+            else:
+                y_offset = -5 if source.index % 2 == 0 else 5
+            source_label = (
+                f"{_isotope_short_name(source.isotope)}-{source.index}"
+                if label_source_names
+                else str(source.index)
+            )
             ax.annotate(
-                str(source.index),
+                source_label,
                 xy=(x_value, y_value),
-                xytext=(-3 if x_inward else 3, -3 if y_inward else 3),
+                xytext=(x_offset, y_offset),
                 textcoords="offset points",
-                ha="right" if x_inward else "left",
-                va="top" if y_inward else "bottom",
-                fontsize=FIG_TICK_SIZE,
+                ha="right" if x_offset < 0 else "left",
+                va="top" if y_offset < 0 else "bottom",
+                fontsize=(
+                    max(FIG_TICK_SIZE, 7.2)
+                    if label_source_names
+                    else FIG_TICK_SIZE
+                ),
                 color=color,
                 fontweight="bold",
-                bbox={"fc": "white", "ec": "none", "alpha": 0.72, "pad": 0.2},
+                bbox={
+                    "boxstyle": "round,pad=0.12",
+                    "fc": "white",
+                    "ec": color if label_source_names else "none",
+                    "lw": 0.45,
+                    "alpha": 0.86,
+                },
                 zorder=8,
             )
     if bundle.split_aware_results:
@@ -1642,79 +1797,106 @@ def _plot_projection(
             for result in bundle.split_aware_results
             for index in result.assigned_component_indices
         }
-        for estimate in bundle.estimated_sources:
-            x_value, y_value = _projection(estimate.position_xyz, projection)
-            color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
-            assigned = (estimate.isotope, estimate.index) in assigned_ids
-            if assigned:
-                ax.scatter(
-                    x_value,
-                    y_value,
-                    marker="x",
-                    s=22,
-                    color=color,
-                    linewidth=0.8,
-                    alpha=0.82,
-                    zorder=5,
-                )
-            else:
-                ax.scatter(
-                    x_value,
-                    y_value,
-                    marker="D",
-                    s=25,
-                    facecolor="none",
-                    edgecolor=color,
-                    linewidth=0.8,
-                    alpha=0.82,
-                    zorder=5,
-                )
+        if show_raw_components:
+            for estimate in bundle.estimated_sources:
+                x_value, y_value = _projection(estimate.position_xyz, projection)
+                color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
+                assigned = (estimate.isotope, estimate.index) in assigned_ids
+                if assigned:
+                    ax.scatter(
+                        x_value,
+                        y_value,
+                        marker="x",
+                        s=22,
+                        color=color,
+                        linewidth=0.8,
+                        alpha=0.82,
+                        zorder=5,
+                    )
+                else:
+                    ax.scatter(
+                        x_value,
+                        y_value,
+                        marker="D",
+                        s=25,
+                        facecolor="none",
+                        edgecolor=color,
+                        linewidth=0.8,
+                        alpha=0.82,
+                        zorder=5,
+                    )
         for result in bundle.split_aware_results:
             x_value, y_value = _projection(
                 result.merged_centroid_position_xyz,
                 projection,
             )
             color = ISOTOPE_COLORS.get(result.truth.isotope, "#555555")
-            ax.scatter(
-                x_value,
-                y_value,
-                marker="X",
-                s=42,
-                facecolor=color,
-                edgecolor="#111111",
-                linewidth=0.45,
-                zorder=6,
-            )
+            if use_cui_source_markers:
+                ax.scatter(
+                    x_value,
+                    y_value,
+                    marker="x",
+                    s=72 * marker_scale,
+                    color=color,
+                    linewidth=1.8,
+                    zorder=6,
+                )
+            else:
+                ax.scatter(
+                    x_value,
+                    y_value,
+                    marker="X",
+                    s=42 * marker_scale,
+                    facecolor=color,
+                    edgecolor="#111111",
+                    linewidth=0.45,
+                    zorder=6,
+                )
     else:
         matched_estimate_ids = {
             (match.estimate.isotope, match.estimate.index): match.truth
             for match in bundle.matches
         }
-        for estimate in bundle.estimated_sources:
-            x_value, y_value = _projection(estimate.position_xyz, projection)
-            color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
-            matched_truth = matched_estimate_ids.get((estimate.isotope, estimate.index))
-            marker = "X" if matched_truth is not None else "D"
-            ax.scatter(
-                x_value,
-                y_value,
-                marker=marker,
-                s=38 if matched_truth is not None else 24,
-                facecolor="none" if matched_truth is None else color,
-                edgecolor=color,
-                linewidth=1.0,
-                zorder=6,
-            )
-    ax.set_xlim(-0.15, limits[0] + 0.25)
-    ax.set_ylim(-0.15, limits[1] + (0.60 if projection == "xy" else 0.35))
-    ax.set_aspect("equal")
-    ax.set_xticks(np.arange(0.0, limits[0] + 0.1, 2.0))
-    ax.set_yticks(np.arange(0.0, limits[1] + 0.1, 2.0))
-    ax.grid(True, linewidth=0.25, alpha=0.34)
-    ax.tick_params(labelsize=FIG_TICK_SIZE)
-    ax.set_xlabel("x [m]" if projection == "xy" else "y [m]", fontsize=FIG_LABEL_SIZE)
-    ax.set_ylabel("y [m]" if projection == "xy" else "z [m]", fontsize=FIG_LABEL_SIZE)
-    ax.set_title(title, fontsize=FIG_TITLE_SIZE, fontweight="bold", pad=3)
+        if show_raw_components:
+            for estimate in bundle.estimated_sources:
+                x_value, y_value = _projection(estimate.position_xyz, projection)
+                color = ISOTOPE_COLORS.get(estimate.isotope, "#555555")
+                matched_truth = matched_estimate_ids.get(
+                    (estimate.isotope, estimate.index)
+                )
+                if use_cui_source_markers and matched_truth is not None:
+                    ax.scatter(
+                        x_value,
+                        y_value,
+                        marker="x",
+                        s=72 * marker_scale,
+                        color=color,
+                        linewidth=1.8,
+                        zorder=6,
+                    )
+                else:
+                    marker = "X" if matched_truth is not None else "D"
+                    ax.scatter(
+                        x_value,
+                        y_value,
+                        marker=marker,
+                        s=38 if matched_truth is not None else 24,
+                        facecolor="none" if matched_truth is None else color,
+                        edgecolor=color,
+                        linewidth=1.0,
+                        zorder=6,
+                    )
+    format_metric_projection_axis(
+        ax,
+        bounds_xyz=(0.0, room_x, 0.0, room_y, 0.0, room_z),
+        projection=projection,
+        title=title,
+        padding_fraction=0.025,
+        title_size=FIG_TITLE_SIZE,
+        label_size=FIG_LABEL_SIZE,
+        tick_size=FIG_TICK_SIZE,
+        title_weight="bold",
+    )
 
 
 def _plot_cardinality(ax: Axes, bundle: CompletedRunBundle) -> None:
@@ -1983,7 +2165,7 @@ def _scene_legend_handles(bundle: CompletedRunBundle) -> list[Line2D]:
             markerfacecolor="#747c84",
             markeredgecolor="#343a40",
             linestyle="none",
-            label="physical obstacle",
+            label="Physical obstacle",
         ),
         Line2D(
             [],
@@ -2074,6 +2256,76 @@ def _scene_legend_handles(bundle: CompletedRunBundle) -> list[Line2D]:
     return handles
 
 
+def _manuscript_scene_legend_handles(
+    bundle: CompletedRunBundle,
+) -> list[Line2D]:
+    """Return the evidence-focused legend used by the main-paper result figure."""
+    handles = [
+        Line2D(
+            [],
+            [],
+            marker="s",
+            markersize=5.5,
+            markerfacecolor="#747c84",
+            markeredgecolor="#343a40",
+            linestyle="none",
+            label="Physical obstacle",
+        ),
+        Line2D(
+            [],
+            [],
+            color="#009eae",
+            linewidth=1.4,
+            label=(
+                "Recorded route"
+                if bundle.route_segments_xyz
+                else "Route unavailable"
+            ),
+        ),
+        Line2D(
+            [],
+            [],
+            marker="o",
+            markersize=4.8,
+            markerfacecolor="white",
+            markeredgecolor="#009eae",
+            linestyle="none",
+            label="Measurement station",
+        ),
+    ]
+    for isotope in ("Cs-137", "Co-60"):
+        if not any(source.isotope == isotope for source in bundle.truth_sources):
+            continue
+        color = ISOTOPE_COLORS.get(isotope, "#555555")
+        handles.extend(
+            (
+                Line2D(
+                    [],
+                    [],
+                    marker="*",
+                    markersize=6.5,
+                    markerfacecolor=color,
+                    markeredgecolor="white",
+                    markeredgewidth=0.6,
+                    linestyle="none",
+                    label=f"{isotope} truth",
+                ),
+                Line2D(
+                    [],
+                    [],
+                    marker="x",
+                    markersize=7.0,
+                    markerfacecolor="none",
+                    markeredgecolor=color,
+                    markeredgewidth=1.8,
+                    linestyle="none",
+                    label=f"{isotope} estimate",
+                ),
+            )
+        )
+    return handles
+
+
 def render_completed_run_summary(
     run_dir: Path,
     output_path: Path = EXPERIMENT_FIG_PATH,
@@ -2132,13 +2384,85 @@ def render_completed_run_summary(
     return save_figure(fig, output_path)
 
 
+def render_completed_run_scene(
+    run_dir: Path,
+    output_path: Path = MANUSCRIPT_RESULT_FIG_PATH,
+    *,
+    split_aware_evaluation: Path | None = None,
+) -> Path:
+    """Render a CUI-derived floor/elevation view of the robot and source result."""
+    bundle = (
+        load_completed_run(run_dir)
+        if split_aware_evaluation is None
+        else load_split_aware_completed_run(run_dir, split_aware_evaluation)
+    )
+    fig = plt.figure(figsize=(7.15, 3.55))
+    floor_ax = fig.add_axes((0.055, 0.13, 0.30, 0.82))
+    elevation_ax = fig.add_axes((0.405, 0.39, 0.575, 0.54))
+    _plot_projection(
+        floor_ax,
+        bundle,
+        projection="xy",
+        title="(a) Recorded floor map",
+        label_truth_ids=True,
+        label_source_names=True,
+        show_posterior_support=False,
+        show_raw_components=False,
+        show_navigation_occupancy=False,
+        emphasize_stations=True,
+        show_station_labels=True,
+        show_truth_estimate_links=False,
+        use_cui_source_markers=True,
+        marker_scale=1.32,
+    )
+    _plot_projection(
+        elevation_ax,
+        bundle,
+        projection="xz",
+        title="(b) Recorded elevation map",
+        label_truth_ids=True,
+        label_source_names=True,
+        show_posterior_support=False,
+        show_raw_components=False,
+        show_navigation_occupancy=False,
+        show_route_segments=False,
+        emphasize_stations=True,
+        show_station_labels=True,
+        show_truth_estimate_links=False,
+        use_cui_source_markers=True,
+        marker_scale=1.32,
+    )
+    legend_handles = _manuscript_scene_legend_handles(bundle)
+    fig.legend(
+        handles=legend_handles[:3],
+        loc="lower center",
+        bbox_to_anchor=(0.69, 0.115),
+        ncol=3,
+        fontsize=max(FIG_TICK_SIZE, 7.0),
+        frameon=False,
+        handletextpad=0.40,
+        columnspacing=0.90,
+    )
+    fig.legend(
+        handles=legend_handles[3:],
+        loc="lower center",
+        bbox_to_anchor=(0.69, 0.030),
+        ncol=4,
+        fontsize=max(FIG_TICK_SIZE, 7.0),
+        frameon=False,
+        handletextpad=0.35,
+        columnspacing=0.75,
+    )
+    return save_figure(fig, output_path)
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for deterministic figure generation."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--skip-concepts",
         action="store_true",
-        help="Do not regenerate the problem and method figures.",
+        help="Do not regenerate the environment and detector/shield figures.",
     )
     parser.add_argument(
         "--completed-run-dir",
@@ -2189,17 +2513,25 @@ def main() -> None:
     args = parse_args()
     generated: list[Path] = []
     if not args.skip_concepts:
-        generated.extend((render_problem_setting(), render_method_overview()))
+        generated.extend(
+            (render_experiment_environment(), render_detector_shield_sequence())
+        )
     if not args.skip_experiment:
         if args.completed_run_dir is None:
             raise ValueError(
                 "--completed-run-dir is required unless --skip-experiment is used."
             )
-        generated.append(
-            render_completed_run_summary(
-                args.completed_run_dir,
-                args.experiment_output,
-                split_aware_evaluation=args.split_aware_evaluation,
+        generated.extend(
+            (
+                render_completed_run_summary(
+                    args.completed_run_dir,
+                    args.experiment_output,
+                    split_aware_evaluation=args.split_aware_evaluation,
+                ),
+                render_completed_run_scene(
+                    args.completed_run_dir,
+                    split_aware_evaluation=args.split_aware_evaluation,
+                ),
             )
         )
     for output in generated:

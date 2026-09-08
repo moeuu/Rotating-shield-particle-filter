@@ -1,86 +1,363 @@
-"""Render RA-L manuscript figures from an Isaac Sim scene.
+"""Capture authenticated RA-L scene and detector views in Isaac Sim.
 
-The script authors a deterministic cluttered 3-D scene, captures the robot,
-detector-shield module, and environment overview using Isaac Sim, and writes
-PDF files into the RA-L manuscript figure directories.
-Only visual prims are added here; this script does not alter runtime transport,
-PF observations, or Geant4 settings.
+The scene capture is reconstructed from one completed MeasurementLog and its
+private truth manifest. Three directionally diverse emitted gamma tracks per
+source are selected from separately saved native Geant4 step trajectories at
+the displayed recorded pose. The detector sequence uses four spatially legible
+Fe/Pb pairs that were actually acquired at one adaptive station. Visual
+annotations do not alter transport or inference.
 """
 
 from __future__ import annotations
 
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+import math
 from pathlib import Path
 import shutil
 import sys
+from typing import Any
 
-from PIL import Image
-from PIL import ImageDraw
-from PIL import ImageFont
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
+RUNTIME_ROOT = ROOT.parent / "Rotating-shield-simulation-runtime"
+PF_SRC = ROOT / "src"
+RUNTIME_SRC = RUNTIME_ROOT / "src"
 OUTPUT_ROOT = ROOT / "results" / "ral_isaac_figures"
-SERIF_FONT_REGULAR = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
+DEFAULT_RUN_ID = "ral_a3fde7067c4ac222_proposed"
+DEFAULT_RUN_DIR = ROOT / "results" / "ral_ablation" / "runs" / DEFAULT_RUN_ID
+DEFAULT_MEASUREMENT_LOG = (
+    ROOT / "results" / "ral_ablation" / "measurement_logs" / DEFAULT_RUN_ID
+)
+DEFAULT_TRUTH_MANIFEST = (
+    RUNTIME_ROOT
+    / "private_runs"
+    / "ral_ablation"
+    / "truth_manifests"
+    / f"{DEFAULT_RUN_ID}.json"
+)
+DEFAULT_GEANT4_TRACKS = (
+    RUNTIME_ROOT
+    / "private_runs"
+    / "ral_ablation"
+    / "figure_tracks"
+    / f"{DEFAULT_RUN_ID}_station_05.json"
+)
+EMISSION_TRACKS_PER_SOURCE = 3
 
-for import_root in (ROOT, SRC):
+for import_root in (ROOT, PF_SRC, RUNTIME_SRC):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from scripts.ral_figure_common import LATEX_ROOT  # noqa: E402
-from runtime.experiment_profiles import (  # noqa: E402
-    CS_CO_SURFACE_SEARCH_PROFILE,
+from measurement.obstacle_assets import obstacle_instances_from_dicts  # noqa: E402
+from measurement.shielding import (  # noqa: E402
+    physical_shield_normal_from_orientation_index,
 )
 from sim.isaacsim_app.app import IsaacSimApplication  # noqa: E402
+from sim.isaacsim_app.estimator_visualizer import ISOTOPE_COLORS  # noqa: E402
 from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription  # noqa: E402
+from sim.shield_geometry import SHIELD_CONTACT_RADIUS_M  # noqa: E402
 from sim.protocol import SimulationCommand  # noqa: E402
 
 
-def _obstacle_cells() -> list[tuple[int, int]]:
-    """Return a deterministic cluttered obstacle layout for the paper figures."""
-    cells: set[tuple[int, int]] = set()
-    cells.update((3, y) for y in range(2, 8))
-    cells.update((6, y) for y in range(7, 13))
-    cells.update((x, 10) for x in range(1, 5))
-    cells.update((x, 4) for x in range(6, 9))
-    cells.update({(1, 13), (2, 13), (8, 2), (8, 3), (4, 14), (5, 14)})
-    cells.update({(1, 5), (2, 5), (7, 12), (8, 12), (5, 1)})
-    return sorted(cells)
+@dataclass(frozen=True, slots=True)
+class CaptureInputs:
+    """Contain authenticated inputs required for the Isaac Sim captures."""
+
+    run_id: str
+    run_dir: Path
+    measurement_log_dir: Path
+    truth_manifest_path: Path
+    environment: dict[str, Any]
+    truth: dict[str, Any]
+    station_positions_xyz: np.ndarray
+    station_yaw_rad: np.ndarray
+    station_pair_ids: tuple[tuple[int, ...], ...]
+    route_segments_xyz: tuple[np.ndarray, ...]
 
 
-def _scene_description() -> SceneDescription:
-    """Create the deterministic Isaac Sim scene used for all captures."""
-    room_size = (
-        CS_CO_SURFACE_SEARCH_PROFILE.environment.size_x,
-        CS_CO_SURFACE_SEARCH_PROFILE.environment.size_y,
-        CS_CO_SURFACE_SEARCH_PROFILE.environment.size_z,
+def _read_json(path: Path) -> dict[str, Any]:
+    """Read one JSON object from disk."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"{path} must contain a JSON object.")
+    return payload
+
+
+def _sha256(path: Path) -> str:
+    """Return the SHA-256 digest of one file."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_geant4_tracks(path: Path) -> dict[str, Any]:
+    """Load an authenticated actual-Geant4 trajectory artifact."""
+    resolved = Path(path).expanduser().resolve()
+    payload = _read_json(resolved)
+    if payload.get("schema_version") != 1:
+        raise ValueError("The Geant4 trajectory artifact has an unknown schema.")
+    if payload.get("artifact_semantics") != (
+        "actual native Geant4 primary-gamma step endpoints; no drawn or "
+        "interpolated particle histories"
+    ):
+        raise ValueError("The trajectory artifact is not actual Geant4 step data.")
+    validation = payload.get("validation")
+    if not isinstance(validation, dict) or not validation.get(
+        "all_points_are_native_step_endpoints"
+    ):
+        raise ValueError("The trajectory artifact lacks native-step validation.")
+    return payload
+
+
+def _yaw_from_quaternion_wxyz(quaternion: np.ndarray) -> float:
+    """Return the planar yaw represented by one WXYZ quaternion."""
+    w_value, x_value, y_value, z_value = (
+        float(value) for value in np.asarray(quaternion, dtype=np.float64)
     )
+    return math.atan2(
+        2.0 * (w_value * z_value + x_value * y_value),
+        1.0 - 2.0 * (y_value * y_value + z_value * z_value),
+    )
+
+
+def _load_route_segments(metadata_path: Path, run_id: str) -> tuple[np.ndarray, ...]:
+    """Load exact persisted travel-waypoint segments from MeasurementLog rows."""
+    segments: list[np.ndarray] = []
+    for line_number, line in enumerate(
+        metadata_path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("run_id") != run_id:
+            raise ValueError(
+                f"{metadata_path}:{line_number} has a different run_id."
+            )
+        metadata = row.get("metadata")
+        if not isinstance(metadata, dict):
+            raise TypeError(
+                f"{metadata_path}:{line_number} lacks a metadata object."
+            )
+        raw_waypoints = metadata.get("travel_waypoints_xyz")
+        if raw_waypoints is None:
+            continue
+        waypoints = np.asarray(raw_waypoints, dtype=np.float64)
+        if (
+            waypoints.ndim != 2
+            or waypoints.shape[1] != 3
+            or len(waypoints) < 2
+            or np.any(~np.isfinite(waypoints))
+        ):
+            raise ValueError(
+                f"{metadata_path}:{line_number} has invalid travel waypoints."
+            )
+        segments.append(waypoints)
+    if not segments:
+        raise ValueError("The completed MeasurementLog contains no saved route.")
+    return tuple(segments)
+
+
+def load_capture_inputs(
+    *,
+    run_dir: Path,
+    measurement_log_dir: Path,
+    truth_manifest_path: Path,
+) -> CaptureInputs:
+    """Load and cross-check one completed run for deterministic rendering."""
+    run_dir = Path(run_dir).expanduser().resolve()
+    measurement_log_dir = Path(measurement_log_dir).expanduser().resolve()
+    truth_manifest_path = Path(truth_manifest_path).expanduser().resolve()
+    result = _read_json(run_dir / "closed_loop_result.json")
+    environment = _read_json(measurement_log_dir / "environment.json")
+    truth = _read_json(truth_manifest_path)
+    if result.get("execution_status") != "complete":
+        raise ValueError("Isaac capture requires a completed closed-loop run.")
+    run_id = result.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("The completed result lacks a valid run_id.")
+    if truth.get("run_id") != run_id:
+        raise ValueError("The truth manifest is not bound to the completed run.")
+
+    observations_path = measurement_log_dir / "observations.npz"
+    with np.load(observations_path, allow_pickle=False) as observations:
+        station_ids = np.asarray(observations["station_id"], dtype=np.int64)
+        poses = np.asarray(observations["detector_pose_xyz"], dtype=np.float64)
+        quaternions = np.asarray(
+            observations["detector_quat_wxyz"], dtype=np.float64
+        )
+        fe_indices = np.asarray(
+            observations["fe_orientation_index"], dtype=np.int64
+        )
+        pb_indices = np.asarray(
+            observations["pb_orientation_index"], dtype=np.int64
+        )
+    record_count = int(result.get("record_count", -1))
+    station_count = int(result.get("station_count", -1))
+    if (
+        station_ids.shape != (record_count,)
+        or poses.shape != (record_count, 3)
+        or quaternions.shape != (record_count, 4)
+        or fe_indices.shape != (record_count,)
+        or pb_indices.shape != (record_count,)
+    ):
+        raise ValueError("Observation arrays disagree with the completed result.")
+    if np.any(~np.isfinite(poses)) or np.any(~np.isfinite(quaternions)):
+        raise ValueError("Observation poses contain nonfinite values.")
+    expected_stations = np.arange(station_count, dtype=np.int64)
+    if not np.array_equal(np.unique(station_ids), expected_stations):
+        raise ValueError("Observation station identifiers are not contiguous.")
+    first_rows = np.asarray(
+        [int(np.flatnonzero(station_ids == station)[0]) for station in expected_stations]
+    )
+    station_positions = poses[first_rows]
+    station_yaw = np.asarray(
+        [_yaw_from_quaternion_wxyz(quaternions[row]) for row in first_rows],
+        dtype=np.float64,
+    )
+    station_pairs: list[tuple[int, ...]] = []
+    for station in expected_stations:
+        mask = station_ids == station
+        pair_ids = tuple(
+            int(value) for value in (fe_indices[mask] * 8 + pb_indices[mask])
+        )
+        if len(pair_ids) != 8:
+            raise ValueError("Every rendered station must contain exactly eight views.")
+        station_pairs.append(pair_ids)
+    route_segments = _load_route_segments(
+        measurement_log_dir / "observation_metadata.jsonl",
+        run_id,
+    )
+    return CaptureInputs(
+        run_id=run_id,
+        run_dir=run_dir,
+        measurement_log_dir=measurement_log_dir,
+        truth_manifest_path=truth_manifest_path,
+        environment=environment,
+        truth=truth,
+        station_positions_xyz=station_positions,
+        station_yaw_rad=station_yaw,
+        station_pair_ids=tuple(station_pairs),
+        route_segments_xyz=route_segments,
+    )
+
+
+def _scene_description(inputs: CaptureInputs) -> SceneDescription:
+    """Create an Isaac scene from authenticated environment and truth artifacts."""
+    environment = inputs.environment
+    obstacle_grid = environment.get("obstacle_grid")
+    if not isinstance(obstacle_grid, dict):
+        raise TypeError("environment.obstacle_grid must be an object.")
+    raw_instances = environment.get("obstacle_instances")
+    if not isinstance(raw_instances, list) or not raw_instances:
+        raise ValueError("The current scene lacks physical obstacle instances.")
+    raw_sources = inputs.truth.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ValueError("The truth manifest lacks source records.")
     sources = [
-        SourceDescription("Cs-137", (8.2, 13.3, 0.85), 30000.0),
-        SourceDescription("Cs-137", (1.2, 13.8, 2.8), 26000.0),
-        SourceDescription("Cs-137", (8.8, 2.0, 1.7), 24000.0),
-        SourceDescription("Cs-137", (4.5, 0.2, 3.5), 22000.0),
-        SourceDescription("Co-60", (2.1, 11.6, 0.85), 18000.0),
-        SourceDescription("Co-60", (9.8, 7.0, 2.4), 16000.0),
-        SourceDescription("Co-60", (5.5, 14.8, 4.2), 14000.0),
+        SourceDescription(
+            isotope=str(source["isotope"]),
+            position_xyz=tuple(float(value) for value in source["position"]),
+            intensity_cps_1m=float(source["intensity_cps_1m"]),
+            transport_position_xyz=tuple(
+                float(value) for value in source["transport_position"]
+            ),
+            surface_chart_id=int(source["surface_chart_id"]),
+            surface_uv=tuple(float(value) for value in source["surface_uv"]),
+            surface_normal_xyz=tuple(
+                float(value) for value in source["surface_normal"]
+            ),
+            surface_emission_policy_sha256=str(
+                source["surface_emission_policy_sha256"]
+            ),
+        )
+        for source in raw_sources
     ]
     return SceneDescription(
-        room_size_xyz=room_size,
-        obstacle_origin_xy=(0.0, 0.0),
-        obstacle_cell_size_m=1.0,
-        obstacle_grid_shape=(int(room_size[0]), int(room_size[1])),
+        room_size_xyz=tuple(
+            float(environment[field]) for field in ("size_x", "size_y", "size_z")
+        ),
+        obstacle_origin_xy=tuple(float(value) for value in obstacle_grid["origin"]),
+        obstacle_cell_size_m=float(obstacle_grid["cell_size"]),
+        obstacle_grid_shape=tuple(int(value) for value in obstacle_grid["grid_shape"]),
         obstacle_material="concrete",
-        obstacle_cells=_obstacle_cells(),
+        obstacle_cells=[
+            tuple(int(value) for value in cell)
+            for cell in obstacle_grid.get("blocked_cells", [])
+        ],
+        obstacle_instances=obstacle_instances_from_dicts(raw_instances),
         author_obstacle_prims=True,
-        author_room_boundary_prims=True,
+        author_room_boundary_prims=False,
         sources=sources,
         usd_path=None,
         use_config_usd_fallback=False,
     )
 
 
-def _app_config() -> dict[str, object]:
-    """Return the visual Isaac Sim app configuration for manuscript captures."""
+def _material_visual_rules(environment: dict[str, Any]) -> list[dict[str, object]]:
+    """Return subtle material-specific colors for exact obstacle components."""
+    colors = {
+        "concrete": [0.39, 0.41, 0.43],
+        "steel": [0.23, 0.29, 0.34],
+        "aluminum": [0.56, 0.60, 0.63],
+        "lead": [0.38, 0.40, 0.45],
+    }
+    rules: list[dict[str, object]] = []
+    raw_instances = environment.get("obstacle_instances", [])
+    if not isinstance(raw_instances, list):
+        return rules
+    for instance in raw_instances:
+        if not isinstance(instance, dict):
+            continue
+        instance_name = str(instance.get("name", ""))
+        components = instance.get("components", [])
+        if not isinstance(components, list):
+            continue
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            material = str(component.get("material", "")).lower()
+            color = colors.get(material, [0.45, 0.47, 0.49])
+            component_name = str(component.get("name", ""))
+            rules.append(
+                {
+                    "path_prefix": (
+                        "/World/SimBridge/Obstacles/"
+                        f"{instance_name}/{component_name}"
+                    ),
+                    "color_rgb": color,
+                    "opacity": 1.0,
+                    "roughness": 0.72,
+                }
+            )
+    return rules
+
+
+def _app_config(inputs: CaptureInputs) -> dict[str, object]:
+    """Return a high-quality Isaac Sim configuration for manuscript captures."""
+    source_rules = [
+        {
+            "path_prefix": "/World/SimBridge/Sources/Cs_137",
+            "color_rgb": [1.0, 0.04, 0.03],
+            "opacity": 1.0,
+            "roughness": 0.20,
+            "emissive_scale": 7.0,
+        },
+        {
+            "path_prefix": "/World/SimBridge/Sources/Co_60",
+            "color_rgb": [0.03, 0.42, 1.0],
+            "opacity": 1.0,
+            "roughness": 0.20,
+            "emissive_scale": 7.0,
+        },
+    ]
     return {
         "headless": True,
         "renderer": "RayTracedLighting",
@@ -88,168 +365,111 @@ def _app_config() -> dict[str, object]:
         "obstacle_height_m": 1.8,
         "robot_animation_time_scale": 0.0,
         "lighting": {
-            "dome_intensity": 1400.0,
+            "dome_intensity": 1125.0,
             "color_rgb": [0.98, 0.99, 1.0],
             "interior_lights": [
                 {
-                    "position_xyz": [2.0, 2.0, 3.7],
-                    "intensity": 80000.0,
-                    "radius_m": 0.05,
+                    "position_xyz": [1.4, 1.5, 6.8],
+                    "intensity": 65000.0,
+                    "radius_m": 0.08,
                 },
                 {
-                    "position_xyz": [7.8, 7.0, 3.7],
-                    "intensity": 90000.0,
-                    "radius_m": 0.05,
+                    "position_xyz": [8.7, 8.0, 7.2],
+                    "intensity": 80000.0,
+                    "radius_m": 0.08,
                 },
                 {
-                    "position_xyz": [4.5, 14.0, 3.7],
-                    "intensity": 80000.0,
-                    "radius_m": 0.05,
+                    "position_xyz": [3.5, 14.0, 6.5],
+                    "intensity": 70000.0,
+                    "radius_m": 0.08,
                 },
             ],
         },
         "stage_visual_rules": [
             {
                 "path_prefix": "/World/Environment/Wall/Floor",
-                "color_rgb": [0.62, 0.65, 0.67],
-                "opacity": 1.0,
-                "roughness": 0.75,
-            },
-            {
-                "path_prefix": "/World/Environment/Wall",
-                "color_rgb": [0.62, 0.67, 0.70],
-                "opacity": 0.18,
-                "roughness": 0.85,
-            },
-            {
-                "path_prefix": "/World/SimBridge/Obstacles",
-                "color_rgb": [0.40, 0.43, 0.46],
+                "color_rgb": [0.73, 0.75, 0.76],
                 "opacity": 1.0,
                 "roughness": 0.78,
             },
             {
-                "path_prefix": "/World/SimBridge/Sources",
-                "color_rgb": [1.0, 0.04, 0.02],
-                "opacity": 1.0,
-                "roughness": 0.25,
-                "emissive_scale": 5.0,
+                "path_prefix": "/World/Environment/Wall",
+                "color_rgb": [0.74, 0.78, 0.80],
+                "opacity": 0.10,
+                "roughness": 0.88,
             },
             {
                 "path_prefix": "/World/SimBridge/Robot/Body",
-                "color_rgb": [0.23, 0.29, 0.34],
+                "color_rgb": [0.18, 0.23, 0.28],
                 "opacity": 1.0,
                 "roughness": 0.48,
-                "emissive_scale": 0.2,
             },
             {
                 "path_prefix": "/World/SimBridge/Robot/Detector",
-                "color_rgb": [0.0, 0.85, 1.0],
+                "color_rgb": [0.00, 0.84, 0.95],
                 "opacity": 1.0,
-                "roughness": 0.25,
-                "emissive_scale": 2.8,
+                "roughness": 0.20,
+                "emissive_scale": 3.2,
             },
             {
                 "path_prefix": "/World/SimBridge/Robot/FeShield",
-                "color_rgb": [0.96, 0.56, 0.08],
+                "color_rgb": [0.95, 0.56, 0.06],
                 "opacity": 1.0,
-                "roughness": 0.45,
-                "emissive_scale": 0.7,
+                "roughness": 0.42,
+                "emissive_scale": 0.45,
             },
             {
                 "path_prefix": "/World/SimBridge/Robot/PbShield",
-                "color_rgb": [0.62, 0.66, 0.76],
+                "color_rgb": [0.72, 0.75, 0.82],
                 "opacity": 1.0,
-                "roughness": 0.45,
-                "emissive_scale": 0.4,
+                "roughness": 0.42,
+                "emissive_scale": 0.25,
             },
+            *source_rules,
+            *_material_visual_rules(inputs.environment),
         ],
         "stage_material_rules": [
             {"path_prefix": "/World/Environment", "material": "concrete"},
-            {"path_prefix": "/World/SimBridge/Obstacles", "material": "concrete"},
         ],
     }
 
 
 def _command(
+    inputs: CaptureInputs,
     *,
+    station_index: int,
+    pair_id: int,
     step_id: int,
-    pose_xy: tuple[float, float],
-    yaw: float,
-    fe: int,
-    pb: int,
 ) -> SimulationCommand:
-    """Create a robot command for a still manuscript capture."""
+    """Create a still command from one recorded station and orientation pair."""
+    if station_index < 0 or station_index >= len(inputs.station_positions_xyz):
+        raise ValueError("station_index is outside the recorded run.")
+    if pair_id < 0 or pair_id >= 64:
+        raise ValueError("pair_id must lie in [0, 63].")
     return SimulationCommand(
         step_id=step_id,
-        target_pose_xyz=(pose_xy[0], pose_xy[1], 0.0),
-        target_base_yaw_rad=yaw,
-        fe_orientation_index=fe,
-        pb_orientation_index=pb,
+        target_pose_xyz=tuple(
+            float(value) for value in inputs.station_positions_xyz[station_index]
+        ),
+        target_base_yaw_rad=float(inputs.station_yaw_rad[station_index]),
+        fe_orientation_index=pair_id // 8,
+        pb_orientation_index=pair_id % 8,
         dwell_time_s=20.0,
     )
 
 
-def _pump(app: IsaacSimApplication, frames: int = 24) -> None:
-    """Advance Isaac Sim several frames so render state settles."""
-    for _ in range(frames):
-        app.update()
-
-
 def _backend(app: IsaacSimApplication):
-    """Return the real Isaac Sim stage backend from the application."""
+    """Return the real stage backend from one Isaac Sim application."""
     backend = app._stage_backend  # noqa: SLF001
     if backend is None:
-        raise RuntimeError("Isaac Sim backend is not available.")
+        raise RuntimeError("Isaac Sim stage backend is unavailable.")
     return backend
 
 
-def _author_context_prims(
-    app: IsaacSimApplication,
-    *,
-    include_robot_path: bool,
-) -> None:
-    """Add visual-only measurement path and source-ray guides for captures."""
-    backend = _backend(app)
-    if include_robot_path:
-        path_points = (
-            (1.2, 1.4, 0.08),
-            (2.4, 3.1, 0.08),
-            (4.3, 5.9, 0.08),
-            (5.5, 8.2, 0.08),
-            (7.1, 10.4, 0.08),
-            (8.0, 12.2, 0.08),
-        )
-        backend.ensure_polyline(
-            "/World/SimBridge/View/RobotPath",
-            points_xyz=path_points,
-            color_rgb=(0.05, 0.32, 1.0),
-            width_m=0.045,
-        )
-        for index, point in enumerate(path_points):
-            backend.ensure_sphere(
-                f"/World/SimBridge/View/Measurement_{index:02d}",
-                radius_m=0.085,
-                translation_xyz=point,
-                color_rgb=(0.05, 0.32, 1.0),
-                material="air",
-            )
-    detector = (4.3, 5.9, 0.72)
-    for index, source in enumerate(_scene_description().sources):
-        source_marker = (source.position_xyz[0], source.position_xyz[1], 2.08)
-        backend.ensure_sphere(
-            f"/World/SimBridge/View/SourceMarker_{index:02d}",
-            radius_m=0.17,
-            translation_xyz=source_marker,
-            color_rgb=(1.0, 0.05, 0.02),
-            material="air",
-        )
-        backend.ensure_polyline(
-            f"/World/SimBridge/View/GammaRay_{index:02d}",
-            points_xyz=(source_marker, detector),
-            color_rgb=(1.0, 0.86, 0.05),
-            width_m=0.026,
-        )
-    backend.step()
+def _pump(app: IsaacSimApplication, frames: int = 24) -> None:
+    """Advance Isaac Sim until authored render state has settled."""
+    for _ in range(frames):
+        app.update()
 
 
 def _set_camera(
@@ -260,14 +480,14 @@ def _set_camera(
     target: tuple[float, float, float],
     focal_length_mm: float,
 ) -> None:
-    """Create and update one Isaac Sim camera."""
+    """Create or update one deterministic Isaac Sim camera."""
     _backend(app).set_camera_view(
         path,
         eye_xyz=eye,
         target_xyz=target,
         focal_length_mm=focal_length_mm,
     )
-    _pump(app, frames=18)
+    _pump(app, frames=20)
 
 
 def _capture(
@@ -277,7 +497,7 @@ def _capture(
     name: str,
     resolution: tuple[int, int],
 ) -> Path:
-    """Capture one RGB render product from an Isaac Sim camera."""
+    """Capture one raw RGB render from an Isaac Sim camera."""
     import omni.replicator.core as rep  # type: ignore
 
     capture_dir = output_dir / f"capture_{name}"
@@ -296,359 +516,652 @@ def _capture(
     render_product.destroy()
     candidates = sorted(capture_dir.glob("rgb*.png"))
     if not candidates:
-        raise RuntimeError(f"Replicator did not write an RGB image in {capture_dir}")
+        raise RuntimeError(f"Isaac Sim wrote no RGB image in {capture_dir}.")
     final_path = output_dir / f"{name}.png"
     shutil.copy2(candidates[-1], final_path)
     return final_path
 
 
-def _save_pdf(image_path: Path, pdf_path: Path) -> None:
-    """Write a PNG image as a single-page PDF."""
-    pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    with Image.open(image_path) as image:
-        image.convert("RGB").save(pdf_path, "PDF", resolution=300.0)
+def _trajectory_points(track: dict[str, Any]) -> np.ndarray:
+    """Return one finite native Geant4 trajectory as an ``N x 3`` array."""
+    points = np.asarray(track.get("points_xyz_m"), dtype=np.float64)
+    if (
+        points.ndim != 2
+        or points.shape[1] != 3
+        or len(points) < 2
+        or np.any(~np.isfinite(points))
+    ):
+        raise ValueError("A saved Geant4 track contains invalid step endpoints.")
+    return points
 
 
-def _font(size_px: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Return a Times-compatible serif font for figure annotations."""
-    try:
-        return ImageFont.truetype(SERIF_FONT_REGULAR, size_px)
-    except OSError:
-        return ImageFont.load_default()
+def _trajectory_length_m(track: dict[str, Any]) -> float:
+    """Return the polyline length of one actual Geant4 trajectory."""
+    points = _trajectory_points(track)
+    return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
 
 
-def _text_box(
-    draw: ImageDraw.ImageDraw,
-    xy: tuple[int, int],
-    text: str,
-    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
-    *,
-    outline_rgb: tuple[int, int, int],
-) -> tuple[int, int, int, int]:
-    """Draw a compact in-figure label box and return its bounds."""
-    left, top = xy
-    bbox = draw.multiline_textbbox((left, top), text, font=font, spacing=4)
-    pad_x = 12
-    pad_y = 8
-    box = (
-        bbox[0] - pad_x,
-        bbox[1] - pad_y,
-        bbox[2] + pad_x,
-        bbox[3] + pad_y,
-    )
-    draw.rounded_rectangle(
-        box,
-        radius=4,
-        fill=(255, 255, 255, 232),
-        outline=outline_rgb + (255,),
-        width=3,
-    )
-    draw.multiline_text((left, top), text, fill=(15, 15, 15, 255), font=font, spacing=4)
-    return box
+def _trajectory_initial_direction(track: dict[str, Any]) -> np.ndarray:
+    """Return the first nonzero unit direction of one saved trajectory."""
+    deltas = np.diff(_trajectory_points(track), axis=0)
+    lengths = np.linalg.norm(deltas, axis=1)
+    nonzero = np.flatnonzero(lengths > 1.0e-12)
+    if nonzero.size == 0:
+        raise ValueError("A saved Geant4 track has no nonzero transport step.")
+    index = int(nonzero[0])
+    return deltas[index] / lengths[index]
 
 
-def _callout(
-    draw: ImageDraw.ImageDraw,
-    *,
-    text: str,
-    label_xy: tuple[int, int],
-    target_xy: tuple[int, int],
-    color_rgb: tuple[int, int, int],
-    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
-) -> None:
-    """Draw a label with a pointer line to the target feature."""
-    box = _text_box(draw, label_xy, text, font, outline_rgb=color_rgb)
-    start_x, start_y = _callout_anchor(box, target_xy)
-    draw.line(
-        (start_x, start_y, target_xy[0], target_xy[1]),
-        fill=color_rgb + (255,),
-        width=4,
-    )
-    radius = 8
-    draw.ellipse(
-        (
-            target_xy[0] - radius,
-            target_xy[1] - radius,
-            target_xy[0] + radius,
-            target_xy[1] + radius,
-        ),
-        fill=color_rgb + (255,),
-    )
-
-
-def _callout_many(
-    draw: ImageDraw.ImageDraw,
-    *,
-    text: str,
-    label_xy: tuple[int, int],
-    target_xys: tuple[tuple[int, int], ...],
-    color_rgb: tuple[int, int, int],
-    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
-) -> None:
-    """Draw one label with pointer lines to several target features."""
-    box = _text_box(draw, label_xy, text, font, outline_rgb=color_rgb)
-    radius = 8
-    for target_xy in target_xys:
-        start_x, start_y = _callout_anchor(box, target_xy)
-        draw.line(
-            (start_x, start_y, target_xy[0], target_xy[1]),
-            fill=color_rgb + (255,),
-            width=4,
+def _trajectory_identity(track: dict[str, Any]) -> dict[str, object]:
+    """Return fields that uniquely identify one rendered native trajectory."""
+    return {
+        key: track[key]
+        for key in (
+            "mode",
+            "source_index",
+            "isotope",
+            "primary_batch_index",
+            "primary_history_index",
+            "bias_branch_lineage_id",
+            "track_id",
+            "initial_energy_keV",
+            "raw_step_count",
+            "detector_entered",
+            "interacted",
+            "points_truncated",
         )
-        draw.ellipse(
-            (
-                target_xy[0] - radius,
-                target_xy[1] - radius,
-                target_xy[0] + radius,
-                target_xy[1] + radius,
-            ),
-            fill=color_rgb + (255,),
-        )
-
-
-def _callout_anchor(
-    box: tuple[int, int, int, int],
-    target_xy: tuple[int, int],
-) -> tuple[int, int]:
-    """Return the box-edge point nearest to the target without crossing text."""
-    left, top, right, bottom = box
-    target_x, target_y = target_xy
-    inset = 14
-    if target_y < top:
-        return min(max(target_x, left + inset), right - inset), top
-    if target_y > bottom:
-        return min(max(target_x, left + inset), right - inset), bottom
-    if target_x < left:
-        return left, min(max(target_y, top + inset), bottom - inset)
-    return right, min(max(target_y, top + inset), bottom - inset)
-
-
-def _legend(
-    draw: ImageDraw.ImageDraw,
-    *,
-    xy: tuple[int, int],
-    rows: tuple[tuple[str, tuple[int, int, int]], ...],
-    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
-) -> None:
-    """Draw a small color legend inside a figure panel."""
-    left, top = xy
-    swatch_w = 68
-    pad_x = 22
-    pad_y = 18
-    text_sizes = [draw.textbbox((0, 0), label, font=font) for label, _ in rows]
-    text_width = max((bbox[2] - bbox[0] for bbox in text_sizes), default=0)
-    text_height = max((bbox[3] - bbox[1] for bbox in text_sizes), default=28)
-    row_h = max(56, text_height + 20)
-    width = pad_x * 3 + swatch_w + text_width
-    height = pad_y * 2 + row_h * len(rows)
-    draw.rounded_rectangle(
-        (left, top, left + width, top + height),
-        radius=4,
-        fill=(255, 255, 255, 228),
-        outline=(35, 35, 35, 255),
-        width=2,
-    )
-    for index, (label, color) in enumerate(rows):
-        y = top + pad_y + index * row_h
-        center_y = y + row_h // 2
-        draw.line(
-            (left + pad_x, center_y, left + pad_x + swatch_w, center_y),
-            fill=color + (255,),
-            width=5,
-        )
-        draw.text(
-            (left + pad_x * 2 + swatch_w, center_y - text_height // 2),
-            label,
-            fill=(15, 15, 15, 255),
-            font=font,
-        )
-
-
-def _annotate_capture(image_path: Path, kind: str) -> Path:
-    """Add publication-style component labels to one manuscript capture."""
-    with Image.open(image_path).convert("RGBA") as image:
-        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        label_font = _font(60)
-        legend_font = _font(58)
-        if kind == "detector":
-            _callout(
-                draw,
-                text="CeBr3\ndetector",
-                label_xy=(980, 210),
-                target_xy=(832, 566),
-                color_rgb=(0, 140, 165),
-                font=label_font,
-            )
-            _callout(
-                draw,
-                text="Fe octant\nshield",
-                label_xy=(445, 735),
-                target_xy=(683, 712),
-                color_rgb=(210, 150, 0),
-                font=label_font,
-            )
-            _callout(
-                draw,
-                text="Pb octant\nshield",
-                label_xy=(950, 670),
-                target_xy=(948, 520),
-                color_rgb=(95, 105, 130),
-                font=label_font,
-            )
-            _callout(
-                draw,
-                text="mobile\nbase",
-                label_xy=(970, 880),
-                target_xy=(850, 930),
-                color_rgb=(65, 80, 90),
-                font=label_font,
-            )
-        elif kind == "problem":
-            _callout(
-                draw,
-                text="robot +\nNondirectional Detector\n+ Fe/Pb shields",
-                label_xy=(300, 720),
-                target_xy=(812, 675),
-                color_rgb=(0, 120, 150),
-                font=label_font,
-            )
-            _callout(
-                draw,
-                text="cluttered 3-D environment",
-                label_xy=(1025, 805),
-                target_xy=(1210, 620),
-                color_rgb=(80, 80, 80),
-                font=label_font,
-            )
-            _callout_many(
-                draw,
-                text="radiation sources",
-                label_xy=(1255, 150),
-                target_xys=((1195, 88), (620, 158), (1205, 523)),
-                color_rgb=(190, 55, 45),
-                font=label_font,
-            )
-            _callout(
-                draw,
-                text="gamma\nrays",
-                label_xy=(1265, 390),
-                target_xy=(1010, 565),
-                color_rgb=(210, 170, 0),
-                font=label_font,
-            )
-        elif kind == "environment":
-            _legend(
-                draw,
-                xy=(44, 44),
-                rows=(
-                    ("measurement path", (0, 88, 210)),
-                    ("gamma path", (220, 180, 0)),
-                    ("blocked cell", (85, 92, 96)),
-                ),
-                font=legend_font,
-            )
-            _callout(
-                draw,
-                text="traversable\ncorridor",
-                label_xy=(1120, 705),
-                target_xy=(890, 610),
-                color_rgb=(85, 85, 85),
-                font=label_font,
-            )
-            _callout(
-                draw,
-                text="robot\nstation",
-                label_xy=(640, 800),
-                target_xy=(756, 710),
-                color_rgb=(0, 120, 150),
-                font=label_font,
-            )
-            _callout(
-                draw,
-                text="concrete\nobstacle",
-                label_xy=(1130, 250),
-                target_xy=(1220, 422),
-                color_rgb=(80, 80, 80),
-                font=label_font,
-            )
-        annotated = Image.alpha_composite(image, overlay).convert("RGB")
-        annotated.save(image_path)
-    return image_path
-
-
-def _copy_to_manuscript() -> None:
-    """Copy generated PDFs into the current RA-L manuscript figure locations."""
-    copies = {
-        "problem_setting.pdf": (
-            LATEX_ROOT / "sections/01_introduction/figures/ProblemSetting.pdf"
-        ),
+    } | {
+        "point_count": int(len(_trajectory_points(track))),
+        "trajectory_length_m": _trajectory_length_m(track),
     }
-    for source_name, destination in copies.items():
-        shutil.copy2(OUTPUT_ROOT / source_name, destination)
+
+
+def _select_geant4_tracks(
+    inputs: CaptureInputs,
+    artifact: dict[str, Any],
+    *,
+    station_index: int,
+) -> tuple[dict[str, Any], ...]:
+    """Select diverse actual emission tracks for every displayed source."""
+    if artifact.get("run_id") != inputs.run_id:
+        raise ValueError("Geant4 tracks are bound to a different run.")
+    if int(artifact.get("station_index", -1)) != station_index:
+        raise ValueError("Geant4 tracks were not recorded at the rendered station.")
+    expected_pair = inputs.station_pair_ids[station_index][0]
+    if int(artifact.get("recorded_pair_id", -1)) != expected_pair:
+        raise ValueError("Geant4 tracks use a different recorded shield pair.")
+    detector = np.asarray(
+        artifact.get("detector_pose_xyz_m"), dtype=np.float64
+    )
+    if not np.allclose(
+        detector,
+        inputs.station_positions_xyz[station_index],
+        rtol=0.0,
+        atol=1.0e-10,
+    ):
+        raise ValueError("Geant4 track detector pose differs from the MeasurementLog.")
+    modes = artifact.get("modes")
+    if not isinstance(modes, dict):
+        raise TypeError("Geant4 trajectory modes must be an object.")
+    isotropic = modes.get("isotropic_emission")
+    if not isinstance(isotropic, dict):
+        raise TypeError("The isotropic Geant4 trajectory mode is required.")
+    isotropic_tracks = isotropic.get("tracks")
+    if not isinstance(isotropic_tracks, list):
+        raise TypeError("The isotropic Geant4 trajectory mode needs a track array.")
+
+    emission_selection: list[dict[str, Any]] = []
+    for source_index in range(len(inputs.truth["sources"])):
+        candidates = [
+            track
+            for track in isotropic_tracks
+            if int(track.get("source_index", -1)) == source_index
+            and not bool(track.get("points_truncated", True))
+            and _trajectory_length_m(track) >= 0.75
+        ]
+        if not candidates:
+            raise ValueError(
+                f"No readable actual Geant4 emission track for source {source_index}."
+            )
+        if len(candidates) < EMISSION_TRACKS_PER_SOURCE:
+            raise ValueError(
+                "Insufficient readable Geant4 emission tracks for source "
+                f"{source_index}: need {EMISSION_TRACKS_PER_SOURCE}."
+            )
+        anchor = min(
+            candidates,
+            key=lambda track: (
+                abs(_trajectory_length_m(track) - 3.0),
+                int(track["primary_history_index"]),
+            ),
+        )
+        selected = [anchor]
+        selected_directions = [_trajectory_initial_direction(anchor)]
+        remaining = [track for track in candidates if track is not anchor]
+        while len(selected) < EMISSION_TRACKS_PER_SOURCE:
+            next_track = min(
+                remaining,
+                key=lambda track: (
+                    -min(
+                        1.0
+                        - float(
+                            np.clip(
+                                np.dot(
+                                    _trajectory_initial_direction(track),
+                                    direction,
+                                ),
+                                -1.0,
+                                1.0,
+                            )
+                        )
+                        for direction in selected_directions
+                    ),
+                    abs(_trajectory_length_m(track) - 3.0),
+                    int(track["primary_history_index"]),
+                ),
+            )
+            selected.append(next_track)
+            selected_directions.append(_trajectory_initial_direction(next_track))
+            remaining.remove(next_track)
+        emission_selection.extend(selected)
+    return tuple(emission_selection)
+
+
+def _author_run_context(
+    app: IsaacSimApplication,
+    inputs: CaptureInputs,
+    geant4_tracks: dict[str, Any],
+    *,
+    station_index: int,
+) -> tuple[dict[str, Any], ...]:
+    """Author the saved route, sources, and selected actual Geant4 tracks."""
+    backend = _backend(app)
+    context_root = "/World/SimBridge/View/AuthenticatedRun"
+    backend.remove_prim(context_root)
+    backend.ensure_xform(context_root)
+    for index, segment in enumerate(inputs.route_segments_xyz):
+        backend.ensure_polyline(
+            f"{context_root}/Route_{index:02d}",
+            points_xyz=tuple(
+                tuple(float(value) for value in row) for row in segment
+            ),
+            color_rgb=(0.00, 0.62, 0.70),
+            width_m=0.035,
+        )
+    for index, position in enumerate(inputs.station_positions_xyz):
+        backend.ensure_sphere(
+            f"{context_root}/Station_{index:02d}",
+            radius_m=0.065,
+            translation_xyz=tuple(float(value) for value in position),
+            color_rgb=(0.04, 0.04, 0.04),
+            material="air",
+        )
+    for index, source in enumerate(inputs.truth["sources"]):
+        isotope = str(source["isotope"])
+        backend.ensure_sphere(
+            f"{context_root}/Source_{index:02d}",
+            radius_m=0.145,
+            translation_xyz=tuple(float(value) for value in source["position"]),
+            color_rgb=ISOTOPE_COLORS.get(isotope, (1.0, 0.8, 0.05)),
+            material="air",
+        )
+    emission_tracks = _select_geant4_tracks(
+        inputs,
+        geant4_tracks,
+        station_index=station_index,
+    )
+    for index, track in enumerate(emission_tracks):
+        points = _trajectory_points(track)
+        backend.ensure_polyline(
+            f"{context_root}/Geant4Emission_{index:02d}",
+            points_xyz=tuple(
+                tuple(float(value) for value in point) for point in points
+            ),
+            color_rgb=(0.18, 0.82, 0.26),
+            width_m=0.030,
+        )
+    backend.step()
+    return emission_tracks
+
+
+def _author_room_context(app: IsaacSimApplication, inputs: CaptureInputs) -> None:
+    """Author a solid ground plane and unobtrusive wireframe room boundary."""
+    backend = _backend(app)
+    room_x = float(inputs.environment["size_x"])
+    room_y = float(inputs.environment["size_y"])
+    room_z = float(inputs.environment["size_z"])
+    root = "/World/SimBridge/View/RoomContext"
+    backend.remove_prim(root)
+    backend.ensure_xform(root)
+    backend.ensure_box(
+        f"{root}/Ground",
+        size_xyz=(room_x, room_y, 0.08),
+        translation_xyz=(0.5 * room_x, 0.5 * room_y, -0.04),
+        color_rgb=(0.73, 0.75, 0.76),
+        material="concrete",
+    )
+    lower = (
+        (0.0, 0.0, 0.01),
+        (room_x, 0.0, 0.01),
+        (room_x, room_y, 0.01),
+        (0.0, room_y, 0.01),
+        (0.0, 0.0, 0.01),
+    )
+    upper = tuple((x_value, y_value, room_z) for x_value, y_value, _ in lower)
+    backend.ensure_polyline(
+        f"{root}/LowerBoundary",
+        points_xyz=lower,
+        color_rgb=(0.34, 0.37, 0.40),
+        width_m=0.018,
+    )
+    backend.ensure_polyline(
+        f"{root}/UpperBoundary",
+        points_xyz=upper,
+        color_rgb=(0.44, 0.47, 0.50),
+        width_m=0.014,
+    )
+    for index, (x_value, y_value) in enumerate(
+        ((0.0, 0.0), (room_x, 0.0), (room_x, room_y), (0.0, room_y))
+    ):
+        backend.ensure_polyline(
+            f"{root}/VerticalBoundary_{index:02d}",
+            points_xyz=((x_value, y_value, 0.0), (x_value, y_value, room_z)),
+            color_rgb=(0.44, 0.47, 0.50),
+            width_m=0.014,
+        )
+    backend.step()
+
+
+def _author_studio(app: IsaacSimApplication) -> None:
+    """Author a neutral inspection floor and background for head close-ups."""
+    backend = _backend(app)
+    backend.remove_prim("/World/SimBridge/View/AuthenticatedRun")
+    backend.remove_prim("/World/SimBridge/View/Studio")
+    backend.ensure_xform("/World/SimBridge/View/Studio")
+    backend.ensure_box(
+        "/World/SimBridge/View/Studio/Floor",
+        size_xyz=(5.0, 5.0, 0.08),
+        translation_xyz=(0.0, 0.0, -0.04),
+        color_rgb=(0.70, 0.73, 0.75),
+        material="concrete",
+    )
+    backend.ensure_box(
+        "/World/SimBridge/View/Studio/Backdrop",
+        size_xyz=(5.0, 0.08, 4.0),
+        translation_xyz=(0.0, 1.65, 2.0),
+        color_rgb=(0.42, 0.46, 0.50),
+        material="concrete",
+    )
+    backend.step()
+
+
+def _author_studio_telescoping_mast(
+    app: IsaacSimApplication,
+    *,
+    detector_height_m: float,
+) -> None:
+    """Render a slim two-stage mast below the detector for close-up views."""
+    if not math.isfinite(detector_height_m) or detector_height_m <= 0.20:
+        raise ValueError("detector_height_m must exceed 0.20 m.")
+    backend = _backend(app)
+    robot_root = "/World/SimBridge/Robot"
+    mount_top_m = detector_height_m - SHIELD_CONTACT_RADIUS_M
+    upper_top_m = mount_top_m - 0.012
+    collar_center_m = min(0.60, 0.62 * upper_top_m)
+    lower_bottom_m = 0.10
+    lower_top_m = collar_center_m + 0.015
+    upper_bottom_m = collar_center_m - 0.010
+    backend.ensure_box(
+        f"{robot_root}/Mast",
+        size_xyz=(0.045, 0.045, lower_top_m - lower_bottom_m),
+        translation_xyz=(
+            0.0,
+            0.0,
+            0.5 * (lower_bottom_m + lower_top_m),
+        ),
+        color_rgb=(0.22, 0.25, 0.28),
+        material="steel",
+    )
+    backend.ensure_box(
+        f"{robot_root}/StudioMastUpper",
+        size_xyz=(0.022, 0.022, upper_top_m - upper_bottom_m),
+        translation_xyz=(
+            0.0,
+            0.0,
+            0.5 * (upper_bottom_m + upper_top_m),
+        ),
+        color_rgb=(0.54, 0.58, 0.61),
+        material="steel",
+    )
+    backend.ensure_box(
+        f"{robot_root}/StudioMastCollar",
+        size_xyz=(0.060, 0.060, 0.040),
+        translation_xyz=(0.0, 0.0, collar_center_m),
+        color_rgb=(0.14, 0.17, 0.20),
+        material="steel",
+    )
+    backend.ensure_box(
+        f"{robot_root}/StudioHeadMount",
+        size_xyz=(0.032, 0.032, 0.024),
+        translation_xyz=(0.0, 0.0, mount_top_m - 0.012),
+        color_rgb=(0.18, 0.21, 0.24),
+        material="steel",
+    )
+    backend.step()
+
+
+def _studio_command(pair_id: int, step_id: int) -> SimulationCommand:
+    """Create one fixed-pose shield command for the detector inspection view."""
+    return SimulationCommand(
+        step_id=step_id,
+        target_pose_xyz=(0.0, 0.0, 1.05),
+        target_base_yaw_rad=0.0,
+        fe_orientation_index=pair_id // 8,
+        pb_orientation_index=pair_id % 8,
+        dwell_time_s=20.0,
+    )
+
+
+def _select_spatially_legible_pairs(
+    recorded_pair_ids: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Select four recorded pairs whose two octants separate in the camera."""
+    eye = np.asarray((0.90, -1.22, 1.48), dtype=np.float64)
+    target = np.asarray((0.0, 0.0, 1.02), dtype=np.float64)
+    view = eye - target
+    view /= np.linalg.norm(view)
+    camera_up = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
+    camera_right = np.cross(view, camera_up)
+    camera_right /= np.linalg.norm(camera_right)
+    camera_vertical = np.cross(camera_right, view)
+    camera_vertical /= np.linalg.norm(camera_vertical)
+
+    scores: list[tuple[float, int]] = []
+    for recorded_index, pair_id in enumerate(recorded_pair_ids):
+        fe_normal = physical_shield_normal_from_orientation_index(pair_id // 8)
+        pb_normal = physical_shield_normal_from_orientation_index(pair_id % 8)
+        fe_projection = np.asarray(
+            (
+                np.dot(fe_normal, camera_right),
+                np.dot(fe_normal, camera_vertical),
+            ),
+            dtype=np.float64,
+        )
+        pb_projection = np.asarray(
+            (
+                np.dot(pb_normal, camera_right),
+                np.dot(pb_normal, camera_vertical),
+            ),
+            dtype=np.float64,
+        )
+        separation = float(np.linalg.norm(fe_projection - pb_projection))
+        visibility = max(0.0, float(np.dot(fe_normal, view))) + max(
+            0.0, float(np.dot(pb_normal, view))
+        )
+        scores.append((separation + 0.4 * visibility, recorded_index))
+    selected_indices = {
+        recorded_index
+        for _, recorded_index in sorted(scores, reverse=True)[:4]
+    }
+    return tuple(
+        pair_id
+        for recorded_index, pair_id in enumerate(recorded_pair_ids)
+        if recorded_index in selected_indices
+    )
+
+
+def _artifact_record(path: Path) -> dict[str, object]:
+    """Return one path, size, and digest record for provenance."""
+    resolved = Path(path).resolve()
+    return {
+        "path": resolved.as_posix(),
+        "size_bytes": resolved.stat().st_size,
+        "sha256": _sha256(resolved),
+    }
+
+
+def _write_provenance(
+    inputs: CaptureInputs,
+    *,
+    output_dir: Path,
+    output_paths: list[Path],
+    environment_station_index: int,
+    shield_station_index: int,
+    all_shield_pair_ids: tuple[int, ...],
+    shield_pair_ids: tuple[int, ...],
+    geant4_track_artifact_path: Path,
+    emission_tracks: tuple[dict[str, Any], ...],
+) -> Path:
+    """Write enough capture metadata to reproduce every raw render."""
+    source_paths = [
+        inputs.run_dir / "closed_loop_result.json",
+        inputs.run_dir / "planner_audit.jsonl",
+        inputs.measurement_log_dir / "environment.json",
+        inputs.measurement_log_dir / "observations.npz",
+        inputs.measurement_log_dir / "observation_metadata.jsonl",
+        inputs.truth_manifest_path,
+        geant4_track_artifact_path,
+        Path(__file__),
+        RUNTIME_ROOT / "src" / "sim" / "isaacsim_app" / "scene_builder.py",
+        RUNTIME_ROOT / "src" / "sim" / "shield_geometry.py",
+        RUNTIME_ROOT / "src" / "measurement" / "detector_geometry.py",
+    ]
+    payload = {
+        "schema_version": 1,
+        "run_id": inputs.run_id,
+        "source_files": [_artifact_record(path) for path in source_paths],
+        "outputs": [_artifact_record(path) for path in output_paths],
+        "environment_capture": {
+            "station_index": environment_station_index,
+            "detector_pose_xyz_m": inputs.station_positions_xyz[
+                environment_station_index
+            ].tolist(),
+            "pair_id": inputs.station_pair_ids[environment_station_index][0],
+            "camera": {
+                "eye_xyz_m": [14.5, -13.0, 13.0],
+                "target_xyz_m": [5.0, 7.6, 1.45],
+                "focal_length_mm": 25.0,
+                "resolution_px": [2400, 1400],
+            },
+            "route_semantics": "exact persisted travel_waypoints_xyz",
+            "station_semantics": "recorded detector_pose_xyz",
+            "source_semantics": "private truth overlay for contextual paper figure",
+            "geant4_track_artifact": _artifact_record(
+                geant4_track_artifact_path
+            ),
+            "geant4_track_semantics": (
+                "actual native Geant4 primary-gamma step endpoints selected "
+                "without coordinate interpolation"
+            ),
+            "displayed_isotropic_emission_tracks": [
+                _trajectory_identity(track) for track in emission_tracks
+            ],
+            "track_display_selection": (
+                "three actual isotropic tracks per source: one approximately "
+                "3 m anchor followed by two tracks maximizing the minimum "
+                "initial-direction separation; deterministic history-index ties"
+            ),
+        },
+        "detector_sequence": {
+            "recorded_station_index": shield_station_index,
+            "all_recorded_pair_ids": list(all_shield_pair_ids),
+            "selected_pair_ids": list(shield_pair_ids),
+            "orientation_pairs": [
+                {"fe": pair_id // 8, "pb": pair_id % 8}
+                for pair_id in shield_pair_ids
+            ],
+            "studio_detector_pose_xyz_m": [0.0, 0.0, 1.05],
+            "camera": {
+                "eye_xyz_m": [0.90, -1.22, 1.48],
+                "target_xyz_m": [0.0, 0.0, 1.02],
+                "focal_length_mm": 68.0,
+                "resolution_px": [1400, 1050],
+            },
+            "note": (
+                "The neutral studio changes only visual context; detector and "
+                "shield geometry use the runtime scene builder. The support is "
+                "rendered as a slim two-stage mast at the commanded detector "
+                "height; this visual housing is not transport geometry. All "
+                "eight recorded pairs are retained as candidate renders. The "
+                "four displayed pairs maximize projected Fe/Pb separation and "
+                "camera visibility while preserving acquisition order."
+            ),
+        },
+        "renderer": "Isaac Sim RayTracedLighting",
+        "randomness": "none",
+    }
+    output_path = Path(output_dir) / "isaac_capture_provenance.json"
+    output_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return output_path
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse authenticated capture paths and selected run indices."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
+    parser.add_argument(
+        "--measurement-log-dir",
+        type=Path,
+        default=DEFAULT_MEASUREMENT_LOG,
+    )
+    parser.add_argument(
+        "--truth-manifest",
+        type=Path,
+        default=DEFAULT_TRUTH_MANIFEST,
+    )
+    parser.add_argument(
+        "--geant4-tracks",
+        type=Path,
+        default=DEFAULT_GEANT4_TRACKS,
+    )
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_ROOT)
+    parser.add_argument(
+        "--environment-station",
+        type=int,
+        default=5,
+        help="Recorded station shown with the robot in the scene overview.",
+    )
+    parser.add_argument(
+        "--shield-station",
+        type=int,
+        default=1,
+        help="Recorded adaptive station supplying the four displayed pair IDs.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    """Render all Isaac Sim manuscript captures and update the LaTeX figures."""
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    app = IsaacSimApplication(use_mock=False, app_config=_app_config())
+    """Capture the current scene and a four-view recorded shield sequence."""
+    args = parse_args()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    inputs = load_capture_inputs(
+        run_dir=args.run_dir,
+        measurement_log_dir=args.measurement_log_dir,
+        truth_manifest_path=args.truth_manifest,
+    )
+    geant4_track_path = Path(args.geant4_tracks).expanduser().resolve()
+    geant4_tracks = _load_geant4_tracks(geant4_track_path)
+    environment_station = int(args.environment_station)
+    shield_station = int(args.shield_station)
+    if shield_station <= 0:
+        raise ValueError("The shield sequence must use a posterior-adaptive station.")
+    all_shield_pair_ids = inputs.station_pair_ids[shield_station]
+    shield_pair_ids = _select_spatially_legible_pairs(all_shield_pair_ids)
+    generated: list[Path] = []
+    provenance_path: Path | None = None
+    app = IsaacSimApplication(use_mock=False, app_config=_app_config(inputs))
     try:
-        app.reset(_scene_description())
-        app.step(_command(step_id=0, pose_xy=(4.3, 5.9), yaw=1.05, fe=0, pb=6))
-
-        _set_camera(
+        app.reset(_scene_description(inputs))
+        _author_room_context(app, inputs)
+        environment_pair_id = inputs.station_pair_ids[environment_station][0]
+        app.step(
+            _command(
+                inputs,
+                station_index=environment_station,
+                pair_id=environment_pair_id,
+                step_id=0,
+            )
+        )
+        emission_tracks = _author_run_context(
             app,
-            "/World/SimBridge/View/DetectorCamera",
-            eye=(6.35, 3.35, 2.35),
-            target=(4.25, 5.92, 0.78),
-            focal_length_mm=44.0,
+            inputs,
+            geant4_tracks,
+            station_index=environment_station,
         )
-        detector = _capture(
-            camera_path="/World/SimBridge/View/DetectorCamera",
-            output_dir=OUTPUT_ROOT,
-            name="detector_module",
-            resolution=(1600, 1050),
-        )
-        _annotate_capture(detector, "detector")
-
-        app.step(_command(step_id=20, pose_xy=(4.3, 5.9), yaw=1.05, fe=0, pb=6))
-        _author_context_prims(app, include_robot_path=False)
-        _set_camera(
-            app,
-            "/World/SimBridge/View/ProblemCamera",
-            eye=(5.1, -5.6, 11.7),
-            target=(5.0, 8.0, 0.2),
-            focal_length_mm=22.0,
-        )
-        problem = _capture(
-            camera_path="/World/SimBridge/View/ProblemCamera",
-            output_dir=OUTPUT_ROOT,
-            name="problem_setting",
-            resolution=(1800, 1050),
-        )
-        _annotate_capture(problem, "problem")
-
         _set_camera(
             app,
             "/World/SimBridge/View/EnvironmentCamera",
-            eye=(5.0, -3.6, 9.2),
-            target=(5.0, 8.0, 0.1),
-            focal_length_mm=23.0,
+            eye=(14.5, -13.0, 13.0),
+            target=(5.0, 7.6, 1.45),
+            focal_length_mm=25.0,
         )
-        _author_context_prims(app, include_robot_path=True)
-        environment = _capture(
-            camera_path="/World/SimBridge/View/EnvironmentCamera",
-            output_dir=OUTPUT_ROOT,
-            name="simulation_environment",
-            resolution=(1700, 1150),
+        generated.append(
+            _capture(
+                camera_path="/World/SimBridge/View/EnvironmentCamera",
+                output_dir=output_dir,
+                name="experiment_environment",
+                resolution=(2400, 1400),
+            )
         )
-        _annotate_capture(environment, "environment")
 
-        for image_path in (problem, detector, environment):
-            _save_pdf(image_path, image_path.with_suffix(".pdf"))
-        _copy_to_manuscript()
+        studio_scene = SceneDescription(
+            room_size_xyz=(5.0, 5.0, 4.0),
+            author_obstacle_prims=False,
+            author_room_boundary_prims=False,
+            sources=[],
+            usd_path=None,
+            use_config_usd_fallback=False,
+        )
+        app.reset(studio_scene)
+        _author_studio(app)
+        _set_camera(
+            app,
+            "/World/SimBridge/View/DetectorSequenceCamera",
+            eye=(0.90, -1.22, 1.48),
+            target=(0.0, 0.0, 1.02),
+            focal_length_mm=68.0,
+        )
+        candidate_paths: dict[int, Path] = {}
+        for recorded_index, pair_id in enumerate(all_shield_pair_ids):
+            app.step(_studio_command(pair_id, step_id=100 + recorded_index))
+            _author_studio_telescoping_mast(app, detector_height_m=1.05)
+            _pump(app, frames=18)
+            candidate_path = _capture(
+                camera_path="/World/SimBridge/View/DetectorSequenceCamera",
+                output_dir=output_dir,
+                name=(
+                    f"shield_candidate_{recorded_index:02d}_pair_{pair_id:02d}"
+                ),
+                resolution=(1400, 1050),
+            )
+            candidate_paths[pair_id] = candidate_path
+            generated.append(candidate_path)
+        for view_index, pair_id in enumerate(shield_pair_ids):
+            selected_path = output_dir / f"shield_sequence_{view_index:02d}.png"
+            shutil.copy2(candidate_paths[pair_id], selected_path)
+            generated.append(selected_path)
+        provenance_path = _write_provenance(
+            inputs,
+            output_dir=output_dir,
+            output_paths=generated,
+            environment_station_index=environment_station,
+            shield_station_index=shield_station,
+            all_shield_pair_ids=all_shield_pair_ids,
+            shield_pair_ids=shield_pair_ids,
+            geant4_track_artifact_path=geant4_track_path,
+            emission_tracks=emission_tracks,
+        )
+        for output in generated:
+            print(f"Wrote {output}", flush=True)
+        print(f"Wrote {provenance_path}", flush=True)
     finally:
         app.close()
+    if provenance_path is None:
+        raise RuntimeError("Isaac Sim closed before capture provenance was written.")
 
 
 if __name__ == "__main__":

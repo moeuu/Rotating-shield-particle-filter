@@ -89,8 +89,8 @@ implemented facts, measured results, inferences, and limitations.
 
 ## Page and figure budget
 
-- Page 1: abstract, motivation, three contribution statements, and the compact
-  problem/attenuation-code figure.
+- Page 1: abstract, motivation, concise outcome-based contributions, and the
+  environment figure when float placement permits.
 - Pages 2--4: related boundary, model, and coupled inference/design method.
 - Page 5: experiment and evaluation contract.
 - Pages 6--7: four-variant comparison and discussion.
@@ -101,21 +101,36 @@ not create artificial white space by removing necessary explanation, and do
 not compress figure or table text below the readable limits in the
 [figure policy](figures.md).
 
-The current manuscript has two live figures with distinct roles:
+The current manuscript has three live figures with distinct roles:
 
-1. the robotic problem and physical Fe/Pb attenuation code; and
-2. the coupled inference and planning mechanism.
+1. the evaluated environment, robot, actual obstacle geometry, sources, route,
+   and sensing head;
+2. a close-up four-view sequence that makes the fixed detector and independent
+   Fe/Pb shield rotations physically understandable; and
+3. equally weighted floor/elevation projections of the representative robot
+   route, matching station numbers, physical obstacles, station heights, and
+   merged source outcome. Marker displacement is sufficient for the visual
+   comparison; omit redundant truth--estimate connector lines.
 
-Do not use the same primary scene rendering for both roles. The completed-run
-3-D case audit is a review/supplementary artifact for now. After all four
-variants are complete, decide from the quantitative evidence whether a result
-figure should replace or restructure one live figure, or whether the result is
-clearer as a table. Do not add a third live figure by default.
+Present the coupled inference/planning mechanism with the defining equations
+and a compact, line-numbered mathematical pseudocode for one station transition
+from $\pi_{t-1}$ through action, acquisition, and SMC/RJSMC to $\pi_t$.
+State that its eight views are open loop with respect to inference and that
+feedback closes only across station boundaries. Align its steps to the method
+subsections; a text-only process diagram does not justify figure space.
 
-If a result figure becomes live, follow the figure policy's evidence grammar:
-actual obstacle geometry in a contextual 3-D view, companion orthogonal
-projections or explicit 3-D error metrics, saved routes only, redundant marker
-encoding, and a comparison-first presentation shared by all variants.
+Do not use the same primary scene rendering for multiple roles. The six-panel
+completed-run case audit remains a review/supplementary artifact; the compact
+third figure uses the same authenticated data only to expose robot motion,
+obstacle shape, height, and final 3-D structure. Comparative superiority remains
+grounded in the all-variant result tables.
+
+For a live result figure, follow the figure policy's evidence grammar:
+actual obstacle geometry in the contextual 3-D environment figure, matched
+floor/elevation projections or explicit 3-D error metrics, saved routes only,
+redundant marker
+encoding, and an explicit statement that truth overlays were unavailable to
+planning and inference.
 
 ## Figure and table selection
 
