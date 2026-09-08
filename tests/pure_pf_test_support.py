@@ -1,4 +1,4 @@
-"""Local schema-v6 physics-only fixtures for pure-PF contract tests."""
+"""Local physics-only fixtures for pure-PF contract tests."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from measurement.detector_geometry import DetectorObservationGeometry
 from measurement.kernels import ShieldParams
 from measurement.observation_model import RuntimeObservationModel
 from measurement.source_boundary import surface_emission_policy_sha256
-from pf.full_spectrum import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
+from runtime.contracts import FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY
 from pf.provenance import strict_canonical_json_bytes
 from runtime.measurement_log import (
     MeasurementLogRecord,
@@ -77,7 +77,7 @@ def _synthetic_validation_manifest(
     model_contract_hash: str,
     additive_scatter_contract_hash: str,
 ) -> dict[str, object]:
-    """Return a strict schema-v6 validation-only approval manifest."""
+    """Return a strict validation-only approval manifest."""
     operator = _test_operator()
     green_validation = synthetic_detector_green_validation_manifest(
         operator,
@@ -236,7 +236,7 @@ def runtime_observation_model(
 
 @lru_cache(maxsize=1)
 def _runtime_config_template() -> dict[str, object]:
-    """Build one immutable schema-v6 runtime fixture template."""
+    """Build one immutable runtime fixture template."""
     model = approved_full_spectrum_model()
     payload = model.manifest_payload()
     return {
@@ -267,7 +267,7 @@ def _runtime_config_template() -> dict[str, object]:
 
 
 def runtime_config() -> dict[str, object]:
-    """Return a fresh resolved schema-v6 physical test configuration."""
+    """Return a fresh resolved physical test configuration."""
     return copy.deepcopy(_runtime_config_template())
 
 

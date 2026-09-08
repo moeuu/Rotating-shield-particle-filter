@@ -57,9 +57,15 @@ profiles inherit that value, so changing this one field updates live and RA-L PF
 runs without duplicating the setting. An MLE session may use entirely different
 estimator settings while connecting to the same runtime protocol.
 
+The configuration always uses the current exact-RJ PF and the runtime's current
+detector Green spectrum model. No implementation version needs to be selected:
+`pure_pf_schema_version` may be omitted. An explicit retired format is rejected.
+Resolved artifacts retain format identifiers and scientific contract hashes so
+existing observations, approvals, and posteriors keep their original identity.
+
 The runtime owns reachable candidate poses and their physical motion costs. PF owns
 candidate ranking and shield-program selection. Every selected station writes
-the compact schema-v3 `planner_audit.jsonl`: selected pose/program/score/EIG,
+the compact `planner_audit.jsonl`: selected pose/program/score/EIG,
 physical pose and proxy/exact subset-evaluation counts, the EIG leader, compact
 top-ranked actions, and resolved EIG seeds. When the fixed-eight shadow audit is
 enabled, it additionally retains all-pose proxy `I_2/I_4/I_8`, paired exact

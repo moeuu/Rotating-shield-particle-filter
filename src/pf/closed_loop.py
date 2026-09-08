@@ -1628,7 +1628,6 @@ def run_pf_closed_loop(
         )
         resources.callback(client.close)
         ready = client.handshake()
-        schema_version = ready.schema_version
         context = ready.context
         candidates = ready.candidates
         bootstrap = ready.bootstrap
@@ -1678,39 +1677,35 @@ def run_pf_closed_loop(
         reusable_cui_frame: PFFrame | None = None
         stop_reason = "maximum_station_budget"
         continue_acquisition = True
-        if schema_version == 1:
-            assert bootstrap is not None
-            current_pose = np.asarray(
-                candidates.candidate_poses_xyz[bootstrap.candidate_index],
-                dtype=np.float64,
-            )
-            _require_candidate_anchor(candidates, current_pose)
-            visited = []
-            record_count = live_session.record_count
-            cui_elapsed_time_s = 0.0
-            station_id = 0
-            bootstrap_audit = build_bootstrap_planner_audit(
-                station_id=0,
-                pose_index=int(bootstrap.candidate_index),
-                pose_xyz=current_pose,
-                program=current_program,
-                shadow_enabled=bool(
-                    planner.shield_view_count_shadow_enabled
-                    and current_program.kind != "external_control"
-                ),
-                candidate_view_counts=tuple(
-                    planner.shield_view_count_shadow_candidate_counts
-                ),
-                retention_fraction=float(
-                    planner.shield_view_count_shadow_retention_fraction
-                ),
-                per_comparison_confidence=float(
-                    planner.shield_view_count_shadow_per_comparison_confidence
-                ),
-            )
-            planner_writer.append(bootstrap_audit)
-        else:
-            raise RuntimeError("PF live acquisition requires fresh protocol schema 1.")
+        current_pose = np.asarray(
+            candidates.candidate_poses_xyz[bootstrap.candidate_index],
+            dtype=np.float64,
+        )
+        _require_candidate_anchor(candidates, current_pose)
+        visited = []
+        record_count = live_session.record_count
+        cui_elapsed_time_s = 0.0
+        station_id = 0
+        bootstrap_audit = build_bootstrap_planner_audit(
+            station_id=0,
+            pose_index=int(bootstrap.candidate_index),
+            pose_xyz=current_pose,
+            program=current_program,
+            shadow_enabled=bool(
+                planner.shield_view_count_shadow_enabled
+                and current_program.kind != "external_control"
+            ),
+            candidate_view_counts=tuple(
+                planner.shield_view_count_shadow_candidate_counts
+            ),
+            retention_fraction=float(
+                planner.shield_view_count_shadow_retention_fraction
+            ),
+            per_comparison_confidence=float(
+                planner.shield_view_count_shadow_per_comparison_confidence
+            ),
+        )
+        planner_writer.append(bootstrap_audit)
         while continue_acquisition and station_id < budget.max_stations:
             if record_count + len(current_program.pair_ids) > budget.max_measurements:
                 stop_reason = "maximum_measurement_budget"

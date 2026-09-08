@@ -387,13 +387,15 @@ def enforce_pure_runtime_settings(
     *,
     profile: EstimatorProfile | str | None = None,
 ) -> dict[str, Any]:
-    """Validate the one complete schema-v2 production-live configuration."""
+    """Resolve and validate the single current production-live configuration."""
     if not isinstance(runtime_config, Mapping) or any(
         not isinstance(key, str) for key in runtime_config
     ):
         raise ValueError(
             "Production live PF configuration must be a string-keyed object."
         )
+    runtime_config = dict(runtime_config)
+    runtime_config.setdefault("pure_pf_schema_version", PURE_PF_SCHEMA_VERSION)
     actual_top_level = frozenset(runtime_config)
     missing_top_level = sorted(
         PRODUCTION_LIVE_TOP_LEVEL_KEYS.difference(actual_top_level)
@@ -403,7 +405,7 @@ def enforce_pure_runtime_settings(
     )
     if missing_top_level or unknown_top_level:
         raise ValueError(
-            "Production live PF schema-v2 keys differ from the exact contract: "
+            "Production live PF keys differ from the exact contract: "
             f"missing={missing_top_level}, unknown_or_retired={unknown_top_level}."
         )
     schema_version = runtime_config.get("pure_pf_schema_version")
@@ -412,7 +414,9 @@ def enforce_pure_runtime_settings(
         or not isinstance(schema_version, int)
         or schema_version != PURE_PF_SCHEMA_VERSION
     ):
-        raise ValueError("Runtime configuration requires pure_pf_schema_version=2.")
+        raise ValueError(
+            "Unsupported pure_pf_schema_version; use the current PF format."
+        )
     if runtime_config["hard_max_sources"] is None:
         raise ValueError(
             "Production live PF requires an explicit hard_max_sources capacity."
@@ -426,7 +430,7 @@ def enforce_pure_runtime_settings(
     unknown_adaptive = sorted(adaptive_keys - PRODUCTION_ADAPTIVE_STOP_KEYS)
     if missing_adaptive or unknown_adaptive:
         raise ValueError(
-            "adaptive_stop keys differ from the exact schema-v2 contract: "
+            "adaptive_stop keys differ from the exact contract: "
             f"missing={missing_adaptive}, unknown_or_retired={unknown_adaptive}."
         )
     for key in ("assessment_start_station", "required_consecutive_stations"):
@@ -471,7 +475,7 @@ def enforce_pure_runtime_settings(
         unknown_dss = sorted(dss_keys - production_dss_keys)
         if missing_dss or unknown_dss:
             raise ValueError(
-                "dss_pp keys differ from the exact schema-v2 contract: "
+                "dss_pp keys differ from the exact contract: "
                 f"missing={missing_dss}, unknown_or_retired={unknown_dss}."
             )
         try:

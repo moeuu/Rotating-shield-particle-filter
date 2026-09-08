@@ -1,5 +1,4 @@
 {
-  "pure_pf_schema_version": 2,
   "estimator_profile": "pf_strict",
   "num_particles": 4096,
   "max_sources": 5,

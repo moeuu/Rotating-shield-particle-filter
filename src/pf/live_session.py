@@ -483,7 +483,7 @@ def load_production_live_pf_config(
     *,
     profile: str,
 ) -> ValidatedProductionPFConfig:
-    """Load and validate one complete production-live schema-v2 file."""
+    """Load and validate one complete production-live file."""
     try:
         document = load_pf_config(path)
     except (OSError, TypeError, ValueError, RuntimeError) as exc:

@@ -10,9 +10,9 @@ from typing import Mapping, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
+from runtime.contracts import FULL_SPECTRUM_MODEL_SCHEMA_VERSION
 
-FULL_SPECTRUM_CONTRACT_HASH_METADATA_KEY = "full_spectrum_contract_hash_sha256"
-FULL_SPECTRUM_MODEL_SCHEMA_VERSION = 7
+
 FULL_SPECTRUM_MODEL_ID = "geometry_conditioned_full_spectrum"
 DETECTOR_IMPACT_PHASE_COUNT = 8
 DETECTOR_IMPACT_FEATURE_ORDER = tuple(
@@ -559,12 +559,12 @@ def catalog_line_layout_by_isotope(
     return result
 
 
-def _validate_schema_v7_manifest(
+def _validate_current_manifest(
     model: FullSpectrumGenerativeModel,
     *,
     lines: tuple[CatalogTransportLine, ...],
 ) -> None:
-    """Validate the PF-facing physics-only schema-v7 manifest contract."""
+    """Validate the PF-facing physics-only manifest contract."""
     payload = model.manifest_payload()
     if not isinstance(payload, Mapping):
         raise TypeError("Full-spectrum model manifest must be a mapping.")
@@ -600,7 +600,7 @@ def _validate_schema_v7_manifest(
     missing = required_fields - set(payload)
     if missing:
         raise ValueError(
-            f"Full-spectrum schema-v7 manifest is missing fields: {sorted(missing)}."
+            f"Full-spectrum manifest is missing fields: {sorted(missing)}."
         )
     forbidden_legacy_fields = {
         "native_response_contract_sha256",
@@ -766,7 +766,7 @@ def _validate_schema_v7_manifest(
     ):
         raise ValueError(
             "Production full-spectrum manifest is not the canonical "
-            "physics-only detector-Green schema-v7 contract."
+            "physics-only detector-Green contract."
         )
     _strict_sha256(
         discrepancy["obstacle_material_contract_sha256"],
@@ -843,7 +843,7 @@ def _validate_full_spectrum_contract(
         or np.any(~np.isfinite(energy_axis))
     ):
         raise ValueError(
-            "Full-spectrum schema-v7 energy axis must be the exact 0--1700 "
+            "Full-spectrum energy axis must be the exact 0--1700 "
             "keV, 2 keV-bin runtime axis."
         )
     lines = validated_catalog_transport_lines(
@@ -875,7 +875,7 @@ def _validate_full_spectrum_contract(
         raise ValueError(
             "Full-spectrum detector Green geometry contract is invalid."
         )
-    _validate_schema_v7_manifest(model, lines=lines)
+    _validate_current_manifest(model, lines=lines)
     return model
 
 

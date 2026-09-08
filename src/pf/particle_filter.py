@@ -38,7 +38,7 @@ from pf.particle_types import StructuralGeometryBatch
 from pf.randomness import isotope_random_generator, normalize_pf_random_seed
 from pf.state import IsotopeState
 from pf.strength_prior import StrengthPrior
-from spectrum.additive_scatter import AdditiveNoncollidedTransportResponse
+from spectrum.additive_scatter import PhysicsOnlyNoncollidedTransportResponse
 from pf.structural_rj import (
     POISSON_GEOMETRIC_TAIL_CARDINALITY_PRIOR_POLICY,
     BirthDeathMoveProbabilities,
@@ -230,7 +230,9 @@ class IsotopeParticleFilter(
         strict_catalog_line_contract: bool = False,
         dry_air_total_attenuation_contract_id: str | None = None,
         dry_air_total_attenuation_contract_sha256: str | None = None,
-        additive_scatter_response: (AdditiveNoncollidedTransportResponse | None) = None,
+        additive_scatter_response: (
+            PhysicsOnlyNoncollidedTransportResponse | None
+        ) = None,
         random_seed: int = 0,
     ) -> None:
         """Initialize particle state, priors, and continuous measurement kernels."""

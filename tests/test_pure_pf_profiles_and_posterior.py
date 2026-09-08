@@ -102,7 +102,7 @@ def _phase_resolved_transport_features(
 
 
 def _production_live_settings() -> dict[str, object]:
-    """Load a fresh copy of the complete production schema-v2 settings."""
+    """Load a fresh copy of the complete production settings."""
     root = Path(__file__).resolve().parents[1]
     return json.loads(
         (root / "configs/pf/pf_strict_3d.json").read_text(encoding="utf-8")
@@ -1291,13 +1291,10 @@ def test_profile_aliases_are_not_part_of_the_runtime_schema(
 def test_runtime_requires_exact_pure_pf_schema_version(
     schema_version: object,
 ) -> None:
-    """Runtime configuration must explicitly select pure-PF schema version 2."""
+    """Explicit retired or invalid format identifiers must fail closed."""
     payload = _production_live_settings()
-    if schema_version is not None:
-        payload["pure_pf_schema_version"] = schema_version
-    else:
-        del payload["pure_pf_schema_version"]
-    with pytest.raises(ValueError, match="pure_pf_schema_version=2|missing"):
+    payload["pure_pf_schema_version"] = schema_version
+    with pytest.raises(ValueError, match="Unsupported pure_pf_schema_version"):
         enforce_pure_runtime_settings(payload)
 
 
@@ -5947,3 +5944,14 @@ def test_persistent_transport_cache_follows_joint_resampling(
     assert cached is not None
     np.testing.assert_array_equal(cached[0][:, 0, 0, 0], indices)
     assert estimator.last_joint_persistent_cache_reindex_count == 1
+
+
+def test_unversioned_pf_config_resolves_to_current_without_mutation() -> None:
+    """Omitting the format tag must resolve to the same authenticated settings."""
+    payload = _production_live_settings()
+    payload.pop("pure_pf_schema_version", None)
+    resolved = enforce_pure_runtime_settings(payload)
+    assert "pure_pf_schema_version" not in payload
+    assert resolved == enforce_pure_runtime_settings(
+        {**payload, "pure_pf_schema_version": PURE_PF_SCHEMA_VERSION}
+    )
