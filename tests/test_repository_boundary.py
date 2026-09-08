@@ -22,6 +22,8 @@ def test_pf_repository_contains_no_simulation_implementation() -> None:
     """Geant4, observation generation, and raw-log writing stay shared."""
     forbidden = (
         ROOT / "native",
+        ROOT / "sim",
+        ROOT / "data" / "manchester_nuclear_assets",
         ROOT / "obstacle_layouts",
         ROOT / "source_layouts",
         ROOT / "src" / "sim",
@@ -31,6 +33,12 @@ def test_pf_repository_contains_no_simulation_implementation() -> None:
     )
 
     assert all(not path.exists() for path in forbidden)
+
+
+def test_pf_repository_uses_only_the_current_evaluation_package() -> None:
+    """The retired standalone evaluator must not shadow current run scoring."""
+    assert not (ROOT / "src" / "evaluation_metrics.py").exists()
+    assert (ROOT / "src" / "evaluation" / "completed_run.py").is_file()
 
 
 def test_pf_repository_contains_no_legacy_runtime_entry_points() -> None:

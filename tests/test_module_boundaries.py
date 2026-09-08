@@ -6,7 +6,7 @@ import planning.dss_pp as dss_pp
 import pf.particle_filter as particle_filter
 
 from evaluation.source_normalization import Source as ExtractedSource
-from evaluation_metrics import Source as PublicSource
+from evaluation import Source as PublicSource
 from pf.estimator import (
     JointPlanningParticles as PublicJointPlanningParticles,
 )

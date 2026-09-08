@@ -57,3 +57,16 @@ def test_repository_index_excludes_generated_artifacts() -> None:
         ["git", "ls-files", "-ci", "--exclude-standard"], cwd=root, text=True,
     ).splitlines()
     assert tracked == [], f"Remove generated/local files from Git: {tracked}"
+
+
+def test_retired_build_and_runtime_directories_are_reported(tmp_path: Path) -> None:
+    """Old build trees and migrated runtime assets must not accumulate again."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for directory in ("build/lib", "sim", "data/manchester_nuclear_assets"):
+        (tmp_path / directory).mkdir(parents=True)
+    _, problems = MODULE.audit(tmp_path)
+    assert problems == [
+        "Retired or runtime-owned directory: build",
+        "Retired or runtime-owned directory: sim",
+        "Retired or runtime-owned directory: data/manchester_nuclear_assets",
+    ]

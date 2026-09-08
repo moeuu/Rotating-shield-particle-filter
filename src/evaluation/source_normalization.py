@@ -9,8 +9,6 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-PROBABILITY_ROUNDOFF_ATOL = 1.0e-12
-
 
 @dataclass(frozen=True)
 class Source:
@@ -38,21 +36,6 @@ def non_negative_finite(value: Any, *, name: str) -> float:
     if not np.isfinite(numeric) or numeric < 0.0:
         raise ValueError(f"{name} must be finite and non-negative.")
     return numeric
-
-
-def unit_interval_probability(value: Any, *, name: str) -> float:
-    """Return a probability, clipping only numeric boundary roundoff."""
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be finite and in [0, 1].") from exc
-    if (
-        not np.isfinite(numeric)
-        or numeric < -PROBABILITY_ROUNDOFF_ATOL
-        or numeric > 1.0 + PROBABILITY_ROUNDOFF_ATOL
-    ):
-        raise ValueError(f"{name} must be finite and in [0, 1].")
-    return float(np.clip(numeric, 0.0, 1.0))
 
 
 def _extract_strength(value: Any) -> float | None:
@@ -130,5 +113,4 @@ __all__ = [
     "non_negative_finite",
     "normalize_source",
     "normalize_sources",
-    "unit_interval_probability",
 ]

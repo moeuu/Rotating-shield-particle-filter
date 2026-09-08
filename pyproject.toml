@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
 
 [project]
 name = "rotating-shield-particle-filter"
@@ -28,11 +28,34 @@ dependencies = [
 [project.scripts]
 rotating-shield-pf-live = "pf.closed_loop:main"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
+[tool.hatch.build]
+exclude = ["**/__pycache__/**", "**/*.py[cod]", "**/*.egg-info/**"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/baselines",
+    "src/evaluation",
+    "src/pf",
+    "src/planning",
+    "src/visualization",
+]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src",
+    "configs",
+    "scripts",
+    "tests",
+    "docs",
+    "AGENTS.md",
+    "CITATION.cff",
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+    "uv.lock",
+    ".gitignore",
+    ".python-version",
+]
 
 [tool.uv.sources]
 rotating-shield-simulation-runtime = { path = "../Rotating-shield-simulation-runtime", editable = true }

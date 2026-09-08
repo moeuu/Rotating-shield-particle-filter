@@ -20,6 +20,10 @@ def audit(root: Path) -> tuple[list[str], list[str]]:
         ["git", "ls-files", "-z", "-ci", "--exclude-standard"], cwd=root,
     ).decode().split("\0")
     problems = [f"Tracked generated/local file: {p}" for p in tracked_ignored if p]
+    for name in ("build", "sim", "data/manchester_nuclear_assets"):
+        path = root / name
+        if path.exists() or path.is_symlink():
+            problems.append(f"Retired or runtime-owned directory: {name}")
     inventory = []
     for name in ("results", "logs", "tmp"):
         base = root / name

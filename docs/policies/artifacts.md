@@ -10,6 +10,10 @@ rendered review images, videos, local datasets, caches, or temporary exports.
 tracked artifacts remain available in Git history; removing them from the index
 does not delete local copies. Git history is not a backup for new ignored data.
 
+Manchester environment downloads, original assets, converted USD, and textures
+belong exclusively in the sibling runtime's ignored
+`data/manchester_nuclear_assets/`. Do not recreate `sim/` or an asset copy here.
+
 Keep final paper figures and submission assets in the manuscript workspace under
 its own versioning policy. Keep their raw evidence and provenance in the durable
 run bundle and a separately backed-up artifact store before local cleanup.
@@ -46,6 +50,14 @@ use persistent sessions for long acquisitions. Tests must use pytest `tmp_path`
 or a temporary directory, never persistent `results/pf-test-*` folders.
 
 ## Retention and checks
+
+Build with `uv build`. The explicit Hatchling package list reads current source
+directly and does not reuse a persistent `build/lib/` tree. Keep release wheels
+and source distributions in ignored `dist/`; remove superseded distributions
+instead of treating them as source backups. Packaging tests build disposable
+source copies with deliberately stale build files and compare every packaged
+Python file and its bytes against the current source, including a wheel rebuilt
+from the source distribution. Do not restore incremental setuptools build trees.
 
 After each completed or failed experiment, report its exact paths and status.
 Retain complete evidence for active paper results, current acceptance runs, and
