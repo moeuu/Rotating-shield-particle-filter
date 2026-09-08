@@ -248,3 +248,14 @@
 - When starting a simulation that exposes a CUI/split-view progress URL, relay
   that URL in the chat immediately. Do not require the user to inspect terminal
   logs to find the progress view.
+
+
+## Artifact hygiene
+
+- Before creating experiment outputs or cleaning generated files, read
+  `docs/policies/artifacts.md`.
+- Keep all generated results and logs out of Git, including rendered review
+  figures. Never use `git add -f` to bypass these exclusions.
+- Use fresh run-ID directories and keep related logs and provenance together.
+  Tests must use temporary directories. Do not create new ad-hoc results roots.
+- Before committing, run `uv run python scripts/audit_artifacts.py --check`.

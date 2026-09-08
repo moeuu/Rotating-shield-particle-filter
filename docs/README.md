@@ -21,6 +21,9 @@ history retains them.
 
 ## Policies
 
+- [Artifact and Git policy](policies/artifacts.md): output layout, retention,
+  generated-file exclusions, and read-only hygiene checks.
+
 - [PF compute policy](policies/compute.md): batching, device execution, and
   equivalence requirements for PF-owned heavy code.
 - [PF inference fidelity policy](policies/inference_fidelity.md): causal

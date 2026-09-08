@@ -44,7 +44,7 @@ uv run rotating-shield-pf-live \
   --config configs/pf/pf_strict_3d.json \
   --profile pf_strict \
   --seed 1 \
-  --output-dir results/pf-live-run-001
+  --output-dir results/runs/run-001
 ```
 
 Create and serve the private, action-free scenario from the shared runtime. The
@@ -122,3 +122,13 @@ If this software contributes to research, use the metadata in
 a scholarly request, not an additional license condition. Repository-authored
 software and documentation are released under the [MIT License](LICENSE);
 third-party dependencies and externally sourced data retain their own terms.
+
+## Generated artifacts
+
+Follow the [artifact and Git policy](docs/policies/artifacts.md) for run folders,
+logs, retention, and paper evidence. Generated files stay local and ignored.
+Check the output layout and Git index with:
+
+```bash
+uv run python scripts/audit_artifacts.py --check
+```
